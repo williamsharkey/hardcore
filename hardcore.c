@@ -120,7 +120,11 @@ static int g_dpi = 96;
 static char g_distro[128];
 static char g_start_dir[1024];   /* Windows or Linux path */
 static wchar_t g_cfg_dir[MAX_PATH];
-static char g_rc_linux[1024];    /* rc.bash as seen from inside WSL */
+static int g_shell_ps;           /* shell=powershell in config.ini: tabs run PowerShell, not WSL */
+static int g_no_bash;            /* the distro has no bash: run its default shell, without rc.bash */
+static int g_have_distro = 1;    /* any WSL distro registered for this user (HKCU\...\Lxss) */
+static char g_mnt_root[64] = "/mnt/";   /* where Windows drives appear in WSL (wsl.conf automount root) */
+static wchar_t g_default_distro[128];
 static int g_win_w = 0, g_win_h = 0;
 static int g_inbox_conpty;       /* --inbox-conpty: use Windows' own conhost */
 static const char *g_conpty_kind = "inbox";
@@ -270,9 +274,15 @@ typedef struct Tab {
     int busy;                    /* term_busy(), as of the last check: drives the throbber */
     int attention;               /* bell, notification, or a busy program went quiet: the bell mark */
     int ps_seen;                 /* t.ps_state as of the last update_busy() */
+    int kind;                    /* TK_WSL or TK_PS */
+    int help;                    /* a help screen instead of a shell: HELP_* */
+    DWORD born;                  /* GetTickCount() at spawn: a quick death means a setup problem */
     int spare;                   /* pre-warmed, waiting on stdin for its directory */
     char start_dir[1024];
 } Tab;
+
+enum { TK_WSL, TK_PS };
+enum { HELP_NONE, HELP_NO_DISTRO, HELP_FAILED };
 
 static HWND g_hwnd;
 
@@ -1106,13 +1116,8 @@ static void percent_decode(char *s) {
 static void set_cwd(Term *t, const char *p) {
     char tmp[1024];
     size_t i;
-    if (!p || !*p) return;
-    /* a Windows path (wslpath -w style) becomes /mnt/<drive>/... */
-    if (((p[0] | 32) >= 'a' && (p[0] | 32) <= 'z') && p[1] == ':' && (p[2] == '\\' || p[2] == '/' || !p[2])) {
-        snprintf(tmp, sizeof(tmp), "/mnt/%c%s", p[0] | 32, p + 2);
-        for (i = 0; tmp[i]; i++) if (tmp[i] == '\\') tmp[i] = '/';
-        p = tmp;
-    }
+    (void)tmp; (void)i;
+    if (!p || !*p) return;       /* kept as reported: Linux paths from WSL, Windows paths from PowerShell */
     if (strcmp(t->cwd, p) != 0) {
         snprintf(t->cwd, sizeof(t->cwd), "%s", p);
         t->dirty = 1;
@@ -1269,6 +1274,15 @@ static void osc_dispatch(Term *t) {
     case 7501:                   /* program status, see program_status() */
         if (!strcmp(rest, "?")) term_reply(t, "\x1b]7501;?\x1b\\");
         else program_status(t, rest);
+        break;
+    case 7700:                   /* from rc.bash: mnt=<wslpath -u C:\>, when drives aren't under /mnt */
+        if (!strncmp(rest, "mnt=", 4) && rest[4] == '/') {
+            char *e;
+            snprintf(g_mnt_root, sizeof(g_mnt_root), "%s", rest + 4);
+            e = g_mnt_root + strlen(g_mnt_root);
+            if (e > g_mnt_root && e[-1] == '/') *--e = 0;          /* "/c/" → "/c" → "/" */
+            while (e > g_mnt_root && e[-1] != '/') *--e = 0;
+        }
         break;
     case 133:                    /* semantic prompts: A = a prompt (or a Claude turn) starts here */
         if (rest[0] == 'A' && !t->alt) add_mark(t);
@@ -1568,14 +1582,6 @@ static int tab_drain(Tab *tb) {
     return n;
 }
 
-static void win_to_linux_path(const char *w, char *out, size_t cap) {
-    size_t i;
-    if (((w[0] | 32) >= 'a' && (w[0] | 32) <= 'z') && w[1] == ':') {
-        snprintf(out, cap, "/mnt/%c%s", w[0] | 32, w + 2);
-        for (i = 0; out[i]; i++) if (out[i] == '\\') out[i] = '/';
-    } else snprintf(out, cap, "%s", w);
-}
-
 /* Login-shell startup files, then report $PWD on every prompt (OSC 9;9).
    Written by hardcore on each launch; nothing in your dotfiles changes. */
 static const char RC_BASH[] =
@@ -1586,6 +1592,8 @@ static const char RC_BASH[] =
     "elif [ -r ~/.profile ]; then . ~/.profile\n"
     "elif [ -r ~/.bashrc ]; then . ~/.bashrc\n"
     "fi\n"
+    "# drives mounted somewhere other than /mnt (wsl.conf automount root): tell hardcore where\n"
+    "[ -d /mnt/c ] || printf '\\033]7700;mnt=%s\\033\\\\' \"$(wslpath -u 'C:\\' 2>/dev/null)\"\n"
     "# tell programs what this terminal can do (WSL doesn't carry WT_SESSION-style hints):\n"
     "# 24-bit color (chalk/supports-color, so Claude Code's theme isn't cut to 256 colors)\n"
     "# and OSC 8 hyperlinks (supports-hyperlinks)\n"
@@ -1593,7 +1601,9 @@ static const char RC_BASH[] =
     "# a pre-warmed spare tab: profile already loaded, wait (silently) to be told where to go\n"
     "if [ -n \"$HARDCORE_SPARE\" ]; then\n"
     "  unset HARDCORE_SPARE\n"
-    "  IFS= read -rs __hardcore_dir && cd -- \"$__hardcore_dir\" 2>/dev/null\n"
+    "  IFS= read -rs __hardcore_dir\n"
+    "  case $__hardcore_dir in [A-Za-z]:*) __hardcore_dir=$(wslpath -u \"$__hardcore_dir\") ;; esac\n"
+    "  cd -- \"$__hardcore_dir\" 2>/dev/null\n"
     "  unset __hardcore_dir\n"
     "fi\n"
     "__hardcore_cwd() { printf '\\033]9;9;%s\\033\\\\\\033]133;A\\033\\\\' \"$PWD\"; }\n"
@@ -1618,8 +1628,99 @@ static void write_rc(void) {
         fwrite(RC_BASH, 1, sizeof(RC_BASH) - 1, f);
         fclose(f);
     }
-    WideCharToMultiByte(CP_UTF8, 0, path, -1, wpath, sizeof(wpath), NULL, NULL);
-    win_to_linux_path(wpath, g_rc_linux, sizeof(g_rc_linux));
+    (void)wpath;
+    /* WSLENV's /p flag hands rc.bash's path to Linux translated for whatever
+       mount root the distro uses; no /mnt assumption on our side */
+    {
+        wchar_t old[2048] = L"", wslenv[2200];
+        DWORD n = GetEnvironmentVariableW(L"WSLENV", old, 2048);
+        SetEnvironmentVariableW(L"HARDCORE_RC", path);
+        _snwprintf(wslenv, 2200, L"%ls%lsHARDCORE_RC/p", old, n ? L":" : L"");
+        wslenv[2199] = 0;
+        SetEnvironmentVariableW(L"WSLENV", wslenv);
+    }
+    /* what PowerShell tabs (and Claude Code for Windows in them) should know */
+    SetEnvironmentVariableW(L"COLORTERM", L"truecolor");
+    SetEnvironmentVariableW(L"TERM_PROGRAM", L"hardcore");
+    SetEnvironmentVariableW(L"FORCE_HYPERLINK", L"1");
+}
+
+/* Distros registered for this user, and the default one's name. No process,
+   no WSL service start: just the registry, so it costs microseconds. */
+static int wsl_distros(void) {
+    HKEY k, d;
+    wchar_t name[128], def[64] = L"";
+    DWORD i, n = 0, sz;
+    g_default_distro[0] = 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss", 0, KEY_READ, &k)) return 0;
+    sz = sizeof(def);
+    RegGetValueW(k, NULL, L"DefaultDistribution", RRF_RT_REG_SZ, NULL, def, &sz);
+    for (i = 0;; i++) {
+        wchar_t sub[64], dn[128];
+        DWORD subn = 64;
+        if (RegEnumKeyExW(k, i, sub, &subn, NULL, NULL, NULL, NULL)) break;
+        sz = sizeof(dn);
+        if (RegOpenKeyExW(k, sub, 0, KEY_READ, &d)) continue;
+        if (!RegGetValueW(d, NULL, L"DistributionName", RRF_RT_REG_SZ, NULL, dn, &sz)) {
+            n++;
+            if (!_wcsicmp(sub, def) || !g_default_distro[0]) _snwprintf(g_default_distro, 128, L"%ls", dn);
+        }
+        RegCloseKey(d);
+    }
+    RegCloseKey(k);
+    (void)name;
+    return (int)n;
+}
+
+/* A folder for a PowerShell tab: Windows paths as-is, <mount root>/c/x → C:\x,
+   other Linux paths through \\wsl.localhost\<distro>. */
+static void to_windows_dir(const char *p, wchar_t *out, int cap) {
+    char tmp[1200];
+    size_t m = strlen(g_mnt_root), i;
+    if (!p[0]) { _snwprintf(out, cap, L"%ls", _wgetenv(L"USERPROFILE") ? _wgetenv(L"USERPROFILE") : L"C:\\"); return; }
+    if (p[1] == ':') snprintf(tmp, sizeof(tmp), "%s", p);
+    else if (!strncmp(p, g_mnt_root, m) && isalpha((unsigned char)p[m]) && (p[m + 1] == '/' || !p[m + 1]))
+        snprintf(tmp, sizeof(tmp), "%c:%s", toupper((unsigned char)p[m]), p[m + 1] ? p + m + 1 : "\\");
+    else if (p[0] == '/') {
+        char dn[128];
+        WideCharToMultiByte(CP_UTF8, 0, g_distro[0] ? L"" : g_default_distro, -1, dn, sizeof(dn), NULL, NULL);
+        snprintf(tmp, sizeof(tmp), "\\\\wsl.localhost\\%s%s", g_distro[0] ? g_distro : dn, p);
+    } else snprintf(tmp, sizeof(tmp), "%s", p);
+    for (i = 0; tmp[i]; i++) if (tmp[i] == '/') tmp[i] = '\\';
+    MultiByteToWideChar(CP_UTF8, 0, tmp, -1, out, cap);
+    out[cap - 1] = 0;
+}
+
+/* PowerShell (7 if installed, else Windows PowerShell), with a prompt hook
+   that reports the folder (OSC 9;9) and marks the prompt (OSC 133;A), the
+   same two things rc.bash does for bash. Your profile still loads. */
+static void powershell_cmd(wchar_t *out, int cap) {
+    static const char hook[] =
+        "$global:__hc_prompt = $function:prompt\n"
+        "function global:prompt { $e = [char]27; "
+        "[Console]::Write(\"$e]9;9;$($executionContext.SessionState.Path.CurrentLocation.ProviderPath)$e\\$e]133;A$e\\\"); "
+        "& $global:__hc_prompt }\n";
+    wchar_t exe[MAX_PATH], w[1024];
+    char b64[3000];
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int n = MultiByteToWideChar(CP_UTF8, 0, hook, -1, w, 1024) - 1, i, k = 0;
+    const unsigned char *b = (const unsigned char *)w;
+    int len = n * 2;             /* -EncodedCommand is base64 of UTF-16LE */
+    for (i = 0; i < len; i += 3) {
+        unsigned v = (unsigned)b[i] << 16 | (i + 1 < len ? (unsigned)b[i + 1] << 8 : 0) | (i + 2 < len ? b[i + 2] : 0);
+        b64[k++] = tbl[(v >> 18) & 63];
+        b64[k++] = tbl[(v >> 12) & 63];
+        b64[k++] = i + 1 < len ? tbl[(v >> 6) & 63] : '=';
+        b64[k++] = i + 2 < len ? tbl[v & 63] : '=';
+    }
+    b64[k] = 0;
+    if (!SearchPathW(NULL, L"pwsh.exe", NULL, MAX_PATH, exe, NULL)) {
+        wchar_t sys[MAX_PATH];
+        GetSystemDirectoryW(sys, MAX_PATH);
+        _snwprintf(exe, MAX_PATH, L"%ls\\WindowsPowerShell\\v1.0\\powershell.exe", sys);
+    }
+    _snwprintf(out, cap, L"\"%ls\" -NoLogo -NoExit -EncodedCommand %hs", exe, b64);
+    out[cap - 1] = 0;
 }
 
 static void term_message(Term *t, const char *msg) {
@@ -1634,7 +1735,7 @@ static int tab_spawn(Tab *tb) {
     PROCESS_INFORMATION pi;
     SIZE_T attr_sz = 0;
     char cmd[4096];
-    wchar_t wcmd[4096];
+    wchar_t wcmd[4096], wdir[MAX_PATH * 2];
     BOOL ok;
 
     if (!pCreatePC) {
@@ -1669,10 +1770,17 @@ static int tab_spawn(Tab *tb) {
     InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_sz);
     UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, tb->hpc, sizeof(HPCON_), NULL, NULL);
 
-    snprintf(cmd, sizeof(cmd), "wsl.exe%s%s%s --cd \"%s\" -e bash --rcfile \"%s\" -i",
-             g_distro[0] ? " -d \"" : "", g_distro, g_distro[0] ? "\"" : "",
-             tb->start_dir, g_rc_linux);
-    MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd, 4096);
+    if (tb->kind == TK_PS) {
+        powershell_cmd(wcmd, 4096);
+        to_windows_dir(tb->start_dir, wdir, MAX_PATH * 2);
+    } else {
+        /* bash with our rc (its path arrives through WSLENV, translated), or,
+           in a distro without bash, whatever its default shell is */
+        snprintf(cmd, sizeof(cmd), "wsl.exe%s%s%s --cd \"%s\"%s",
+                 g_distro[0] ? " -d \"" : "", g_distro, g_distro[0] ? "\"" : "", tb->start_dir,
+                 g_no_bash ? "" : " -e bash -c \"exec bash --rcfile \\\"$HARDCORE_RC\\\" -i\"");
+        MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd, 4096);
+    }
     memset(&pi, 0, sizeof(pi));
     /* tabs are only spawned from the UI thread, so a temporary env var is safe;
        WSLENV carries it across into Linux */
@@ -1684,16 +1792,19 @@ static int tab_spawn(Tab *tb) {
         SetEnvironmentVariableW(L"HARDCORE_SPARE", L"1");
         SetEnvironmentVariableW(L"WSLENV", wslenv);
         ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                            NULL, NULL, &si.StartupInfo, &pi);
+                            NULL, tb->kind == TK_PS && GetFileAttributesW(wdir) != INVALID_FILE_ATTRIBUTES ? wdir : NULL,
+                            &si.StartupInfo, &pi);
         SetEnvironmentVariableW(L"HARDCORE_SPARE", NULL);
         SetEnvironmentVariableW(L"WSLENV", n ? old : NULL);
     } else {
         ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                            NULL, NULL, &si.StartupInfo, &pi);
+                            NULL, tb->kind == TK_PS && GetFileAttributesW(wdir) != INVALID_FILE_ATTRIBUTES ? wdir : NULL,
+                            &si.StartupInfo, &pi);
     }
     if (!ok) {
         char msg[256];
-        snprintf(msg, sizeof(msg), "\x1b[31mhardcore: could not start wsl.exe (error %lu)\x1b[0m\r\n", GetLastError());
+        snprintf(msg, sizeof(msg), "\x1b[31mhardcore: could not start %s (error %lu)\x1b[0m\r\n",
+                 tb->kind == TK_PS ? "PowerShell" : "wsl.exe", GetLastError());
         term_message(&tb->t, msg);
         DeleteProcThreadAttributeList(si.lpAttributeList);
         HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
@@ -1703,9 +1814,37 @@ static int tab_spawn(Tab *tb) {
     HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
     CloseHandle(pi.hThread);
     tb->proc = pi.hProcess;
+    tb->born = GetTickCount();
     tb->reader = CreateThread(NULL, 0, reader_thread, tb, 0, NULL);
     RegisterWaitForSingleObject(&tb->wait, tb->proc, on_child_exit, tb, INFINITE, WT_EXECUTEONLYONCE);
     return 1;
+}
+
+/* In place of a shell: what's wrong and the one key that fixes it. Plain
+   text in the terminal itself, one font, nothing to click through. */
+static void show_help(Tab *tb, int what, DWORD code) {
+    Term *t = &tb->t;
+    char buf[1024];
+    tb->help = what;
+    InterlockedExchange(&tb->exited, 1);
+    t->m_cursor_vis = 0;
+    term_message(t, "\r\n");
+    if (what == HELP_NO_DISTRO) {
+        term_message(t, "\x1b[1mhardcore\x1b[0m runs your Linux shell through WSL, and this PC has no Linux\r\n"
+                        "distribution installed yet.\r\n\r\n");
+        term_message(t, "  \x1b[38;2;255;166;13mI\x1b[0m  install WSL and Ubuntu     \x1b[2mruns wsl --install; Windows asks for admin,\r\n"
+                        "                                and may want a restart and a Linux user name\x1b[0m\r\n");
+        term_message(t, "  \x1b[38;2;255;166;13mP\x1b[0m  use PowerShell instead     \x1b[2mremembered in config.ini (shell=powershell)\x1b[0m\r\n");
+        term_message(t, "  \x1b[38;2;255;166;13mEnter\x1b[0m  check again\r\n");
+    } else {
+        snprintf(buf, sizeof(buf), "\r\n\x1b[2m%s exited right away (code %ld).\x1b[0m\r\n\r\n",
+                 tb->kind == TK_PS ? "PowerShell" : "WSL", (long)code);
+        term_message(t, buf);
+        term_message(t, "  \x1b[38;2;255;166;13mEnter\x1b[0m  try again\r\n");
+        if (tb->kind == TK_WSL)
+            term_message(t, "  \x1b[38;2;255;166;13mP\x1b[0m  use PowerShell instead     \x1b[2mremembered in config.ini (shell=powershell)\x1b[0m\r\n");
+    }
+    t->dirty = 1;
 }
 
 static Tab *tab_create(const char *dir, int spare) {
@@ -1717,9 +1856,11 @@ static Tab *tab_create(const char *dir, int spare) {
     tb->id = g_next_id++;
     InitializeCriticalSection(&tb->lock);
     tb->spare = spare;
+    tb->kind = g_shell_ps ? TK_PS : TK_WSL;
     snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", dir && *dir ? dir : g_start_dir);
     if (tb->start_dir[1] == ':' || tb->start_dir[0] == '/') set_cwd(&tb->t, tb->start_dir);
-    tab_spawn(tb);
+    if (tb->kind == TK_WSL && !g_have_distro) show_help(tb, HELP_NO_DISTRO, 0);
+    else tab_spawn(tb);
     return tb;
 }
 
@@ -1777,6 +1918,7 @@ static void config_load(void) {
         while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
         if (!strcmp(line, "dir") && *v) snprintf(g_start_dir, sizeof(g_start_dir), "%s", v);
         else if (!strcmp(line, "distro")) snprintf(g_distro, sizeof(g_distro), "%s", v);
+        else if (!strcmp(line, "shell")) g_shell_ps = !_stricmp(v, "powershell");
         else if (!strcmp(line, "width")) g_win_w = atoi(v);
         else if (!strcmp(line, "height")) g_win_h = atoi(v);
     }
@@ -1796,6 +1938,8 @@ static void config_save(void) {
     fprintf(f, "dir=%s\n", g_cfg_dir_line);
     fprintf(f, "# WSL distro name; empty = your default distro\n");
     fprintf(f, "distro=%s\n", g_distro);
+    fprintf(f, "# shell=powershell runs PowerShell in tabs instead of WSL; empty = WSL\n");
+    fprintf(f, "shell=%s\n", g_shell_ps ? "powershell" : "");
     fprintf(f, "width=%d\nheight=%d\n", g_win_w, g_win_h);
     fclose(f);
 }
@@ -1975,8 +2119,19 @@ static void dropped_path(const wchar_t *path, wchar_t *q, size_t cap) {
     const wchar_t *p, *safe = L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-+:@%,=";
     size_t k, j = 0;
     int needq = 0;
+    if (active_tab() && active_tab()->kind == TK_PS) {   /* PowerShell: the Windows path, '...' if needed */
+        for (k = 0; path[k]; k++) if (!wcschr(safe, path[k]) && path[k] != L'\\') needq = 1;
+        if (needq) q[j++] = L'\'';
+        for (k = 0; path[k] && j + 4 < cap; k++) {
+            if (path[k] == L'\'') q[j++] = L'\'';
+            q[j++] = path[k];
+        }
+        if (needq) q[j++] = L'\'';
+        q[j] = 0;
+        return;
+    }
     if (iswalpha(path[0]) && path[1] == L':') {
-        _snwprintf(lin, MAX_PATH * 4 + 16, L"/mnt/%c%ls", towlower(path[0]), path + 2);
+        _snwprintf(lin, MAX_PATH * 4 + 16, L"%hs%c%ls", g_mnt_root, towlower(path[0]), path + 2);
     } else if (!_wcsnicmp(path, L"\\\\wsl.localhost\\", 16) || !_wcsnicmp(path, L"\\\\wsl$\\", 7)) {
         p = wcschr(path + 2, L'\\');                 /* skip \\host */
         p = p ? wcschr(p + 1, L'\\') : NULL;           /* skip \distro */
@@ -3022,7 +3177,7 @@ static void activate(int i) {
 static void schedule_spare(void) { SetTimer(g_hwnd, TIMER_SPARE, 1000, NULL); }
 
 static void make_spare(void) {
-    if (g_spare || !g_ntabs) return;
+    if (g_spare || !g_ntabs || g_shell_ps || g_no_bash || !g_have_distro) return;
     g_spare = tab_create(g_start_dir, 1);
 }
 
@@ -3036,7 +3191,7 @@ static void new_tab_here(void) {
         char lin[1100];
         tb = g_spare;
         g_spare = NULL;
-        win_to_linux_path(dir, lin, sizeof(lin) - 1);
+        snprintf(lin, sizeof(lin) - 1, "%s", dir);
         snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", lin);
         set_cwd(&tb->t, lin);
         strcat(lin, "\n");
@@ -3095,6 +3250,8 @@ static void scroll_view(int lines) {
 static int auto_scale(void) { return g_dpi >= 144 ? (g_dpi + 48) / 96 : 1; }
 
 /* Returns 1 if the key was consumed (its WM_CHAR is then dropped). */
+static int help_key(Tab *tb, uint32_t c);
+
 /* Ctrl+Shift+J: the next tab that wants you. Claude blocked on a question
    first, then failures, then finished/rang (the bell). */
 static void jump_to_attention(void) {
@@ -3143,6 +3300,7 @@ static int handle_keydown(WPARAM vk) {
     const char *seq = NULL;
     int n = 0;
     if (!tb) return 0;
+    if (tb->help && vk == VK_RETURN && !ctrl && !alt) return help_key(tb, '\r');
 
     /* hardcore's own shortcuts; everything else goes to the shell */
     if (ctrl && shift && !alt) {
@@ -3158,7 +3316,9 @@ static int handle_keydown(WPARAM vk) {
         }
     }
     if (ctrl && !shift && !alt && vk == VK_TAB) { activate((g_active + 1) % g_ntabs); return 1; }
-    if (ctrl && alt && vk >= '1' && vk <= '9') { activate(vk == '9' ? g_ntabs - 1 : (int)(vk - '1')); return 1; }
+    /* AltGr arrives as Ctrl+Alt with the right Alt down; on many layouts
+       AltGr+7/8/9/0 is how you type { [ ] }, so it's never a tab jump */
+    if (ctrl && alt && !(GetKeyState(VK_RMENU) & 0x8000) && vk >= '1' && vk <= '9') { activate(vk == '9' ? g_ntabs - 1 : (int)(vk - '1')); return 1; }
     if (shift && !ctrl && !alt) {
         switch (vk) {
         case VK_PRIOR: scroll_view(tb->t.rows - 1); return 1;
@@ -3232,6 +3392,8 @@ static void handle_char(WPARAM wc, int alt) {
     char buf[8];
     int n = 0;
     uint32_t cp = (uint32_t)wc;
+    Tab *tb = active_tab();
+    if (tb && tb->help) { help_key(tb, cp); return; }
     if (cp >= 0xD800 && cp <= 0xDBFF) { g_high_surrogate = (wchar_t)cp; return; }
     if (cp >= 0xDC00 && cp <= 0xDFFF) {
         if (!g_high_surrogate) return;
@@ -3390,6 +3552,86 @@ static void save_window_size(void) {
     }
 }
 
+/* runs a command with no window and returns its exit code (-1 = didn't run / timed out) */
+static long run_quiet(const wchar_t *cmdline, DWORD timeout_ms) {
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[1024];
+    DWORD code = (DWORD)-1;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    _snwprintf(cmd, 1024, L"%ls", cmdline);
+    cmd[1023] = 0;
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) return -1;
+    if (WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    else TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (long)code;
+}
+
+/* a fresh shell in tab i, in the folder the old one was in */
+static void replace_tab(int i) {
+    Tab *old = g_tabs[i], *tb = tab_create(old->t.cwd[0] ? old->t.cwd : old->start_dir, 0);
+    if (!tb) return;
+    g_tabs[i] = tb;
+    tab_destroy_async(old);
+    activate(i);
+}
+
+static void diagnose(Tab *tb, DWORD code) {
+    int i;
+    if (tb->kind == TK_WSL) {
+        g_have_distro = wsl_distros() > 0;
+        if (!g_have_distro) { show_help(tb, HELP_NO_DISTRO, code); return; }
+        if (!g_no_bash) {
+            wchar_t cmd[300];
+            _snwprintf(cmd, 300, L"wsl.exe%ls%hs%ls -e sh -c \"command -v bash >/dev/null\"",
+                       g_distro[0] ? L" -d \"" : L"", g_distro, g_distro[0] ? L"\"" : L"");
+            if (run_quiet(cmd, 8000) == 1) {   /* sh ran, bash isn't there (Alpine and friends) */
+                g_no_bash = 1;
+                if (g_spare) { tab_destroy_async(g_spare); g_spare = NULL; }
+                for (i = 0; i < g_ntabs; i++)
+                    if (g_tabs[i] == tb) {
+                        replace_tab(i);
+                        term_message(&g_tabs[i]->t, "\x1b[2mhardcore: this distro has no bash, so tabs run its default shell. "
+                                                    "They won't follow cd for new tabs.\x1b[0m\r\n");
+                    }
+                return;
+            }
+        }
+    }
+    show_help(tb, HELP_FAILED, code);
+}
+
+/* keys on a help screen: I install, P PowerShell, Enter retry */
+static int help_key(Tab *tb, uint32_t c) {
+    int i, at = -1;
+    for (i = 0; i < g_ntabs; i++) if (g_tabs[i] == tb) at = i;
+    if (at < 0) return 0;
+    if ((c == 'i' || c == 'I') && tb->help == HELP_NO_DISTRO) {
+        ShellExecuteW(g_hwnd, L"runas", L"wsl.exe", L"--install", NULL, SW_SHOWNORMAL);
+        term_message(&tb->t, "\r\n\x1b[2mInstalling in the window Windows opened. When it's done (a restart and a\r\n"
+                             "Linux user name may come first), press Enter here.\x1b[0m\r\n");
+        tb->t.dirty = 1;
+        InvalidateRect(g_hwnd, NULL, FALSE);
+        return 1;
+    }
+    if ((c == 'p' || c == 'P') && tb->kind == TK_WSL) {
+        g_shell_ps = 1;
+        config_save();
+        if (g_spare) { tab_destroy_async(g_spare); g_spare = NULL; }
+        replace_tab(at);
+        return 1;
+    }
+    if (c == '\r') {
+        g_have_distro = wsl_distros() > 0 && !_wgetenv(L"HARDCORE_PRETEND_NO_WSL");
+        replace_tab(at);
+        return 1;
+    }
+    return 1;                    /* nothing else means anything here */
+}
+
 static int window_dpi(HWND h);
 
 static int metric_for(HWND h, int index) {
@@ -3431,7 +3673,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Tab *tb = active_tab();
         memcpy(buf, cd->lpData, n);
         buf[n] = 0;
-        if (cd->dwData == 0x48430001 && tb) {          /* type: \n becomes Enter */
+        if (cd->dwData == 0x48430001 && tb && tb->help) {   /* a help screen takes keys, not text */
+            help_key(tb, buf[0] == '\n' ? '\r' : (unsigned char)buf[0]);
+        } else if (cd->dwData == 0x48430001 && tb) {   /* type: \n becomes Enter */
             size_t i;
             for (i = 0; i < n; i++) if (buf[i] == '\n') buf[i] = '\r';
             tab_write(tb, buf, (int)n);
@@ -3636,9 +3880,18 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_APP_EXITED: {
         Tab *tb = tab_by_id((int)wp);
+        DWORD code = 0;
         int i;
         if (!tb) return 0;
         tab_drain(tb);
+        if (tb->proc) GetExitCodeProcess(tb->proc, &code);
+        /* died within 3 s with an error: a setup problem, not you typing exit.
+           Keep the tab and say what's wrong instead of vanishing. */
+        if (code != 0 && GetTickCount() - tb->born < 3000 && !tb->help) {
+            diagnose(tb, code);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         for (i = 0; i < g_ntabs; i++)
             if (g_tabs[i] == tb) close_tab(i);
         return 0;
@@ -4085,6 +4338,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     trace("conpty loaded");
     default_start_dir();
     write_rc();
+    if (!g_shell_ps) g_have_distro = wsl_distros() > 0 && !_wgetenv(L"HARDCORE_PRETEND_NO_WSL");   /* the env: tests */
     trace("rc written");
     if (selftest_out[0]) return selftest(selftest_out);
     gfx_thread = CreateThread(NULL, 0, gfx_device_thread, NULL, 0, NULL);

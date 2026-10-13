@@ -94,6 +94,26 @@ and forth between them.
 Claude Code turns on mouse reporting, so a plain drag goes to Claude. Hold
 **Shift** to select text with the terminal instead.
 
+## What it needs
+
+- **Windows 11.** Windows 10 1903 or later should work (ConPTY is bundled),
+  but it's untested and the corners are square. x64; ARM64 Windows runs it
+  under emulation.
+- **WSL with any distro.** WSL 1 and WSL 2 both work, and so does a custom
+  drive mount root (`[automount] root=` in wsl.conf).
+  - With no distro installed, the first tab is a welcome screen: **I** runs
+    `wsl --install` (Windows asks for admin), **P** switches to PowerShell.
+  - A distro without bash (Alpine) runs its own default shell. Tabs then
+    can't follow `cd`.
+  - If the shell dies at startup, its error stays on screen with **Enter**
+    to retry, instead of the window vanishing.
+- **No WSL at all?** `shell=powershell` in config.ini, or **P** on the
+  welcome screen, gives the same terminal with PowerShell 7 (or Windows
+  PowerShell) in every tab. New tabs still open in the current folder, and
+  Claude Code for Windows gets the same integration.
+
+See [PRODUCT.md](PRODUCT.md) for what sharing it more widely would take.
+
 ## Build
 
 From WSL, with `mingw-w64` and `python3` installed:
@@ -112,7 +132,7 @@ make install    # copy to %LOCALAPPDATA%\hardcore + Start menu and desktop short
 | Double-click the empty part of the tab column | Maximize / restore (it's the title bar) |
 | Ctrl+Shift+W, or middle-click a tab, or click its × | Close tab |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
-| Ctrl+Alt+1…9 | Jump to tab (9 = last) |
+| Ctrl+Alt+1…9 | Jump to tab (9 = last). AltGr+digit still types `{ [ ] }` on layouts that need it |
 | Ctrl+Shift+J | Jump to the next tab that needs you: Claude blocked, failed, or finished |
 | Ctrl+Shift+↑ / ↓ | Previous / next prompt or Claude turn in the scrollback |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste. A clipboard image pastes as the path of a saved PNG; copied files paste as their paths |
@@ -158,6 +178,7 @@ If your login shell is zsh or fish, the tab still opens bash.
 ```ini
 dir=             # folder for new windows; empty = %USERPROFILE%
 distro=          # WSL distro; empty = default
+shell=           # powershell = PowerShell tabs instead of WSL
 width=… height=… # last window size
 ```
 
