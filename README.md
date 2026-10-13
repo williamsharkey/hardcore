@@ -21,7 +21,7 @@ From WSL, with `mingw-w64` and `python3` installed:
 ```bash
 make            # → wsl-easy.exe
 make selftest   # headless: ConPTY → wsl.exe → bash → cwd tracking → VT parser
-make install    # copy to %LOCALAPPDATA%\wsl-easy + Start menu shortcut
+make install    # copy to %LOCALAPPDATA%\wsl-easy + Start menu and desktop shortcuts
 ```
 
 ## Keys

@@ -2,7 +2,7 @@
 #
 #   make             → wsl-easy.exe
 #   make selftest    → headless ConPTY/WSL/parser check (run from WSL or Windows)
-#   make install     → copy to %LOCALAPPDATA%\wsl-easy\ and add a Start menu shortcut
+#   make install     → copy to %LOCALAPPDATA%\wsl-easy\ and add Start menu + desktop shortcuts
 
 CC      ?= x86_64-w64-mingw32-gcc
 WINDRES ?= x86_64-w64-mingw32-windres
