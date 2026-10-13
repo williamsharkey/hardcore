@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hand-drawn glyphs that Unifont lacks (or has as something else), in the
 same 8x16 / 16x16 one-bit style. Edit the pictures below, then:
-    python3 tools/draw_extra.py > font/wsl-easy-extra.hex
+    python3 tools/draw_extra.py > font/hardcore-extra.hex
 Later .hex files override earlier ones in tools/gen_font.py, so these win."""
 
 GLYPHS = {

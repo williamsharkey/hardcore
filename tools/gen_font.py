@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack GNU Unifont .hex files into font.bin for wsl-easy.
+"""Pack GNU Unifont .hex files into font.bin for hardcore.
 
     gen_font.py OUT IN.hex[.gz] [IN2.hex ...]     later inputs override earlier ones
 

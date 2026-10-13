@@ -1,8 +1,8 @@
 /*
- * wsl-easy.c — a tabbed terminal for WSL on Windows 11.
+ * hardcore.c — a tabbed terminal for WSL on Windows 11.
  *
  * Grown out of dumbterm (github.com/williamsharkey/dumbterm): same GNU Unifont
- * bitmap glyphs, same immediate-mode GL renderer, same amber cursor. What is
+ * bitmap glyphs, same immediate-mode drawing, same amber cursor. What is
  * different:
  *
  *   - ConPTY instead of anonymous pipes + a JS shim, so the child is a real
@@ -11,15 +11,15 @@
  *     DEC line drawing, mouse reporting, bracketed paste, sync output.
  *   - Tabs. The "+" button (and Ctrl+Shift+T) opens a new WSL shell in the
  *     directory the current tab is sitting in. The shell reports $PWD on every
- *     prompt through OSC 9;9 from a small rc file wsl-easy writes for itself.
+ *     prompt through OSC 9;9 from a small rc file hardcore writes for itself.
  *   - New windows start in %USERPROFILE% (/mnt/c/Users/<you>), not ~.
  *
  * Build (from WSL or MSYS2):
- *   make            → wsl-easy.exe
+ *   make            → hardcore.exe
  *
  * Usage:
- *   wsl-easy.exe [--cd DIR] [--distro NAME] [DIR]
- *   wsl-easy.exe --selftest OUT.txt     # headless ConPTY + parser check
+ *   hardcore.exe [--cd DIR] [--distro NAME] [DIR]
+ *   hardcore.exe --selftest OUT.txt     # headless ConPTY + parser check
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -29,7 +29,10 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
-#include <GL/gl.h>
+#define COBJMACROS
+#include <d3d11.h>
+#include <dxgi1_5.h>
+#include <d3dcompiler.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,6 +106,7 @@ static PFN_ClosePC  pClosePC;
 #define MAX_PARAMS   32
 #define OSC_MAX      8192
 
+#define HARDCORE_VERSION "0.3"
 #define AMBER 0xFFA60D           /* dumbterm's phosphor cursor */
 #define DEF_FG 0xCCCCCC
 #define DEF_BG 0x0C0C0C
@@ -236,6 +240,7 @@ typedef struct {
     uint32_t spin_ch;            /* first char of the title, when it looks like a spinner */
     DWORD spin_at;               /* when it last changed */
     int spin_n;                  /* changes in a row, each within SPIN_HOLD ms of the last */
+    int progress;                /* OSC 9;4 progress state: 1 normal, 2 error, 3 indeterminate, 4 paused */
     int dirty;
 } Term;
 
@@ -259,7 +264,7 @@ typedef struct Tab {
 
 static HWND g_hwnd;
 
-/* WSL_EASY_TRACE=1 writes startup phase times to %TEMP%\\wsl-easy-trace.txt */
+/* HARDCORE_TRACE=1 writes startup phase times to %TEMP%\\hardcore-trace.txt */
 static FILE *g_trace;
 static LARGE_INTEGER g_t0, g_qpf;
 static void trace(const char *what) {
@@ -269,6 +274,13 @@ static void trace(const char *what) {
     fprintf(g_trace, "%8.2f ms  %s\n", (double)(t.QuadPart - g_t0.QuadPart) * 1000.0 / (double)g_qpf.QuadPart, what);
     fflush(g_trace);
 }
+
+/* HARDCORE_LAT=1: per keypress, how long until the shell's echo arrived and
+   until the frame showing it was handed to the compositor
+   (%TEMP%\hardcore-lat.txt: key→output ms, key→render start, key→SwapBuffers returned) */
+static FILE *g_lat;
+static LARGE_INTEGER g_lat_key, g_lat_out, g_lat_render;
+static double lat_ms(LARGE_INTEGER a, LARGE_INTEGER b) { return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpf.QuadPart; }
 
 static void tab_write(Tab *tb, const void *s, int n) {
     DWORD w;
@@ -888,6 +900,8 @@ static void csi_dispatch(Term *t, int f) {
     }
     if (t->priv == '>') {
         if (f == 'c') term_reply(t, "\x1b[>0;10;1c");
+        /* XTVERSION: programs (Claude Code among them) ask which terminal this is */
+        else if (f == 'q' && P(t, 0, 0) == 0) term_reply(t, "\x1bP>|hardcore(" HARDCORE_VERSION ")\x1b\\");
         return;
     }
     if (t->priv) return;
@@ -1121,6 +1135,7 @@ static void title_spin(Term *t) {
 }
 
 static int term_busy(const Term *t) {
+    if (t->progress == 1 || t->progress == 3) return 1;
     return t->spin_n >= 2 && GetTickCount() - t->spin_at < SPIN_HOLD;
 }
 
@@ -1137,6 +1152,9 @@ static void osc_dispatch(Term *t) {
         t->title[255] = 0;
         title_spin(t);
         t->dirty = 1;
+        break;
+    case 99:                     /* OSC 99 ; metadata ; payload (kitty notifications) */
+        if (strchr(rest, ';')) t->bell = 1;
         break;
     case 777:                    /* OSC 777 ; notify ; title ; body (urxvt, Ghostty) */
         if (!strncmp(rest, "notify;", 7)) t->bell = 1;
@@ -1159,6 +1177,8 @@ static void osc_dispatch(Term *t) {
                 p++;
             }
             set_cwd(t, p);
+        } else if (!strncmp(rest, "4;", 2)) {
+            t->progress = atoi(rest + 2);   /* ConEmu/Windows Terminal progress: 9;4;state;percent */
         } else if (!(rest[0] >= '0' && rest[0] <= '9' && rest[1] == ';')) {
             t->bell = 1;         /* OSC 9 ; message: an iTerm2-style notification */
         }
@@ -1246,6 +1266,7 @@ static void esc_dispatch(Term *t, int b) {
         t->title[0] = 0;
         t->spin_ch = 0;
         t->spin_n = 0;
+        t->progress = 0;
         break;
     }
     case 'Z': term_reply(t, "\x1b[?62;22c"); break;   /* DECID = DA */
@@ -1434,24 +1455,28 @@ static void win_to_linux_path(const char *w, char *out, size_t cap) {
 }
 
 /* Login-shell startup files, then report $PWD on every prompt (OSC 9;9).
-   Written by wsl-easy on each launch; nothing in your dotfiles changes. */
+   Written by hardcore on each launch; nothing in your dotfiles changes. */
 static const char RC_BASH[] =
-    "# written by wsl-easy on every launch; edits here are overwritten\n"
+    "# written by hardcore on every launch; edits here are overwritten\n"
     "[ -r /etc/profile ] && . /etc/profile\n"
     "if [ -r ~/.bash_profile ]; then . ~/.bash_profile\n"
     "elif [ -r ~/.bash_login ]; then . ~/.bash_login\n"
     "elif [ -r ~/.profile ]; then . ~/.profile\n"
     "elif [ -r ~/.bashrc ]; then . ~/.bashrc\n"
     "fi\n"
+    "# tell programs what this terminal can do (WSL doesn't carry WT_SESSION-style hints):\n"
+    "# 24-bit color (chalk/supports-color, so Claude Code's theme isn't cut to 256 colors)\n"
+    "# and OSC 8 hyperlinks (supports-hyperlinks)\n"
+    "export COLORTERM=truecolor TERM_PROGRAM=hardcore FORCE_HYPERLINK=1\n"
     "# a pre-warmed spare tab: profile already loaded, wait (silently) to be told where to go\n"
-    "if [ -n \"$WSL_EASY_SPARE\" ]; then\n"
-    "  unset WSL_EASY_SPARE\n"
-    "  IFS= read -rs __wsl_easy_dir && cd -- \"$__wsl_easy_dir\" 2>/dev/null\n"
-    "  unset __wsl_easy_dir\n"
+    "if [ -n \"$HARDCORE_SPARE\" ]; then\n"
+    "  unset HARDCORE_SPARE\n"
+    "  IFS= read -rs __hardcore_dir && cd -- \"$__hardcore_dir\" 2>/dev/null\n"
+    "  unset __hardcore_dir\n"
     "fi\n"
-    "__wsl_easy_cwd() { printf '\\033]9;9;%s\\033\\\\' \"$PWD\"; }\n"
-    "case \";${PROMPT_COMMAND[0]};\" in *\";__wsl_easy_cwd;\"*) ;; *)\n"
-    "  PROMPT_COMMAND=\"__wsl_easy_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;;\n"
+    "__hardcore_cwd() { printf '\\033]9;9;%s\\033\\\\' \"$PWD\"; }\n"
+    "case \";${PROMPT_COMMAND[0]};\" in *\";__hardcore_cwd;\"*) ;; *)\n"
+    "  PROMPT_COMMAND=\"__hardcore_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;;\n"
     "esac\n";
 
 static void write_rc(void) {
@@ -1485,7 +1510,7 @@ static int tab_spawn(Tab *tb) {
     BOOL ok;
 
     if (!pCreatePC) {
-        term_message(&tb->t, "\x1b[31mwsl-easy: this Windows has no ConPTY (needs Windows 10 1809+)\x1b[0m\r\n");
+        term_message(&tb->t, "\x1b[31mhardcore: this Windows has no ConPTY (needs Windows 10 1809+)\x1b[0m\r\n");
         return 0;
     }
     /* a roomy output pipe: with the 4 KB default, ConPTY stalls on every few KB */
@@ -1499,7 +1524,7 @@ static int tab_spawn(Tab *tb) {
     if (FAILED(hr)) {
         CloseHandle(in_w);
         CloseHandle(out_r);
-        term_message(&tb->t, "\x1b[31mwsl-easy: CreatePseudoConsole failed\x1b[0m\r\n");
+        term_message(&tb->t, "\x1b[31mhardcore: CreatePseudoConsole failed\x1b[0m\r\n");
         return 0;
     }
     tb->pin_w = in_w;
@@ -1507,7 +1532,7 @@ static int tab_spawn(Tab *tb) {
 
     memset(&si, 0, sizeof(si));
     si.StartupInfo.cb = sizeof(si);
-    /* Without this a child of a console-attached wsl-easy inherits our std
+    /* Without this a child of a console-attached hardcore inherits our std
        handles instead of talking to the pseudoconsole. */
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput = si.StartupInfo.hStdOutput = si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
@@ -1526,13 +1551,13 @@ static int tab_spawn(Tab *tb) {
     if (tb->spare) {
         wchar_t old[2048] = L"", wslenv[2100];
         DWORD n = GetEnvironmentVariableW(L"WSLENV", old, 2048);
-        _snwprintf(wslenv, 2100, L"%ls%lsWSL_EASY_SPARE", old, n ? L":" : L"");
+        _snwprintf(wslenv, 2100, L"%ls%lsHARDCORE_SPARE", old, n ? L":" : L"");
         wslenv[2099] = 0;
-        SetEnvironmentVariableW(L"WSL_EASY_SPARE", L"1");
+        SetEnvironmentVariableW(L"HARDCORE_SPARE", L"1");
         SetEnvironmentVariableW(L"WSLENV", wslenv);
         ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                             NULL, NULL, &si.StartupInfo, &pi);
-        SetEnvironmentVariableW(L"WSL_EASY_SPARE", NULL);
+        SetEnvironmentVariableW(L"HARDCORE_SPARE", NULL);
         SetEnvironmentVariableW(L"WSLENV", n ? old : NULL);
     } else {
         ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
@@ -1540,7 +1565,7 @@ static int tab_spawn(Tab *tb) {
     }
     if (!ok) {
         char msg[256];
-        snprintf(msg, sizeof(msg), "\x1b[31mwsl-easy: could not start wsl.exe (error %lu)\x1b[0m\r\n", GetLastError());
+        snprintf(msg, sizeof(msg), "\x1b[31mhardcore: could not start wsl.exe (error %lu)\x1b[0m\r\n", GetLastError());
         term_message(&tb->t, msg);
         DeleteProcThreadAttributeList(si.lpAttributeList);
         HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
@@ -1609,7 +1634,7 @@ static void config_load(void) {
     wchar_t path[MAX_PATH], *la = _wgetenv(L"LOCALAPPDATA");
     char line[1200];
     FILE *f;
-    _snwprintf(g_cfg_dir, MAX_PATH, L"%ls\\wsl-easy", la ? la : L".");
+    _snwprintf(g_cfg_dir, MAX_PATH, L"%ls\\hardcore", la ? la : L".");
     g_cfg_dir[MAX_PATH - 1] = 0;
     CreateDirectoryW(g_cfg_dir, NULL);
     config_path(path);
@@ -1638,7 +1663,7 @@ static void config_save(void) {
     config_path(path);
     f = _wfopen(path, L"wb");
     if (!f) return;
-    fprintf(f, "# wsl-easy settings\n");
+    fprintf(f, "# hardcore settings\n");
     fprintf(f, "# starting folder for new windows (Windows or Linux path); empty = %%USERPROFILE%%\n");
     fprintf(f, "dir=%s\n", g_cfg_dir_line);
     fprintf(f, "# WSL distro name; empty = your default distro\n");
@@ -1675,8 +1700,6 @@ static int utf8_encode(uint32_t cp, char *o) {
 
 /* ── window, input, rendering ─────────────────────────────────────── */
 
-static HDC g_hdc;
-static HGLRC g_glrc;
 static int g_focused = 1;
 static int g_mouse_x = -1, g_mouse_y = -1;
 static DWORD g_last_paint;
@@ -1687,13 +1710,16 @@ static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 #define CH (FONT_H * g_scale)
 #define PAD (4 * g_scale)
 #define SCROLLBAR_W (6 * g_scale)
-static int tabbar_h(void) { return CH + 16 * g_scale; }   /* the tab strip is the title bar */
-static int term_ox(void) { return PAD; }
-static int term_oy(void) { return tabbar_h() + PAD; }
+/* All the chrome is one column on the left: window buttons on top, then the
+   tabs, then "+". The terminal gets the whole height to itself. */
+static int sidebar_w(void) { return 20 * CW; }
+static int caption_h(void) { return CH + 14 * g_scale; }
+static int term_ox(void) { return sidebar_w() + PAD; }
+static int term_oy(void) { return PAD; }
 
 static void compute_grid(int w, int h, int *cols, int *rows) {
-    *cols = (w - 2 * PAD - SCROLLBAR_W) / CW;
-    *rows = (h - tabbar_h() - 2 * PAD) / CH;
+    *cols = (w - sidebar_w() - 2 * PAD - SCROLLBAR_W) / CW;
+    *rows = (h - 2 * PAD) / CH;
     if (*cols < 10) *cols = 10;
     if (*rows < 3) *rows = 3;
     if (*cols > 1000) *cols = 1000;
@@ -1813,20 +1839,6 @@ static void paste_wide(const wchar_t *w) {
     free(s);
 }
 
-static void paste(void) {
-    HANDLE h;
-    if (!OpenClipboard(g_hwnd)) return;
-    h = GetClipboardData(CF_UNICODETEXT);
-    if (h) {
-        const wchar_t *w = (const wchar_t *)GlobalLock(h);
-        if (w) {
-            paste_wide(w);
-            GlobalUnlock(h);
-        }
-    }
-    CloseClipboard();
-}
-
 /* A Windows path as you'd type it in WSL, shell-quoted only when needed:
    C:\x y → '/mnt/c/x y', \\wsl.localhost\Debian\home → /home */
 static void dropped_path(const wchar_t *path, wchar_t *q, size_t cap) {
@@ -1858,7 +1870,8 @@ static void dropped_path(const wchar_t *path, wchar_t *q, size_t cap) {
 }
 
 /* Files dropped from Explorer are typed in as WSL paths, space-separated */
-static void drop_files(HDROP drop) {
+/* types the files' WSL paths, space separated */
+static void paste_hdrop(HDROP drop) {
     UINT i, n = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
     wchar_t *out = (wchar_t *)calloc(1, sizeof(wchar_t));
     size_t len = 0;
@@ -1874,9 +1887,82 @@ static void drop_files(HDROP drop) {
         out[len++] = L' ';
         out[len] = 0;
     }
-    DragFinish(drop);
     paste_wide(out);
     free(out);
+}
+
+static void drop_files(HDROP drop) {
+    paste_hdrop(drop);
+    DragFinish(drop);
+}
+
+/* A bitmap on the clipboard (a screenshot, "copy image") is saved as a PNG
+   under %LOCALAPPDATA%\hardcore\pasted and its path is typed instead.
+   That's how Claude Code (and anything else) takes an image: as a file path. */
+typedef int (WINAPI *PFN_GdiplusStartup)(ULONG_PTR *, const void *, void *);
+typedef int (WINAPI *PFN_GdipCreateBitmapFromGdiDib)(const BITMAPINFO *, void *, void **);
+typedef int (WINAPI *PFN_GdipSaveImageToFile)(void *, const WCHAR *, const CLSID *, const void *);
+typedef int (WINAPI *PFN_GdipDisposeImage)(void *);
+
+static int save_clipboard_png(HANDLE dib, wchar_t *path, size_t cap) {
+    static const CLSID png = {0x557CF406, 0x1A04, 0x11D3, {0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E}};
+    static ULONG_PTR token;
+    struct { UINT32 ver; void *cb; BOOL no_thread, no_codecs; } in = {1, NULL, FALSE, FALSE};
+    HMODULE gp = LoadLibraryW(L"gdiplus.dll");
+    PFN_GdiplusStartup start = gp ? (PFN_GdiplusStartup)(void *)GetProcAddress(gp, "GdiplusStartup") : NULL;
+    PFN_GdipCreateBitmapFromGdiDib mk = gp ? (PFN_GdipCreateBitmapFromGdiDib)(void *)GetProcAddress(gp, "GdipCreateBitmapFromGdiDib") : NULL;
+    PFN_GdipSaveImageToFile save = gp ? (PFN_GdipSaveImageToFile)(void *)GetProcAddress(gp, "GdipSaveImageToFile") : NULL;
+    PFN_GdipDisposeImage dispose = gp ? (PFN_GdipDisposeImage)(void *)GetProcAddress(gp, "GdipDisposeImage") : NULL;
+    BITMAPINFO *bi = (BITMAPINFO *)GlobalLock(dib);
+    void *img = NULL;
+    SYSTEMTIME st;
+    int ok = 0;
+    if (!bi) return 0;
+    if (start && mk && save && dispose && (token || start(&token, &in, NULL) == 0)) {
+        /* pixels follow the header and any color table / BI_BITFIELDS masks */
+        BITMAPINFOHEADER *h = &bi->bmiHeader;
+        DWORD ncolors = h->biClrUsed ? h->biClrUsed : (h->biBitCount <= 8 ? 1u << h->biBitCount : 0);
+        DWORD masks = (h->biCompression == BI_BITFIELDS && h->biSize == sizeof(BITMAPINFOHEADER)) ? 12 : 0;
+        unsigned char *bits = (unsigned char *)bi + h->biSize + masks + ncolors * sizeof(RGBQUAD);
+        wchar_t dir[MAX_PATH];
+        _snwprintf(dir, MAX_PATH, L"%ls\\pasted", g_cfg_dir);
+        dir[MAX_PATH - 1] = 0;
+        CreateDirectoryW(dir, NULL);
+        GetLocalTime(&st);
+        _snwprintf(path, cap, L"%ls\\%04d%02d%02d-%02d%02d%02d-%03d.png", dir, st.wYear, st.wMonth, st.wDay,
+                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        path[cap - 1] = 0;
+        if (mk(bi, bits, &img) == 0 && img) {
+            ok = save(img, path, &png, NULL) == 0;
+            dispose(img);
+        }
+    }
+    GlobalUnlock(dib);
+    return ok;
+}
+
+/* Text pastes as text. Files copied in Explorer paste as their WSL paths,
+   like a drop. An image pastes as the path of a PNG made from it. */
+static void paste(void) {
+    HANDLE h;
+    if (!OpenClipboard(g_hwnd)) return;
+    if ((h = GetClipboardData(CF_HDROP))) {
+        paste_hdrop((HDROP)h);
+    } else if ((h = GetClipboardData(CF_UNICODETEXT))) {
+        const wchar_t *w = (const wchar_t *)GlobalLock(h);
+        if (w) {
+            paste_wide(w);
+            GlobalUnlock(h);
+        }
+    } else if ((h = GetClipboardData(CF_DIB))) {
+        wchar_t path[MAX_PATH], q[MAX_PATH * 2 + 16];
+        if (save_clipboard_png(h, path, MAX_PATH)) {
+            dropped_path(path, q, MAX_PATH * 2 + 16);
+            wcscat(q, L" ");
+            paste_wide(q);
+        }
+    }
+    CloseClipboard();
 }
 
 /* ── glyph atlas: on-demand 16×16 slots in one texture ─────────────── */
@@ -1885,14 +1971,298 @@ static void drop_files(HDROP drop) {
 #define SLOTS_PER_ROW (ATLAS / 16)
 #define MAX_SLOTS (SLOTS_PER_ROW * SLOTS_PER_ROW)
 #define HASH_SIZE 65536
-static GLuint g_tex;
 static uint32_t g_hkey[HASH_SIZE];   /* cp + 1, 0 = empty */
 static uint16_t g_hslot[HASH_SIZE];
 static uint8_t g_hwidth[HASH_SIZE];
 static int g_nslots;
-static int g_in_quads;
+
+static void glyph_cache_reset(void);
+
+/* ── renderer: Direct3D 11 on a flip-model swap chain ──────────────── */
+
+/* Why not OpenGL any more: a WGL window is a "redirected" surface that DWM
+   copies into its composition. Measured here, our whole key→echo→render path
+   took 1.4 ms, then the frame waited 6 ms (p50) to 19 ms (p99) on that copy.
+   A flip-model swap chain hands DWM the buffer itself, and with tearing
+   allowed Windows can promote the window to an independent flip or a
+   hardware overlay plane, skipping composition altogether.
+
+   The drawing code is still immediate mode: r_color() sets the color,
+   r_quad() / r_quad_uv() append two triangles to one CPU-side vertex array,
+   and r_present() uploads it and draws everything with a single Draw. */
+
+typedef struct { float x, y, u, v; uint32_t rgba; } Vtx;
+
+/* not in every mingw libuuid */
+static const GUID IID_IDXGIFactory5_ = {0x7632e1f5, 0xee65, 0x4dca, {0x87, 0xfd, 0x84, 0xcd, 0x75, 0xf8, 0x83, 0x8d}};
+static const GUID IID_IDXGISwapChainMedia_ = {0xdd95b90b, 0xf05f, 0x4f6a, {0xbd, 0x65, 0x25, 0xbf, 0xb2, 0x64, 0xbd, 0x84}};
+
+static ID3D11Device *g_dev;
+static ID3D11DeviceContext *g_ctx;
+static IDXGISwapChain1 *g_sc;
+static ID3D11RenderTargetView *g_rtv;
+static ID3D11Texture2D *g_atlas;
+static ID3D11ShaderResourceView *g_srv;
+static ID3D11Buffer *g_vb;
+static ID3D11VertexShader *g_vs;
+static ID3D11PixelShader *g_ps;
+static ID3D11InputLayout *g_il;
+static ID3D11BlendState *g_blend;
+static ID3D11SamplerState *g_samp;
+static ID3D11RasterizerState *g_rs;
+static int g_tearing;            /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
+static int g_gfx_ready;          /* swap chain exists: GDI no longer paints */
+static float g_rw = 1, g_rh = 1; /* current frame size, for pixel → clip space */
+static uint32_t g_rgba = 0xFFFFFFFF;
+#define VB_VERTS 65536           /* per Draw; a frame that needs more draws in pieces */
+static Vtx g_vtx[VB_VERTS];
+static int g_nvtx;
+
+static const char HLSL[] =
+    "struct VI { float2 p : POSITION; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
+    "struct VO { float4 p : SV_Position; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
+    "VO vs(VI i) { VO o; o.p = float4(i.p, 0, 1); o.uv = i.uv; o.c = i.c; return o; }\n"
+    "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+    "float4 ps(VO i) : SV_Target {\n"
+    "  float a = i.uv.x < 0 ? 1 : t.SampleLevel(s, i.uv, 0).a;\n"
+    "  return float4(i.c.rgb, i.c.a * a); }\n";
+
+typedef HRESULT (WINAPI *PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *,
+                                         LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
+
+static void r_color(uint32_t rgb, float a) {
+    g_rgba = ((rgb >> 16) & 255) | (rgb & 0xFF00) | ((rgb & 255) << 16) | ((uint32_t)(a * 255.0f + 0.5f) << 24);
+}
+
+static void r_flush(void) {
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (!g_nvtx || !g_ctx) return;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)g_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, g_vtx, sizeof(Vtx) * g_nvtx);
+        ID3D11DeviceContext_Unmap(g_ctx, (ID3D11Resource *)g_vb, 0);
+        ID3D11DeviceContext_Draw(g_ctx, (UINT)g_nvtx, 0);
+    }
+    g_nvtx = 0;
+}
+
+static void r_vert(float x, float y, float u, float v) {
+    Vtx *p = &g_vtx[g_nvtx++];
+    p->x = x * 2.0f / g_rw - 1.0f;
+    p->y = 1.0f - y * 2.0f / g_rh;
+    p->u = u;
+    p->v = v;
+    p->rgba = g_rgba;
+}
+
+/* textured quad; u0 < 0 means a solid one */
+static void r_quad_uv(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1) {
+    if (g_nvtx + 6 > VB_VERTS) r_flush();
+    r_vert(x0, y0, u0, v0); r_vert(x1, y0, u1, v0); r_vert(x1, y1, u1, v1);
+    r_vert(x0, y0, u0, v0); r_vert(x1, y1, u1, v1); r_vert(x0, y1, u0, v1);
+}
+
+static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1, y1, -1, -1, -1, -1); }
+
+/* one 16×16 alpha glyph into the atlas */
+static void r_upload(int x, int y, const unsigned char *bmp) {
+    D3D11_BOX b = {(UINT)x, (UINT)y, 0, (UINT)x + 16, (UINT)y + 16, 1};
+    ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_atlas, 0, &b, bmp, 16, 0);
+}
+
+static void r_make_rtv(void) {
+    ID3D11Texture2D *back = NULL;
+    if (SUCCEEDED(IDXGISwapChain1_GetBuffer(g_sc, 0, &IID_ID3D11Texture2D, (void **)&back))) {
+        ID3D11Device_CreateRenderTargetView(g_dev, (ID3D11Resource *)back, NULL, &g_rtv);
+        ID3D11Texture2D_Release(back);
+    }
+}
+
+static void r_resize(void) {
+    if (!g_sc) return;
+    RECT r;
+    GetClientRect(g_hwnd, &r);
+    if (r.right <= 0 || r.bottom <= 0) return;   /* minimized */
+    ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 0, NULL, NULL);
+    if (g_rtv) { ID3D11RenderTargetView_Release(g_rtv); g_rtv = NULL; }
+    IDXGISwapChain1_ResizeBuffers(g_sc, 0, 0, 0, DXGI_FORMAT_UNKNOWN, g_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    r_make_rtv();
+}
+
+static void r_begin(int w, int h) {
+    static const float bg[4] = {((DEF_BG >> 16) & 255) / 255.0f, ((DEF_BG >> 8) & 255) / 255.0f, (DEF_BG & 255) / 255.0f, 1};
+    D3D11_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+    UINT stride = sizeof(Vtx), off = 0;
+    g_rw = (float)w;
+    g_rh = (float)h;
+    g_nvtx = 0;
+    ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 1, &g_rtv, NULL);
+    ID3D11DeviceContext_ClearRenderTargetView(g_ctx, g_rtv, bg);
+    ID3D11DeviceContext_RSSetViewports(g_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(g_ctx, g_rs);
+    ID3D11DeviceContext_IASetPrimitiveTopology(g_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetInputLayout(g_ctx, g_il);
+    ID3D11DeviceContext_IASetVertexBuffers(g_ctx, 0, 1, &g_vb, &stride, &off);
+    ID3D11DeviceContext_VSSetShader(g_ctx, g_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(g_ctx, g_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1, &g_srv);
+    ID3D11DeviceContext_PSSetSamplers(g_ctx, 0, 1, &g_samp);
+    ID3D11DeviceContext_OMSetBlendState(g_ctx, g_blend, NULL, 0xFFFFFFFF);
+}
+
+static void gfx_lost(void);
+
+static void r_present(void) {
+    HRESULT hr;
+    r_flush();
+    hr = IDXGISwapChain1_Present(g_sc, 0, g_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) gfx_lost();
+}
+
+/* Device, shaders and atlas: no window needed, so this runs on a worker
+   thread while the main thread shows the window and starts wsl.exe. */
+static int gfx_init_device(void) {
+    static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+    HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+    PFN_D3DCompile compile = dc ? (PFN_D3DCompile)(void *)GetProcAddress(dc, "D3DCompile") : NULL;
+    ID3DBlob *vsb = NULL, *psb = NULL;
+    HRESULT hr;
+    if (!compile) return 0;
+    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_SINGLETHREADED, levels, 3,
+                           D3D11_SDK_VERSION, &g_dev, NULL, &g_ctx);
+    if (FAILED(hr))
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, D3D11_CREATE_DEVICE_SINGLETHREADED, levels, 3,
+                               D3D11_SDK_VERSION, &g_dev, NULL, &g_ctx);
+    if (FAILED(hr)) return 0;
+    if (FAILED(compile(HLSL, sizeof(HLSL) - 1, NULL, NULL, NULL, "vs", "vs_4_0", 0, 0, &vsb, NULL)) ||
+        FAILED(compile(HLSL, sizeof(HLSL) - 1, NULL, NULL, NULL, "ps", "ps_4_0", 0, 0, &psb, NULL)))
+        return 0;
+    ID3D11Device_CreateVertexShader(g_dev, ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb), NULL, &g_vs);
+    ID3D11Device_CreatePixelShader(g_dev, ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb), NULL, &g_ps);
+    {
+        D3D11_INPUT_ELEMENT_DESC el[3] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+        ID3D11Device_CreateInputLayout(g_dev, el, 3, ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb), &g_il);
+    }
+    ID3D10Blob_Release(vsb);
+    ID3D10Blob_Release(psb);
+    {
+        D3D11_BUFFER_DESC bd = {sizeof(g_vtx), D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+        ID3D11Device_CreateBuffer(g_dev, &bd, NULL, &g_vb);
+    }
+    {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof(td));
+        td.Width = td.Height = ATLAS;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ID3D11Device_CreateTexture2D(g_dev, &td, NULL, &g_atlas);
+        ID3D11Device_CreateShaderResourceView(g_dev, (ID3D11Resource *)g_atlas, NULL, &g_srv);
+    }
+    {
+        D3D11_BLEND_DESC b;
+        memset(&b, 0, sizeof(b));
+        b.RenderTarget[0].BlendEnable = TRUE;
+        b.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        b.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        b.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        b.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        b.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        b.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        b.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        ID3D11Device_CreateBlendState(g_dev, &b, &g_blend);
+    }
+    {
+        D3D11_SAMPLER_DESC sd;
+        memset(&sd, 0, sizeof(sd));
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        ID3D11Device_CreateSamplerState(g_dev, &sd, &g_samp);
+    }
+    {
+        D3D11_RASTERIZER_DESC rd;
+        memset(&rd, 0, sizeof(rd));
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        rd.DepthClipEnable = TRUE;
+        ID3D11Device_CreateRasterizerState(g_dev, &rd, &g_rs);
+    }
+    {   /* don't queue frames: each present should be the newest one */
+        IDXGIDevice1 *xd = NULL;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(g_dev, &IID_IDXGIDevice1, (void **)&xd))) {
+            IDXGIDevice1_SetMaximumFrameLatency(xd, 1);
+            IDXGIDevice1_Release(xd);
+        }
+    }
+    return 1;
+}
+
+static DWORD WINAPI gfx_device_thread(LPVOID unused) {
+    (void)unused;
+    return (DWORD)gfx_init_device();
+}
+
+/* The swap chain belongs to the window's thread. */
+static int gfx_init_swapchain(HWND hwnd) {
+    IDXGIDevice *xd = NULL;
+    IDXGIAdapter *ad = NULL;
+    IDXGIFactory2 *f = NULL;
+    DXGI_SWAP_CHAIN_DESC1 d;
+    HRESULT hr;
+    if (!g_dev) return 0;
+    ID3D11Device_QueryInterface(g_dev, &IID_IDXGIDevice, (void **)&xd);
+    IDXGIDevice_GetAdapter(xd, &ad);
+    IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&f);
+    IDXGIAdapter_Release(ad);
+    IDXGIDevice_Release(xd);
+    if (!f) return 0;
+    {
+        IDXGIFactory5 *f5 = NULL;
+        BOOL allow = FALSE;
+        if (SUCCEEDED(IDXGIFactory2_QueryInterface(f, &IID_IDXGIFactory5_, (void **)&f5))) {
+            if (SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof(allow))))
+                g_tearing = allow ? 1 : 0;
+            IDXGIFactory5_Release(f5);
+        }
+    }
+    if (_wgetenv(L"HARDCORE_NO_TEARING")) g_tearing = 0;
+    memset(&d, 0, sizeof(d));
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    d.BufferCount = 2;
+    d.Scaling = DXGI_SCALING_NONE;          /* during a live resize, don't stretch the old frame */
+    d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    d.Flags = g_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    hr = IDXGIFactory2_CreateSwapChainForHwnd(f, (IUnknown *)g_dev, hwnd, &d, NULL, NULL, &g_sc);
+    if (SUCCEEDED(hr)) IDXGIFactory2_MakeWindowAssociation(f, hwnd, DXGI_MWA_NO_ALT_ENTER);   /* Alt+Enter is the shell's */
+    IDXGIFactory2_Release(f);
+    if (FAILED(hr)) return 0;
+    r_make_rtv();
+    g_gfx_ready = 1;
+    return 1;
+}
+
+#define REL(p) do { if (p) { (p)->lpVtbl->Release(p); (p) = NULL; } } while (0)
+
+/* driver update, TDR, GPU switch: start over and redraw every glyph */
+static void gfx_lost(void) {
+    g_gfx_ready = 0;
+    REL(g_rtv); REL(g_sc); REL(g_rs); REL(g_samp); REL(g_blend); REL(g_srv); REL(g_atlas);
+    REL(g_vb); REL(g_il); REL(g_ps); REL(g_vs); REL(g_ctx); REL(g_dev);
+    glyph_cache_reset();
+    if (gfx_init_device()) gfx_init_swapchain(g_hwnd);
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
 
 static void glyph_cache_reset(void) {
+    r_flush();                   /* quads already queued still point at the old slots */
     memset(g_hkey, 0, sizeof(g_hkey));
     g_nslots = 0;
 }
@@ -1922,11 +2292,7 @@ static int glyph_slot(uint32_t cp, int *gw) {
         }
     }
     slot = g_nslots++;
-    if (g_in_quads) glEnd();
-    glBindTexture(GL_TEXTURE_2D, g_tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, (slot % SLOTS_PER_ROW) * 16, (slot / SLOTS_PER_ROW) * 16, 16, 16,
-                    GL_ALPHA, GL_UNSIGNED_BYTE, bmp);
-    if (g_in_quads) glBegin(GL_QUADS);
+    r_upload((slot % SLOTS_PER_ROW) * 16, (slot / SLOTS_PER_ROW) * 16, bmp);
     g_hkey[h] = cp + 1;
     g_hslot[h] = (uint16_t)slot;
     g_hwidth[h] = (uint8_t)w;
@@ -1934,20 +2300,9 @@ static int glyph_slot(uint32_t cp, int *gw) {
     return slot;
 }
 
-static void gl_color(uint32_t rgb, float a) {
-    glColor4ub((GLubyte)(rgb >> 16), (GLubyte)(rgb >> 8), (GLubyte)rgb, (GLubyte)(a * 255));
-}
-
-static void quad(float x0, float y0, float x1, float y1) {
-    glVertex2f(x0, y0); glVertex2f(x1, y0); glVertex2f(x1, y1); glVertex2f(x0, y1);
-}
-
 static void fill_rect(float x0, float y0, float x1, float y1, uint32_t rgb, float a) {
-    glDisable(GL_TEXTURE_2D);
-    gl_color(rgb, a);
-    glBegin(GL_QUADS);
+    r_color(rgb, a);
     quad(x0, y0, x1, y1);
-    glEnd();
 }
 
 /* Draws one glyph into a w_cells-wide box at (x, y). A 16px-wide Unifont glyph
@@ -1969,10 +2324,7 @@ static void draw_glyph(uint32_t cp, float x, float y, int w_cells, int scale) {
     } else {
         x1 = x + cw * w_cells;
     }
-    glTexCoord2f(u0, v0); glVertex2f(x0, y0);
-    glTexCoord2f(u1, v0); glVertex2f(x1, y0);
-    glTexCoord2f(u1, v1); glVertex2f(x1, y1);
-    glTexCoord2f(u0, v1); glVertex2f(x0, y1);
+    r_quad_uv(x0, y0, x1, y1, u0, v0, u1, v1);
 }
 
 static uint32_t resolve(uint32_t spec, int is_fg, int bold) {
@@ -1998,7 +2350,7 @@ static void cell_colors(const Cell *c, uint32_t *fg, uint32_t *bg) {
 static int draw_label(const wchar_t *s, float x, float y, float max_w, uint32_t rgb) {
     int n = 0;
     float cx = x;
-    gl_color(rgb, 1);
+    r_color(rgb, 1);
     for (; *s; s++) {
         uint32_t cp = *s;
         int w;
@@ -2058,53 +2410,50 @@ static void drip_init(void) {
 }
 
 #define TIMER_THROB 3
-#define BELL_GLYPH 0xF8F0        /* hand-drawn, font/wsl-easy-extra.hex */
+#define BELL_GLYPH 0xF8F0        /* hand-drawn, font/hardcore-extra.hex */
 
-static int caption_btn_w(void) { return 46 * g_scale; }
+static int caption_btn_w(void) { return 40 * g_scale; }
 
-/* tab bar geometry: [tabs][+] ........ drag space ........ [–][□][×] */
+/* sidebar geometry, top to bottom:
+     [ drag ][ – ][ □ ][ × ]     caption_h()
+     ▌⣿ folder-name        ×     one row per tab
+       +                         new tab
+       ... drag space (it's the title bar) ...                         */
 enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR };
-static int tab_width(int win_w) {
-    int avail = win_w - 6 * g_scale - tabbar_h() - 3 * caption_btn_w() - 48 * g_scale;
-    int w = g_ntabs ? avail / g_ntabs : avail;
-    int maxw = 24 * CW, minw = 6 * CW;
-    if (w > maxw) w = maxw;
-    if (w < minw) w = minw;
-    return w;
+
+static int tabs_top(void) { return caption_h() + 2 * g_scale; }
+
+static int row_h(void) {
+    RECT r;
+    int h = CH + 10 * g_scale, avail;
+    GetClientRect(g_hwnd, &r);
+    avail = r.bottom - tabs_top() - 4 * g_scale;
+    if ((g_ntabs + 1) * h > avail && g_ntabs + 1 > 0) h = avail / (g_ntabs + 1);   /* many tabs: squeeze */
+    if (h < CH) h = CH;
+    return h;
 }
 
-static int tab_top(void) { return 6 * g_scale; }
-
 static int hit_tabbar(int mx, int my, int *idx) {
-    RECT r;
-    int tw, x0 = 6 * g_scale, i, bh = tabbar_h();
-    GetClientRect(g_hwnd, &r);
-    if (my < 0 || my >= bh) return HIT_NONE;
-    if (mx >= r.right - 3 * caption_btn_w()) return HIT_NONE;
-    tw = tab_width(r.right);
-    for (i = 0; i < g_ntabs; i++) {
-        int tx = x0 + i * tw;
-        if (mx >= tx && mx < tx + tw - 2 * g_scale) {
+    int rh = row_h(), top = tabs_top(), i;
+    if (mx < 0 || mx >= sidebar_w() || my < caption_h()) return HIT_NONE;
+    if (my >= top) {
+        i = (my - top) / rh;
+        if (i < g_ntabs) {
             *idx = i;
-            if (mx >= tx + tw - 2 * g_scale - CW - 6 * g_scale) return HIT_CLOSE;
+            if (mx >= sidebar_w() - CW - 10 * g_scale) return HIT_CLOSE;
             return HIT_TAB;
         }
-    }
-    {
-        int px = x0 + g_ntabs * tw + 2 * g_scale;
-        if (mx >= px && mx < px + bh - tab_top()) return HIT_PLUS;
+        if (i == g_ntabs) return HIT_PLUS;
     }
     return HIT_BAR;
 }
 
 /* caption buttons: HTMINBUTTON / HTMAXBUTTON / HTCLOSE, or 0 */
 static int caption_hit(int mx, int my) {
-    RECT r;
-    int bw = caption_btn_w();
-    GetClientRect(g_hwnd, &r);
-    if (my < 0 || my >= tabbar_h() || mx < r.right - 3 * bw || mx >= r.right) return 0;
-    if (mx >= r.right - bw) return HTCLOSE;
-    if (mx >= r.right - 2 * bw) return HTMAXBUTTON;
+    int bw = caption_btn_w(), right = sidebar_w();
+    if (my < 0 || my >= caption_h() || mx < right - 3 * bw || mx >= right) return 0;
+    if (mx >= right - bw) return HTCLOSE;
+    if (mx >= right - 2 * bw) return HTMAXBUTTON;
     return HTMINBUTTON;
 }
 
@@ -2114,17 +2463,15 @@ static int g_nc_hover, g_nc_press, g_win_active = 1;
 static void px_line(float x0, float y0, int n, int dx, int dy, uint32_t rgb) {
     int i;
     float s = (float)g_scale;
-    gl_color(rgb, 1);
-    glBegin(GL_QUADS);
+    r_color(rgb, 1);
     for (i = 0; i < n; i++) quad(x0 + i * dx * s, y0 + i * dy * s, x0 + i * dx * s + s, y0 + i * dy * s + s);
-    glEnd();
 }
 
-static void render_caption_buttons(int win_w) {
-    int bw = caption_btn_w(), bh = tabbar_h(), k, s = g_scale;
+static void render_caption_buttons(void) {
+    int bw = caption_btn_w(), bh = caption_h(), k, s = g_scale;
     for (k = 0; k < 3; k++) {
         int code = k == 0 ? HTMINBUTTON : k == 1 ? HTMAXBUTTON : HTCLOSE;
-        float x = (float)(win_w - (3 - k) * bw), cx = x + bw / 2 - 5 * s, cy = (float)(bh / 2 - 5 * s);
+        float x = (float)(sidebar_w() - (3 - k) * bw), cx = x + bw / 2 - 5 * s, cy = (float)(bh / 2 - 5 * s);
         int hov = g_nc_hover == code, prs = g_nc_press == code && hov;
         uint32_t fg = g_win_active ? 0xCCCCCC : 0x7A7A7A;
         if (hov && code == HTCLOSE) {
@@ -2133,7 +2480,6 @@ static void render_caption_buttons(int win_w) {
         } else if (hov) {
             fill_rect(x, 0, x + bw, (float)bh, prs ? 0x262626 : 0x2D2D2D, 1);
         }
-        glDisable(GL_TEXTURE_2D);
         if (code == HTMINBUTTON) {
             px_line(cx, cy + 5 * s, 10, 1, 0, fg);
         } else if (code == HTMAXBUTTON && !IsZoomed(g_hwnd)) {
@@ -2155,58 +2501,49 @@ static void render_caption_buttons(int win_w) {
     }
 }
 
-static void render_tabbar(int win_w) {
-    int i, idx = -1, hover = HIT_NONE, tw = tab_width(win_w), x0 = 6 * g_scale, bh = tabbar_h();
-    float top = (float)tab_top(), ty = top + (float)(bh - top - CH) / 2;
+static void render_tabbar(int win_w, int win_h) {
+    int i, idx = -1, hover = HIT_NONE, sw = sidebar_w(), rh = row_h(), top = tabs_top();
+    float lx = (float)(10 * g_scale);
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
+    (void)win_w;
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
-    fill_rect(0, 0, (float)win_w, (float)bh, BAR_BG, 1);
+    fill_rect(0, 0, (float)sw, (float)win_h, BAR_BG, 1);
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         wchar_t label[256];
-        float tx = (float)(x0 + i * tw), lx = tx + 6 * g_scale;
+        float y0 = (float)(top + i * rh), ty = y0 + (float)(rh - CH) / 2;
         int act = (i == g_active), hov = (idx == i && (hover == HIT_TAB || hover == HIT_CLOSE));
-        uint32_t bg = act ? DEF_BG : hov ? TAB_HOVER : TAB_BG, fg = act ? 0xF2F2F2 : 0x9A9A9A;
-        fill_rect(tx, top, tx + tw - 2 * g_scale, (float)bh, bg, 1);
-        if (act) fill_rect(tx, top, tx + tw - 2 * g_scale, top + 2 * g_scale, AMBER, 1);
+        uint32_t fg = act ? 0xF2F2F2 : 0x9A9A9A;
+        /* the active tab takes the terminal's background, so it reads as attached to it */
+        if (act || hov) fill_rect(0, y0, (float)sw, y0 + rh, act ? DEF_BG : TAB_HOVER, 1);
+        if (act) fill_rect(0, y0, (float)(2 * g_scale), y0 + rh, AMBER, 1);
         tab_label(tb, label, 256);
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, g_tex);
-        glBegin(GL_QUADS);
-        g_in_quads = 1;
         /* one status cell before the name: throbber, else bell, else nothing */
         if (tb->busy) {
-            gl_color(act ? 0xF2F2F2 : 0xBDBDBD, 1);
+            r_color(act ? 0xF2F2F2 : 0xBDBDBD, 1);
             draw_glyph(drip, lx, ty, 1, g_scale);
         } else if (tb->attention) {
-            gl_color(AMBER, 1);
+            r_color(AMBER, 1);
             draw_glyph(BELL_GLYPH, lx, ty, 1, g_scale);
-        }
-        draw_label(label, lx + 2 * CW, ty, (float)(tw - 2 * g_scale - 12 * g_scale - 3 * CW), fg);
-        if (act || hov) {
-            float cx = tx + tw - 2 * g_scale - CW - 6 * g_scale;
-            gl_color((hov && hover == HIT_CLOSE) ? 0xFF6B5E : 0x8A8A8A, 1);
-            draw_glyph(0x00D7, cx, ty, 1, g_scale);
-        }
-        glEnd();
-        g_in_quads = 0;
-        if (tb->activity && !act && !tb->busy && !tb->attention)
+        } else if (tb->activity && !act) {
             fill_rect(lx + 3 * g_scale, ty + CH / 2 - g_scale, lx + 5 * g_scale, ty + CH / 2 + g_scale, 0x8A8A8A, 1);
-        if (tb->exited) fill_rect(lx + 2 * CW, ty + CH / 2, tx + tw - 10 * g_scale - CW, ty + CH / 2 + g_scale, 0x8A8A8A, 1);
-    }
-    {
-        float px = (float)(x0 + g_ntabs * tw + 2 * g_scale), sz = (float)(bh - tab_top() - 2 * g_scale);
-        int hov = hover == HIT_PLUS;
-        fill_rect(px, top, px + sz, top + sz, hov ? TAB_HOVER : BAR_BG, 1);
-        /* a plain plus, drawn rather than taken from the font */
-        {
-            float cx = px + sz / 2, cy = top + sz / 2, arm = sz * 0.28f, th = (float)g_scale;
-            uint32_t col = hov ? 0xF2F2F2 : 0xB0B0B0;
-            fill_rect(cx - arm, cy - th, cx + arm, cy + th, col, 1);
-            fill_rect(cx - th, cy - arm, cx + th, cy + arm, col, 1);
         }
+        draw_label(label, lx + 2 * CW, ty, (float)(sw - lx - 2 * CW - CW - 12 * g_scale), fg);
+        if (act || hov) {
+            r_color((hov && hover == HIT_CLOSE) ? 0xFF6B5E : 0x8A8A8A, 1);
+            draw_glyph(0x00D7, (float)(sw - CW - 8 * g_scale), ty, 1, g_scale);
+        }
+        if (tb->exited) fill_rect(lx + 2 * CW, ty + CH / 2, (float)(sw - CW - 12 * g_scale), ty + CH / 2 + g_scale, 0x8A8A8A, 1);
     }
-    render_caption_buttons(win_w);
+    {   /* "+": a plain plus in the status column, drawn rather than taken from the font */
+        float y0 = (float)(top + g_ntabs * rh), cx = lx + CW / 2, cy = y0 + rh / 2.0f, arm = 4.0f * g_scale, th = (float)g_scale;
+        int hov = hover == HIT_PLUS;
+        uint32_t col = hov ? 0xF2F2F2 : 0x9A9A9A;
+        if (hov) fill_rect(0, y0, (float)sw, y0 + rh, TAB_HOVER, 1);
+        fill_rect(cx - arm, cy - th / 2 - th / 2, cx + arm + th, cy + th / 2 + th / 2, col, 1);
+        fill_rect(cx - th / 2 - th / 2, cy - arm, cx + th / 2 + th / 2, cy + arm + th, col, 1);
+    }
+    render_caption_buttons();
 }
 
 static void render(void) {
@@ -2216,22 +2553,13 @@ static void render(void) {
     int y, x, ox = term_ox(), oy = term_oy();
     long long base;
     GetClientRect(g_hwnd, &r);
-    glViewport(0, 0, r.right, r.bottom);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(0, r.right, r.bottom, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glClearColor(((DEF_BG >> 16) & 255) / 255.0f, ((DEF_BG >> 8) & 255) / 255.0f, (DEF_BG & 255) / 255.0f, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    render_tabbar(r.right);
+    r_begin(r.right, r.bottom);
+    render_tabbar(r.right, r.bottom);
     if (!tb) return;
     t = &tb->t;
     base = term_base(t);
 
     /* backgrounds + selection */
-    glDisable(GL_TEXTURE_2D);
-    glBegin(GL_QUADS);
     for (y = 0; y < t->rows; y++) {
         const Cell *cells;
         int n, wrapped, L = t->hcount - t->view + y;
@@ -2243,17 +2571,12 @@ static void render(void) {
             else bg = DEF_BG;
             if (sel) bg = SEL_BG;
             if (bg == DEF_BG) continue;
-            gl_color(bg, 1);
+            r_color(bg, 1);
             quad((float)(ox + x * CW), (float)(oy + y * CH), (float)(ox + (x + 1) * CW), (float)(oy + (y + 1) * CH));
         }
     }
-    glEnd();
 
     /* glyphs */
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_tex);
-    glBegin(GL_QUADS);
-    g_in_quads = 1;
     for (y = 0; y < t->rows; y++) {
         const Cell *cells;
         int n, wrapped, L = t->hcount - t->view + y;
@@ -2266,19 +2589,15 @@ static void render(void) {
             cell_colors(c, &fg, &bg);
             if (fg == bg && !(c->attr & A_HIDDEN)) continue;
             w = (c->wflag == W_WIDE) ? 2 : 1;
-            gl_color(fg, 1);
+            r_color(fg, 1);
             draw_glyph(c->ch, (float)(ox + x * CW), (float)(oy + y * CH), w, g_scale);
             /* Unifont has no bold; smear one pixel right, except box drawing */
             if ((c->attr & A_BOLD) && !(c->ch >= 0x2500 && c->ch <= 0x259F))
                 draw_glyph(c->ch, (float)(ox + x * CW + g_scale), (float)(oy + y * CH), w, g_scale);
         }
     }
-    glEnd();
-    g_in_quads = 0;
 
     /* underline / strike */
-    glDisable(GL_TEXTURE_2D);
-    glBegin(GL_QUADS);
     for (y = 0; y < t->rows; y++) {
         const Cell *cells;
         int n, wrapped, L = t->hcount - t->view + y;
@@ -2291,15 +2610,14 @@ static void render(void) {
             cell_colors(c, &fg, &bg);
             if (c->link && !(c->attr & A_UNDER)) {   /* OSC 8 link: dotted underline */
                 int d;
-                gl_color(fg, 0.6f);
+                r_color(fg, 0.6f);
                 for (d = 0; d < CW; d += 2 * g_scale) quad(x0 + d, y0 + CH - g_scale, x0 + d + g_scale, y0 + CH);
             }
-            gl_color(fg, 1);
+            r_color(fg, 1);
             if (c->attr & A_UNDER) quad(x0, y0 + CH - g_scale, x0 + CW, y0 + CH);
             if (c->attr & A_STRIKE) quad(x0, y0 + CH / 2, x0 + CW, y0 + CH / 2 + g_scale);
         }
     }
-    glEnd();
 
     /* cursor: dumbterm amber */
     if (t->view == 0 && t->m_cursor_vis) {
@@ -2320,14 +2638,8 @@ static void render(void) {
             const Cell *c = CELL(t, t->cx, t->cy);
             fill_rect(cx, cy, cx + cw, cy + CH, AMBER, 0.9f);
             if (c->ch > ' ' && c->wflag != W_CONT) {
-                glEnable(GL_TEXTURE_2D);
-                glBindTexture(GL_TEXTURE_2D, g_tex);
-                glBegin(GL_QUADS);
-                g_in_quads = 1;
-                gl_color(DEF_BG, 1);
+                r_color(DEF_BG, 1);
                 draw_glyph(c->ch, cx, cy, w, g_scale);
-                glEnd();
-                g_in_quads = 0;
             }
         }
     }
@@ -2350,9 +2662,34 @@ static void update_title(void) {
     wchar_t label[256], title[300];
     if (!tb) return;
     tab_label(tb, label, 256);
-    _snwprintf(title, 300, L"%ls — wsl-easy", label);
+    _snwprintf(title, 300, L"%ls — hardcore", label);
     title[299] = 0;
     SetWindowTextW(g_hwnd, title);
+}
+
+/* Completes the previous keypress's line once its frame has had time to reach
+   the display: DXGI reports the vblank it was scanned out on (SyncQPCTime) and
+   whether DWM composed it (0) or it went straight to a hardware plane (1). */
+static char g_lat_line[128];
+static LARGE_INTEGER g_lat_pkey;
+static UINT g_lat_pid;
+static void lat_finish(void) {
+    IDXGISwapChainMedia *m = NULL;
+    DXGI_FRAME_STATISTICS_MEDIA st;
+    double shown = -1;
+    int mode = -1;
+    if (!g_lat || !g_lat_line[0]) return;
+    memset(&st, 0, sizeof(st));
+    if (g_sc && SUCCEEDED(IDXGISwapChain1_QueryInterface(g_sc, &IID_IDXGISwapChainMedia_, (void **)&m))) {
+        if (SUCCEEDED(IDXGISwapChainMedia_GetFrameStatisticsMedia(m, &st)) && st.PresentCount == g_lat_pid) {
+            shown = lat_ms(g_lat_pkey, st.SyncQPCTime);
+            mode = (int)st.CompositionMode;
+        }
+        IDXGISwapChainMedia_Release(m);
+    }
+    fprintf(g_lat, "%s %.2f %d\n", g_lat_line, shown, mode);
+    fflush(g_lat);
+    g_lat_line[0] = 0;
 }
 
 static void paint_now(void) {
@@ -2361,9 +2698,19 @@ static void paint_now(void) {
         SetTimer(g_hwnd, 1, 20, NULL);
         return;
     }
+    if (g_lat && g_lat_out.QuadPart) QueryPerformanceCounter(&g_lat_render);
     render();
-    SwapBuffers(g_hdc);
+    r_present();
     g_last_paint = GetTickCount();
+    if (g_lat && g_lat_out.QuadPart) {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        lat_finish();
+        snprintf(g_lat_line, sizeof(g_lat_line), "%.2f %.2f %.2f", lat_ms(g_lat_key, g_lat_out), lat_ms(g_lat_key, g_lat_render), lat_ms(g_lat_key, t));
+        g_lat_pkey = g_lat_key;
+        IDXGISwapChain1_GetLastPresentCount(g_sc, &g_lat_pid);
+        g_lat_key.QuadPart = g_lat_out.QuadPart = 0;
+    }
 }
 
 /* Re-checks which tabs are animating a spinner title. A tab that stops while
@@ -2376,7 +2723,13 @@ static void update_busy(void) {
         int b = term_busy(&tb->t);
         if (b != tb->busy) {
             changed = 1;
-            if (!b && (i != g_active || !g_focused)) tb->attention = 1;
+            if (!b && (i != g_active || !g_focused)) {
+                tb->attention = 1;
+                if (!g_focused) {        /* finished while you were in another window */
+                    FLASHWINFO fi = {sizeof(fi), g_hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
+                    FlashWindowEx(&fi);
+                }
+            }
             tb->busy = b;
         }
         any |= b;
@@ -2488,7 +2841,7 @@ static int handle_keydown(WPARAM vk) {
     int n = 0;
     if (!tb) return 0;
 
-    /* wsl-easy's own shortcuts; everything else goes to the shell */
+    /* hardcore's own shortcuts; everything else goes to the shell */
     if (ctrl && shift && !alt) {
         switch (vk) {
         case 'T': new_tab_here(); return 1;
@@ -2723,61 +3076,6 @@ static void scrollbar_set(int my) {
 
 /* ── window procedure ─────────────────────────────────────────────── */
 
-static void gl_init(void) {
-    PIXELFORMATDESCRIPTOR pfd;
-    int pf;
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.nSize = sizeof(pfd);
-    pfd.nVersion = 1;
-    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-    pfd.iPixelType = PFD_TYPE_RGBA;
-    pfd.cColorBits = 32;
-    pf = ChoosePixelFormat(g_hdc, &pfd);
-    SetPixelFormat(g_hdc, pf, &pfd);
-    g_glrc = wglCreateContext(g_hdc);
-    wglMakeCurrent(g_hdc, g_glrc);
-    {   /* vsync off: we only draw when something changed */
-        typedef BOOL (WINAPI *PFNSWAP)(int);
-        PFNSWAP swap = (PFNSWAP)(void *)wglGetProcAddress("wglSwapIntervalEXT");
-        if (swap) swap(0);
-    }
-    glDisable(GL_DEPTH_TEST);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glGenTextures(1, &g_tex);
-    glBindTexture(GL_TEXTURE_2D, g_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, ATLAS, ATLAS, 0, GL_ALPHA, GL_UNSIGNED_BYTE, NULL);
-    glyph_cache_reset();
-}
-
-/* Loading the OpenGL driver is most of our startup (~80 ms on an AMD iGPU).
-   A throwaway context on a worker thread pulls the driver DLLs in while the
-   main thread creates the window and starts wsl.exe. */
-static DWORD WINAPI gl_warm_thread(LPVOID unused) {
-    HWND w = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, NULL, NULL, GetModuleHandleW(NULL), NULL);
-    HDC dc = w ? GetDC(w) : NULL;
-    PIXELFORMATDESCRIPTOR pfd;
-    (void)unused;
-    if (dc) {
-        HGLRC rc;
-        memset(&pfd, 0, sizeof(pfd));
-        pfd.nSize = sizeof(pfd);
-        pfd.nVersion = 1;
-        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-        pfd.iPixelType = PFD_TYPE_RGBA;
-        pfd.cColorBits = 32;
-        SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd);
-        rc = wglCreateContext(dc);
-        if (rc) wglDeleteContext(rc);
-        ReleaseDC(w, dc);
-    }
-    if (w) DestroyWindow(w);
-    return 0;
-}
-
 static void save_window_size(void) {
     RECT r;
     if (!IsIconic(g_hwnd) && !IsZoomed(g_hwnd) && GetWindowRect(g_hwnd, &r)) {
@@ -2805,7 +3103,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
         g_hwnd = hwnd;
-        g_hdc = GetDC(hwnd);
         trace("WM_CREATE");
         DragAcceptFiles(hwnd, TRUE);
         return 0;
@@ -2843,7 +3140,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return pt.x < corner ? HTTOPLEFT : pt.x >= r.right - corner ? HTTOPRIGHT : HTTOP;
         }
         if ((cap = caption_hit(pt.x, pt.y))) return cap;
-        if (pt.y < tabbar_h() && hit_tabbar(pt.x, pt.y, &idx) == HIT_BAR) return HTCAPTION;
+        if (hit_tabbar(pt.x, pt.y, &idx) == HIT_BAR) return HTCAPTION;
         return HTCLIENT;
     }
     case WM_NCMOUSEMOVE: {
@@ -2886,7 +3183,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return DefWindowProcW(hwnd, msg, wp, -1);   /* -1: no classic frame repaint */
     case WM_ERASEBKGND:
-        if (!g_glrc) break;      /* before GL: let the class brush paint it dark */
+        if (!g_gfx_ready) break; /* before the swap chain: let the class brush paint it dark */
         return 1;
     case WM_DROPFILES:
         SetForegroundWindow(hwnd);
@@ -2900,7 +3197,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetCursorPos(&pt);
             ScreenToClient(hwnd, &pt);
             mouse_cell(pt.x, pt.y, &col, &row);
-            if (pt.y < tabbar_h()) SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_ARROW));
+            if (pt.x < sidebar_w()) SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_ARROW));
             else if ((GetKeyState(VK_CONTROL) & 0x8000) && link_at(col, row, url, sizeof(url)))
                 SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
             else SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM));
@@ -2910,16 +3207,16 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
-        if (g_glrc) paint_now();
+        if (g_gfx_ready) paint_now();
         else {
-            /* GL isn't up yet (the driver takes ~80 ms to load): show the
+            /* the swap chain isn't up yet (device creation is on a worker): show the
                window's colors right away so it appears instantly */
             RECT r, bar;
             HBRUSH bg = CreateSolidBrush(RGB(DEF_BG >> 16, (DEF_BG >> 8) & 255, DEF_BG & 255));
             HBRUSH bb = CreateSolidBrush(RGB(BAR_BG >> 16, (BAR_BG >> 8) & 255, BAR_BG & 255));
             GetClientRect(hwnd, &r);
             bar = r;
-            bar.bottom = tabbar_h();
+            bar.right = sidebar_w();
             FillRect(ps.hdc, &r, bg);
             FillRect(ps.hdc, &bar, bb);
             DeleteObject(bg);
@@ -2936,8 +3233,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) {
+            r_resize();
             resize_all();
-            InvalidateRect(hwnd, NULL, FALSE);
+            /* draw now, not on the next WM_PAINT: during a live resize the
+               compositor shows the swap chain's last frame until we do */
+            if (g_gfx_ready) paint_now();
+            else InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
     case WM_EXITSIZEMOVE:
@@ -2968,6 +3269,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_APP_OUTPUT: {
         int i, changed = 0;
+        if (g_lat && g_lat_key.QuadPart && !g_lat_out.QuadPart) QueryPerformanceCounter(&g_lat_out);
         for (i = 0; i < g_ntabs; i++) {
             Tab *tb = g_tabs[i];
             if (tab_drain(tb) <= 0) continue;
@@ -3005,6 +3307,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if (g_lat && !g_lat_key.QuadPart) {
+            lat_finish();
+            QueryPerformanceCounter(&g_lat_key);
+        }
         if (msg == WM_SYSKEYDOWN && (wp == VK_F4 || wp == VK_SPACE) && !(GetKeyState(VK_CONTROL) & 0x8000)) break;
         if (handle_keydown(wp)) {
             MSG m;
@@ -3025,7 +3331,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_MOUSEMOVE: {
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), col, row;
-        int was_bar = g_mouse_y >= 0 && g_mouse_y < tabbar_h(), on_bar = my < tabbar_h();
+        int was_bar = g_mouse_y >= 0 && g_mouse_x < sidebar_w(), on_bar = mx < sidebar_w();
         Tab *tb = active_tab();
         TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&tme);
@@ -3113,7 +3419,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         mouse_report(1, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp);
         return 0;
     case WM_RBUTTONDOWN:
-        if (GET_Y_LPARAM(lp) < tabbar_h()) return 0;
+        if (GET_X_LPARAM(lp) < sidebar_w()) return 0;
         if (mouse_report(2, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp)) return 0;
         /* conhost habit: right-click copies a selection, or pastes */
         if (g_sel_on) {
@@ -3384,17 +3690,22 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     MSG msg;
     char selftest_out[MAX_PATH] = "";
     HWND h;
-    HANDLE gl_warm = NULL;
+    HANDLE gfx_thread = NULL;
     (void)prev; (void)cmdline;
 
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_t0);
-    if (_wgetenv(L"WSL_EASY_TRACE")) {
+    if (_wgetenv(L"HARDCORE_TRACE")) {
         wchar_t tp[MAX_PATH];
-        _snwprintf(tp, MAX_PATH, L"%ls\\wsl-easy-trace.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
+        _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-trace.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
         g_trace = _wfopen(tp, L"wb");
     }
     trace("wWinMain");
+    if (_wgetenv(L"HARDCORE_LAT")) {
+        wchar_t tp[MAX_PATH];
+        _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-lat.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
+        g_lat = _wfopen(tp, L"wb");
+    }
     dpi_awareness();
     palette_init();
     drip_init();
@@ -3431,34 +3742,34 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     write_rc();
     trace("rc written");
     if (selftest_out[0]) return selftest(selftest_out);
-    gl_warm = CreateThread(NULL, 0, gl_warm_thread, NULL, 0, NULL);
+    gfx_thread = CreateThread(NULL, 0, gfx_device_thread, NULL, 0, NULL);
 
     memset(&wc, 0, sizeof(wc));
-    wc.style = CS_OWNDC | CS_DBLCLKS;
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM);
     wc.hbrBackground = CreateSolidBrush(RGB(DEF_BG >> 16, (DEF_BG >> 8) & 255, DEF_BG & 255));  /* no white flash */
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
-    wc.lpszClassName = L"wsl-easy";
+    wc.lpszClassName = L"hardcore";
     RegisterClassW(&wc);
 
     g_dpi = window_dpi(NULL);
     g_scale = auto_scale();
     if (g_win_w < 300 || g_win_h < 160) {
         r.left = r.top = 0;
-        r.right = 2 * PAD + SCROLLBAR_W + 120 * CW;
-        r.bottom = tabbar_h() + 2 * PAD + 34 * CH;
+        r.right = sidebar_w() + 2 * PAD + SCROLLBAR_W + 120 * CW;
+        r.bottom = 2 * PAD + 36 * CH;
         AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
         g_win_w = r.right - r.left;
         g_win_h = r.bottom - r.top - GetSystemMetrics(SM_CYCAPTION) - frame_thickness(NULL);   /* no caption: see WM_NCCALCSIZE */
     }
     trace("class registered");
-    h = CreateWindowExW(0, L"wsl-easy", L"wsl-easy", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+    h = CreateWindowExW(0, L"hardcore", L"hardcore", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                         g_win_w, g_win_h, NULL, NULL, inst, NULL);
     if (!h) return 1;
     SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    trace("window created (incl. GL init)");
+    trace("window created");
     g_dpi = window_dpi(h);
     g_scale = auto_scale();
     dark_titlebar(h);
@@ -3469,12 +3780,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     ShowWindow(h, show);
     UpdateWindow(h);
     trace("window shown");
-    new_tab_here();              /* wsl.exe boots while the GL driver loads */
+    new_tab_here();              /* wsl.exe boots while the D3D device is created */
     trace("first tab spawned");
-    if (gl_warm) { WaitForSingleObject(gl_warm, 2000); CloseHandle(gl_warm); }
-    trace("GL driver warm");
-    gl_init();
-    trace("GL ready");
+    if (gfx_thread) { WaitForSingleObject(gfx_thread, 5000); CloseHandle(gfx_thread); }
+    trace("D3D device ready");
+    if (!gfx_init_swapchain(h)) {
+        MessageBoxW(h, L"Couldn't start Direct3D 11.", L"hardcore", MB_ICONERROR);
+        return 1;
+    }
+    trace("swap chain ready");
     InvalidateRect(h, NULL, FALSE);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {

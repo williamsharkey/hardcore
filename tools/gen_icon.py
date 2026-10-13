@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draws the wsl-easy icon (amber ">_" on near-black, dumbterm's phosphor color)
+"""Draws the hardcore icon (amber ">_" on near-black, dumbterm's phosphor color)
 as a PNG-in-ICO with 16/24/32/48/64/256 px frames. No dependencies."""
 import struct, sys, zlib
 

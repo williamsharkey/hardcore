@@ -148,15 +148,17 @@ static void dup_init(void) {
     ID3D11Device_CreateTexture2D(g_dev, &td, NULL, &g_stage);
 }
 
+static int g_left;               /* --left PX: skip a sidebar (hardcore's tab column) */
+
 static void cap_init(Cap *c, int top_skip) {
     RECT r;
     POINT p = {0, 0};
     if (!g_dup) dup_init();
     GetClientRect(g_target, &r);
     ClientToScreen(g_target, &p);
-    c->x = p.x;
+    c->x = p.x + g_left;
     c->y = p.y + top_skip;
-    c->w = r.right;
+    c->w = r.right - g_left;
     c->h = r.bottom - top_skip;
     if (c->x < 0) c->x = 0;
     if (c->y < 0) c->y = 0;
@@ -450,6 +452,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--title") && i + 1 < argc) g_title = argv[++i];
         else if (!strcmp(argv[i], "--n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--top") && i + 1 < argc) top = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--left") && i + 1 < argc) g_left = atoi(argv[++i]);
         else arg = argv[i];
     }
     if (!g_class) { fprintf(stderr, "need --class\n"); return 2; }
@@ -495,6 +498,16 @@ int main(int argc, char **argv) {
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
         return 0;
     }
+    if (!strcmp(cmd, "keys")) {   /* N 'x' presses, 60-100 ms apart, no screen capture running */
+        int k;
+        focus();
+        for (k = 0; k < (n ? n : 150); k++) {
+            must_be_foreground();
+            send_vk('X', 0, 0);
+            Sleep(60 + rand() % 40);
+        }
+        return 0;
+    }
     if (!strcmp(cmd, "hover") && arg) {   /* move the pointer only, in client coordinates */
         POINT p;
         if (sscanf(arg, "%ld,%ld", &p.x, &p.y) != 2 || !in_client(p)) return 2;
@@ -511,6 +524,6 @@ int main(int argc, char **argv) {
         send_vk(vk, ctrl, shift);
         return 0;
     }
-    fprintf(stderr, "usage: termbench latency|newtab|launch|type|key|click|hover|shot|resize --class C [--title T] [--n N] [--top PX] [ARG]\n");
+    fprintf(stderr, "usage: termbench latency|newtab|launch|type|key|keys|click|hover|shot|resize --class C [--title T] [--n N] [--top PX] [ARG]\n");
     return 2;
 }

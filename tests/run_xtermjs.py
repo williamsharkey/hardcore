@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Replays the xterm.js escape-sequence fixtures (tests/xtermjs, expected
-screens captured from real xterm at 80x25) through wsl-easy's parser and diffs
+screens captured from real xterm at 80x25) through hardcore's parser and diffs
 the screen, the same comparison xterm.js's own Terminal2.test.ts makes.
 
     python3 tests/run_xtermjs.py [-v] [NAME_SUBSTRING...]
@@ -23,7 +23,7 @@ names = sorted(f[:-3] for f in os.listdir(FIX) if f.endswith('.in'))
 names = [n for n in names if not filters or any(f in n for f in filters)]
 out = os.path.join(ROOT, 'build', 'replay.txt')
 os.makedirs(os.path.dirname(out), exist_ok=True)
-subprocess.run([os.path.join(ROOT, 'wsl-easy.exe'), '--replay', winpath(out), '80', '25']
+subprocess.run([os.path.join(ROOT, 'hardcore.exe'), '--replay', winpath(out), '80', '25']
                + [winpath(os.path.join(FIX, n + '.in')) for n in names], check=True)
 
 screens, cur = {}, None
