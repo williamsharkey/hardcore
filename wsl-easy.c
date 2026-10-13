@@ -74,9 +74,11 @@ extern const unsigned char conpty_dll[], conpty_dll_end[], openconsole_exe[], op
 
 /* Returns the glyph record (width byte + rows) or NULL. */
 static const unsigned char *font_glyph(uint32_t cp) {
-    uint32_t off;
-    if (cp > 0xFFFF) return NULL;
-    memcpy(&off, font_blob + 4 + cp * 4, 4);
+    uint32_t page, off;
+    if (cp > 0x10FFFF) return NULL;
+    memcpy(&page, font_blob + 4 + (cp >> 8) * 4, 4);
+    if (!page) return NULL;
+    memcpy(&off, font_blob + page + (cp & 255) * 4, 4);
     if (!off || font_blob + off >= font_blob_end) return NULL;
     return font_blob + off;
 }
@@ -159,32 +161,25 @@ static void palette_init(void) {
     }
 }
 
-/* wcwidth, coarse: enough to agree with ConPTY on the common cases */
+/* wcwidth from Unicode 17 (tools/gen_width.py → build/width.inc): the same
+classic rule ConPTY measures with, so our grid agrees with the console host */
+#include "build/width.inc"
+
+static int in_ranges(uint32_t cp, const uint32_t (*r)[2], int n) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (cp < r[mid][0]) hi = mid - 1;
+        else if (cp > r[mid][1]) lo = mid + 1;
+        else return 1;
+    }
+    return 0;
+}
+
 static int cp_width(uint32_t cp) {
-    static const uint32_t zero[][2] = {
-        {0x0300, 0x036F}, {0x0483, 0x0489}, {0x0591, 0x05BD}, {0x0610, 0x061A}, {0x064B, 0x065F},
-        {0x0E31, 0x0E31}, {0x0E34, 0x0E3A}, {0x0E47, 0x0E4E}, {0x1AB0, 0x1AFF}, {0x1DC0, 0x1DFF},
-        {0x200B, 0x200F}, {0x2028, 0x202E}, {0x2060, 0x2064}, {0x20D0, 0x20FF}, {0xFE00, 0xFE0F},
-        {0xFE20, 0xFE2F}, {0xFEFF, 0xFEFF}, {0x1F3FB, 0x1F3FF}, {0xE0000, 0xE0FFF}};
-    static const uint32_t wide[][2] = {
-        {0x1100, 0x115F}, {0x231A, 0x231B}, {0x2329, 0x232A}, {0x23E9, 0x23EC}, {0x23F0, 0x23F0},
-        {0x23F3, 0x23F3}, {0x25FD, 0x25FE}, {0x2614, 0x2615}, {0x2648, 0x2653}, {0x267F, 0x267F},
-        {0x2693, 0x2693}, {0x26A1, 0x26A1}, {0x26AA, 0x26AB}, {0x26BD, 0x26BE}, {0x26C4, 0x26C5},
-        {0x26CE, 0x26CE}, {0x26D4, 0x26D4}, {0x26EA, 0x26EA}, {0x26F2, 0x26F3}, {0x26F5, 0x26F5},
-        {0x26FA, 0x26FA}, {0x26FD, 0x26FD}, {0x2705, 0x2705}, {0x270A, 0x270B}, {0x2728, 0x2728},
-        {0x274C, 0x274C}, {0x274E, 0x274E}, {0x2753, 0x2755}, {0x2757, 0x2757}, {0x2795, 0x2797},
-        {0x27B0, 0x27B0}, {0x27BF, 0x27BF}, {0x2B1B, 0x2B1C}, {0x2B50, 0x2B50}, {0x2B55, 0x2B55},
-        {0x2E80, 0x303E}, {0x3041, 0x33FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xA000, 0xA4CF},
-        {0xA960, 0xA97F}, {0xAC00, 0xD7A3}, {0xF900, 0xFAFF}, {0xFE10, 0xFE19}, {0xFE30, 0xFE6F},
-        {0xFF00, 0xFF60}, {0xFFE0, 0xFFE6}, {0x1F004, 0x1F004}, {0x1F0CF, 0x1F0CF}, {0x1F18E, 0x1F18E},
-        {0x1F191, 0x1F19A}, {0x1F200, 0x1F251}, {0x1F300, 0x1F64F}, {0x1F680, 0x1F6FF},
-        {0x1F7E0, 0x1F7EB}, {0x1F90C, 0x1F9FF}, {0x1FA70, 0x1FAFF}, {0x20000, 0x3FFFD}};
-    size_t i;
     if (cp < 0x300) return 1;
-    for (i = 0; i < sizeof(zero) / sizeof(zero[0]); i++)
-        if (cp >= zero[i][0] && cp <= zero[i][1]) return 0;
-    for (i = 0; i < sizeof(wide) / sizeof(wide[0]); i++)
-        if (cp >= wide[i][0] && cp <= wide[i][1]) return 2;
+    if (in_ranges(cp, W0, (int)(sizeof(W0) / sizeof(W0[0])))) return 0;
+    if (in_ranges(cp, W2, (int)(sizeof(W2) / sizeof(W2[0])))) return 2;
     return 1;
 }
 
@@ -237,7 +232,10 @@ typedef struct {
     /* reported by the shell / apps */
     wchar_t title[256];
     char cwd[1024];
-    int bell;
+    int bell;                    /* BEL, or a desktop-notification OSC (9 / 777) */
+    uint32_t spin_ch;            /* first char of the title, when it looks like a spinner */
+    DWORD spin_at;               /* when it last changed */
+    int spin_n;                  /* changes in a row, each within SPIN_HOLD ms of the last */
     int dirty;
 } Term;
 
@@ -252,7 +250,9 @@ typedef struct Tab {
     int in_n, in_cap;
     volatile LONG posted;
     volatile LONG exited;
-    int activity;
+    int activity;                /* output while in the background */
+    int busy;                    /* term_busy(), as of the last check: drives the throbber */
+    int attention;               /* bell, notification, or a busy program went quiet: the bell mark */
     int spare;                   /* pre-warmed, waiting on stdin for its directory */
     char start_dir[1024];
 } Tab;
@@ -1095,6 +1095,35 @@ static int b64val(int c) {
     return -1;
 }
 
+/* Programs that animate their title (Claude Code: "◐ task", "◑ task", ...;
+   others use braille or asterisks) count as busy while the first character
+   keeps changing. One change alone is a static marker such as Claude's idle "✳". */
+#define SPIN_HOLD 1500
+
+static int spinnerish(uint32_t c) {
+    return (c >= 0x2800 && c <= 0x28FF) || (c >= 0x25D0 && c <= 0x25D3) || (c >= 0x25F4 && c <= 0x25F7) ||
+           (c >= 0x2596 && c <= 0x259F) || (c >= 0x2722 && c <= 0x274B) || (c >= 0x25B0 && c <= 0x25C5) ||
+           c == 0x00B7 || c == 0x2219 || c == 0x2022 || c == 0x22C6 || c == 0x2605 || c == 0x2606;
+}
+
+static void title_spin(Term *t) {
+    uint32_t c = t->title[0];
+    DWORD now = GetTickCount();
+    if (!(spinnerish(c) && t->title[1] == L' ')) {
+        t->spin_ch = 0;
+        t->spin_n = 0;
+        return;
+    }
+    if (c == t->spin_ch) return;
+    t->spin_n = (t->spin_ch && now - t->spin_at < SPIN_HOLD) ? t->spin_n + 1 : 1;
+    t->spin_ch = c;
+    t->spin_at = now;
+}
+
+static int term_busy(const Term *t) {
+    return t->spin_n >= 2 && GetTickCount() - t->spin_at < SPIN_HOLD;
+}
+
 static void osc_dispatch(Term *t) {
     char *s = t->osc, *rest;
     int code;
@@ -1106,7 +1135,11 @@ static void osc_dispatch(Term *t) {
     case 0: case 2:
         MultiByteToWideChar(CP_UTF8, 0, rest, -1, t->title, 255);
         t->title[255] = 0;
+        title_spin(t);
         t->dirty = 1;
+        break;
+    case 777:                    /* OSC 777 ; notify ; title ; body (urxvt, Ghostty) */
+        if (!strncmp(rest, "notify;", 7)) t->bell = 1;
         break;
     case 7:
         if (!strncmp(rest, "file://", 7)) {
@@ -1126,6 +1159,8 @@ static void osc_dispatch(Term *t) {
                 p++;
             }
             set_cwd(t, p);
+        } else if (!(rest[0] >= '0' && rest[0] <= '9' && rest[1] == ';')) {
+            t->bell = 1;         /* OSC 9 ; message: an iTerm2-style notification */
         }
         break;
     case 10: case 11:
@@ -1209,6 +1244,8 @@ static void esc_dispatch(Term *t, int b) {
         memset(t->saved, 0, sizeof(t->saved));
         for (x = 0; x < t->cols; x++) t->tabs[x] = (x % 8 == 0);
         t->title[0] = 0;
+        t->spin_ch = 0;
+        t->spin_n = 0;
         break;
     }
     case 'Z': term_reply(t, "\x1b[?62;22c"); break;   /* DECID = DA */
@@ -1650,7 +1687,7 @@ static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 #define CH (FONT_H * g_scale)
 #define PAD (4 * g_scale)
 #define SCROLLBAR_W (6 * g_scale)
-static int tabbar_h(void) { return CH + 10 * g_scale; }
+static int tabbar_h(void) { return CH + 16 * g_scale; }   /* the tab strip is the title bar */
 static int term_ox(void) { return PAD; }
 static int term_oy(void) { return tabbar_h() + PAD; }
 
@@ -1982,40 +2019,68 @@ static int draw_label(const wchar_t *s, float x, float y, float max_w, uint32_t 
     return (int)(cx - x);
 }
 
-/* tab label: a program's own title wins; the shell's "user@host: path"
-   title loses to the folder name, which is what you actually want to see */
+/* tab label: the folder's name and nothing else. Programs' titles are
+   mostly noise ("✳ Claude Code — ...", "user@host: ~/x"); the only thing we
+   take from them is whether they're animating a spinner (see title_spin). */
 static void tab_label(Tab *tb, wchar_t *out, int cap) {
-    const wchar_t *title = tb->t.title;
-    int shellish = !title[0] || (wcschr(title, L'@') && wcschr(title, L':')) ||
-                   (wcslen(title) > 4 && !_wcsicmp(title + wcslen(title) - 4, L".exe"));
-    if (!shellish) {
-        _snwprintf(out, cap, L"%ls", title);
-    } else if (tb->t.cwd[0]) {
-        const char *b = strrchr(tb->t.cwd, '/');
-        b = (b && b[1]) ? b + 1 : tb->t.cwd;
-        MultiByteToWideChar(CP_UTF8, 0, b, -1, out, cap);
-    } else {
-        _snwprintf(out, cap, L"wsl");
-    }
+    const char *dir = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, *b = NULL, *p;
+    for (p = dir; *p; p++)
+        if ((*p == '/' || *p == '\\') && p[1]) b = p + 1;
+    if (!dir[0]) _snwprintf(out, cap, L"wsl");
+    else MultiByteToWideChar(CP_UTF8, 0, b ? b : dir, -1, out, cap);
     out[cap - 1] = 0;
 }
 
-/* tab bar geometry */
+/* The throbber: braille drops fall one at a time and stack up in a single
+   cell, left and right in turn, then the full cell drains out the bottom. */
+static uint16_t g_drip[40];
+static int g_ndrip;
+#define DRIP_MS 70
+
+static void drip_init(void) {
+    /* braille dot bits by column, top to bottom */
+    static const uint8_t col[2][4] = {{0x01, 0x02, 0x04, 0x40}, {0x08, 0x10, 0x20, 0x80}};
+    uint8_t pile = 0;
+    int level, side, y, k;
+    for (level = 3; level >= 0; level--)
+        for (side = 0; side < 2; side++) {
+            for (y = 0; y <= level; y++) g_drip[g_ndrip++] = (uint16_t)(0x2800 | pile | col[side][y]);
+            pile |= col[side][level];
+        }
+    for (k = 1; k <= 3; k++) {   /* drain: the pile slides down and out */
+        uint8_t m = 0;
+        for (side = 0; side < 2; side++)
+            for (y = 0; y < 4; y++)
+                if (y - k >= 0 && (pile & col[side][y - k])) m |= col[side][y];
+        g_drip[g_ndrip++] = (uint16_t)(0x2800 | m);
+    }
+    g_drip[g_ndrip++] = 0x2800;
+}
+
+#define TIMER_THROB 3
+#define BELL_GLYPH 0xF8F0        /* hand-drawn, font/wsl-easy-extra.hex */
+
+static int caption_btn_w(void) { return 46 * g_scale; }
+
+/* tab bar geometry: [tabs][+] ........ drag space ........ [–][□][×] */
 enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR };
 static int tab_width(int win_w) {
-    int avail = win_w - 8 * g_scale - tabbar_h() - 8 * g_scale;
+    int avail = win_w - 6 * g_scale - tabbar_h() - 3 * caption_btn_w() - 48 * g_scale;
     int w = g_ntabs ? avail / g_ntabs : avail;
-    int maxw = 26 * CW, minw = 6 * CW;
+    int maxw = 24 * CW, minw = 6 * CW;
     if (w > maxw) w = maxw;
     if (w < minw) w = minw;
     return w;
 }
+
+static int tab_top(void) { return 6 * g_scale; }
 
 static int hit_tabbar(int mx, int my, int *idx) {
     RECT r;
     int tw, x0 = 6 * g_scale, i, bh = tabbar_h();
     GetClientRect(g_hwnd, &r);
     if (my < 0 || my >= bh) return HIT_NONE;
+    if (mx >= r.right - 3 * caption_btn_w()) return HIT_NONE;
     tw = tab_width(r.right);
     for (i = 0; i < g_ntabs; i++) {
         int tx = x0 + i * tw;
@@ -2027,22 +2092,81 @@ static int hit_tabbar(int mx, int my, int *idx) {
     }
     {
         int px = x0 + g_ntabs * tw + 2 * g_scale;
-        if (mx >= px && mx < px + bh - 6 * g_scale) return HIT_PLUS;
+        if (mx >= px && mx < px + bh - tab_top()) return HIT_PLUS;
     }
     return HIT_BAR;
 }
 
+/* caption buttons: HTMINBUTTON / HTMAXBUTTON / HTCLOSE, or 0 */
+static int caption_hit(int mx, int my) {
+    RECT r;
+    int bw = caption_btn_w();
+    GetClientRect(g_hwnd, &r);
+    if (my < 0 || my >= tabbar_h() || mx < r.right - 3 * bw || mx >= r.right) return 0;
+    if (mx >= r.right - bw) return HTCLOSE;
+    if (mx >= r.right - 2 * bw) return HTMAXBUTTON;
+    return HTMINBUTTON;
+}
+
+static int g_nc_hover, g_nc_press, g_win_active = 1;
+
+/* one-pixel-wide strokes, scaled: the caption glyphs stay as sharp as the font */
+static void px_line(float x0, float y0, int n, int dx, int dy, uint32_t rgb) {
+    int i;
+    float s = (float)g_scale;
+    gl_color(rgb, 1);
+    glBegin(GL_QUADS);
+    for (i = 0; i < n; i++) quad(x0 + i * dx * s, y0 + i * dy * s, x0 + i * dx * s + s, y0 + i * dy * s + s);
+    glEnd();
+}
+
+static void render_caption_buttons(int win_w) {
+    int bw = caption_btn_w(), bh = tabbar_h(), k, s = g_scale;
+    for (k = 0; k < 3; k++) {
+        int code = k == 0 ? HTMINBUTTON : k == 1 ? HTMAXBUTTON : HTCLOSE;
+        float x = (float)(win_w - (3 - k) * bw), cx = x + bw / 2 - 5 * s, cy = (float)(bh / 2 - 5 * s);
+        int hov = g_nc_hover == code, prs = g_nc_press == code && hov;
+        uint32_t fg = g_win_active ? 0xCCCCCC : 0x7A7A7A;
+        if (hov && code == HTCLOSE) {
+            fill_rect(x, 0, x + bw, (float)bh, prs ? 0x94241A : 0xC42B1C, 1);
+            fg = 0xFFFFFF;
+        } else if (hov) {
+            fill_rect(x, 0, x + bw, (float)bh, prs ? 0x262626 : 0x2D2D2D, 1);
+        }
+        glDisable(GL_TEXTURE_2D);
+        if (code == HTMINBUTTON) {
+            px_line(cx, cy + 5 * s, 10, 1, 0, fg);
+        } else if (code == HTMAXBUTTON && !IsZoomed(g_hwnd)) {
+            px_line(cx, cy, 10, 1, 0, fg);
+            px_line(cx, cy + 9 * s, 10, 1, 0, fg);
+            px_line(cx, cy, 10, 0, 1, fg);
+            px_line(cx + 9 * s, cy, 10, 0, 1, fg);
+        } else if (code == HTMAXBUTTON) {       /* restore: two stacked squares */
+            px_line(cx, cy + 2 * s, 8, 1, 0, fg);
+            px_line(cx, cy + 9 * s, 8, 1, 0, fg);
+            px_line(cx, cy + 2 * s, 8, 0, 1, fg);
+            px_line(cx + 7 * s, cy + 2 * s, 8, 0, 1, fg);
+            px_line(cx + 2 * s, cy, 8, 1, 0, fg);
+            px_line(cx + 9 * s, cy, 8, 0, 1, fg);
+        } else {
+            px_line(cx, cy, 10, 1, 1, fg);
+            px_line(cx + 9 * s, cy, 10, -1, 1, fg);
+        }
+    }
+}
+
 static void render_tabbar(int win_w) {
     int i, idx = -1, hover = HIT_NONE, tw = tab_width(win_w), x0 = 6 * g_scale, bh = tabbar_h();
-    float ty = (float)(bh - CH) / 2 + g_scale;
+    float top = (float)tab_top(), ty = top + (float)(bh - top - CH) / 2;
+    uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     fill_rect(0, 0, (float)win_w, (float)bh, BAR_BG, 1);
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         wchar_t label[256];
-        float tx = (float)(x0 + i * tw), top = 4.0f * g_scale;
+        float tx = (float)(x0 + i * tw), lx = tx + 6 * g_scale;
         int act = (i == g_active), hov = (idx == i && (hover == HIT_TAB || hover == HIT_CLOSE));
-        uint32_t bg = act ? DEF_BG : hov ? TAB_HOVER : TAB_BG;
+        uint32_t bg = act ? DEF_BG : hov ? TAB_HOVER : TAB_BG, fg = act ? 0xF2F2F2 : 0x9A9A9A;
         fill_rect(tx, top, tx + tw - 2 * g_scale, (float)bh, bg, 1);
         if (act) fill_rect(tx, top, tx + tw - 2 * g_scale, top + 2 * g_scale, AMBER, 1);
         tab_label(tb, label, 256);
@@ -2050,7 +2174,15 @@ static void render_tabbar(int win_w) {
         glBindTexture(GL_TEXTURE_2D, g_tex);
         glBegin(GL_QUADS);
         g_in_quads = 1;
-        draw_label(label, tx + 8 * g_scale, ty, (float)(tw - 2 * g_scale - 16 * g_scale - CW), act ? 0xF2F2F2 : 0x9A9A9A);
+        /* one status cell before the name: throbber, else bell, else nothing */
+        if (tb->busy) {
+            gl_color(act ? 0xF2F2F2 : 0xBDBDBD, 1);
+            draw_glyph(drip, lx, ty, 1, g_scale);
+        } else if (tb->attention) {
+            gl_color(AMBER, 1);
+            draw_glyph(BELL_GLYPH, lx, ty, 1, g_scale);
+        }
+        draw_label(label, lx + 2 * CW, ty, (float)(tw - 2 * g_scale - 12 * g_scale - 3 * CW), fg);
         if (act || hov) {
             float cx = tx + tw - 2 * g_scale - CW - 6 * g_scale;
             gl_color((hov && hover == HIT_CLOSE) ? 0xFF6B5E : 0x8A8A8A, 1);
@@ -2058,11 +2190,12 @@ static void render_tabbar(int win_w) {
         }
         glEnd();
         g_in_quads = 0;
-        if (tb->activity && !act) fill_rect(tx + 3 * g_scale, ty + CH / 2 - g_scale, tx + 5 * g_scale, ty + CH / 2 + g_scale, AMBER, 1);
-        if (tb->exited) fill_rect(tx + 8 * g_scale, ty + CH / 2, tx + tw - 10 * g_scale - CW, ty + CH / 2 + g_scale, 0x8A8A8A, 1);
+        if (tb->activity && !act && !tb->busy && !tb->attention)
+            fill_rect(lx + 3 * g_scale, ty + CH / 2 - g_scale, lx + 5 * g_scale, ty + CH / 2 + g_scale, 0x8A8A8A, 1);
+        if (tb->exited) fill_rect(lx + 2 * CW, ty + CH / 2, tx + tw - 10 * g_scale - CW, ty + CH / 2 + g_scale, 0x8A8A8A, 1);
     }
     {
-        float px = (float)(x0 + g_ntabs * tw + 2 * g_scale), sz = (float)(bh - 6 * g_scale), top = 4.0f * g_scale;
+        float px = (float)(x0 + g_ntabs * tw + 2 * g_scale), sz = (float)(bh - tab_top() - 2 * g_scale);
         int hov = hover == HIT_PLUS;
         fill_rect(px, top, px + sz, top + sz, hov ? TAB_HOVER : BAR_BG, 1);
         /* a plain plus, drawn rather than taken from the font */
@@ -2073,6 +2206,7 @@ static void render_tabbar(int win_w) {
             fill_rect(cx - th, cy - arm, cx + th, cy + arm, col, 1);
         }
     }
+    render_caption_buttons(win_w);
 }
 
 static void render(void) {
@@ -2232,12 +2366,34 @@ static void paint_now(void) {
     g_last_paint = GetTickCount();
 }
 
+/* Re-checks which tabs are animating a spinner title. A tab that stops while
+   you're looking elsewhere gets the bell mark: that's "Claude is done". */
+static int g_throb_on;
+static void update_busy(void) {
+    int i, any = 0, changed = 0;
+    for (i = 0; i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        int b = term_busy(&tb->t);
+        if (b != tb->busy) {
+            changed = 1;
+            if (!b && (i != g_active || !g_focused)) tb->attention = 1;
+            tb->busy = b;
+        }
+        any |= b;
+    }
+    if (any && !g_throb_on) SetTimer(g_hwnd, TIMER_THROB, DRIP_MS, NULL);
+    if (!any && g_throb_on) KillTimer(g_hwnd, TIMER_THROB);
+    g_throb_on = any;
+    if (any || changed) InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
 /* ── tab management ───────────────────────────────────────────────── */
 
 static void activate(int i) {
     if (i < 0 || i >= g_ntabs) return;
     g_active = i;
     g_tabs[i]->activity = 0;
+    g_tabs[i]->attention = 0;
     g_sel_on = 0;
     update_title();
     InvalidateRect(g_hwnd, NULL, FALSE);
@@ -2630,6 +2786,21 @@ static void save_window_size(void) {
     }
 }
 
+static int window_dpi(HWND h);
+
+static int metric_for(HWND h, int index) {
+    typedef int (WINAPI *PFN)(int, UINT);
+    static PFN f;
+    static int tried;
+    if (!tried) { tried = 1; f = (PFN)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi"); }
+    return f ? f(index, (UINT)window_dpi(h)) : GetSystemMetrics(index);
+}
+
+/* resize frame height: how far a maximized window hangs over the screen edge */
+static int frame_thickness(HWND h) {
+    return metric_for(h, SM_CYFRAME) + metric_for(h, 92 /* SM_CXPADDEDBORDER */);
+}
+
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
@@ -2648,6 +2819,72 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
            close, and conhost takes the shells down with it. Closing stays instant. */
         PostQuitMessage(0);
         return 0;
+    case WM_NCCALCSIZE:
+        /* The tab strip is the title bar: keep the standard side and bottom
+           frame (resize borders, shadow, snap), drop the caption. Maximized,
+           the window hangs off-screen by the frame width, so inset by it. */
+        {
+            RECT *rc = wp ? &((NCCALCSIZE_PARAMS *)lp)->rgrc[0] : (RECT *)lp;
+            int top = rc->top;
+            DefWindowProcW(hwnd, msg, wp, lp);
+            rc->top = top + (IsZoomed(hwnd) ? frame_thickness(hwnd) : 0);
+            return 0;
+        }
+    case WM_NCHITTEST: {
+        LRESULT hit = DefWindowProcW(hwnd, msg, wp, lp);
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        RECT r;
+        int idx, cap;
+        if (hit != HTCLIENT) return hit;
+        ScreenToClient(hwnd, &pt);
+        GetClientRect(hwnd, &r);
+        if (!IsZoomed(hwnd) && pt.y < 5 * g_scale) {
+            int corner = 16 * g_scale;
+            return pt.x < corner ? HTTOPLEFT : pt.x >= r.right - corner ? HTTOPRIGHT : HTTOP;
+        }
+        if ((cap = caption_hit(pt.x, pt.y))) return cap;
+        if (pt.y < tabbar_h() && hit_tabbar(pt.x, pt.y, &idx) == HIT_BAR) return HTCAPTION;
+        return HTCLIENT;
+    }
+    case WM_NCMOUSEMOVE: {
+        int h = (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) ? (int)wp : 0;
+        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE | TME_NONCLIENT, hwnd, 0};
+        TrackMouseEvent(&tme);
+        if (g_mouse_y >= 0) { g_mouse_x = g_mouse_y = -1; InvalidateRect(hwnd, NULL, FALSE); }
+        if (h != g_nc_hover) { g_nc_hover = h; InvalidateRect(hwnd, NULL, FALSE); }
+        break;                   /* DefWindowProc still runs: Win11 snap layouts hang off HTMAXBUTTON */
+    }
+    case WM_NCMOUSELEAVE:
+        if (g_nc_hover || g_nc_press) { g_nc_hover = g_nc_press = 0; InvalidateRect(hwnd, NULL, FALSE); }
+        return 0;
+    case WM_NCLBUTTONDOWN:
+    case WM_NCLBUTTONDBLCLK:
+        /* our caption buttons: DefWindowProc would track and paint the classic ones */
+        if (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) {
+            g_nc_press = (int)wp;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        break;
+    case WM_NCLBUTTONUP:
+        if (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) {
+            int was = g_nc_press;
+            g_nc_press = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+            if (was != (int)wp) return 0;
+            if (wp == HTCLOSE) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            else if (wp == HTMINBUTTON) ShowWindow(hwnd, SW_MINIMIZE);
+            else ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+            return 0;
+        }
+        break;
+    case WM_NCRBUTTONUP:
+        if (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) wp = HTCAPTION;   /* system menu */
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_NCACTIVATE:
+        g_win_active = (int)wp;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return DefWindowProcW(hwnd, msg, wp, -1);   /* -1: no classic frame repaint */
     case WM_ERASEBKGND:
         if (!g_glrc) break;      /* before GL: let the class brush paint it dark */
         return 1;
@@ -2692,6 +2929,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
+        if (wp == TIMER_THROB) { update_busy(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
         else InvalidateRect(hwnd, NULL, FALSE);
@@ -2723,6 +2961,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KILLFOCUS: {
         Tab *tb = active_tab();
         g_focused = (msg == WM_SETFOCUS);
+        if (g_focused && tb) tb->attention = 0;
         if (tb && tb->t.m_focus) tab_write(tb, g_focused ? "\x1b[I" : "\x1b[O", 3);
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
@@ -2738,11 +2977,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 tb->t.bell = 0;
                 if (!g_focused || i != g_active) {
                     FLASHWINFO fi = {sizeof(fi), hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
+                    tb->attention = 1;
                     if (!g_focused) FlashWindowEx(&fi);
                 }
             }
             changed = 1;
         }
+        update_busy();
         if (changed) {
             static int first = 1;
             if (first) { first = 0; trace("first child output"); }
@@ -2790,6 +3031,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TrackMouseEvent(&tme);
         g_mouse_x = mx;
         g_mouse_y = my;
+        if (g_nc_hover) { g_nc_hover = 0; InvalidateRect(hwnd, NULL, FALSE); }
         if (was_bar || on_bar) InvalidateRect(hwnd, NULL, FALSE);
         if (g_sb_drag) { scrollbar_set(my); return 0; }
         if (g_sel_drag && tb) {
@@ -2821,10 +3063,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit == HIT_TAB) { activate(idx); return 0; }
         if (hit == HIT_CLOSE) { close_tab(idx); return 0; }
         if (hit == HIT_PLUS) { new_tab_here(); return 0; }
-        if (hit == HIT_BAR) {
-            if (msg == WM_LBUTTONDBLCLK) new_tab_here();
-            return 0;
-        }
+        if (hit == HIT_BAR) return 0;
         GetClientRect(hwnd, &r);
         if (tb && mx >= r.right - SCROLLBAR_W - g_scale && tb->t.hcount && !tb->t.alt) {
             g_sb_drag = 1;
@@ -3158,6 +3397,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     trace("wWinMain");
     dpi_awareness();
     palette_init();
+    drip_init();
     config_load();
     snprintf(g_cfg_dir_line, sizeof(g_cfg_dir_line), "%s", g_start_dir);
     for (i = 1; i < argc; i++) {
@@ -3211,12 +3451,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         r.bottom = tabbar_h() + 2 * PAD + 34 * CH;
         AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
         g_win_w = r.right - r.left;
-        g_win_h = r.bottom - r.top;
+        g_win_h = r.bottom - r.top - GetSystemMetrics(SM_CYCAPTION) - frame_thickness(NULL);   /* no caption: see WM_NCCALCSIZE */
     }
     trace("class registered");
     h = CreateWindowExW(0, L"wsl-easy", L"wsl-easy", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                         g_win_w, g_win_h, NULL, NULL, inst, NULL);
     if (!h) return 1;
+    SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     trace("window created (incl. GL init)");
     g_dpi = window_dpi(h);
     g_scale = auto_scale();

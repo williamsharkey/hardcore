@@ -7,10 +7,19 @@ your WSL shell. It isn't a jack of all trades.
 - **Starts in `/mnt/c/Users/<you>`** (your `%USERPROFILE%`), not in `~` inside the distro.
 - **Tabs.** Click **+** (or press Ctrl+Shift+T) and the new WSL tab opens in
   **the same folder as the tab you're in**.
-- **Tab labels** show the folder name, or the program's own title while one
-  is running (for example, Claude Code).
-- An inactive tab that produces output gets an amber dot, so you can see when
-  Claude is working in another tab.
+- **Tabs live in the title bar**, like Chrome and Windows Terminal, with
+  drawn min/max/close buttons. Snap layouts still appear when you hover over
+  maximize, and dragging the empty strip moves the window.
+- **A tab's label is its folder's name.** Nothing else: no icons, no
+  program titles, no `✳ Claude Code — …` noise.
+- **One status cell before the name:**
+  - **Throbber.** A program that animates its title (Claude Code's `◐`/`◑`, or
+    braille and asterisk spinners) gets a braille drip: dots fall, stack up
+    and drain.
+  - **Bell mark.** An amber bell appears when a background tab rings (BEL, or
+    an OSC 9 / OSC 777 notification), or when its throbber stops, which
+    means Claude finished. It clears when you look at the tab.
+  - **Gray dot.** Plain output in a background tab.
 - **Fast where you feel it.** New tabs come up already ready: a pre-warmed
   shell is waiting, so the prompt is there in the first frame (about 6 ms,
   against 127 ms in Windows Terminal). Keypress to screen is about 8 ms p50
@@ -18,8 +27,8 @@ your WSL shell. It isn't a jack of all trades.
   numbers and the method are in [bench/RESULTS.md](bench/RESULTS.md).
 - **One font, one look, one size.** GNU Unifont at an integer scale picked from
   the monitor's DPI. There are no themes, no zoom and no settings UI.
-- One static `.exe` (about 3.6 MB) with the full Unifont BMP and Windows
-  Terminal's own ConPTY built in. There's nothing to install and no runtime
+- One static `.exe` (about 5.9 MB) with Unifont 18 (115k glyphs, emoji
+  included) and Windows Terminal's own ConPTY built in. There's nothing to install and no runtime
   dependencies.
 
 ## Build
@@ -36,7 +45,8 @@ make install    # copy to %LOCALAPPDATA%\wsl-easy + Start menu and desktop short
 
 | Keys | Action |
 |---|---|
-| Ctrl+Shift+T, or click **+**, or double-click the empty tab bar | New tab in the current folder |
+| Ctrl+Shift+T, or click **+** | New tab in the current folder |
+| Double-click the empty tab strip | Maximize / restore (it's the title bar) |
 | Ctrl+Shift+W, or middle-click a tab, or click its × | Close tab |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+Alt+1…9 | Jump to tab (9 = last) |
@@ -108,13 +118,12 @@ comparison.
 |---|---|---|
 | Child I/O | anonymous pipes + `--require` JS shim faking `isTTY` | ConPTY: a real pty for the WSL shell, using Windows Terminal's OpenConsole (bundled, MIT) rather than the slow inbox conhost |
 | VT parser | cursor/erase/SGR | adds scroll regions, IL/DL/ICH/DCH/ECH, SL/SR, DECIC/DECDC, tab stops, alt screen (1049), DEC line drawing, DECSC/DECRC, RIS/DECSTR, LNM, DSR/DA/DECRQM/DECRQCRA replies, mouse (1000/1002/1003/1006), bracketed paste, focus events, sync output (2026), OSC 0/2/7/8/9;9/10/11/52, cursor shapes |
-| Glyphs | 609-glyph Unifont subset in a header | the full Unifont BMP (57k glyphs), uploaded to a GL atlas the first time each glyph is drawn |
+| Glyphs | 609-glyph Unifont subset in a header | Unifont 18.0.01, planes 0–3 (115k glyphs, all 1,219 emoji-presentation characters), uploaded to a GL atlas the first time each glyph is drawn |
 | Wide chars | squeezed into one cell | real 2-cell CJK and emoji widths; 16-px symbols in 1-cell slots are still shrunk the dumbterm way |
 | Renderer | immediate-mode GL, amber cursor and scrollbar | same, and it redraws only when something changes (no busy loop) |
 | Scrollback | fixed 5000 × 400-cell ring | 20,000 lines, each trimmed to its used width. Text rewraps when the window is resized |
 
 Known gaps:
-- Emoji outside the BMP render as `�`, because the plane-1 Unifont file isn't bundled.
 - No left/right margins (DECSLRM) or VT420 rectangle operations.
 - No find-in-scrollback.
 - Tabs can't be reordered by dragging.
@@ -124,5 +133,19 @@ Known gaps:
 
 ## Font
 
-GNU Unifont 13.0.06, dual licensed under GPLv2+ with the font embedding
-exception or the SIL OFL 1.1. See `font/unifont-13.0.06-license.txt`.
+GNU Unifont 18.0.01 (`font/unifont-18.0.01.hex.gz`): planes 0–3, without
+the private-use area. It's dual licensed under GPLv2+ with the font embedding
+exception or the SIL OFL 1.1; see `font/unifont-license.txt`.
+
+On top of it, `font/wsl-easy-extra.hex` holds a few hand-drawn glyphs in the
+same style. They come from `tools/draw_extra.py`, whose glyphs are ASCII pictures
+you can edit:
+- the tab bell;
+- the Powerline prompt symbols ` `.
+
+Unifont's private-use area is CSUR (Klingon and others), so it's left out, and
+these fill the slots that prompts actually use.
+
+Character widths come from Unicode 17 (`font/ucd`, generated by
+`tools/gen_width.py`). They use the classic wcwidth rule, which ConPTY also
+measures with.

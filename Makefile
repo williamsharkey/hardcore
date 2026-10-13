@@ -18,9 +18,18 @@ endif
 
 all: wsl-easy.exe
 
-build/font.bin: font/unifont-13.0.06.hex tools/gen_font.py
+FONT = font/unifont-18.0.01.hex.gz font/wsl-easy-extra.hex
+
+build/font.bin: $(FONT) tools/gen_font.py
 	@mkdir -p build
-	python3 tools/gen_font.py $< $@
+	python3 tools/gen_font.py $@ $(FONT)
+
+build/width.inc: font/ucd/EastAsianWidth.txt font/ucd/DerivedGeneralCategory.txt tools/gen_width.py
+	@mkdir -p build
+	python3 tools/gen_width.py font/ucd > $@
+
+font/wsl-easy-extra.hex: tools/draw_extra.py
+	python3 $< > $@
 
 build/wsl-easy.ico: tools/gen_icon.py
 	@mkdir -p build
@@ -31,7 +40,7 @@ build/res.o: wsl-easy.rc build/wsl-easy.ico
 
 CONPTY_VER = 1.25.260930003
 
-wsl-easy.exe: wsl-easy.c build/font.bin build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
+wsl-easy.exe: wsl-easy.c build/font.bin build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-o $@ wsl-easy.c build/res.o $(LIBS)
 

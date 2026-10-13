@@ -427,6 +427,15 @@ static int cmd_shot(const char *path) {
     return 0;
 }
 
+/* never click or point outside the window under test */
+static int in_client(POINT p) {
+    RECT r;
+    GetClientRect(g_target, &r);
+    if (p.x >= 0 && p.y >= 0 && p.x < r.right && p.y < r.bottom) return 1;
+    fprintf(stderr, "termbench: %ld,%ld is outside the %ldx%ld client area\n", p.x, p.y, r.right, r.bottom);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *cmd = argc > 1 ? argv[1] : "";
     const char *arg = NULL;
@@ -463,6 +472,12 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(cmd, "shot") && arg) return cmd_shot(arg);
+    if (!strcmp(cmd, "size")) {
+        RECT r;
+        GetClientRect(g_target, &r);
+        printf("%ld %ld\n", r.right, r.bottom);
+        return 0;
+    }
     if (!strcmp(cmd, "resize") && arg) {
         int w, h;
         if (sscanf(arg, "%d,%d", &w, &h) != 2) return 2;
@@ -471,13 +486,20 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "click") && arg) {
         POINT p;
-        if (sscanf(arg, "%ld,%ld", &p.x, &p.y) != 2) return 2;
+        if (sscanf(arg, "%ld,%ld", &p.x, &p.y) != 2 || !in_client(p)) return 2;
         focus();
         must_be_foreground();
         ClientToScreen(g_target, &p);
         SetCursorPos(p.x, p.y);
         mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        return 0;
+    }
+    if (!strcmp(cmd, "hover") && arg) {   /* move the pointer only, in client coordinates */
+        POINT p;
+        if (sscanf(arg, "%ld,%ld", &p.x, &p.y) != 2 || !in_client(p)) return 2;
+        ClientToScreen(g_target, &p);
+        SetCursorPos(p.x, p.y);
         return 0;
     }
     if (!strcmp(cmd, "key") && arg) {
@@ -489,6 +511,6 @@ int main(int argc, char **argv) {
         send_vk(vk, ctrl, shift);
         return 0;
     }
-    fprintf(stderr, "usage: termbench latency|newtab|type|shot --class C [--title T] [--n N] [--top PX] [ARG]\n");
+    fprintf(stderr, "usage: termbench latency|newtab|launch|type|key|click|hover|shot|resize --class C [--title T] [--n N] [--top PX] [ARG]\n");
     return 2;
 }
