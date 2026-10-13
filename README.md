@@ -7,28 +7,33 @@ jack of all trades. There are no options, themes or settings UI: one font, one
 look, one size, one layout.
 
 ```
- ─  □  ×  │ wm@w11:/mnt/c/Users/you/github/thing$ claude
-▌⣿ thing  │
-   tmp    │  ...
- ⍾  notes │
-   +      │
-          │
+▌⣿ thing            │ wm@w11:~/github/thing$ claude          ░ ─  □  × ░
+  Running make test │ 
+ ? api              │ > ...
+  approve Bash:     │ 
+  git push origin   │ 
+ ⍾ notes            │ 
+  +                 │
 ```
 
 - **Starts in `/mnt/c/Users/<you>`** (your `%USERPROFILE%`), not in `~` inside the distro.
-- **Tabs run down the left edge**, like Chrome's vertical tabs. That column is
-  all the chrome there is: window buttons at the top, tabs, then **+**. The
-  terminal gets the whole height. Snap layouts still appear when you hover
-  over maximize, and the empty part of the column drags the window.
+- **Tabs run down the left edge**, like Chrome's vertical tabs: tabs, then
+  **+**. Min/max/close float over the terminal's top-right corner on smoked
+  glass. Text runs underneath and only the mouse belongs to them, so no row
+  is lost to a title bar. Snap layouts appear when you hover over maximize,
+  and the empty part of the tab column drags the window.
 - **+** (or Ctrl+Shift+T) opens a new WSL tab **in the same folder as the
   tab you're in**.
 - **A tab's label is its folder's name.** Nothing else: no icons, no
   program titles, no `✳ Claude Code — …` noise.
-- **One status cell before the name:**
-  - **Throbber.** While Claude Code works, its tab shows a braille drip:
-    dots fall, stack up and drain. The signal is Claude's `◐`/`◑` title
-    spinner or OSC 9;4 progress, and any program that spins its title or
-    reports progress gets it too.
+- **One status cell before the name**, plus a dim line under it saying what
+  Claude is doing, asking or just did (see [Claude Code](#claude-code)):
+  - **Amber `?`.** Claude is blocked on you: a permission, a question, a
+    login. Its question is shown under the name, two lines if needed.
+  - **Red `!`.** The turn failed (API error, overloaded, ...).
+  - **Throbber.** Claude is working: a braille drip, where dots fall, stack
+    up and drain. Programs that spin their title or send OSC 9;4 progress get
+    it too.
   - **Bell mark.** An amber bell appears when a background tab finishes (its
     throbber stops) or rings (BEL, or an OSC 9 / 99 / 777 notification). If
     hardcore isn't the focused window, its taskbar button flashes too. The
@@ -50,13 +55,35 @@ look, one size, one layout.
 ## Claude Code
 
 hardcore was checked against what Claude Code 2.1 actually sends and asks
-for, recorded inside it:
+for, recorded inside it.
+
+**Program status (OSC 7501).** Claude Code asks the terminal `OSC 7501 ; ?`.
+A terminal that answers gets told, as things change:
+- the session's state (`working`, `blocked` with a kind such as permission
+  or question, `done`, `idle`, `error`);
+- the message that goes with it (`approve Bash: git push`, the turn's
+  summary);
+- its background tasks.
+
+hardcore answers, and that's what drives the tab column:
+- the `?`, `!` and throbber marks;
+- the dim detail line under each name;
+- **Ctrl+Shift+J**, which jumps to the next tab that needs you (blocked
+  first, then failed, then finished);
+- a flashing taskbar button when Claude stops to ask while you're in
+  another window.
+
+The title-spinner guess is only a fallback, for older versions.
+
+**Turns and prompts (OSC 133).** Each shell prompt is marked, and so is
+each Claude turn when Claude marks it. **Ctrl+Shift+↑ / ↓** scrolls back
+and forth between them.
 
 | Claude Code uses | hardcore |
 |---|---|
 | 24-bit color for its theme | `COLORTERM=truecolor` is exported. Over WSL nothing else says so (WT relies on `WT_SESSION`), and without it chalk drops to 256 colors |
 | OSC 8 links (file paths, docs) | Ctrl+click opens them. `FORCE_HYPERLINK=1` is exported so supports-hyperlinks says yes |
-| XTVERSION (`CSI > 0 q`), DA1/DA2, OSC 11 background query | answered: `hardcore(0.3)`. The replies make it back through ConPTY |
+| XTVERSION (`CSI > 0 q`), DA1/DA2, OSC 11 background query, cell size (`CSI 16 t`), DECRQM 2026 | answered: `hardcore(0.3)`. The replies make it back through ConPTY |
 | Synchronized output (2026) | frames are held until the update ends (200 ms cap), so redraws don't flicker |
 | Focus events, bracketed paste, SGR mouse | yes |
 | Title spinner, OSC 9;4 progress | the tab throbber, and the bell mark when it stops |
@@ -86,6 +113,8 @@ make install    # copy to %LOCALAPPDATA%\hardcore + Start menu and desktop short
 | Ctrl+Shift+W, or middle-click a tab, or click its × | Close tab |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+Alt+1…9 | Jump to tab (9 = last) |
+| Ctrl+Shift+J | Jump to the next tab that needs you: Claude blocked, failed, or finished |
+| Ctrl+Shift+↑ / ↓ | Previous / next prompt or Claude turn in the scrollback |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste. A clipboard image pastes as the path of a saved PNG; copied files paste as their paths |
 | Right-click | Copy the selection if there is one, otherwise paste (conhost habit) |
 | Shift+Insert / Ctrl+Insert | Paste / copy |
@@ -143,6 +172,11 @@ comparison.
   xterm. All 71 pass.
 - `bench/run-esctest.sh` runs [esctest2](https://github.com/ThomasDickey/esctest2)
   inside a live window: 273 passing, against 90 for Windows Terminal.
+- `bench/termbench.exe send|cmd|snap` drives a hardcore window over
+  WM_COPYDATA. It types, opens tabs and snapshots hardcore's own back buffer,
+  all without focus or synthetic input. Start the window with
+  `--no-activate` and tests never take your keyboard. `bench/claude-sim.sh`
+  plays Claude Code's OSC 7501 states.
 - `bench/termbench.exe` measures any terminal window from outside: keypress → frame
   (DXGI desktop duplication, so the times come from present timestamps), new tab →
   prompt, cold launch, plus screenshot and typing helpers. See

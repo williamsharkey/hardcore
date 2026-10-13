@@ -498,6 +498,22 @@ int main(int argc, char **argv) {
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
         return 0;
     }
+    /* send / cmd / snap: hardcore's WM_COPYDATA test channel. No focus change,
+       no synthetic input: your keyboard stays yours while tests run. */
+    if ((!strcmp(cmd, "send") || !strcmp(cmd, "cmd") || !strcmp(cmd, "snap")) && arg) {
+        char buf[4096], *o = buf;
+        const char *q;
+        COPYDATASTRUCT cd;
+        for (q = arg; *q && o < buf + sizeof(buf) - 1; q++) {
+            if (q[0] == '\\' && q[1] == 'n') { *o++ = '\n'; q++; }
+            else *o++ = *q;
+        }
+        *o = 0;
+        cd.dwData = !strcmp(cmd, "send") ? 0x48430001 : !strcmp(cmd, "cmd") ? 0x48430002 : 0x48430003;
+        cd.cbData = (DWORD)(o - buf);
+        cd.lpData = buf;
+        return SendMessageA(g_target, WM_COPYDATA, 0, (LPARAM)&cd) ? 0 : 1;
+    }
     if (!strcmp(cmd, "keys")) {   /* N 'x' presses, 60-100 ms apart, no screen capture running */
         int k;
         focus();
@@ -524,6 +540,6 @@ int main(int argc, char **argv) {
         send_vk(vk, ctrl, shift);
         return 0;
     }
-    fprintf(stderr, "usage: termbench latency|newtab|launch|type|key|keys|click|hover|shot|resize --class C [--title T] [--n N] [--top PX] [ARG]\n");
+    fprintf(stderr, "usage: termbench latency|newtab|launch|send|cmd|snap|type|key|keys|click|hover|shot|resize --class C [--title T] [--n N] [--top PX] [ARG]\n");
     return 2;
 }

@@ -241,6 +241,17 @@ typedef struct {
     DWORD spin_at;               /* when it last changed */
     int spin_n;                  /* changes in a row, each within SPIN_HOLD ms of the last */
     int progress;                /* OSC 9;4 progress state: 1 normal, 2 error, 3 indeterminate, 4 paused */
+    /* OSC 7501 program status (Claude Code): the main session's state */
+    int ps_state;                /* PS_NONE, PS_IDLE, ... */
+    char ps_kind[24];            /* for PS_BLOCKED: permission, question, auth, ... */
+    wchar_t ps_msg[200];         /* what it's doing, or what it needs from you */
+    int ps_pct;                  /* -1 = unknown */
+    int ps_tasks;                /* background agents/tasks currently working */
+    char ps_task_id[16][33];
+    uint8_t ps_task_on[16];
+    /* OSC 133 ; A marks: absolute line numbers of prompts / turn starts, oldest first */
+    long long marks[512];
+    int nmarks;
     int dirty;
 } Term;
 
@@ -258,6 +269,7 @@ typedef struct Tab {
     int activity;                /* output while in the background */
     int busy;                    /* term_busy(), as of the last check: drives the throbber */
     int attention;               /* bell, notification, or a busy program went quiet: the bell mark */
+    int ps_seen;                 /* t.ps_state as of the last update_busy() */
     int spare;                   /* pre-warmed, waiting on stdin for its directory */
     char start_dir[1024];
 } Tab;
@@ -550,6 +562,7 @@ static void reflow_main(Term *t, int cols, int rows) {
         t->hist[t->hcount++] = out.v[i];
     }
     t->hpushed = t->hcount;
+    t->nmarks = 0;               /* line numbers changed under them; reflow doesn't track marks */
     for (y = 0; y < orows; y++) free(t->row[0][y]);
     free(t->row[0]);
     free(t->wrapf[0]);
@@ -1063,6 +1076,12 @@ static void csi_dispatch(Term *t, int f) {
         if (P(t, 0, 0) == 18) {
             snprintf(buf, sizeof(buf), "\x1b[8;%d;%dt", t->rows, t->cols);
             term_reply(t, buf);
+        } else if (P(t, 0, 0) == 16) {   /* cell size in pixels (Claude Code asks, for images) */
+            snprintf(buf, sizeof(buf), "\x1b[6;%d;%dt", FONT_H * g_scale, FONT_W * g_scale);
+            term_reply(t, buf);
+        } else if (P(t, 0, 0) == 14) {   /* text area in pixels */
+            snprintf(buf, sizeof(buf), "\x1b[4;%d;%dt", t->rows * FONT_H * g_scale, t->cols * FONT_W * g_scale);
+            term_reply(t, buf);
         }
         break;
     }
@@ -1100,6 +1119,96 @@ static void set_cwd(Term *t, const char *p) {
     }
 }
 
+enum { PS_NONE, PS_IDLE, PS_WORKING, PS_BLOCKED, PS_DONE, PS_ERROR };
+
+static int b64val(int c);
+
+/* base64 → UTF-8 → wide, for OSC 7501 title= / msg= */
+static void b64_to_wide(const char *in, size_t n, wchar_t *out, int cap) {
+    char buf[1600];
+    int bits = 0, k = 0, v;
+    uint32_t acc = 0;
+    size_t i;
+    for (i = 0; i < n && k < (int)sizeof(buf) - 1; i++) {
+        if ((v = b64val((unsigned char)in[i])) < 0) continue;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; buf[k++] = (char)(acc >> bits); }
+    }
+    buf[k] = 0;
+    if (!MultiByteToWideChar(CP_UTF8, 0, buf, -1, out, cap)) out[0] = 0;
+    out[cap - 1] = 0;
+    for (i = 0; out[i]; i++) if (out[i] < 32) out[i] = L' ';   /* one line */
+}
+
+/* OSC 7501 ; state=S:app=A[:id=I][:kind=K][:progress=N][:title=B64][:msg=B64]
+   Claude Code sends this once the terminal has answered "OSC 7501 ; ?".
+   No id = the session itself; an id = one of its background tasks. */
+static void program_status(Term *t, char *s) {
+    char state[16] = "", id[33] = "", kind[24] = "", *f, *next;
+    const char *msg = NULL;
+    size_t msg_n = 0;
+    int pct = -1, ps, i, free_i = -1;
+    for (f = s; f && *f; f = next) {
+        char *eq = strchr(f, '=');
+        size_t vn;
+        next = strchr(f, ':');
+        vn = next ? (size_t)(next - (eq ? eq + 1 : f)) : strlen(eq ? eq + 1 : f);
+        if (next) next++;
+        if (!eq || (next && eq > next)) continue;
+        if (!strncmp(f, "state=", 6)) snprintf(state, sizeof(state), "%.*s", (int)vn, eq + 1);
+        else if (!strncmp(f, "id=", 3)) snprintf(id, sizeof(id), "%.*s", (int)vn, eq + 1);
+        else if (!strncmp(f, "kind=", 5)) snprintf(kind, sizeof(kind), "%.*s", (int)vn, eq + 1);
+        else if (!strncmp(f, "progress=", 9)) pct = atoi(eq + 1);
+        else if (!strncmp(f, "msg=", 4)) { msg = eq + 1; msg_n = vn; }
+    }
+    ps = !strcmp(state, "working") ? PS_WORKING : !strcmp(state, "blocked") ? PS_BLOCKED :
+         !strcmp(state, "done") ? PS_DONE : !strcmp(state, "error") || !strcmp(state, "failed") ? PS_ERROR :
+         !strcmp(state, "idle") ? PS_IDLE : PS_NONE;
+    if (id[0]) {                 /* a background task */
+        for (i = 0; i < 16; i++) {
+            if (t->ps_task_on[i] && !strcmp(t->ps_task_id[i], id)) break;
+            if (!t->ps_task_on[i] && free_i < 0) free_i = i;
+        }
+        if (i == 16) i = free_i;
+        if (i >= 0) {
+            if (ps == PS_WORKING || ps == PS_BLOCKED) {
+                snprintf(t->ps_task_id[i], sizeof(t->ps_task_id[i]), "%s", id);
+                t->ps_task_on[i] = 1;
+            } else t->ps_task_on[i] = 0;
+        }
+        for (t->ps_tasks = 0, i = 0; i < 16; i++) t->ps_tasks += t->ps_task_on[i];
+        t->dirty = 1;
+        return;
+    }
+    if (!strcmp(state, "clear")) {   /* the program exited, or wiped its status */
+        t->ps_state = PS_NONE;
+        t->ps_msg[0] = 0;
+        t->ps_tasks = 0;
+        memset(t->ps_task_on, 0, sizeof(t->ps_task_on));
+        t->dirty = 1;
+        return;
+    }
+    t->ps_state = ps;
+    t->ps_pct = pct;
+    snprintf(t->ps_kind, sizeof(t->ps_kind), "%s", kind);
+    if (msg) b64_to_wide(msg, msg_n, t->ps_msg, 200);
+    else t->ps_msg[0] = 0;
+    t->dirty = 1;
+}
+
+static long long term_abs_line(const Term *t, int y);
+
+static void add_mark(Term *t) {
+    long long at = term_abs_line(t, t->cy);
+    if (t->nmarks && t->marks[t->nmarks - 1] >= at) {   /* redrawn in place: keep one */
+        t->marks[t->nmarks - 1] = at;
+        return;
+    }
+    if (t->nmarks == 512) { memmove(t->marks, t->marks + 1, sizeof(t->marks[0]) * 511); t->nmarks--; }
+    t->marks[t->nmarks++] = at;
+}
+
 static int b64val(int c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -1135,6 +1244,7 @@ static void title_spin(Term *t) {
 }
 
 static int term_busy(const Term *t) {
+    if (t->ps_state != PS_NONE) return t->ps_state == PS_WORKING;   /* Claude said so: believe it */
     if (t->progress == 1 || t->progress == 3) return 1;
     return t->spin_n >= 2 && GetTickCount() - t->spin_at < SPIN_HOLD;
 }
@@ -1155,6 +1265,13 @@ static void osc_dispatch(Term *t) {
         break;
     case 99:                     /* OSC 99 ; metadata ; payload (kitty notifications) */
         if (strchr(rest, ';')) t->bell = 1;
+        break;
+    case 7501:                   /* program status, see program_status() */
+        if (!strcmp(rest, "?")) term_reply(t, "\x1b]7501;?\x1b\\");
+        else program_status(t, rest);
+        break;
+    case 133:                    /* semantic prompts: A = a prompt (or a Claude turn) starts here */
+        if (rest[0] == 'A' && !t->alt) add_mark(t);
         break;
     case 777:                    /* OSC 777 ; notify ; title ; body (urxvt, Ghostty) */
         if (!strncmp(rest, "notify;", 7)) t->bell = 1;
@@ -1383,6 +1500,7 @@ static void term_line(const Term *t, int L, const Cell **cells, int *n, int *wra
 }
 
 static long long term_base(const Term *t) { return t->hpushed - t->hcount; }
+static long long term_abs_line(const Term *t, int y) { return t->hpushed + y; }
 
 /* ── tabs: ConPTY + reader thread ─────────────────────────────────── */
 
@@ -1431,6 +1549,9 @@ static VOID CALLBACK on_child_exit(PVOID ctx, BOOLEAN timed_out) {
 }
 
 /* Moves pending output into the parser. Returns bytes consumed. */
+/* HARDCORE_VTLOG=1: everything ConPTY hands us, raw, to %TEMP%\\hardcore-vt.log */
+static FILE *g_vtlog;
+
 static int tab_drain(Tab *tb) {
     char *data;
     int n;
@@ -1441,6 +1562,7 @@ static int tab_drain(Tab *tb) {
     tb->in_n = tb->in_cap = 0;
     InterlockedExchange(&tb->posted, 0);
     LeaveCriticalSection(&tb->lock);
+    if (n && g_vtlog) { fwrite(data, 1, (size_t)n, g_vtlog); fflush(g_vtlog); }
     if (n) vt_feed(&tb->t, (unsigned char *)data, n);
     free(data);
     return n;
@@ -1474,7 +1596,13 @@ static const char RC_BASH[] =
     "  IFS= read -rs __hardcore_dir && cd -- \"$__hardcore_dir\" 2>/dev/null\n"
     "  unset __hardcore_dir\n"
     "fi\n"
-    "__hardcore_cwd() { printf '\\033]9;9;%s\\033\\\\' \"$PWD\"; }\n"
+    "__hardcore_cwd() { printf '\\033]9;9;%s\\033\\\\\\033]133;A\\033\\\\' \"$PWD\"; }\n"
+    "# report the folder on every cd too, so \"cd x && claude\" labels the tab x right away\n"
+    "if ! declare -F cd >/dev/null; then\n"
+    "  cd() { builtin cd \"$@\" && __hardcore_cwd; }\n"
+    "  pushd() { builtin pushd \"$@\" && __hardcore_cwd; }\n"
+    "  popd() { builtin popd \"$@\" && __hardcore_cwd; }\n"
+    "fi\n"
     "case \";${PROMPT_COMMAND[0]};\" in *\";__hardcore_cwd;\"*) ;; *)\n"
     "  PROMPT_COMMAND=\"__hardcore_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;;\n"
     "esac\n";
@@ -1710,10 +1838,11 @@ static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 #define CH (FONT_H * g_scale)
 #define PAD (4 * g_scale)
 #define SCROLLBAR_W (6 * g_scale)
-/* All the chrome is one column on the left: window buttons on top, then the
-   tabs, then "+". The terminal gets the whole height to itself. */
+/* The chrome: one column on the left with the tabs and "+". Min/max/close
+   float over the terminal's top-right corner on smoked glass: the text runs
+   underneath, only the mouse is theirs. No row is spent on a title bar. */
 static int sidebar_w(void) { return 20 * CW; }
-static int caption_h(void) { return CH + 14 * g_scale; }
+static int caption_h(void) { return CH + 8 * g_scale; }   /* the glass buttons' height */
 static int term_ox(void) { return sidebar_w() + PAD; }
 static int term_oy(void) { return PAD; }
 
@@ -2347,28 +2476,57 @@ static void cell_colors(const Cell *c, uint32_t *fg, uint32_t *bg) {
 }
 
 /* draws a UTF-16 label clipped to max_w pixels; returns width used */
-static int draw_label(const wchar_t *s, float x, float y, float max_w, uint32_t rgb) {
+/* UTF-16 → code points with cell widths (zero-width dropped); returns count */
+static int text_cells(const wchar_t *s, uint32_t *cps, uint8_t *ws, int cap) {
     int n = 0;
-    float cx = x;
-    r_color(rgb, 1);
-    for (; *s; s++) {
+    for (; *s && n < cap; s++) {
         uint32_t cp = *s;
         int w;
         if (cp >= 0xD800 && cp <= 0xDBFF && s[1] >= 0xDC00 && s[1] <= 0xDFFF) {
             cp = 0x10000 + ((cp - 0xD800) << 10) + (s[1] - 0xDC00);
             s++;
         }
-        w = cp_width(cp);
-        if (w == 0) continue;
-        if (cx + w * CW > x + max_w) {
-            if (n) draw_glyph(0x2026, cx - CW, y, 1, g_scale);
-            break;
-        }
-        draw_glyph(cp, cx, y, w, g_scale);
-        cx += w * CW;
-        n++;
+        if ((w = cp_width(cp)) == 0) continue;
+        cps[n] = cp;
+        ws[n++] = (uint8_t)w;
     }
-    return (int)(cx - x);
+    return n;
+}
+
+/* Lays text into up to max_lines lines of max_w pixels, breaking anywhere;
+   the last line ends in "…" if it doesn't all fit. Draws when draw is set.
+   Returns the lines used. */
+static int layout_text(const wchar_t *s, float x, float y, float max_w, int max_lines, uint32_t rgb, int draw) {
+    uint32_t cps[512];
+    uint8_t ws[512];
+    int n = text_cells(s, cps, ws, 512), per = (int)(max_w / CW), i = 0, line, k;
+    if (per < 2) return 1;
+    if (draw) r_color(rgb, 1);
+    for (line = 0; line < max_lines && i < n; line++) {
+        int last = line == max_lines - 1, cols = 0, end = i, brk = -1, rest = 0, col;
+        for (k = i; k < n; k++) rest += ws[k];
+        if (rest <= per) end = n;                      /* the rest fits on this line */
+        else {
+            int room = last ? per - 1 : per;           /* the last line keeps a cell for "…" */
+            while (end < n && cols + ws[end] <= room) {
+                if (cps[end] == ' ') brk = end;
+                cols += ws[end++];
+            }
+            if (!last && brk > i) end = brk + 1;       /* wrap at a space when there is one */
+        }
+        for (col = 0, k = i; k < end; k++) {
+            if (draw && !(col == 0 && cps[k] == ' ')) draw_glyph(cps[k], x + col * CW, y + line * CH, ws[k], g_scale);
+            if (!(col == 0 && cps[k] == ' ')) col += ws[k];
+        }
+        if (last && end < n && draw) draw_glyph(0x2026, x + col * CW, y + line * CH, 1, g_scale);
+        i = end;
+        while (i < n && cps[i] == ' ' && !last) i++;  /* no leading space on the next line */
+    }
+    return line ? line : 1;
+}
+
+static int draw_label(const wchar_t *s, float x, float y, float max_w, uint32_t rgb) {
+    return layout_text(s, x, y, max_w, 1, rgb, 1);
 }
 
 /* tab label: the folder's name and nothing else. Programs' titles are
@@ -2412,7 +2570,7 @@ static void drip_init(void) {
 #define TIMER_THROB 3
 #define BELL_GLYPH 0xF8F0        /* hand-drawn, font/hardcore-extra.hex */
 
-static int caption_btn_w(void) { return 40 * g_scale; }
+static int caption_btn_w(void) { return 46 * g_scale; }
 
 /* sidebar geometry, top to bottom:
      [ drag ][ – ][ □ ][ × ]     caption_h()
@@ -2421,36 +2579,74 @@ static int caption_btn_w(void) { return 40 * g_scale; }
        ... drag space (it's the title bar) ...                         */
 enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR };
 
-static int tabs_top(void) { return caption_h() + 2 * g_scale; }
+static int tabs_top(void) { return 8 * g_scale; }   /* the gap above the tabs drags the window */
 
-static int row_h(void) {
+/* the dim second line under a tab's name: what Claude is doing, asking, or did */
+static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
+    const Term *t = &tb->t;
+    if (t->ps_state == PS_NONE || t->ps_state == PS_IDLE) return NULL;
+    if (t->ps_msg[0]) {
+        if (t->ps_tasks) _snwprintf(buf, cap, L"%ls · %d bg", t->ps_msg, t->ps_tasks);
+        else _snwprintf(buf, cap, L"%ls", t->ps_msg);
+    } else if (t->ps_state == PS_BLOCKED) {
+        _snwprintf(buf, cap, L"%hs", t->ps_kind[0] ? t->ps_kind : "waiting for you");
+    } else if (t->ps_tasks) {
+        _snwprintf(buf, cap, L"%d background task%ls", t->ps_tasks, t->ps_tasks == 1 ? L"" : L"s");
+    } else return NULL;
+    buf[cap - 1] = 0;
+    return buf;
+}
+
+/* Row layout, recomputed per use (64 tabs at most). A tab with a detail line
+   is two text lines tall. When they don't all fit, details go first, then
+   rows squeeze. */
+static int g_row_y[MAX_TABS + 2], g_row_two[MAX_TABS + 1];   /* g_row_two: detail lines, 0..2 */
+static float detail_w(void) { return (float)(sidebar_w() - 10 * g_scale - 2 * CW - 8 * g_scale); }
+static void tab_layout(void) {
     RECT r;
-    int h = CH + 10 * g_scale, avail;
+    int base = CH + 10 * g_scale, i, need = 0, two = 1, h, y, avail;
+    wchar_t tmp[220];
     GetClientRect(g_hwnd, &r);
     avail = r.bottom - tabs_top() - 4 * g_scale;
-    if ((g_ntabs + 1) * h > avail && g_ntabs + 1 > 0) h = avail / (g_ntabs + 1);   /* many tabs: squeeze */
+    for (i = 0; i < g_ntabs; i++) {
+        const wchar_t *d = tab_detail(g_tabs[i], tmp, 220);
+        /* what Claude is asking you gets two lines; the rest get one */
+        g_row_two[i] = !d ? 0 : g_tabs[i]->t.ps_state == PS_BLOCKED ? layout_text(d, 0, 0, detail_w(), 2, 0, 0) : 1;
+        need += base + g_row_two[i] * CH;
+    }
+    need += base;                                        /* the + row */
+    if (need > avail) two = 0;
+    h = base;
+    if (!two && (g_ntabs + 1) * base > avail) h = avail / (g_ntabs + 1);
     if (h < CH) h = CH;
-    return h;
+    for (y = tabs_top(), i = 0; i <= g_ntabs; i++) {
+        if (i < g_ntabs && !two) g_row_two[i] = 0;
+        g_row_y[i] = y;
+        y += h + (i < g_ntabs ? g_row_two[i] * CH : 0);
+    }
+    g_row_y[g_ntabs + 1] = y;
 }
 
 static int hit_tabbar(int mx, int my, int *idx) {
-    int rh = row_h(), top = tabs_top(), i;
-    if (mx < 0 || mx >= sidebar_w() || my < caption_h()) return HIT_NONE;
-    if (my >= top) {
-        i = (my - top) / rh;
-        if (i < g_ntabs) {
-            *idx = i;
-            if (mx >= sidebar_w() - CW - 10 * g_scale) return HIT_CLOSE;
-            return HIT_TAB;
-        }
+    int i;
+    if (mx < 0 || mx >= sidebar_w() || my < 0) return HIT_NONE;
+    tab_layout();
+    for (i = 0; i <= g_ntabs; i++) {
+        if (my < g_row_y[i] || my >= g_row_y[i + 1]) continue;
         if (i == g_ntabs) return HIT_PLUS;
+        *idx = i;
+        if (mx >= sidebar_w() - CW - 10 * g_scale) return HIT_CLOSE;
+        return HIT_TAB;
     }
     return HIT_BAR;
 }
 
 /* caption buttons: HTMINBUTTON / HTMAXBUTTON / HTCLOSE, or 0 */
 static int caption_hit(int mx, int my) {
-    int bw = caption_btn_w(), right = sidebar_w();
+    RECT r;
+    int bw = caption_btn_w(), right;
+    GetClientRect(g_hwnd, &r);
+    right = r.right;
     if (my < 0 || my >= caption_h() || mx < right - 3 * bw || mx >= right) return 0;
     if (mx >= right - bw) return HTCLOSE;
     if (mx >= right - 2 * bw) return HTMAXBUTTON;
@@ -2467,13 +2663,14 @@ static void px_line(float x0, float y0, int n, int dx, int dy, uint32_t rgb) {
     for (i = 0; i < n; i++) quad(x0 + i * dx * s, y0 + i * dy * s, x0 + i * dx * s + s, y0 + i * dy * s + s);
 }
 
-static void render_caption_buttons(void) {
+static void render_caption_buttons(int win_w) {
     int bw = caption_btn_w(), bh = caption_h(), k, s = g_scale;
     for (k = 0; k < 3; k++) {
         int code = k == 0 ? HTMINBUTTON : k == 1 ? HTMAXBUTTON : HTCLOSE;
-        float x = (float)(sidebar_w() - (3 - k) * bw), cx = x + bw / 2 - 5 * s, cy = (float)(bh / 2 - 5 * s);
+        float x = (float)(win_w - (3 - k) * bw), cx = x + bw / 2 - 5 * s, cy = (float)(bh / 2 - 5 * s);
         int hov = g_nc_hover == code, prs = g_nc_press == code && hov;
         uint32_t fg = g_win_active ? 0xCCCCCC : 0x7A7A7A;
+        fill_rect(x, 0, x + bw, (float)bh, BAR_BG, 0.62f);       /* smoked glass: text shows through */
         if (hov && code == HTCLOSE) {
             fill_rect(x, 0, x + bw, (float)bh, prs ? 0x94241A : 0xC42B1C, 1);
             fg = 0xFFFFFF;
@@ -2502,24 +2699,31 @@ static void render_caption_buttons(void) {
 }
 
 static void render_tabbar(int win_w, int win_h) {
-    int i, idx = -1, hover = HIT_NONE, sw = sidebar_w(), rh = row_h(), top = tabs_top();
-    float lx = (float)(10 * g_scale);
+    int i, idx = -1, hover = HIT_NONE, sw = sidebar_w();
+    float lx = (float)(10 * g_scale), textw = (float)(sw - 10 * g_scale - 3 * CW - 12 * g_scale);
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
-    (void)win_w;
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
+    tab_layout();
     fill_rect(0, 0, (float)sw, (float)win_h, BAR_BG, 1);
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
-        wchar_t label[256];
-        float y0 = (float)(top + i * rh), ty = y0 + (float)(rh - CH) / 2;
+        wchar_t label[256], detail[220];
+        float y0 = (float)g_row_y[i], y1 = (float)g_row_y[i + 1];
+        float ty = y0 + (y1 - y0 - (1 + g_row_two[i]) * CH) / 2;
         int act = (i == g_active), hov = (idx == i && (hover == HIT_TAB || hover == HIT_CLOSE));
         uint32_t fg = act ? 0xF2F2F2 : 0x9A9A9A;
         /* the active tab takes the terminal's background, so it reads as attached to it */
-        if (act || hov) fill_rect(0, y0, (float)sw, y0 + rh, act ? DEF_BG : TAB_HOVER, 1);
-        if (act) fill_rect(0, y0, (float)(2 * g_scale), y0 + rh, AMBER, 1);
+        if (act || hov) fill_rect(0, y0, (float)sw, y1, act ? DEF_BG : TAB_HOVER, 1);
+        if (act) fill_rect(0, y0, (float)(2 * g_scale), y1, AMBER, 1);
         tab_label(tb, label, 256);
-        /* one status cell before the name: throbber, else bell, else nothing */
-        if (tb->busy) {
+        /* one status cell before the name, strongest first:
+           ? Claude needs you   ! it failed   throbber: working   bell: finished or rang   dot: output */
+        if (tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) {
+            uint32_t ch = tb->t.ps_state == PS_BLOCKED ? '?' : '!';
+            r_color(tb->t.ps_state == PS_BLOCKED ? AMBER : 0xE74856, 1);
+            draw_glyph(ch, lx, ty, 1, g_scale);
+            draw_glyph(ch, lx + g_scale, ty, 1, g_scale);       /* bold, the way cells do it */
+        } else if (tb->busy) {
             r_color(act ? 0xF2F2F2 : 0xBDBDBD, 1);
             draw_glyph(drip, lx, ty, 1, g_scale);
         } else if (tb->attention) {
@@ -2528,7 +2732,10 @@ static void render_tabbar(int win_w, int win_h) {
         } else if (tb->activity && !act) {
             fill_rect(lx + 3 * g_scale, ty + CH / 2 - g_scale, lx + 5 * g_scale, ty + CH / 2 + g_scale, 0x8A8A8A, 1);
         }
-        draw_label(label, lx + 2 * CW, ty, (float)(sw - lx - 2 * CW - CW - 12 * g_scale), fg);
+        draw_label(label, lx + 2 * CW, ty, textw, fg);
+        if (g_row_two[i] && tab_detail(tb, detail, 220))
+            layout_text(detail, lx + 2 * CW, ty + CH, detail_w(), g_row_two[i],
+                        tb->t.ps_state == PS_BLOCKED ? 0xC9A15A : 0x767676, 1);
         if (act || hov) {
             r_color((hov && hover == HIT_CLOSE) ? 0xFF6B5E : 0x8A8A8A, 1);
             draw_glyph(0x00D7, (float)(sw - CW - 8 * g_scale), ty, 1, g_scale);
@@ -2536,14 +2743,14 @@ static void render_tabbar(int win_w, int win_h) {
         if (tb->exited) fill_rect(lx + 2 * CW, ty + CH / 2, (float)(sw - CW - 12 * g_scale), ty + CH / 2 + g_scale, 0x8A8A8A, 1);
     }
     {   /* "+": a plain plus in the status column, drawn rather than taken from the font */
-        float y0 = (float)(top + g_ntabs * rh), cx = lx + CW / 2, cy = y0 + rh / 2.0f, arm = 4.0f * g_scale, th = (float)g_scale;
+        float y0 = (float)g_row_y[g_ntabs], rh = (float)(g_row_y[g_ntabs + 1] - g_row_y[g_ntabs]);
+        float cx = lx + CW / 2, cy = y0 + rh / 2.0f, arm = 4.0f * g_scale, th = (float)g_scale;
         int hov = hover == HIT_PLUS;
         uint32_t col = hov ? 0xF2F2F2 : 0x9A9A9A;
         if (hov) fill_rect(0, y0, (float)sw, y0 + rh, TAB_HOVER, 1);
-        fill_rect(cx - arm, cy - th / 2 - th / 2, cx + arm + th, cy + th / 2 + th / 2, col, 1);
-        fill_rect(cx - th / 2 - th / 2, cy - arm, cx + th / 2 + th / 2, cy + arm + th, col, 1);
+        fill_rect(cx - arm, cy - th, cx + arm + th, cy + th, col, 1);
+        fill_rect(cx - th, cy - arm, cx + th, cy + arm + th, col, 1);
     }
-    render_caption_buttons();
 }
 
 static void render(void) {
@@ -2555,7 +2762,7 @@ static void render(void) {
     GetClientRect(g_hwnd, &r);
     r_begin(r.right, r.bottom);
     render_tabbar(r.right, r.bottom);
-    if (!tb) return;
+    if (!tb) { render_caption_buttons(r.right); return; }
     t = &tb->t;
     base = term_base(t);
 
@@ -2646,7 +2853,7 @@ static void render(void) {
 
     /* scrollbar, dumbterm-style thin amber thumb */
     if (t->hcount > 0 && !t->alt) {
-        float track_top = (float)oy, track_h = (float)(t->rows * CH);
+        float track_top = (float)caption_h(), track_h = (float)(oy + t->rows * CH - caption_h());   /* starts under the glass */
         float total = (float)(t->hcount + t->rows);
         float bar_h = track_h * t->rows / total, pos, bx = (float)(r.right - SCROLLBAR_W + g_scale);
         if (bar_h < 12 * g_scale) bar_h = (float)(12 * g_scale);
@@ -2655,6 +2862,7 @@ static void render(void) {
         fill_rect(bx, track_top + pos * (track_h - bar_h), bx + SCROLLBAR_W - 2 * g_scale,
                   track_top + pos * (track_h - bar_h) + bar_h, AMBER, t->view ? 0.8f : 0.3f);
     }
+    render_caption_buttons(r.right);   /* last: glass over whatever is under it */
 }
 
 static void update_title(void) {
@@ -2692,6 +2900,49 @@ static void lat_finish(void) {
     g_lat_line[0] = 0;
 }
 
+/* WM_COPYDATA test channel: a pending snapshot of the next frame */
+static wchar_t g_snap_path[MAX_PATH];
+
+static void snap_backbuffer(void) {
+    ID3D11Texture2D *back = NULL, *stage = NULL;
+    D3D11_TEXTURE2D_DESC d;
+    D3D11_MAPPED_SUBRESOURCE m;
+    FILE *f;
+    if (FAILED(IDXGISwapChain1_GetBuffer(g_sc, 0, &IID_ID3D11Texture2D, (void **)&back))) return;
+    ID3D11Texture2D_GetDesc(back, &d);
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_dev, &d, NULL, &stage))) {
+        ID3D11DeviceContext_CopyResource(g_ctx, (ID3D11Resource *)stage, (ID3D11Resource *)back);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)stage, 0, D3D11_MAP_READ, 0, &m))) {
+            if ((f = _wfopen(g_snap_path, L"wb"))) {
+                BITMAPFILEHEADER fh;
+                BITMAPINFOHEADER ih;
+                UINT y;
+                memset(&fh, 0, sizeof(fh));
+                memset(&ih, 0, sizeof(ih));
+                fh.bfType = 0x4D42;
+                fh.bfOffBits = sizeof(fh) + sizeof(ih);
+                fh.bfSize = fh.bfOffBits + d.Width * d.Height * 4;
+                ih.biSize = sizeof(ih);
+                ih.biWidth = (LONG)d.Width;
+                ih.biHeight = -(LONG)d.Height;
+                ih.biPlanes = 1;
+                ih.biBitCount = 32;
+                fwrite(&fh, sizeof(fh), 1, f);
+                fwrite(&ih, sizeof(ih), 1, f);
+                for (y = 0; y < d.Height; y++) fwrite((char *)m.pData + y * m.RowPitch, 4, d.Width, f);
+                fclose(f);
+            }
+            ID3D11DeviceContext_Unmap(g_ctx, (ID3D11Resource *)stage, 0);
+        }
+        ID3D11Texture2D_Release(stage);
+    }
+    ID3D11Texture2D_Release(back);
+}
+
 static void paint_now(void) {
     Tab *tb = active_tab();
     if (tb && tb->t.m_sync && GetTickCount() - tb->t.sync_since < 200) {
@@ -2700,6 +2951,11 @@ static void paint_now(void) {
     }
     if (g_lat && g_lat_out.QuadPart) QueryPerformanceCounter(&g_lat_render);
     render();
+    if (g_snap_path[0]) {
+        r_flush();
+        snap_backbuffer();
+        g_snap_path[0] = 0;
+    }
     r_present();
     g_last_paint = GetTickCount();
     if (g_lat && g_lat_out.QuadPart) {
@@ -2721,6 +2977,15 @@ static void update_busy(void) {
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         int b = term_busy(&tb->t);
+        if (tb->t.ps_state != tb->ps_seen) {
+            /* Claude stopped to ask you something: say so if you aren't looking */
+            if ((tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) && !g_focused) {
+                FLASHWINFO fi = {sizeof(fi), g_hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
+                FlashWindowEx(&fi);
+            }
+            tb->ps_seen = tb->t.ps_state;
+            changed = 1;
+        }
         if (b != tb->busy) {
             changed = 1;
             if (!b && (i != g_active || !g_focused)) {
@@ -2830,6 +3095,44 @@ static void scroll_view(int lines) {
 static int auto_scale(void) { return g_dpi >= 144 ? (g_dpi + 48) / 96 : 1; }
 
 /* Returns 1 if the key was consumed (its WM_CHAR is then dropped). */
+/* Ctrl+Shift+J: the next tab that wants you. Claude blocked on a question
+   first, then failures, then finished/rang (the bell). */
+static void jump_to_attention(void) {
+    int pass, k;
+    for (pass = 0; pass < 3; pass++)
+        for (k = 1; k <= g_ntabs; k++) {
+            Tab *tb = g_tabs[(g_active + k) % g_ntabs];
+            int hit = pass == 0 ? tb->t.ps_state == PS_BLOCKED : pass == 1 ? tb->t.ps_state == PS_ERROR : tb->attention;
+            if (hit) { activate((g_active + k) % g_ntabs); return; }
+        }
+}
+
+/* Ctrl+Shift+Up/Down: scroll to the previous/next OSC 133 mark (a shell
+   prompt, or the start of a Claude turn), placing it at the top. */
+static void jump_mark(int dir) {
+    Tab *tb = active_tab();
+    Term *t;
+    long long top, target = -1, base;
+    int i;
+    if (!tb) return;
+    t = &tb->t;
+    base = term_base(t);
+    top = t->hpushed - t->view;
+    if (dir < 0) {
+        for (i = t->nmarks - 1; i >= 0; i--)
+            if (t->marks[i] < top && t->marks[i] >= base) { target = t->marks[i]; break; }
+    } else {
+        for (i = 0; i < t->nmarks; i++)
+            if (t->marks[i] > top) { target = t->marks[i]; break; }
+    }
+    if (target < 0) { if (dir > 0) t->view = 0; }
+    else {
+        long long v = t->hpushed - target;
+        t->view = v < 0 ? 0 : v > t->hcount ? t->hcount : (int)v;
+    }
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
 static int handle_keydown(WPARAM vk) {
     int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
     int shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -2849,6 +3152,9 @@ static int handle_keydown(WPARAM vk) {
         case 'C': sel_copy(); g_sel_on = 0; InvalidateRect(g_hwnd, NULL, FALSE); return 1;
         case 'V': paste(); return 1;
         case VK_TAB: activate((g_active + g_ntabs - 1) % g_ntabs); return 1;
+        case 'J': jump_to_attention(); return 1;
+        case VK_UP: jump_mark(-1); return 1;
+        case VK_DOWN: jump_mark(1); return 1;
         }
     }
     if (ctrl && !shift && !alt && vk == VK_TAB) { activate((g_active + 1) % g_ntabs); return 1; }
@@ -3066,8 +3372,8 @@ static void scrollbar_set(int my) {
     Tab *tb = active_tab();
     float track_h, f;
     if (!tb || !tb->t.hcount) return;
-    track_h = (float)(tb->t.rows * CH);
-    f = (float)(my - term_oy()) / track_h;
+    track_h = (float)(term_oy() + tb->t.rows * CH - caption_h());
+    f = (float)(my - caption_h()) / track_h;
     if (f < 0) f = 0;
     if (f > 1) f = 1;
     tb->t.view = (int)((1.0f - f) * tb->t.hcount);
@@ -3116,6 +3422,38 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
            close, and conhost takes the shells down with it. Closing stays instant. */
         PostQuitMessage(0);
         return 0;
+    case WM_COPYDATA: {
+        /* Test channel (bench/termbench.exe send / cmd / snap): drives a window
+           that isn't focused, so tests never take the keyboard from you. */
+        COPYDATASTRUCT *cd = (COPYDATASTRUCT *)lp;
+        char buf[4096];
+        size_t n = cd->cbData < sizeof(buf) - 1 ? cd->cbData : sizeof(buf) - 1;
+        Tab *tb = active_tab();
+        memcpy(buf, cd->lpData, n);
+        buf[n] = 0;
+        if (cd->dwData == 0x48430001 && tb) {          /* type: \n becomes Enter */
+            size_t i;
+            for (i = 0; i < n; i++) if (buf[i] == '\n') buf[i] = '\r';
+            tab_write(tb, buf, (int)n);
+        } else if (cd->dwData == 0x48430002) {          /* a hardcore command */
+            if (!strcmp(buf, "newtab")) new_tab_here();
+            else if (!strcmp(buf, "nexttab")) activate((g_active + 1) % g_ntabs);
+            else if (!strcmp(buf, "closetab")) close_tab(g_active);
+            else if (!strcmp(buf, "jump")) jump_to_attention();
+            else if (!strncmp(buf, "tab ", 4)) activate(atoi(buf + 4));
+            else if (!strncmp(buf, "hover ", 6)) {
+                g_mouse_x = atoi(buf + 6);
+                g_mouse_y = strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1;
+            } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);
+            else return FALSE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else if (cd->dwData == 0x48430003 && g_gfx_ready) {   /* snapshot the next frame to a .bmp */
+            MultiByteToWideChar(CP_UTF8, 0, buf, -1, g_snap_path, MAX_PATH);
+            g_snap_path[MAX_PATH - 1] = 0;
+            paint_now();
+        } else return FALSE;
+        return TRUE;
+    }
     case WM_NCCALCSIZE:
         /* The tab strip is the title bar: keep the standard side and bottom
            frame (resize borders, shadow, snap), drop the caption. Maximized,
@@ -3701,6 +4039,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         g_trace = _wfopen(tp, L"wb");
     }
     trace("wWinMain");
+    if (_wgetenv(L"HARDCORE_VTLOG")) {
+        wchar_t tp[MAX_PATH];
+        _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-vt.log", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
+        g_vtlog = _wfopen(tp, L"wb");
+    }
     if (_wgetenv(L"HARDCORE_LAT")) {
         wchar_t tp[MAX_PATH];
         _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-lat.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
@@ -3722,6 +4065,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             char out[MAX_PATH * 3];
             WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
             return unit_tests(out);
+        } else if (!strcmp(a, "--no-activate")) {
+            show = SW_SHOWNOACTIVATE;       /* tests: open behind, never take the keyboard */
         } else if (!strcmp(a, "--inbox-conpty")) {
             g_inbox_conpty = 1;
         } else if (!strcmp(a, "--replay") && i + 3 < argc) {
