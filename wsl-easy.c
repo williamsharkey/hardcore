@@ -109,8 +109,7 @@ static PFN_ClosePC  pClosePC;
 #define TAB_HOVER 0x303030
 #define SEL_BG 0x264F78
 
-static int g_scale_cfg;          /* 0 = follow DPI */
-static int g_scale = 1;
+static int g_scale = 1;          /* integer pixel scale, from the monitor DPI; one size, no zoom */
 static int g_dpi = 96;
 static char g_distro[128];
 static char g_start_dir[1024];   /* Windows or Linux path */
@@ -131,9 +130,11 @@ enum { W_WIDE = 1, W_CONT = 2 };
 
 typedef struct {
     uint32_t ch, fg, bg;
-    uint16_t attr;
-    uint8_t wflag, pad;
+    uint8_t attr, wflag;
+    uint16_t link;               /* OSC 8 hyperlink id, 0 = none */
 } Cell;
+
+#define MAX_LINKS 4096           /* per tab, reused round-robin */
 
 typedef struct {
     Cell *c;
@@ -203,8 +204,8 @@ typedef struct {
 
 typedef struct {
     int cols, rows;
-    Cell *buf[2];
-    uint8_t *wrapf[2];
+    Cell **row[2];               /* per-screen row pointers: scrolling moves pointers, not cells */
+    uint8_t *wrapf[2];           /* row ended in an autowrap (for copy and reflow) */
     int alt;
     int cx, cy, wrapnext;
     Cell pen;
@@ -213,6 +214,8 @@ typedef struct {
     int g0dec;
     uint32_t last_ch;            /* for REP; only valid right after a printed char */
     uint8_t *tabs;               /* per-column tab stop flags */
+    char *links[MAX_LINKS];      /* OSC 8 targets; cell.link = index + 1 */
+    int next_link;
     /* modes */
     int m_newline;
     int m_autowrap, m_origin, m_insert, m_cursor_vis, m_appcursor, m_bracketed;
@@ -250,10 +253,22 @@ typedef struct Tab {
     volatile LONG posted;
     volatile LONG exited;
     int activity;
+    int spare;                   /* pre-warmed, waiting on stdin for its directory */
     char start_dir[1024];
 } Tab;
 
 static HWND g_hwnd;
+
+/* WSL_EASY_TRACE=1 writes startup phase times to %TEMP%\\wsl-easy-trace.txt */
+static FILE *g_trace;
+static LARGE_INTEGER g_t0, g_qpf;
+static void trace(const char *what) {
+    LARGE_INTEGER t;
+    if (!g_trace) return;
+    QueryPerformanceCounter(&t);
+    fprintf(g_trace, "%8.2f ms  %s\n", (double)(t.QuadPart - g_t0.QuadPart) * 1000.0 / (double)g_qpf.QuadPart, what);
+    fflush(g_trace);
+}
 
 static void tab_write(Tab *tb, const void *s, int n) {
     DWORD w;
@@ -270,7 +285,7 @@ static Cell blank_cell(const Term *t) {
     return c;
 }
 
-#define CELL(t, x, y) (&(t)->buf[(t)->alt][(size_t)(y) * (t)->cols + (x)])
+#define CELL(t, x, y) (&(t)->row[(t)->alt][y][x])
 
 static void clear_span(Term *t, int y, int x0, int x1) {
     Cell b = blank_cell(t);
@@ -321,14 +336,38 @@ static void hist_push(Term *t, const Cell *row, int wrapped) {
     if (t->view > 0 && t->view < t->hcount) t->view++;  /* keep the viewport still */
 }
 
+/* Rotates rows [top, bot] by n: positive moves content up (rows leaving at
+   the top come back blank at the bottom), negative moves it down. */
+static void rotate_rows(Term *t, int top, int bot, int n) {
+    Cell *stack[64], **tmp;
+    uint8_t wstack[64], *wtmp;
+    Cell **R = t->row[t->alt];
+    uint8_t *W = t->wrapf[t->alt];
+    int h = bot - top + 1, k = n > 0 ? n : -n;
+    tmp = k <= 64 ? stack : (Cell **)malloc(sizeof(Cell *) * k);
+    wtmp = k <= 64 ? wstack : (uint8_t *)malloc((size_t)k);
+    if (n > 0) {
+        memcpy(tmp, R + top, sizeof(Cell *) * k);
+        memmove(R + top, R + top + k, sizeof(Cell *) * (h - k));
+        memcpy(R + bot - k + 1, tmp, sizeof(Cell *) * k);
+        memmove(W + top, W + top + k, (size_t)(h - k));
+    } else {
+        memcpy(tmp, R + bot - k + 1, sizeof(Cell *) * k);
+        memmove(R + top + k, R + top, sizeof(Cell *) * (h - k));
+        memcpy(R + top, tmp, sizeof(Cell *) * k);
+        memmove(W + top + k, W + top, (size_t)(h - k));
+    }
+    if (tmp != stack) free(tmp);
+    if (wtmp != wstack) free(wtmp);
+}
+
 static void scroll_up(Term *t, int top, int bot, int n, int to_hist) {
     int y, h = bot - top + 1;
     if (n <= 0) return;
     if (n > h) n = h;
     if (to_hist && !t->alt && top == 0)
         for (y = 0; y < n; y++) hist_push(t, CELL(t, 0, y), t->wrapf[0][y]);
-    memmove(CELL(t, 0, top), CELL(t, 0, top + n), sizeof(Cell) * (size_t)t->cols * (h - n));
-    memmove(&t->wrapf[t->alt][top], &t->wrapf[t->alt][top + n], (size_t)(h - n));
+    rotate_rows(t, top, bot, n);
     clear_rows(t, bot - n + 1, bot + 1);
 }
 
@@ -336,8 +375,7 @@ static void scroll_down(Term *t, int top, int bot, int n) {
     int h = bot - top + 1;
     if (n <= 0) return;
     if (n > h) n = h;
-    memmove(CELL(t, 0, top + n), CELL(t, 0, top), sizeof(Cell) * (size_t)t->cols * (h - n));
-    memmove(&t->wrapf[t->alt][top + n], &t->wrapf[t->alt][top], (size_t)(h - n));
+    rotate_rows(t, top, bot, -n);
     clear_rows(t, top, top + n);
 }
 
@@ -372,11 +410,15 @@ static int term_init(Term *t, int cols, int rows) {
     t->rows = rows;
     t->hist = (HLine *)calloc(HIST_LINES, sizeof(HLine));
     for (s = 0; s < 2; s++) {
-        t->buf[s] = (Cell *)malloc(sizeof(Cell) * (size_t)cols * rows);
+        int y;
+        t->row[s] = (Cell **)malloc(sizeof(Cell *) * rows);
         t->wrapf[s] = (uint8_t *)calloc((size_t)rows, 1);
+        if (!t->row[s]) return 0;
+        for (y = 0; y < rows; y++)
+            if (!(t->row[s][y] = (Cell *)malloc(sizeof(Cell) * cols))) return 0;
     }
     t->tabs = (uint8_t *)malloc((size_t)cols);
-    if (!t->hist || !t->buf[0] || !t->buf[1] || !t->tabs) return 0;
+    if (!t->hist || !t->tabs) return 0;
     for (s = 0; s < cols; s++) t->tabs[s] = (s % 8 == 0);
     term_reset(t);
     for (s = 1; s >= 0; s--) {
@@ -389,45 +431,167 @@ static int term_init(Term *t, int cols, int rows) {
 static void term_free(Term *t) {
     hist_clear(t);
     free(t->hist);
-    free(t->buf[0]);
-    free(t->buf[1]);
+    {
+        int s, y;
+        for (s = 0; s < 2; s++) {
+            for (y = 0; y < t->rows; y++) free(t->row[s][y]);
+            free(t->row[s]);
+        }
+    }
     free(t->wrapf[0]);
     free(t->wrapf[1]);
     free(t->tabs);
+    {
+        int i;
+        for (i = 0; i < MAX_LINKS; i++) free(t->links[i]);
+    }
+}
+
+/* growable list of physical lines, used while reflowing */
+typedef struct { HLine *v; int n, cap; } LineList;
+
+static void ll_add(LineList *l, const Cell *c, int n, int wrapped) {
+    HLine *h;
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 256;
+        l->v = (HLine *)realloc(l->v, sizeof(HLine) * l->cap);
+    }
+    h = &l->v[l->n++];
+    h->n = n;
+    h->wrapped = wrapped;
+    h->c = n ? (Cell *)malloc(sizeof(Cell) * n) : NULL;
+    if (n) memcpy(h->c, c, sizeof(Cell) * n);
+}
+
+/* Rewraps the main screen and its scrollback to a new width, the way Windows
+   Terminal does: wrapped rows are joined into logical lines and split again.
+   The cursor keeps its place in the text. */
+static void reflow_main(Term *t, int cols, int rows) {
+    int oc = t->cols, orows = t->rows, y, L, i;
+    int ccx = t->alt ? t->saved[0].cx : t->cx, ccy = t->alt ? t->saved[0].cy : t->cy;
+    int last = ccy, cur_line = -1, cur_off = 0, cur_prow = 0, start, keep;
+    Cell *acc = NULL;
+    int acc_n = 0, acc_cap = 0;
+    LineList out = {0};
+    Cell blank;
+    memset(&blank, 0, sizeof(blank));
+    blank.ch = ' ';
+    /* last screen row worth keeping: the cursor row or the last with content */
+    for (y = orows - 1; y > last; y--) {
+        int x;
+        for (x = 0; x < oc && row_is_blank_default(&t->row[0][y][x]); x++) {}
+        if (x < oc) { last = y; break; }
+    }
+    for (L = 0; L < t->hcount + last + 1; L++) {
+        const Cell *c;
+        int n, wrapped;
+        if (L < t->hcount) {
+            const HLine *h = &t->hist[(t->hstart + L) % HIST_LINES];
+            c = h->c; n = h->n; wrapped = h->wrapped;
+        } else {
+            y = L - t->hcount;
+            c = t->row[0][y]; n = oc; wrapped = t->wrapf[0][y];
+            if (y == ccy) { cur_line = 1; cur_off = acc_n + ccx; }
+        }
+        if (acc_n + oc > acc_cap) {
+            acc_cap = (acc_n + oc) * 2;
+            acc = (Cell *)realloc(acc, sizeof(Cell) * acc_cap);
+        }
+        memcpy(acc + acc_n, c, sizeof(Cell) * n);
+        acc_n += n;
+        if (wrapped) {           /* a wrapped row's trailing blanks are real text */
+            for (; n < oc; n++) acc[acc_n++] = blank;
+            continue;
+        }
+        /* end of a logical line: trim and split it at the new width */
+        {
+            int len = acc_n, pos = 0;
+            while (len > 0 && row_is_blank_default(&acc[len - 1])) len--;
+            if (cur_line == 1 && len < cur_off) len = len;   /* cursor may sit past the text */
+            do {
+                int take = len - pos > cols ? cols : len - pos;
+                if (take == cols && acc[pos + take - 1].wflag == W_WIDE) take--;  /* don't split a wide char */
+                if (cur_line == 1 && cur_off >= pos && (cur_off < pos + cols || pos + take >= len)) {
+                    cur_prow = out.n + (cur_off - pos) / cols;
+                    ccx = (cur_off - pos) % cols;
+                    cur_line = 2;
+                }
+                ll_add(&out, acc + pos, take, pos + take < len);
+                pos += take;
+            } while (pos < len);
+            if (cur_line == 2 && cur_prow >= out.n) {  /* cursor beyond the text, on rows of its own */
+                while (out.n <= cur_prow) ll_add(&out, NULL, 0, 0);
+            }
+            if (cur_line == 2) cur_line = 3;
+            acc_n = 0;
+        }
+    }
+    free(acc);
+    /* screen = the last `rows` lines, but never scroll the cursor off the top */
+    start = out.n - rows;
+    if (start > cur_prow) start = cur_prow;
+    if (start < 0) start = 0;
+    hist_clear(t);
+    keep = start > HIST_LINES ? HIST_LINES : start;
+    for (i = 0; i < start; i++) {
+        if (i < start - keep) { free(out.v[i].c); continue; }
+        t->hist[t->hcount++] = out.v[i];
+    }
+    t->hpushed = t->hcount;
+    for (y = 0; y < orows; y++) free(t->row[0][y]);
+    free(t->row[0]);
+    free(t->wrapf[0]);
+    t->row[0] = (Cell **)malloc(sizeof(Cell *) * rows);
+    t->wrapf[0] = (uint8_t *)calloc((size_t)rows, 1);
+    for (y = 0; y < rows; y++) {
+        int x, idx = start + y;
+        t->row[0][y] = (Cell *)malloc(sizeof(Cell) * cols);
+        for (x = 0; x < cols; x++) t->row[0][y][x] = blank;
+        if (idx < out.n) {
+            memcpy(t->row[0][y], out.v[idx].c, sizeof(Cell) * out.v[idx].n);
+            t->wrapf[0][y] = (uint8_t)out.v[idx].wrapped;
+            free(out.v[idx].c);
+        }
+    }
+    free(out.v);
+    ccy = cur_prow - start;
+    if (ccy < 0) ccy = 0;
+    if (ccy >= rows) ccy = rows - 1;
+    if (ccx >= cols) ccx = cols - 1;
+    if (t->alt) { t->saved[0].cx = ccx; t->saved[0].cy = ccy; }
+    else { t->cx = ccx; t->cy = ccy; }
+}
+
+/* the alt screen (vim, less, htop) just gets cropped or padded; its owner redraws */
+static void resize_alt(Term *t, int cols, int rows) {
+    Cell **nr = (Cell **)malloc(sizeof(Cell *) * rows);
+    uint8_t *nw = (uint8_t *)calloc((size_t)rows, 1);
+    Cell blank;
+    int y, x;
+    memset(&blank, 0, sizeof(blank));
+    blank.ch = ' ';
+    for (y = 0; y < rows; y++) {
+        nr[y] = (Cell *)malloc(sizeof(Cell) * cols);
+        for (x = 0; x < cols; x++)
+            nr[y][x] = (y < t->rows && x < t->cols) ? t->row[1][y][x] : blank;
+        if (cols < t->cols && nr[y][cols - 1].wflag == W_WIDE) nr[y][cols - 1] = blank;
+    }
+    for (y = 0; y < t->rows; y++) free(t->row[1][y]);
+    free(t->row[1]);
+    free(t->wrapf[1]);
+    t->row[1] = nr;
+    t->wrapf[1] = nw;
+    if (t->alt) {
+        if (t->cy >= rows) t->cy = rows - 1;
+        if (t->cx >= cols) t->cx = cols - 1;
+    }
 }
 
 static void term_resize(Term *t, int cols, int rows) {
-    int s, y, x;
+    int s, x;
     if (cols == t->cols && rows == t->rows) return;
-    for (s = 0; s < 2; s++) {
-        Cell *nb = (Cell *)malloc(sizeof(Cell) * (size_t)cols * rows);
-        uint8_t *nw = (uint8_t *)calloc((size_t)rows, 1);
-        int cy = (s == t->alt) ? t->cy : t->saved[s].cy;
-        int shift = 0, cur_alt = t->alt;
-        Cell b;
-        memset(&b, 0, sizeof(b));
-        b.ch = ' ';
-        /* Shrinking: keep the cursor row on screen, push the rest into history. */
-        if (rows < t->rows && cy >= rows) shift = cy - rows + 1;
-        if (s == 0 && shift) {
-            t->alt = 0;
-            for (y = 0; y < shift; y++) hist_push(t, CELL(t, 0, y), t->wrapf[0][y]);
-            t->alt = cur_alt;
-        }
-        for (y = 0; y < rows; y++) {
-            int sy = y + shift;
-            nw[y] = (sy < t->rows) ? t->wrapf[s][sy] : 0;
-            for (x = 0; x < cols; x++)
-                nb[(size_t)y * cols + x] = (sy < t->rows && x < t->cols) ? t->buf[s][(size_t)sy * t->cols + x] : b;
-            if (cols < t->cols && nb[(size_t)y * cols + cols - 1].wflag == W_WIDE) nb[(size_t)y * cols + cols - 1] = b;
-        }
-        free(t->buf[s]);
-        free(t->wrapf[s]);
-        t->buf[s] = nb;
-        t->wrapf[s] = nw;
-        if (s == t->alt) t->cy = cy - shift;
-        else t->saved[s].cy = cy - shift;
-    }
+    reflow_main(t, cols, rows);
+    resize_alt(t, cols, rows);
     {
         uint8_t *nt = (uint8_t *)malloc((size_t)cols);
         for (x = 0; x < cols; x++) nt[x] = x < t->cols ? t->tabs[x] : (x % 8 == 0);
@@ -436,9 +600,6 @@ static void term_resize(Term *t, int cols, int rows) {
     }
     t->cols = cols;
     t->rows = rows;
-    if (t->cx >= cols) t->cx = cols - 1;
-    if (t->cy >= rows) t->cy = rows - 1;
-    if (t->cy < 0) t->cy = 0;
     for (s = 0; s < 2; s++) {
         if (t->saved[s].cx >= cols) t->saved[s].cx = cols - 1;
         if (t->saved[s].cy >= rows) t->saved[s].cy = rows - 1;
@@ -976,6 +1137,19 @@ static void osc_dispatch(Term *t) {
             term_reply(t, buf);
         }
         break;
+    case 8: {                    /* OSC 8 ; params ; URI — hyperlink start, empty URI ends it */
+        char *uri = strchr(rest, ';');
+        if (!uri || !uri[1]) {
+            t->pen.link = 0;
+        } else {
+            int id = t->next_link;
+            t->next_link = (t->next_link + 1) % MAX_LINKS;
+            free(t->links[id]);
+            t->links[id] = _strdup(uri + 1);
+            t->pen.link = (uint16_t)(id + 1);
+        }
+        break;
+    }
     case 52: {
         char *data = strchr(rest, ';');
         if (data && strcmp(data + 1, "?") != 0) {
@@ -1113,7 +1287,22 @@ static void vt_byte(Term *t, unsigned char b) {
 
 static void vt_feed(Term *t, const unsigned char *s, int n) {
     int i;
-    for (i = 0; i < n; i++) vt_byte(t, s[i]);
+    for (i = 0; i < n; i++) {
+        unsigned char b = s[i];
+        /* fast path: printable ASCII in the middle of a row, nothing special going on */
+        if (b >= 0x20 && b < 0x7F && t->st == S_GROUND && !t->utf8_need && !t->wrapnext &&
+            t->cx < t->cols - 1 && !t->g0dec && !t->m_insert) {
+            Cell *c = &t->row[t->alt][t->cy][t->cx];
+            if (!c->wflag) {
+                *c = t->pen;
+                c->ch = b;
+                t->cx++;
+                t->last_ch = b;
+                continue;
+            }
+        }
+        vt_byte(t, b);
+    }
     t->dirty = 1;
 }
 
@@ -1129,7 +1318,7 @@ static void term_line(const Term *t, int L, const Cell **cells, int *n, int *wra
     } else {
         int y = L - t->hcount;
         if (y < 0 || y >= t->rows) { *cells = NULL; *n = 0; *wrapped = 0; return; }
-        *cells = &t->buf[t->alt][(size_t)y * t->cols];
+        *cells = t->row[t->alt][y];
         *n = t->cols;
         *wrapped = t->wrapf[t->alt][y];
     }
@@ -1143,6 +1332,7 @@ static long long term_base(const Term *t) { return t->hpushed - t->hcount; }
 #define WM_APP_EXITED (WM_APP + 2)
 
 static Tab *g_tabs[MAX_TABS];
+static Tab *g_spare;             /* pre-warmed shell for the next new tab */
 static int g_ntabs, g_active;
 static int g_next_id = 1;
 static int g_cols = 120, g_rows = 34;
@@ -1216,6 +1406,12 @@ static const char RC_BASH[] =
     "elif [ -r ~/.profile ]; then . ~/.profile\n"
     "elif [ -r ~/.bashrc ]; then . ~/.bashrc\n"
     "fi\n"
+    "# a pre-warmed spare tab: profile already loaded, wait (silently) to be told where to go\n"
+    "if [ -n \"$WSL_EASY_SPARE\" ]; then\n"
+    "  unset WSL_EASY_SPARE\n"
+    "  IFS= read -rs __wsl_easy_dir && cd -- \"$__wsl_easy_dir\" 2>/dev/null\n"
+    "  unset __wsl_easy_dir\n"
+    "fi\n"
     "__wsl_easy_cwd() { printf '\\033]9;9;%s\\033\\\\' \"$PWD\"; }\n"
     "case \";${PROMPT_COMMAND[0]};\" in *\";__wsl_easy_cwd;\"*) ;; *)\n"
     "  PROMPT_COMMAND=\"__wsl_easy_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;;\n"
@@ -1249,12 +1445,14 @@ static int tab_spawn(Tab *tb) {
     SIZE_T attr_sz = 0;
     char cmd[4096];
     wchar_t wcmd[4096];
+    BOOL ok;
 
     if (!pCreatePC) {
         term_message(&tb->t, "\x1b[31mwsl-easy: this Windows has no ConPTY (needs Windows 10 1809+)\x1b[0m\r\n");
         return 0;
     }
-    if (!CreatePipe(&in_r, &in_w, NULL, 0) || !CreatePipe(&out_r, &out_w, NULL, 0)) return 0;
+    /* a roomy output pipe: with the 4 KB default, ConPTY stalls on every few KB */
+    if (!CreatePipe(&in_r, &in_w, NULL, 0) || !CreatePipe(&out_r, &out_w, NULL, 1 << 20)) return 0;
     sz.X = (SHORT)tb->t.cols;
     sz.Y = (SHORT)tb->t.rows;
     /* OpenConsole can measure glyphs with wcswidth, which is what our grid uses */
@@ -1286,8 +1484,24 @@ static int tab_spawn(Tab *tb) {
              tb->start_dir, g_rc_linux);
     MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd, 4096);
     memset(&pi, 0, sizeof(pi));
-    if (!CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                        NULL, NULL, &si.StartupInfo, &pi)) {
+    /* tabs are only spawned from the UI thread, so a temporary env var is safe;
+       WSLENV carries it across into Linux */
+    if (tb->spare) {
+        wchar_t old[2048] = L"", wslenv[2100];
+        DWORD n = GetEnvironmentVariableW(L"WSLENV", old, 2048);
+        _snwprintf(wslenv, 2100, L"%ls%lsWSL_EASY_SPARE", old, n ? L":" : L"");
+        wslenv[2099] = 0;
+        SetEnvironmentVariableW(L"WSL_EASY_SPARE", L"1");
+        SetEnvironmentVariableW(L"WSLENV", wslenv);
+        ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                            NULL, NULL, &si.StartupInfo, &pi);
+        SetEnvironmentVariableW(L"WSL_EASY_SPARE", NULL);
+        SetEnvironmentVariableW(L"WSLENV", n ? old : NULL);
+    } else {
+        ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                            NULL, NULL, &si.StartupInfo, &pi);
+    }
+    if (!ok) {
         char msg[256];
         snprintf(msg, sizeof(msg), "\x1b[31mwsl-easy: could not start wsl.exe (error %lu)\x1b[0m\r\n", GetLastError());
         term_message(&tb->t, msg);
@@ -1304,7 +1518,7 @@ static int tab_spawn(Tab *tb) {
     return 1;
 }
 
-static Tab *tab_create(const char *dir) {
+static Tab *tab_create(const char *dir, int spare) {
     Tab *tb = (Tab *)calloc(1, sizeof(Tab));
     if (!tb || !term_init(&tb->t, g_cols, g_rows)) {
         free(tb);
@@ -1312,6 +1526,7 @@ static Tab *tab_create(const char *dir) {
     }
     tb->id = g_next_id++;
     InitializeCriticalSection(&tb->lock);
+    tb->spare = spare;
     snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", dir && *dir ? dir : g_start_dir);
     if (tb->start_dir[1] == ':' || tb->start_dir[0] == '/') set_cwd(&tb->t, tb->start_dir);
     tab_spawn(tb);
@@ -1370,8 +1585,7 @@ static void config_load(void) {
         *v++ = 0;
         n = strlen(v);
         while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
-        if (!strcmp(line, "scale")) g_scale_cfg = atoi(v);
-        else if (!strcmp(line, "dir") && *v) snprintf(g_start_dir, sizeof(g_start_dir), "%s", v);
+        if (!strcmp(line, "dir") && *v) snprintf(g_start_dir, sizeof(g_start_dir), "%s", v);
         else if (!strcmp(line, "distro")) snprintf(g_distro, sizeof(g_distro), "%s", v);
         else if (!strcmp(line, "width")) g_win_w = atoi(v);
         else if (!strcmp(line, "height")) g_win_h = atoi(v);
@@ -1387,8 +1601,7 @@ static void config_save(void) {
     config_path(path);
     f = _wfopen(path, L"wb");
     if (!f) return;
-    fprintf(f, "# wsl-easy settings. scale=0 follows the monitor DPI.\n");
-    fprintf(f, "scale=%d\n", g_scale_cfg);
+    fprintf(f, "# wsl-easy settings\n");
     fprintf(f, "# starting folder for new windows (Windows or Linux path); empty = %%USERPROFILE%%\n");
     fprintf(f, "dir=%s\n", g_cfg_dir_line);
     fprintf(f, "# WSL distro name; empty = your default distro\n");
@@ -1470,8 +1683,9 @@ static void resize_all(void) {
     g_sel_on = 0;
     sz.X = (SHORT)cols;
     sz.Y = (SHORT)rows;
-    for (i = 0; i < g_ntabs; i++) {
-        Tab *tb = g_tabs[i];
+    for (i = 0; i <= g_ntabs; i++) {
+        Tab *tb = i < g_ntabs ? g_tabs[i] : g_spare;
+        if (!tb) continue;
         tab_drain(tb);
         term_resize(&tb->t, cols, rows);
         if (tb->hpc) pResizePC(tb->hpc, sz);
@@ -1541,33 +1755,91 @@ static void send_to_active(const char *s, int n) {
     tab_write(tb, s, n);
 }
 
-static void paste(void) {
+/* Sends text the way a paste arrives: CRLF/LF become CR like a typed Enter,
+   ESC is stripped so a paste can't end bracketed-paste mode early. */
+static void paste_wide(const wchar_t *w) {
     Tab *tb = active_tab();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *s, *o;
+    const char *p;
+    if (!tb || n <= 1) return;
+    s = o = (char *)malloc(n + 16);
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL);
+    for (p = s; *p; p++) {
+        if (*p == '\r' && p[1] == '\n') continue;
+        if (*p == 0x1B) continue;
+        *o++ = (*p == '\n') ? '\r' : *p;
+    }
+    if (tb->t.m_bracketed) send_to_active("\x1b[200~", 6);
+    send_to_active(s, (int)(o - s));
+    if (tb->t.m_bracketed) send_to_active("\x1b[201~", 6);
+    free(s);
+}
+
+static void paste(void) {
     HANDLE h;
-    if (!tb || !OpenClipboard(g_hwnd)) return;
+    if (!OpenClipboard(g_hwnd)) return;
     h = GetClipboardData(CF_UNICODETEXT);
     if (h) {
         const wchar_t *w = (const wchar_t *)GlobalLock(h);
         if (w) {
-            int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
-            char *s = (char *)malloc(n + 16), *o = s;
-            const char *p;
-            WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL);
-            /* CRLF/LF → CR, like a typed Enter; strip ESC so a paste can't
-               end bracketed-paste mode early */
-            for (p = s; *p; p++) {
-                if (*p == '\r' && p[1] == '\n') continue;
-                if (*p == 0x1B) continue;
-                *o++ = (*p == '\n') ? '\r' : *p;
-            }
-            if (tb->t.m_bracketed) send_to_active("\x1b[200~", 6);
-            send_to_active(s, (int)(o - s));
-            if (tb->t.m_bracketed) send_to_active("\x1b[201~", 6);
-            free(s);
+            paste_wide(w);
             GlobalUnlock(h);
         }
     }
     CloseClipboard();
+}
+
+/* A Windows path as you'd type it in WSL, shell-quoted only when needed:
+   C:\x y → '/mnt/c/x y', \\wsl.localhost\Debian\home → /home */
+static void dropped_path(const wchar_t *path, wchar_t *q, size_t cap) {
+    wchar_t lin[MAX_PATH * 4 + 16];
+    const wchar_t *p, *safe = L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-+:@%,=";
+    size_t k, j = 0;
+    int needq = 0;
+    if (iswalpha(path[0]) && path[1] == L':') {
+        _snwprintf(lin, MAX_PATH * 4 + 16, L"/mnt/%c%ls", towlower(path[0]), path + 2);
+    } else if (!_wcsnicmp(path, L"\\\\wsl.localhost\\", 16) || !_wcsnicmp(path, L"\\\\wsl$\\", 7)) {
+        p = wcschr(path + 2, L'\\');                 /* skip \\host */
+        p = p ? wcschr(p + 1, L'\\') : NULL;           /* skip \distro */
+        _snwprintf(lin, MAX_PATH * 4 + 16, L"%ls", p ? p : L"/");
+    } else {
+        _snwprintf(lin, MAX_PATH * 4 + 16, L"%ls", path);
+    }
+    lin[MAX_PATH * 4 + 15] = 0;
+    for (k = 0; lin[k]; k++) {
+        if (lin[k] == L'\\') lin[k] = L'/';
+        if (!wcschr(safe, lin[k])) needq = 1;
+    }
+    if (needq) q[j++] = L'\'';
+    for (k = 0; lin[k] && j + 6 < cap; k++) {
+        if (lin[k] == L'\'') { wcscpy(q + j, L"'\\''"); j += 4; }
+        else q[j++] = lin[k];
+    }
+    if (needq) q[j++] = L'\'';
+    q[j] = 0;
+}
+
+/* Files dropped from Explorer are typed in as WSL paths, space-separated */
+static void drop_files(HDROP drop) {
+    UINT i, n = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+    wchar_t *out = (wchar_t *)calloc(1, sizeof(wchar_t));
+    size_t len = 0;
+    for (i = 0; i < n; i++) {
+        wchar_t path[MAX_PATH * 4], q[MAX_PATH * 8 + 16];
+        size_t j;
+        DragQueryFileW(drop, i, path, MAX_PATH * 4);
+        dropped_path(path, q, MAX_PATH * 8 + 16);
+        j = wcslen(q);
+        out = (wchar_t *)realloc(out, sizeof(wchar_t) * (len + j + 2));
+        wcscpy(out + len, q);
+        len += j;
+        out[len++] = L' ';
+        out[len] = 0;
+    }
+    DragFinish(drop);
+    paste_wide(out);
+    free(out);
 }
 
 /* ── glyph atlas: on-demand 16×16 slots in one texture ─────────────── */
@@ -1881,8 +2153,13 @@ static void render(void) {
             const Cell *c = &cells[x];
             uint32_t fg, bg;
             float x0 = (float)(ox + x * CW), y0 = (float)(oy + y * CH);
-            if (!(c->attr & (A_UNDER | A_STRIKE))) continue;
+            if (!(c->attr & (A_UNDER | A_STRIKE)) && !c->link) continue;
             cell_colors(c, &fg, &bg);
+            if (c->link && !(c->attr & A_UNDER)) {   /* OSC 8 link: dotted underline */
+                int d;
+                gl_color(fg, 0.6f);
+                for (d = 0; d < CW; d += 2 * g_scale) quad(x0 + d, y0 + CH - g_scale, x0 + d + g_scale, y0 + CH);
+            }
             gl_color(fg, 1);
             if (c->attr & A_UNDER) quad(x0, y0 + CH - g_scale, x0 + CW, y0 + CH);
             if (c->attr & A_STRIKE) quad(x0, y0 + CH / 2, x0 + CW, y0 + CH / 2 + g_scale);
@@ -1966,13 +2243,39 @@ static void activate(int i) {
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
+#define TIMER_SPARE 2
+
+static void schedule_spare(void) { SetTimer(g_hwnd, TIMER_SPARE, 1000, NULL); }
+
+static void make_spare(void) {
+    if (g_spare || !g_ntabs) return;
+    g_spare = tab_create(g_start_dir, 1);
+}
+
 static void new_tab_here(void) {
-    Tab *cur = active_tab(), *tb;
+    Tab *cur = active_tab(), *tb = NULL;
     int i;
     const char *dir = (cur && cur->t.cwd[0]) ? cur->t.cwd : cur ? cur->start_dir : g_start_dir;
     if (g_ntabs >= MAX_TABS) return;
-    tb = tab_create(dir);
+    /* the spare already has wsl.exe + bash + your profile up; it only needs a cd */
+    if (g_spare && !g_spare->exited && g_spare->proc) {
+        char lin[1100];
+        tb = g_spare;
+        g_spare = NULL;
+        win_to_linux_path(dir, lin, sizeof(lin) - 1);
+        snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", lin);
+        set_cwd(&tb->t, lin);
+        strcat(lin, "\n");
+        tab_write(tb, lin, (int)strlen(lin));
+        tab_drain(tb);
+        tb->spare = 0;
+    } else if (g_spare) {
+        tab_destroy_async(g_spare);
+        g_spare = NULL;
+    }
+    if (!tb) tb = tab_create(dir, 0);
     if (!tb) return;
+    schedule_spare();
     /* insert right after the current tab, like a browser */
     for (i = g_ntabs; i > g_active + 1; i--) g_tabs[i] = g_tabs[i - 1];
     g_tabs[g_ntabs ? g_active + 1 : 0] = tb;
@@ -2015,15 +2318,6 @@ static void scroll_view(int lines) {
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
-static void set_scale(int s) {
-    if (s < 1) s = 1;
-    if (s > 6) s = 6;
-    if (s == g_scale) return;
-    g_scale = s;
-    resize_all();
-    InvalidateRect(g_hwnd, NULL, FALSE);
-}
-
 static int auto_scale(void) { return g_dpi >= 144 ? (g_dpi + 48) / 96 : 1; }
 
 /* Returns 1 if the key was consumed (its WM_CHAR is then dropped). */
@@ -2050,9 +2344,6 @@ static int handle_keydown(WPARAM vk) {
     }
     if (ctrl && !shift && !alt && vk == VK_TAB) { activate((g_active + 1) % g_ntabs); return 1; }
     if (ctrl && alt && vk >= '1' && vk <= '9') { activate(vk == '9' ? g_ntabs - 1 : (int)(vk - '1')); return 1; }
-    if (ctrl && !alt && !shift && (vk == VK_OEM_PLUS || vk == VK_ADD)) { g_scale_cfg = g_scale + 1; set_scale(g_scale_cfg); return 1; }
-    if (ctrl && !alt && !shift && (vk == VK_OEM_MINUS || vk == VK_SUBTRACT)) { g_scale_cfg = g_scale > 1 ? g_scale - 1 : 1; set_scale(g_scale_cfg); return 1; }
-    if (ctrl && !alt && !shift && vk == '0') { g_scale_cfg = 0; set_scale(auto_scale()); return 1; }
     if (shift && !ctrl && !alt) {
         switch (vk) {
         case VK_PRIOR: scroll_view(tb->t.rows - 1); return 1;
@@ -2177,6 +2468,71 @@ static int mouse_report(int button, int press, int motion, int mx, int my, WPARA
     return 1;
 }
 
+/* A URL inside one whitespace-delimited word, if `at` (an index into it)
+   lands on the URL itself; trailing sentence punctuation isn't part of it. */
+static int url_in_word(const char *text, int at, char *out, int cap) {
+    static const char *schemes[] = {"https://", "http://", "file://", "ftp://"};
+    int i;
+    for (i = 0; i < 4; i++) {
+        const char *u = strstr(text, schemes[i]);
+        size_t len;
+        if (!u) continue;
+        len = strlen(u);
+        while (len && strchr(".,;:!?)]}", u[len - 1])) len--;
+        if (len <= strlen(schemes[i])) continue;
+        if (at < (int)(u - text) || at >= (int)(u - text) + (int)len) continue;
+        snprintf(out, cap, "%.*s", (int)len, u);
+        return 1;
+    }
+    return 0;
+}
+
+/* The link under a cell: an OSC 8 target if the app gave one, else a URL
+   spelled out in the text around it. */
+static int link_at(int col, int row, char *out, int cap) {
+    Tab *tb = active_tab();
+    const Cell *cells;
+    int n, wrapped, a, b, k = 0, L;
+    char text[4096];
+    if (!tb) return 0;
+    L = tb->t.hcount - tb->t.view + row;
+    term_line(&tb->t, L, &cells, &n, &wrapped);
+    if (!cells || col >= n) return 0;
+    if (cells[col].link && tb->t.links[cells[col].link - 1]) {
+        snprintf(out, cap, "%s", tb->t.links[cells[col].link - 1]);
+        return 1;
+    }
+    /* plain text: widen to the surrounding run of URL-ish ASCII */
+    for (a = col; a > 0 && cells[a - 1].ch > ' ' && cells[a - 1].ch < 127 && !strchr("\"'<>`", (int)cells[a - 1].ch); a--) {}
+    for (b = col; b < n && cells[b].ch > ' ' && cells[b].ch < 127 && !strchr("\"'<>`", (int)cells[b].ch); b++) {}
+    if (b - a < 8 || b - a >= (int)sizeof(text)) return 0;
+    {
+        int start = a;
+        for (; a < b; a++) text[k++] = (char)cells[a].ch;
+        text[k] = 0;
+        return url_in_word(text, col - start, out, cap);
+    }
+}
+
+/* file:///mnt/c/x opens C:\x; anything else goes to the default handler */
+static void open_url(const char *url) {
+    wchar_t w[2048];
+    char buf[2048];
+    const char *p = url;
+    if (!strncmp(p, "file://", 7)) {
+        p = strchr(p + 7, '/');
+        if (p && !strncmp(p, "/mnt/", 5) && p[5] && (p[6] == '/' || !p[6])) {
+            size_t i;
+            snprintf(buf, sizeof(buf), "%c:%s", p[5] & ~32, p[6] ? p + 6 : "\\");
+            for (i = 0; buf[i]; i++) if (buf[i] == '/') buf[i] = '\\';
+            percent_decode(buf);
+            url = buf;
+        }
+    }
+    MultiByteToWideChar(CP_UTF8, 0, url, -1, w, 2048);
+    ShellExecuteW(g_hwnd, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+}
+
 static int is_word_char(uint32_t ch) {
     return ch > ' ' && !strchr("\"'`()[]{}<>|;,", (int)(ch < 128 ? ch : 'a'));
 }
@@ -2241,6 +2597,31 @@ static void gl_init(void) {
     glyph_cache_reset();
 }
 
+/* Loading the OpenGL driver is most of our startup (~80 ms on an AMD iGPU).
+   A throwaway context on a worker thread pulls the driver DLLs in while the
+   main thread creates the window and starts wsl.exe. */
+static DWORD WINAPI gl_warm_thread(LPVOID unused) {
+    HWND w = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    HDC dc = w ? GetDC(w) : NULL;
+    PIXELFORMATDESCRIPTOR pfd;
+    (void)unused;
+    if (dc) {
+        HGLRC rc;
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.nSize = sizeof(pfd);
+        pfd.nVersion = 1;
+        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+        pfd.iPixelType = PFD_TYPE_RGBA;
+        pfd.cColorBits = 32;
+        SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd);
+        rc = wglCreateContext(dc);
+        if (rc) wglDeleteContext(rc);
+        ReleaseDC(w, dc);
+    }
+    if (w) DestroyWindow(w);
+    return 0;
+}
+
 static void save_window_size(void) {
     RECT r;
     if (!IsIconic(g_hwnd) && !IsZoomed(g_hwnd) && GetWindowRect(g_hwnd, &r)) {
@@ -2254,7 +2635,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         g_hwnd = hwnd;
         g_hdc = GetDC(hwnd);
-        gl_init();
+        trace("WM_CREATE");
+        DragAcceptFiles(hwnd, TRUE);
         return 0;
     case WM_CLOSE:
         save_window_size();
@@ -2267,17 +2649,52 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         PostQuitMessage(0);
         return 0;
     case WM_ERASEBKGND:
+        if (!g_glrc) break;      /* before GL: let the class brush paint it dark */
         return 1;
+    case WM_DROPFILES:
+        SetForegroundWindow(hwnd);
+        drop_files((HDROP)wp);
+        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            POINT pt;
+            int col, row;
+            char url[2048];
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            mouse_cell(pt.x, pt.y, &col, &row);
+            if (pt.y < tabbar_h()) SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_ARROW));
+            else if ((GetKeyState(VK_CONTROL) & 0x8000) && link_at(col, row, url, sizeof(url)))
+                SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
+            else SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM));
+            return TRUE;
+        }
+        break;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
-        paint_now();
+        if (g_glrc) paint_now();
+        else {
+            /* GL isn't up yet (the driver takes ~80 ms to load): show the
+               window's colors right away so it appears instantly */
+            RECT r, bar;
+            HBRUSH bg = CreateSolidBrush(RGB(DEF_BG >> 16, (DEF_BG >> 8) & 255, DEF_BG & 255));
+            HBRUSH bb = CreateSolidBrush(RGB(BAR_BG >> 16, (BAR_BG >> 8) & 255, BAR_BG & 255));
+            GetClientRect(hwnd, &r);
+            bar = r;
+            bar.bottom = tabbar_h();
+            FillRect(ps.hdc, &r, bg);
+            FillRect(ps.hdc, &bar, bb);
+            DeleteObject(bg);
+            DeleteObject(bb);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
     case WM_TIMER:
         KillTimer(hwnd, wp);
-        InvalidateRect(hwnd, NULL, FALSE);
+        if (wp == TIMER_SPARE) make_spare();
+        else InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) {
@@ -2297,7 +2714,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DPICHANGED: {
         RECT *nr = (RECT *)lp;
         g_dpi = HIWORD(wp);
-        if (!g_scale_cfg) g_scale = auto_scale();
+        g_scale = auto_scale();
         SetWindowPos(hwnd, NULL, nr->left, nr->top, nr->right - nr->left, nr->bottom - nr->top, SWP_NOZORDER | SWP_NOACTIVATE);
         resize_all();
         return 0;
@@ -2327,6 +2744,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             changed = 1;
         }
         if (changed) {
+            static int first = 1;
+            if (first) { first = 0; trace("first child output"); }
             update_title();
             InvalidateRect(hwnd, NULL, FALSE);
             /* under a flood of output, still show a frame every ~30ms */
@@ -2413,9 +2832,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             scrollbar_set(my);
             return 0;
         }
-        if (mouse_report(0, 1, 0, mx, my, wp)) return 0;
         if (!tb) return 0;
         mouse_cell(mx, my, &col, &row);
+        if (wp & MK_CONTROL) {   /* Ctrl+click opens a link, even inside mouse-aware apps */
+            char url[2048];
+            if (link_at(col, row, url, sizeof(url))) { open_url(url); return 0; }
+        }
+        if (mouse_report(0, 1, 0, mx, my, wp)) return 0;
         if (msg == WM_LBUTTONDBLCLK) {
             select_word(col, row);
             InvalidateRect(hwnd, NULL, FALSE);
@@ -2470,12 +2893,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Tab *tb = active_tab();
         if (!notches) notches = delta > 0 ? 1 : -1;
         ScreenToClient(hwnd, &pt);
-        if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL) {
-            g_scale_cfg = g_scale + (notches > 0 ? 1 : -1);
-            if (g_scale_cfg < 1) g_scale_cfg = 1;
-            set_scale(g_scale_cfg);
-            return 0;
-        }
         if (!tb) return 0;
         if (tb->t.m_mouse && !(GET_KEYSTATE_WPARAM(wp) & MK_SHIFT)) {
             for (i = 0; i < abs(notches); i++)
@@ -2569,6 +2986,8 @@ static void dark_titlebar(HWND h) {
     COLORREF txt = RGB(0xCC, 0xCC, 0xCC);
     if (!f) return;
     f(h, 20, &on, sizeof(on));       /* DWMWA_USE_IMMERSIVE_DARK_MODE */
+    f(h, 3, &on, sizeof(on));        /* DWMWA_TRANSITIONS_FORCEDISABLED: skip the ~170 ms open/close
+                                        animation, so the window is there the moment it exists */
     f(h, 35, &cap, sizeof(cap));     /* DWMWA_CAPTION_COLOR (Windows 11) */
     f(h, 36, &txt, sizeof(txt));     /* DWMWA_TEXT_COLOR */
 }
@@ -2589,7 +3008,7 @@ static int selftest(const char *out_path) {
     char line[4096];
     g_cols = 100;
     g_rows = 30;
-    tb = tab_create(NULL);
+    tb = tab_create(NULL, 0);
     if (!tb) return 2;
     while (GetTickCount() - start < 20000) {
         Sleep(50);
@@ -2613,7 +3032,7 @@ static int selftest(const char *out_path) {
     for (y = 0; y < tb->t.rows; y++) {
         int x, n = 0;
         for (x = 0; x < tb->t.cols; x++) {
-            Cell *c = &tb->t.buf[tb->t.alt][(size_t)y * tb->t.cols + x];
+            Cell *c = &tb->t.row[tb->t.alt][y][x];
             if (c->wflag == W_CONT) continue;
             n += utf8_encode(c->ch ? c->ch : ' ', line + n);
         }
@@ -2624,6 +3043,48 @@ static int selftest(const char *out_path) {
     fclose(f);
     tab_teardown(tb);
     return phase == 2 ? 0 : 1;
+}
+
+/* --unit OUT: table tests for the pure helpers behind drag & drop and links */
+static int unit_tests(const char *out_path) {
+    static const struct { const wchar_t *in, *want; } paths[] = {
+        {L"C:\\Users\\willi\\notes.txt", L"/mnt/c/Users/willi/notes.txt"},
+        {L"D:\\My Stuff\\a b.png", L"'/mnt/d/My Stuff/a b.png'"},
+        {L"C:\\it's\\here", L"'/mnt/c/it'\\''s/here'"},
+        {L"\\\\wsl.localhost\\Debian\\home\\wm\\x.c", L"/home/wm/x.c"},
+        {L"\\\\wsl$\\Ubuntu\\etc\\hosts", L"/etc/hosts"},
+        {L"\\\\server\\share\\f", L"//server/share/f"},
+    };
+    static const struct { const char *word; int at; const char *want; } urls[] = {
+        {"https://example.com/a?b=c", 3, "https://example.com/a?b=c"},
+        {"(see:https://x.io/y).", 10, "https://x.io/y"},
+        {"(see:https://x.io/y).", 1, NULL},
+        {"file:///mnt/c/Users/willi", 0, "file:///mnt/c/Users/willi"},
+        {"http://", 2, NULL},
+        {"nourl.here", 2, NULL},
+    };
+    FILE *f = fopen(out_path, "wb");
+    int i, fails = 0;
+    if (!f) return 3;
+    for (i = 0; i < (int)(sizeof(paths) / sizeof(paths[0])); i++) {
+        wchar_t got[1024];
+        char a[1024], b[1024];
+        dropped_path(paths[i].in, got, 1024);
+        WideCharToMultiByte(CP_UTF8, 0, got, -1, a, sizeof(a), NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, paths[i].want, -1, b, sizeof(b), NULL, NULL);
+        fprintf(f, "%s drop  %s\n", strcmp(a, b) ? "FAIL" : "ok  ", a);
+        fails += strcmp(a, b) != 0;
+    }
+    for (i = 0; i < (int)(sizeof(urls) / sizeof(urls[0])); i++) {
+        char got[256] = "";
+        int hit = url_in_word(urls[i].word, urls[i].at, got, sizeof(got));
+        int ok = urls[i].want ? (hit && !strcmp(got, urls[i].want)) : !hit;
+        fprintf(f, "%s url   %s @%d -> %s\n", ok ? "ok  " : "FAIL", urls[i].word, urls[i].at, hit ? got : "(none)");
+        fails += !ok;
+    }
+    fprintf(f, "%d failed\n", fails);
+    fclose(f);
+    return fails ? 1 : 0;
 }
 
 /* Parser-only replay for conformance corpora: each input file goes through a
@@ -2661,7 +3122,7 @@ static int replay(const char *out_path, int cols, int rows, wchar_t **files, int
         for (y = 0; y < rows; y++) {
             int x, len = 0;
             for (x = 0; x < cols; x++) {
-                Cell *c = &tb->t.buf[tb->t.alt][(size_t)y * cols + x];
+                Cell *c = &tb->t.row[tb->t.alt][y][x];
                 if (c->wflag == W_CONT) continue;
                 len += utf8_encode(c->ch ? c->ch : ' ', line + len);
             }
@@ -2684,8 +3145,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     MSG msg;
     char selftest_out[MAX_PATH] = "";
     HWND h;
+    HANDLE gl_warm = NULL;
     (void)prev; (void)cmdline;
 
+    QueryPerformanceFrequency(&g_qpf);
+    QueryPerformanceCounter(&g_t0);
+    if (_wgetenv(L"WSL_EASY_TRACE")) {
+        wchar_t tp[MAX_PATH];
+        _snwprintf(tp, MAX_PATH, L"%ls\\wsl-easy-trace.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
+        g_trace = _wfopen(tp, L"wb");
+    }
+    trace("wWinMain");
     dpi_awareness();
     palette_init();
     config_load();
@@ -2697,6 +3167,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, g_start_dir, sizeof(g_start_dir), NULL, NULL);
         } else if (!strcmp(a, "--distro") && i + 1 < argc) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, g_distro, sizeof(g_distro), NULL, NULL);
+        } else if (!strcmp(a, "--unit") && i + 1 < argc) {
+            char out[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
+            return unit_tests(out);
         } else if (!strcmp(a, "--inbox-conpty")) {
             g_inbox_conpty = 1;
         } else if (!strcmp(a, "--replay") && i + 3 < argc) {
@@ -2710,22 +3184,27 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             snprintf(g_start_dir, sizeof(g_start_dir), "%s", a);
         }
     }
+    trace("config");
     load_conpty(g_inbox_conpty);
+    trace("conpty loaded");
     default_start_dir();
     write_rc();
+    trace("rc written");
     if (selftest_out[0]) return selftest(selftest_out);
+    gl_warm = CreateThread(NULL, 0, gl_warm_thread, NULL, 0, NULL);
 
     memset(&wc, 0, sizeof(wc));
     wc.style = CS_OWNDC | CS_DBLCLKS;
     wc.lpfnWndProc = wndproc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM);
+    wc.hbrBackground = CreateSolidBrush(RGB(DEF_BG >> 16, (DEF_BG >> 8) & 255, DEF_BG & 255));  /* no white flash */
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
     wc.lpszClassName = L"wsl-easy";
     RegisterClassW(&wc);
 
     g_dpi = window_dpi(NULL);
-    g_scale = g_scale_cfg ? g_scale_cfg : auto_scale();
+    g_scale = auto_scale();
     if (g_win_w < 300 || g_win_h < 160) {
         r.left = r.top = 0;
         r.right = 2 * PAD + SCROLLBAR_W + 120 * CW;
@@ -2734,19 +3213,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         g_win_w = r.right - r.left;
         g_win_h = r.bottom - r.top;
     }
+    trace("class registered");
     h = CreateWindowExW(0, L"wsl-easy", L"wsl-easy", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                         g_win_w, g_win_h, NULL, NULL, inst, NULL);
     if (!h) return 1;
+    trace("window created (incl. GL init)");
     g_dpi = window_dpi(h);
-    if (!g_scale_cfg) g_scale = auto_scale();
+    g_scale = auto_scale();
     dark_titlebar(h);
     GetClientRect(h, &r);
     compute_grid(r.right, r.bottom, &cols, &rows);
     g_cols = cols;
     g_rows = rows;
-    new_tab_here();
     ShowWindow(h, show);
     UpdateWindow(h);
+    trace("window shown");
+    new_tab_here();              /* wsl.exe boots while the GL driver loads */
+    trace("first tab spawned");
+    if (gl_warm) { WaitForSingleObject(gl_warm, 2000); CloseHandle(gl_warm); }
+    trace("GL driver warm");
+    gl_init();
+    trace("GL ready");
+    InvalidateRect(h, NULL, FALSE);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);

@@ -3,3 +3,4 @@ build/
 *.o
 selftest.txt
 bench/*.exe
+!vendor/conpty/*.exe

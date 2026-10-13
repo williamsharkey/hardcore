@@ -11,8 +11,16 @@ your WSL shell. It isn't a jack of all trades.
   is running (for example, Claude Code).
 - An inactive tab that produces output gets an amber dot, so you can see when
   Claude is working in another tab.
-- One static `.exe` (about 2.3 MB) with the full GNU Unifont BMP built in.
-  There's nothing to install and no runtime dependencies.
+- **Fast where you feel it.** New tabs come up already ready: a pre-warmed
+  shell is waiting, so the prompt is there in the first frame (about 6 ms,
+  against 127 ms in Windows Terminal). Keypress to screen is about 8 ms p50
+  (WT: 16 ms). A cold launch puts a usable window up in about 60 ms. Full
+  numbers and the method are in [bench/RESULTS.md](bench/RESULTS.md).
+- **One font, one look, one size.** GNU Unifont at an integer scale picked from
+  the monitor's DPI. There are no themes, no zoom and no settings UI.
+- One static `.exe` (about 3.6 MB) with the full Unifont BMP and Windows
+  Terminal's own ConPTY built in. There's nothing to install and no runtime
+  dependencies.
 
 ## Build
 
@@ -20,7 +28,7 @@ From WSL, with `mingw-w64` and `python3` installed:
 
 ```bash
 make            # → wsl-easy.exe
-make selftest   # headless: ConPTY → wsl.exe → bash → cwd tracking → VT parser
+make test       # unit tests, xterm.js conformance fixtures, headless ConPTY selftest
 make install    # copy to %LOCALAPPDATA%\wsl-easy + Start menu and desktop shortcuts
 ```
 
@@ -37,7 +45,8 @@ make install    # copy to %LOCALAPPDATA%\wsl-easy + Start menu and desktop short
 | Shift+Insert / Ctrl+Insert | Paste / copy |
 | Drag / double-click | Select / select word (hold Shift to select inside mouse-aware apps) |
 | Shift+PgUp / Shift+PgDn, mouse wheel | Scrollback |
-| Ctrl+= / Ctrl+- / Ctrl+0, Ctrl+wheel | Zoom (integer pixel scale) / reset to DPI default |
+| Ctrl+click | Open a link: an OSC 8 hyperlink (dotted underline) or a URL in the text. `file:///mnt/c/…` opens in Explorer |
+| Drop files from Explorer | Types their WSL paths, quoted if needed: `'/mnt/c/My Stuff/a.png'`, `\\wsl.localhost\Debian\home\x` → `/home/x` |
 | Shift+Enter | Sends ESC CR: a newline in Claude Code instead of submitting |
 | Ctrl+Backspace | Delete the previous word (^W) |
 
@@ -56,8 +65,14 @@ a login shell would (`/etc/profile`, then `~/.bash_profile`, `~/.bash_login`
 or `~/.profile`), then adds one function to `PROMPT_COMMAND` that prints
 `ESC ] 9 ; 9 ; $PWD ESC \` at each prompt. That's the same OSC that Windows
 Terminal uses for "duplicate tab", and ConPTY passes it through. wsl-easy
-remembers the path, and **+** hands it to `wsl.exe --cd`. Your dotfiles are
-never edited.
+remembers the path. Your dotfiles are never edited.
+
+A new tab normally doesn't wait for `wsl.exe` at all. Each window keeps one
+spare shell that has already started and loaded your profile. The spare
+then blocks on a silent `read`. **+** writes the folder to it, it `cd`s there,
+and the prompt appears in the same frame as the tab. A fresh spare starts a
+second later. If the spare isn't ready yet, the tab starts with
+`wsl.exe --cd "<folder>"` as above.
 
 If your login shell is zsh or fish, the tab still opens bash.
 
@@ -66,28 +81,46 @@ If your login shell is zsh or fish, the tab still opens bash.
 `%LOCALAPPDATA%\wsl-easy\config.ini` is written when the window closes:
 
 ```ini
-scale=0          # 0 = follow monitor DPI; 1, 2, 3… = fixed pixel scale
 dir=             # folder for new windows; empty = %USERPROFILE%
 distro=          # WSL distro; empty = default
 width=… height=… # last window size
 ```
 
 The command line overrides it: `wsl-easy.exe [--cd DIR] [--distro NAME] [DIR]`.
+`--inbox-conpty` uses Windows' built-in ConPTY instead of the bundled one, for
+comparison.
+
+## Testing
+
+- `tests/run_xtermjs.py` replays xterm.js's escape-sequence fixtures through the
+  parser (`wsl-easy.exe --replay`) and diffs against screens captured from real
+  xterm. All 71 pass.
+- `bench/run-esctest.sh` runs [esctest2](https://github.com/ThomasDickey/esctest2)
+  inside a live window: 273 passing, against 90 for Windows Terminal.
+- `bench/termbench.exe` measures any terminal window from outside: keypress → frame
+  (DXGI desktop duplication, so the times come from present timestamps), new tab →
+  prompt, cold launch, plus screenshot and typing helpers. See
+  [bench/RESULTS.md](bench/RESULTS.md).
 
 ## What carried over from dumbterm, and what changed
 
 | | dumbterm (W7) | wsl-easy (W11) |
 |---|---|---|
-| Child I/O | anonymous pipes + `--require` JS shim faking `isTTY` | ConPTY: a real pty for the WSL shell |
-| VT parser | cursor/erase/SGR | adds scroll regions, IL/DL/ICH/DCH/ECH, alt screen (1049), DEC line drawing, DECSC/DECRC, DSR/DA replies, mouse (1000/1002/1003/1006), bracketed paste, focus events, sync output (2026), OSC 0/2/7/9;9/10/11/52, cursor shapes |
+| Child I/O | anonymous pipes + `--require` JS shim faking `isTTY` | ConPTY: a real pty for the WSL shell, using Windows Terminal's OpenConsole (bundled, MIT) rather than the slow inbox conhost |
+| VT parser | cursor/erase/SGR | adds scroll regions, IL/DL/ICH/DCH/ECH, SL/SR, DECIC/DECDC, tab stops, alt screen (1049), DEC line drawing, DECSC/DECRC, RIS/DECSTR, LNM, DSR/DA/DECRQM/DECRQCRA replies, mouse (1000/1002/1003/1006), bracketed paste, focus events, sync output (2026), OSC 0/2/7/8/9;9/10/11/52, cursor shapes |
 | Glyphs | 609-glyph Unifont subset in a header | the full Unifont BMP (57k glyphs), uploaded to a GL atlas the first time each glyph is drawn |
 | Wide chars | squeezed into one cell | real 2-cell CJK and emoji widths; 16-px symbols in 1-cell slots are still shrunk the dumbterm way |
 | Renderer | immediate-mode GL, amber cursor and scrollbar | same, and it redraws only when something changes (no busy loop) |
-| Scrollback | fixed 5000 × 400-cell ring | 20,000 lines, each trimmed to its used width |
+| Scrollback | fixed 5000 × 400-cell ring | 20,000 lines, each trimmed to its used width. Text rewraps when the window is resized |
 
-Known gaps: emoji outside the BMP render as `�`, because the plane-1 Unifont
-file isn't bundled. There's no reflow on resize, and tabs can't be reordered
-by dragging.
+Known gaps:
+- Emoji outside the BMP render as `�`, because the plane-1 Unifont file isn't bundled.
+- No left/right margins (DECSLRM) or VT420 rectangle operations.
+- No find-in-scrollback.
+- Tabs can't be reordered by dragging.
+- Huge floods of very short lines drain about 1.8× slower than in Windows
+  Terminal. The time is inside ConPTY's hosting, not wsl-easy's parser
+  (see RESULTS.md).
 
 ## Font
 

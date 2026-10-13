@@ -12,6 +12,10 @@
  *   termbench shot    --class C [--title T] OUT.bmp
  *   termbench key     --class C [--title T] ctrl+shift+tab
  *   termbench click   --class C [--title T] X,Y      (client coordinates)
+ *   termbench resize  --class C [--title T] W,H      (outer window size)
+ *   termbench launch  --class C --top PX "COMMAND LINE"
+ *       Starts the command, waits for a new window of class C, then for a
+ *       prompt on its first text row. Leaves the window open.
  *
  * Window is found by class name, optionally by a substring of its title.
  * Every keystroke is preceded by a foreground check; if the target isn't the
@@ -220,16 +224,18 @@ static int color_far(unsigned int a, unsigned int b) {
     return abs(dr) + abs(dg) + abs(db) > 60;
 }
 
-/* columns with ink in the first `band` pixel rows; background = top-right of the band */
-static int ink_columns(const Cap *c, int band) {
+/* columns with ink in pixel rows [y0, y0+band); background = top-right of the region */
+static int ink_columns_at(const Cap *c, int y0, int band) {
     unsigned int bg = c->px[2 * c->w + c->w - 40];
     int x, y, cols = 0;
-    if (band > c->h) band = c->h;
+    if (y0 + band > c->h) band = c->h - y0;
     for (x = 0; x < c->w - 20; x++)
-        for (y = 0; y < band; y++)
+        for (y = y0; y < y0 + band; y++)
             if (color_far(c->px[y * c->w + x], bg)) { cols++; break; }
     return cols;
 }
+
+static int ink_columns(const Cap *c, int band) { return ink_columns_at(c, 0, band); }
 
 static int cmp_d(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
@@ -277,37 +283,116 @@ static int cmd_latency(int n, int top) {
     return 0;
 }
 
+/* The old tab is prepared with its prompt pushed down to about row 12
+   (bench/run-newtab.sh does that), so the two events are unambiguous:
+   shown = the old prompt is gone from rows ~8-15, ready = a prompt has been
+   drawn on row 0 of the new tab. Both can land in the same frame. */
 static int cmd_newtab(int n, int top) {
     Cap c;
     double *shown = (double *)malloc(sizeof(double) * n), *ready = (double *)malloc(sizeof(double) * n);
-    int i, ns = 0, nr = 0, band;
+    int i, ns = 0, nr = 0, band = 40, low = 150, lowband = 120;
     focus();
     cap_init(&c, top);
-    band = 48;
     for (i = 0; i < n; i++) {
         double t0, t, t_shown = -1, t_ready = -1;
-        int phase = 0;
         cap_settle(&c, 400);
-        if (ink_columns(&c, band) < 40) { fprintf(stderr, "no prompt visible before new tab (iteration %d)\n", i); }
+        if (ink_columns(&c, band) > 20 || ink_columns_at(&c, low, lowband) < 40)
+            fprintf(stderr, "iteration %d: old tab doesn't look prepared (prompt should sit near row 12)\n", i);
         send_vk('T', 1, 1);
         t0 = now_ms();
         while ((t = now_ms()) - t0 < 10000) {
-            int ink;
             if (!cap_next(&c, 100)) continue;
             t = c.present_ms;
-            ink = ink_columns(&c, band);
-            if (getenv("TERMBENCH_TRACE")) fprintf(stderr, "  t=%7.1f ink=%d\n", t - t0, ink);
-            if (phase == 0 && ink < 20)   /* blank but for a cursor */ { t_shown = t - t0; phase = 1; }
-            else if (phase == 1 && ink >= 40) { t_ready = t - t0; break; }
+            if (getenv("TERMBENCH_TRACE")) fprintf(stderr, "  t=%7.1f top=%d low=%d\n", t - t0, ink_columns(&c, band), ink_columns_at(&c, low, lowband));
+            if (t_shown < 0 && ink_columns_at(&c, low, lowband) < 20) t_shown = t - t0;
+            if (t_shown >= 0 && ink_columns(&c, band) >= 40) { t_ready = t - t0; break; }
         }
         if (t_shown >= 0) shown[ns++] = t_shown;
         if (t_ready >= 0) ready[nr++] = t_ready;
         Sleep(300);
         send_vk('W', 1, 1);
-        Sleep(600);
+        Sleep(1500);             /* let a pre-warming terminal get its spare back */
     }
     report("tab shown", shown, ns);
     report("prompt ready", ready, nr);
+    return 0;
+}
+
+static HWND g_known[256];
+static int g_nknown;
+
+static BOOL CALLBACK known_cb(HWND h, LPARAM lp) {
+    char cls[256];
+    (void)lp;
+    GetClassNameA(h, cls, sizeof(cls));
+    if (!strcmp(cls, g_class) && g_nknown < 256) g_known[g_nknown++] = h;
+    return TRUE;
+}
+
+static BOOL CALLBACK fresh_cb(HWND h, LPARAM lp) {
+    char cls[256];
+    int i;
+    (void)lp;
+    if (!IsWindowVisible(h)) return TRUE;
+    GetClassNameA(h, cls, sizeof(cls));
+    if (strcmp(cls, g_class)) return TRUE;
+    for (i = 0; i < g_nknown; i++) if (g_known[i] == h) return TRUE;
+    g_target = h;
+    return FALSE;
+}
+
+/* true once the window is actually composited: its terminal background
+   (#0C0C0C in both terminals) shows at three sample points */
+static int window_on_screen(const Cap *c) {
+    const unsigned int pts[3] = {c->px[2 * c->w + c->w - 40], c->px[(c->h - 10) * c->w + 10], c->px[(c->h / 2) * c->w + c->w - 40]};
+    int i;
+    for (i = 0; i < 3; i++) {
+        int r = (pts[i] >> 16) & 255, g = (pts[i] >> 8) & 255, b = pts[i] & 255;
+        if (r > 30 || g > 30 || b > 30) return 0;
+    }
+    return 1;
+}
+
+static int cmd_launch(const char *cmdline, int top) {
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char buf[2048];
+    double t0, t_hwnd, t_visible = -1, t_ready = -1;
+    Cap c;
+    g_target = NULL;
+    EnumWindows(known_cb, 0);
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    snprintf(buf, sizeof(buf), "%s", cmdline);
+    if (!g_dup) dup_init();
+    t0 = now_ms();
+    if (!CreateProcessA(NULL, buf, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) { fprintf(stderr, "launch failed\n"); return 1; }
+    while (!g_target && now_ms() - t0 < 10000) { EnumWindows(fresh_cb, 0); if (!g_target) Sleep(1); }
+    if (!g_target) { fprintf(stderr, "no window appeared\n"); return 1; }
+    t_hwnd = now_ms() - t0;
+    Sleep(20);                   /* let it reach its first size before we fix the capture rect */
+    cap_init(&c, top);
+    while (now_ms() - t0 < 15000) {
+        if (!cap_next(&c, 100)) continue;
+        if (!window_on_screen(&c)) continue;
+        if (t_visible < 0) t_visible = c.present_ms - t0;
+        if (ink_columns(&c, 40) >= 40) {
+            t_ready = c.present_ms - t0;
+            if (getenv("TERMBENCH_SHOT")) {   /* keep the frame we counted, for checking */
+                FILE *f = fopen(getenv("TERMBENCH_SHOT"), "wb");
+                BITMAPFILEHEADER fh;
+                BITMAPINFOHEADER ih;
+                memset(&fh, 0, sizeof(fh));
+                memset(&ih, 0, sizeof(ih));
+                fh.bfType = 0x4D42;
+                fh.bfOffBits = sizeof(fh) + sizeof(ih);
+                ih.biSize = sizeof(ih); ih.biWidth = c.w; ih.biHeight = -c.h; ih.biPlanes = 1; ih.biBitCount = 32;
+                if (f) { fwrite(&fh, sizeof(fh), 1, f); fwrite(&ih, sizeof(ih), 1, f); fwrite(c.px, 4, (size_t)c.w * c.h, f); fclose(f); }
+            }
+            break;
+        }
+    }
+    printf("hwnd %.1f ms, on screen %.1f ms, prompt %.1f ms\n", t_hwnd, t_visible, t_ready);
     return 0;
 }
 
@@ -359,6 +444,7 @@ int main(int argc, char **argv) {
         else arg = argv[i];
     }
     if (!g_class) { fprintf(stderr, "need --class\n"); return 2; }
+    if (!strcmp(cmd, "launch") && arg) return cmd_launch(arg, top < 0 ? 0 : top);
     EnumWindows(find_cb, 0);
     if (!g_target) { fprintf(stderr, "termbench: no window of class %s%s%s\n", g_class, g_title ? " titled *" : "", g_title ? g_title : ""); return 2; }
     if (top < 0) top = 0;
@@ -377,6 +463,12 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(cmd, "shot") && arg) return cmd_shot(arg);
+    if (!strcmp(cmd, "resize") && arg) {
+        int w, h;
+        if (sscanf(arg, "%d,%d", &w, &h) != 2) return 2;
+        SetWindowPos(g_target, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+        return 0;
+    }
     if (!strcmp(cmd, "click") && arg) {
         POINT p;
         if (sscanf(arg, "%ld,%ld", &p.x, &p.y) != 2) return 2;
