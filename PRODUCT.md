@@ -55,11 +55,10 @@ Still assumed, deliberately:
 
 ## What sharing takes
 
-1. **A license.** The repo has none, so nobody can legally use it yet. MIT
-   is simplest. The bundled parts allow it: Unifont is OFL/GPL-with-font-
-   exception, and ConPTY is MIT. *Your call.*
-2. **Make the repo public** (or a public mirror) and publish `hardcore.exe` as
-   a GitHub release. It's one file, about 6 MB, with nothing to install.
+1. **A license.** Done: MIT. The bundled parts allow it: Unifont is
+   OFL/GPL-with-font-exception, and ConPTY is MIT.
+2. **Public repo and releases.** Done: the repo is public and `hardcore.exe`
+   is a GitHub release. It's one file, about 6 MB, with nothing to install.
 3. **SmartScreen.** An unsigned exe gets "Windows protected your PC" on
    download. The fix is code signing (Azure Trusted Signing is about
    $10/month); winget and Scoop help with reputation too.

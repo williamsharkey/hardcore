@@ -1,7 +1,7 @@
 /*
  * hardcore.c — a tabbed terminal for WSL on Windows 11.
  *
- * Grown out of dumbterm (github.com/williamsharkey/dumbterm): same GNU Unifont
+ * Grown out of dumbterm (an earlier, private terminal): same GNU Unifont
  * bitmap glyphs, same immediate-mode drawing, same amber cursor. What is
  * different:
  *
@@ -4184,10 +4184,10 @@ static int selftest(const char *out_path) {
 /* --unit OUT: table tests for the pure helpers behind drag & drop and links */
 static int unit_tests(const char *out_path) {
     static const struct { const wchar_t *in, *want; } paths[] = {
-        {L"C:\\Users\\willi\\notes.txt", L"/mnt/c/Users/willi/notes.txt"},
+        {L"C:\\Users\\you\\notes.txt", L"/mnt/c/Users/you/notes.txt"},
         {L"D:\\My Stuff\\a b.png", L"'/mnt/d/My Stuff/a b.png'"},
         {L"C:\\it's\\here", L"'/mnt/c/it'\\''s/here'"},
-        {L"\\\\wsl.localhost\\Debian\\home\\wm\\x.c", L"/home/wm/x.c"},
+        {L"\\\\wsl.localhost\\Debian\\home\\you\\x.c", L"/home/you/x.c"},
         {L"\\\\wsl$\\Ubuntu\\etc\\hosts", L"/etc/hosts"},
         {L"\\\\server\\share\\f", L"//server/share/f"},
     };
@@ -4195,7 +4195,7 @@ static int unit_tests(const char *out_path) {
         {"https://example.com/a?b=c", 3, "https://example.com/a?b=c"},
         {"(see:https://x.io/y).", 10, "https://x.io/y"},
         {"(see:https://x.io/y).", 1, NULL},
-        {"file:///mnt/c/Users/willi", 0, "file:///mnt/c/Users/willi"},
+        {"file:///mnt/c/Users/you", 0, "file:///mnt/c/Users/you"},
         {"http://", 2, NULL},
         {"nourl.here", 2, NULL},
     };
