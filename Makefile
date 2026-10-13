@@ -28,8 +28,11 @@ build/wsl-easy.ico: tools/gen_icon.py
 build/res.o: wsl-easy.rc build/wsl-easy.ico
 	$(WINDRES) $< -O coff -o $@
 
-wsl-easy.exe: wsl-easy.c build/font.bin build/res.o
-	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -o $@ wsl-easy.c build/res.o $(LIBS)
+CONPTY_VER = 1.25.260930003
+
+wsl-easy.exe: wsl-easy.c build/font.bin build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
+	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
+		-o $@ wsl-easy.c build/res.o $(LIBS)
 
 selftest: wsl-easy.exe
 	./wsl-easy.exe --selftest selftest.txt; rc=$$?; cat selftest.txt; exit $$rc

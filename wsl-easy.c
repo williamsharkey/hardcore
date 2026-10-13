@@ -50,6 +50,25 @@ __asm__(
     ".text\n");
 extern const unsigned char font_blob[], font_blob_end[];
 
+/* Windows Terminal's own ConPTY (vendor/conpty), extracted on first run. */
+__asm__(
+    ".section .rdata,\"dr\"\n"
+    ".balign 16\n"
+    ".global conpty_dll\n"
+    "conpty_dll:\n"
+    ".incbin \"vendor/conpty/conpty.dll\"\n"
+    ".global conpty_dll_end\n"
+    "conpty_dll_end:\n"
+    ".balign 16\n"
+    ".global openconsole_exe\n"
+    "openconsole_exe:\n"
+    ".incbin \"vendor/conpty/OpenConsole.exe\"\n"
+    ".global openconsole_exe_end\n"
+    "openconsole_exe_end:\n"
+    ".byte 0\n"
+    ".text\n");
+extern const unsigned char conpty_dll[], conpty_dll_end[], openconsole_exe[], openconsole_exe_end[];
+
 #define FONT_W 8
 #define FONT_H 16
 
@@ -98,6 +117,8 @@ static char g_start_dir[1024];   /* Windows or Linux path */
 static wchar_t g_cfg_dir[MAX_PATH];
 static char g_rc_linux[1024];    /* rc.bash as seen from inside WSL */
 static int g_win_w = 0, g_win_h = 0;
+static int g_inbox_conpty;       /* --inbox-conpty: use Windows' own conhost */
+static const char *g_conpty_kind = "inbox";
 
 /* ── cells ─────────────────────────────────────────────────────────── */
 
@@ -173,7 +194,7 @@ static const uint16_t DEC_GFX[31] = { /* ESC ( 0, chars 0x60..0x7e */
 
 /* ── terminal state ────────────────────────────────────────────────── */
 
-enum { S_GROUND, S_ESC, S_ESC_CHARSET, S_ESC_SKIP, S_CSI, S_OSC, S_OSC_ESC, S_STR, S_STR_ESC };
+enum { S_GROUND, S_ESC, S_ESC_INTER, S_CSI, S_OSC, S_OSC_ESC, S_STR, S_STR_ESC };
 
 typedef struct {
     int cx, cy, wrapnext, g0dec, origin;
@@ -190,7 +211,8 @@ typedef struct {
     SavedCursor saved[2];
     int top, bot;
     int g0dec;
-    uint32_t last_ch;
+    uint32_t last_ch;            /* for REP; only valid right after a printed char */
+    uint8_t *tabs;               /* per-column tab stop flags */
     /* modes */
     int m_autowrap, m_origin, m_insert, m_cursor_vis, m_appcursor, m_bracketed;
     int m_mouse, m_mouse_sgr, m_focus, m_sync;
@@ -352,7 +374,9 @@ static int term_init(Term *t, int cols, int rows) {
         t->buf[s] = (Cell *)malloc(sizeof(Cell) * (size_t)cols * rows);
         t->wrapf[s] = (uint8_t *)calloc((size_t)rows, 1);
     }
-    if (!t->hist || !t->buf[0] || !t->buf[1]) return 0;
+    t->tabs = (uint8_t *)malloc((size_t)cols);
+    if (!t->hist || !t->buf[0] || !t->buf[1] || !t->tabs) return 0;
+    for (s = 0; s < cols; s++) t->tabs[s] = (s % 8 == 0);
     term_reset(t);
     for (s = 1; s >= 0; s--) {
         t->alt = s;
@@ -368,6 +392,7 @@ static void term_free(Term *t) {
     free(t->buf[1]);
     free(t->wrapf[0]);
     free(t->wrapf[1]);
+    free(t->tabs);
 }
 
 static void term_resize(Term *t, int cols, int rows) {
@@ -401,6 +426,12 @@ static void term_resize(Term *t, int cols, int rows) {
         t->wrapf[s] = nw;
         if (s == t->alt) t->cy = cy - shift;
         else t->saved[s].cy = cy - shift;
+    }
+    {
+        uint8_t *nt = (uint8_t *)malloc((size_t)cols);
+        for (x = 0; x < cols; x++) nt[x] = x < t->cols ? t->tabs[x] : (x % 8 == 0);
+        free(t->tabs);
+        t->tabs = nt;
     }
     t->cols = cols;
     t->rows = rows;
@@ -492,7 +523,7 @@ static void restore_cursor(Term *t) {
     SavedCursor *s = &t->saved[t->alt];
     t->cx = s->cx < t->cols ? s->cx : t->cols - 1;
     t->cy = s->cy < t->rows ? s->cy : t->rows - 1;
-    t->wrapnext = s->wrapnext;
+    t->wrapnext = 0;             /* xterm: DECRC never restores a pending wrap */
     t->g0dec = s->g0dec;
     t->m_origin = s->origin;
     t->pen = s->pen;
@@ -510,18 +541,57 @@ static void set_alt(Term *t, int on, int clear) {
     t->view = 0;
 }
 
+static void tab_forward(Term *t, int n) {
+    while (n-- > 0) {
+        do t->cx++; while (t->cx < t->cols - 1 && !t->tabs[t->cx]);
+        if (t->cx >= t->cols - 1) { t->cx = t->cols - 1; break; }
+    }
+}
+
+static void tab_back(Term *t, int n) {
+    while (n-- > 0 && t->cx > 0)
+        do t->cx--; while (t->cx > 0 && !t->tabs[t->cx]);
+}
+
+/* SL/SR, DECIC/DECDC: shift columns [x0, cols) of the scroll region by n
+   (positive = right, inserting blanks at x0) */
+static void shift_columns(Term *t, int x0, int n) {
+    int y, x;
+    Cell b = blank_cell(t);
+    for (y = t->top; y <= t->bot; y++) {
+        Cell *row = CELL(t, 0, y);
+        if (n > 0) {
+            for (x = t->cols - 1; x >= x0; x--) row[x] = (x - n >= x0) ? row[x - n] : b;
+        } else {
+            for (x = x0; x < t->cols; x++) row[x] = (x - n < t->cols) ? row[x - n] : b;
+        }
+    }
+}
+
+static void decaln(Term *t) {
+    int y, x;
+    for (y = 0; y < t->rows; y++)
+        for (x = 0; x < t->cols; x++) {
+            Cell *c = CELL(t, x, y);
+            memset(c, 0, sizeof(*c));
+            c->ch = 'E';
+        }
+    t->top = 0;
+    t->bot = t->rows - 1;
+    t->cx = t->cy = 0;
+}
+
 static void control(Term *t, int b) {
+    if (b != 0x1B) t->last_ch = 0;
     switch (b) {
     case 0x07: t->bell = 1; break;
     case 0x08:
-        if (t->wrapnext) t->wrapnext = 0;
-        else if (t->cx > 0) t->cx--;
+        t->wrapnext = 0;
+        if (t->cx > 0) t->cx--;
         break;
-    case 0x09: {
-        int nx = (t->cx + 8) & ~7;
-        t->cx = nx < t->cols ? nx : t->cols - 1;
+    case 0x09:
+        tab_forward(t, 1);
         break;
-    }
     case 0x0A: case 0x0B: case 0x0C:
         term_lf(t);
         t->wrapnext = 0;
@@ -641,9 +711,19 @@ static void csi_dispatch(Term *t, int f) {
         term_reset(t);
         return;
     }
+    if (t->inter == ' ' && (f == '@' || f == 'A')) {     /* SL / SR, only inside the region */
+        if (t->cy >= t->top && t->cy <= t->bot) shift_columns(t, 0, f == 'A' ? P(t, 0, 1) : -P(t, 0, 1));
+        return;
+    }
+    if (t->inter == '\'' && (f == '}' || f == '~')) {   /* DECIC / DECDC */
+        if (t->cy >= t->top && t->cy <= t->bot) shift_columns(t, t->cx, f == '}' ? P(t, 0, 1) : -P(t, 0, 1));
+        return;
+    }
     if (t->inter) return;
 
-    if (f != 'b') t->wrapnext = 0;
+    /* xterm keeps a pending wrap across scrolls, SGR and mode changes */
+    if (!strchr("STbmhlnctqpgI", f)) t->wrapnext = 0;
+    if (f != 'b') t->last_ch = 0;
     switch (f) {
     case '@': insert_blanks(t, P(t, 0, 1)); break;
     case 'A': {               /* stops at the top margin if starting inside it */
@@ -652,7 +732,8 @@ static void csi_dispatch(Term *t, int f) {
         if (t->cy < lim) t->cy = lim;
         break;
     }
-    case 'B': case 'e': {
+    case 'e': t->cy += P(t, 0, 1); if (t->cy >= t->rows) t->cy = t->rows - 1; break;
+    case 'B': {
         int lim = t->cy <= t->bot ? t->bot : t->rows - 1;
         t->cy += P(t, 0, 1);
         if (t->cy > lim) t->cy = lim;
@@ -660,8 +741,20 @@ static void csi_dispatch(Term *t, int f) {
     }
     case 'C': case 'a': t->cx += P(t, 0, 1); if (t->cx >= t->cols) t->cx = t->cols - 1; break;
     case 'D': t->cx -= P(t, 0, 1); if (t->cx < 0) t->cx = 0; break;
-    case 'E': t->cy += P(t, 0, 1); if (t->cy >= t->rows) t->cy = t->rows - 1; t->cx = 0; break;
-    case 'F': t->cy -= P(t, 0, 1); if (t->cy < 0) t->cy = 0; t->cx = 0; break;
+    case 'E': {               /* CNL/CPL stop at the margins like CUD/CUU */
+        int lim = t->cy <= t->bot ? t->bot : t->rows - 1;
+        t->cy += P(t, 0, 1);
+        if (t->cy > lim) t->cy = lim;
+        t->cx = 0;
+        break;
+    }
+    case 'F': {
+        int lim = t->cy >= t->top ? t->top : 0;
+        t->cy -= P(t, 0, 1);
+        if (t->cy < lim) t->cy = lim;
+        t->cx = 0;
+        break;
+    }
     case 'G': case '`': t->cx = P(t, 0, 1) - 1; if (t->cx >= t->cols) t->cx = t->cols - 1; break;
     case 'H': case 'f': {
         int off = t->m_origin ? t->top : 0;
@@ -678,8 +771,12 @@ static void csi_dispatch(Term *t, int f) {
         if (t->cy >= t->rows) t->cy = t->rows - 1;
         break;
     }
-    case 'I': for (n = P(t, 0, 1); n > 0; n--) { t->cx = (t->cx + 8) & ~7; if (t->cx >= t->cols) { t->cx = t->cols - 1; break; } } break;
-    case 'Z': for (n = P(t, 0, 1); n > 0 && t->cx > 0; n--) t->cx = (t->cx - 1) & ~7; break;
+    case 'I': tab_forward(t, P(t, 0, 1)); break;
+    case 'Z': tab_back(t, P(t, 0, 1)); break;
+    case 'g':
+        if (P(t, 0, 0) == 0) t->tabs[t->cx] = 0;
+        else if (P(t, 0, 0) == 3) memset(t->tabs, 0, (size_t)t->cols);
+        break;
     case 'J':
         switch (P(t, 0, 0)) {
         case 0: clear_span(t, t->cy, t->cx, t->cols); clear_rows(t, t->cy + 1, t->rows); break;
@@ -722,13 +819,9 @@ static void csi_dispatch(Term *t, int f) {
     case 'r': {
         int top = P(t, 0, 1) - 1, bot = P(t, 1, t->rows) - 1;
         if (bot >= t->rows) bot = t->rows - 1;
-        if (top < bot) {
-            t->top = top;
-            t->bot = bot;
-        } else {
-            t->top = 0;
-            t->bot = t->rows - 1;
-        }
+        if (top >= bot) break;   /* xterm ignores an empty/inverted region outright */
+        t->top = top;
+        t->bot = bot;
         t->cx = 0;
         t->cy = t->m_origin ? t->top : 0;
         break;
@@ -860,7 +953,14 @@ static void osc_dispatch(Term *t) {
 
 static void esc_dispatch(Term *t, int b) {
     t->st = S_GROUND;
+    if (b != '[') t->last_ch = 0;   /* a CSI decides for itself (REP needs it) */
+    if (b >= 0x20 && b <= 0x2F) {   /* intermediate: ESC ( 0, ESC # 8, ESC SP F ... */
+        t->st = S_ESC_INTER;
+        t->esc_which = b;
+        return;
+    }
     switch (b) {
+    case 'H': t->tabs[t->cx] = 1; break;
     case '[':
         t->st = S_CSI;
         t->np = 0;
@@ -869,8 +969,6 @@ static void esc_dispatch(Term *t, int b) {
         break;
     case ']': t->st = S_OSC; t->osc_n = 0; break;
     case 'P': case 'X': case '^': case '_': t->st = S_STR; break;
-    case '(': case ')': case '*': case '+': t->st = S_ESC_CHARSET; t->esc_which = b; break;
-    case '#': case ' ': case '%': t->st = S_ESC_SKIP; break;
     case '7': save_cursor(t); break;
     case '8': restore_cursor(t); break;
     case 'D': term_lf(t); t->wrapnext = 0; break;
@@ -908,11 +1006,11 @@ static void vt_byte(Term *t, unsigned char b) {
         if (b < 0x20) { control(t, b); return; }
         esc_dispatch(t, b);
         return;
-    case S_ESC_CHARSET:
+    case S_ESC_INTER:
+        if (b < 0x20) { control(t, b); return; }
+        if (b <= 0x2F) return;   /* more intermediates; the first one decides */
         if (t->esc_which == '(') t->g0dec = (b == '0');
-        t->st = S_GROUND;
-        return;
-    case S_ESC_SKIP:
+        else if (t->esc_which == '#' && b == '8') decaln(t);
         t->st = S_GROUND;
         return;
     case S_CSI:
@@ -1101,7 +1199,8 @@ static int tab_spawn(Tab *tb) {
     if (!CreatePipe(&in_r, &in_w, NULL, 0) || !CreatePipe(&out_r, &out_w, NULL, 0)) return 0;
     sz.X = (SHORT)tb->t.cols;
     sz.Y = (SHORT)tb->t.rows;
-    hr = pCreatePC(sz, in_r, out_w, 0, &tb->hpc);
+    /* OpenConsole can measure glyphs with wcswidth, which is what our grid uses */
+    hr = pCreatePC(sz, in_r, out_w, g_conpty_kind[0] == 'O' ? 0x10 /* GLYPH_WIDTH_WCSWIDTH */ : 0, &tb->hpc);
     CloseHandle(in_r);
     CloseHandle(out_w);
     if (FAILED(hr)) {
@@ -2338,8 +2437,46 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 /* ── startup ───────────────────────────────────────────────────────── */
 
-static void load_conpty(void) {
+
+/* Writes an embedded file unless an identical-size copy is already there.
+   Goes through a temp name so a second instance never sees half a file. */
+static int extract(const wchar_t *path, const unsigned char *data, size_t n) {
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    wchar_t tmp[MAX_PATH];
+    HANDLE h;
+    DWORD w;
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fa) && fa.nFileSizeHigh == 0 && fa.nFileSizeLow == n) return 1;
+    _snwprintf(tmp, MAX_PATH, L"%ls.%lu.tmp", path, GetCurrentProcessId());
+    tmp[MAX_PATH - 1] = 0;
+    h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!WriteFile(h, data, (DWORD)n, &w, NULL) || w != n) { CloseHandle(h); DeleteFileW(tmp); return 0; }
+    CloseHandle(h);
+    if (!MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(tmp); return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES; }
+    return 1;
+}
+
+static void load_conpty(int inbox_only) {
     HMODULE k = GetModuleHandleW(L"kernel32.dll");
+    if (!inbox_only) {
+        wchar_t dir[MAX_PATH], dll[MAX_PATH], oc[MAX_PATH];
+        HMODULE m;
+        _snwprintf(dir, MAX_PATH, L"%ls\\conpty-" CONPTY_VER, g_cfg_dir);
+        _snwprintf(dll, MAX_PATH, L"%ls\\conpty.dll", dir);
+        _snwprintf(oc, MAX_PATH, L"%ls\\OpenConsole.exe", dir);
+        CreateDirectoryW(dir, NULL);
+        if (extract(oc, openconsole_exe, (size_t)(openconsole_exe_end - openconsole_exe)) &&
+            extract(dll, conpty_dll, (size_t)(conpty_dll_end - conpty_dll)) &&
+            (m = LoadLibraryW(dll)) != NULL) {
+            pCreatePC = (PFN_CreatePC)(void *)GetProcAddress(m, "ConptyCreatePseudoConsole");
+            pResizePC = (PFN_ResizePC)(void *)GetProcAddress(m, "ConptyResizePseudoConsole");
+            pClosePC = (PFN_ClosePC)(void *)GetProcAddress(m, "ConptyClosePseudoConsole");
+            if (pCreatePC && pResizePC && pClosePC) {
+                g_conpty_kind = "OpenConsole " CONPTY_VER_A;
+                return;
+            }
+        }
+    }
     pCreatePC = (PFN_CreatePC)(void *)GetProcAddress(k, "CreatePseudoConsole");
     pResizePC = (PFN_ResizePC)(void *)GetProcAddress(k, "ResizePseudoConsole");
     pClosePC = (PFN_ClosePC)(void *)GetProcAddress(k, "ClosePseudoConsole");
@@ -2411,6 +2548,7 @@ static int selftest(const char *out_path) {
     }
     f = fopen(out_path, "wb");
     if (!f) return 3;
+    fprintf(f, "conpty=%s\n", g_conpty_kind);
     fprintf(f, "phase=%d cwd=%s cols=%d rows=%d hist=%d\n", phase, tb->t.cwd, tb->t.cols, tb->t.rows, tb->t.hcount);
     WideCharToMultiByte(CP_UTF8, 0, tb->t.title, -1, line, sizeof(line), NULL, NULL);
     fprintf(f, "title=%s\n----\n", line);
@@ -2430,6 +2568,56 @@ static int selftest(const char *out_path) {
     return phase == 2 ? 0 : 1;
 }
 
+/* Parser-only replay for conformance corpora: each input file goes through a
+   fresh terminal the way a pty would deliver it (ONLCR: \n → \r\n), then the
+   screen is written out, one right-trimmed line per row. */
+static int replay(const char *out_path, int cols, int rows, wchar_t **files, int nfiles) {
+    FILE *out = fopen(out_path, "wb");
+    int i;
+    if (!out) return 3;
+    for (i = 0; i < nfiles; i++) {
+        Tab *tb = (Tab *)calloc(1, sizeof(Tab));
+        FILE *f = _wfopen(files[i], L"rb");
+        char name[MAX_PATH * 3], line[8192];
+        unsigned char buf[65536];
+        size_t n, k;
+        int y;
+        WideCharToMultiByte(CP_UTF8, 0, files[i], -1, name, sizeof(name), NULL, NULL);
+        fprintf(out, "=== %s\n", name);
+        if (!f || !tb || !term_init(&tb->t, cols, rows)) {
+            fprintf(out, "(cannot open)\n");
+            continue;
+        }
+        vt_feed(&tb->t, (const unsigned char *)"\r\n\x1b" "c\x1b[H", 7);
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            size_t s = 0;
+            for (k = 0; k < n; k++)
+                if (buf[k] == '\n') {
+                    vt_feed(&tb->t, buf + s, (int)(k - s));
+                    vt_feed(&tb->t, (const unsigned char *)"\r\n", 2);
+                    s = k + 1;
+                }
+            vt_feed(&tb->t, buf + s, (int)(n - s));
+        }
+        fclose(f);
+        for (y = 0; y < rows; y++) {
+            int x, len = 0;
+            for (x = 0; x < cols; x++) {
+                Cell *c = &tb->t.buf[tb->t.alt][(size_t)y * cols + x];
+                if (c->wflag == W_CONT) continue;
+                len += utf8_encode(c->ch ? c->ch : ' ', line + len);
+            }
+            while (len && (line[len - 1] == ' ' || line[len - 1] == '\t')) len--;
+            line[len] = 0;
+            fprintf(out, "%s\n", line);
+        }
+        term_free(&tb->t);
+        free(tb);
+    }
+    fclose(out);
+    return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     int argc, i, cols, rows;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -2442,7 +2630,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     dpi_awareness();
     palette_init();
-    load_conpty();
     config_load();
     snprintf(g_cfg_dir_line, sizeof(g_cfg_dir_line), "%s", g_start_dir);
     for (i = 1; i < argc; i++) {
@@ -2452,12 +2639,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, g_start_dir, sizeof(g_start_dir), NULL, NULL);
         } else if (!strcmp(a, "--distro") && i + 1 < argc) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, g_distro, sizeof(g_distro), NULL, NULL);
+        } else if (!strcmp(a, "--inbox-conpty")) {
+            g_inbox_conpty = 1;
+        } else if (!strcmp(a, "--replay") && i + 3 < argc) {
+            /* --replay OUT COLS ROWS FILE... */
+            char out[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
+            return replay(out, _wtoi(argv[i + 2]), _wtoi(argv[i + 3]), argv + i + 4, argc - i - 4);
         } else if (!strcmp(a, "--selftest") && i + 1 < argc) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, selftest_out, sizeof(selftest_out), NULL, NULL);
         } else if (a[0] != '-') {
             snprintf(g_start_dir, sizeof(g_start_dir), "%s", a);
         }
     }
+    load_conpty(g_inbox_conpty);
     default_start_dir();
     write_rc();
     if (selftest_out[0]) return selftest(selftest_out);
