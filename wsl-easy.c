@@ -214,6 +214,7 @@ typedef struct {
     uint32_t last_ch;            /* for REP; only valid right after a printed char */
     uint8_t *tabs;               /* per-column tab stop flags */
     /* modes */
+    int m_newline;
     int m_autowrap, m_origin, m_insert, m_cursor_vis, m_appcursor, m_bracketed;
     int m_mouse, m_mouse_sgr, m_focus, m_sync;
     DWORD sync_since;
@@ -357,7 +358,7 @@ static void term_reset(Term *t) {
     t->bot = t->rows - 1;
     t->m_autowrap = 1;
     t->m_cursor_vis = 1;
-    t->m_origin = t->m_insert = t->m_appcursor = t->m_bracketed = 0;
+    t->m_origin = t->m_insert = t->m_appcursor = t->m_bracketed = t->m_newline = 0;
     t->m_mouse = t->m_mouse_sgr = t->m_focus = t->m_sync = 0;
     t->g0dec = 0;
     t->cursor_shape = 0;
@@ -593,6 +594,7 @@ static void control(Term *t, int b) {
         tab_forward(t, 1);
         break;
     case 0x0A: case 0x0B: case 0x0C:
+        if (t->m_newline) t->cx = 0;  /* LNM */
         term_lf(t);
         t->wrapnext = 0;
         break;
@@ -685,11 +687,37 @@ static void decset(Term *t, int p, int on) {
     }
 }
 
+static int decrqm(const Term *t, int p) {
+    int on;
+    switch (p) {
+    case 1: on = t->m_appcursor; break;
+    case 6: on = t->m_origin; break;
+    case 7: on = t->m_autowrap; break;
+    case 25: on = t->m_cursor_vis; break;
+    case 47: case 1047: case 1049: on = t->alt; break;
+    case 9: case 1000: case 1002: case 1003: on = t->m_mouse == p; break;
+    case 1004: on = t->m_focus; break;
+    case 1006: on = t->m_mouse_sgr; break;
+    case 2004: on = t->m_bracketed; break;
+    case 2026: on = t->m_sync; break;
+    /* known DEC modes we keep permanently off: 132 cols, smooth scroll,
+       reverse video, autorepeat, blink, NRCS, keypad, backarrow, LR margins... */
+    case 3: case 4: case 5: case 8: case 12: case 18: case 19: case 42: case 45:
+    case 60: case 61: case 64: case 66: case 67: case 69: case 95:
+        on = 0; break;
+    default: return 0;           /* not recognized */
+    }
+    return on ? 1 : 2;
+}
+
 static void csi_dispatch(Term *t, int f) {
     int n, i;
     char buf[64];
     if (t->priv == '?') {
-        if (f == 'h' || f == 'l')
+        if (t->inter == '$' && f == 'p') {          /* DECRQM: is private mode n set? */
+            snprintf(buf, sizeof(buf), "\x1b[?%d;%d$y", P(t, 0, 0), decrqm(t, P(t, 0, 0)));
+            term_reply(t, buf);
+        } else if (f == 'h' || f == 'l')
             for (i = 0; i < t->np; i++) decset(t, t->params[i], f == 'h');
         else if (f == 'J' || f == 'K') {
             t->priv = 0;
@@ -707,8 +735,31 @@ static void csi_dispatch(Term *t, int f) {
         t->cursor_shape = n <= 2 ? 0 : n <= 4 ? 1 : 2;
         return;
     }
-    if (t->inter == '!' && f == 'p') {
+    if (t->inter == '!' && f == 'p') {               /* DECSTR soft reset */
         term_reset(t);
+        memset(&t->saved[t->alt], 0, sizeof(t->saved[0]));
+        return;
+    }
+    if (t->inter == '*' && f == 'y') {               /* DECRQCRA: checksum of a rectangle */
+        int top = P(t, 2, 1) - 1, left = P(t, 3, 1) - 1, bot = P(t, 4, t->rows) - 1, right = P(t, 5, t->cols) - 1, y, x;
+        unsigned sum = 0;
+        if (t->m_origin) { top += t->top; bot += t->top; }
+        if (bot >= t->rows) bot = t->rows - 1;
+        if (right >= t->cols) right = t->cols - 1;
+        for (y = top; y <= bot; y++)
+            for (x = left; x <= right; x++) {
+                const Cell *c = CELL(t, x, y);
+                sum += c->wflag == W_CONT ? 0 : c->ch;
+            }
+        snprintf(buf, sizeof(buf), "\x1bP%d!~%04X\x1b\\", P(t, 0, 0), (0x10000 - (sum & 0xFFFF)) & 0xFFFF);
+        term_reply(t, buf);
+        return;
+    }
+    if (t->inter == '$' && f == 'p') {               /* ANSI DECRQM: only IRM is tracked */
+        int m = P(t, 0, 0);
+        snprintf(buf, sizeof(buf), "\x1b[%d;%d$y", m, m == 4 ? (t->m_insert ? 1 : 2) : m == 20 ? (t->m_newline ? 1 : 2)
+                 : (m >= 1 && m <= 19) ? 2 : 0);     /* the other ISO 6429 modes exist but are fixed off */
+        term_reply(t, buf);
         return;
     }
     if (t->inter == ' ' && (f == '@' || f == 'A')) {     /* SL / SR, only inside the region */
@@ -831,6 +882,7 @@ static void csi_dispatch(Term *t, int f) {
     case 'h': case 'l':
         for (i = 0; i < t->np; i++)
             if (t->params[i] == 4) t->m_insert = (f == 'h');
+            else if (t->params[i] == 20) t->m_newline = (f == 'h');
         break;
     case 't':
         if (P(t, 0, 0) == 18) {
@@ -974,12 +1026,18 @@ static void esc_dispatch(Term *t, int b) {
     case 'D': term_lf(t); t->wrapnext = 0; break;
     case 'E': term_lf(t); t->cx = 0; t->wrapnext = 0; break;
     case 'M': term_ri(t); t->wrapnext = 0; break;
-    case 'c':
-        term_reset(t);
+    case 'c': {                  /* RIS: everything back to power-on */
+        int x;
         set_alt(t, 0, 0);
+        term_reset(t);
         clear_rows(t, 0, t->rows);
         t->cx = t->cy = 0;
+        memset(t->saved, 0, sizeof(t->saved));
+        for (x = 0; x < t->cols; x++) t->tabs[x] = (x % 8 == 0);
+        t->title[0] = 0;
         break;
+    }
+    case 'Z': term_reply(t, "\x1b[?62;22c"); break;   /* DECID = DA */
     }
 }
 
