@@ -3423,7 +3423,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
     row = my < PAD ? -1 : (my - PAD) / CH;
     for (i = 0; i <= g_ntabs; i++) {
         if (my < g_row_y[i] || my >= g_row_y[i + 1]) continue;
-        if (i == g_ntabs) hit = col <= 2 ? HIT_SETTINGS : col >= SB_COLS - 3 ? HIT_PLUS : HIT_BAR;
+        if (i == g_ntabs) hit = col <= 9 ? HIT_SETTINGS : col >= SB_COLS - 3 ? HIT_PLUS : HIT_BAR;   /* the word "settings", the + */
         else {
             *idx = i;
             hit = col >= SB_COLS - 3 ? HIT_CLOSE : HIT_TAB;
@@ -3439,6 +3439,12 @@ static int hit_tabbar(int mx, int my, int *idx) {
             }
     UI_DONE;
     return hit;
+}
+
+/* things in the tab column a click does something to get the pointing hand, as on a web page */
+static int tabbar_action(int mx, int my) {
+    int idx = -1, hit = hit_tabbar(mx, my, &idx);
+    return hit == HIT_SETTINGS || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_FONT || hit == HIT_SCHEME;
 }
 
 /* The terminal tries on the font or scheme under the mouse; anything else
@@ -3699,11 +3705,14 @@ static void render_tabbar(int win_w, int win_h) {
     {   /* settings on the left, + on the right */
         float y0 = (float)g_row_y[g_ntabs], y1 = y0 + CH;
         int hs = hover == HIT_SETTINGS, hp = hover == HIT_PLUS;
-        if (hs) fill_rect(0, y0, 3.0f * CW, y1, TAB_HOVER, 1);
+        /* the s grows into the word when you point at it, and stays while the settings are open */
+        if (hs) fill_rect(0, y0, 10.0f * CW, y1, TAB_HOVER, 1);
         if (hp) fill_rect((float)((SB_COLS - 3) * CW), y0, (float)sw, y1, TAB_HOVER, 1);
-        r_color(hs || g_settings_open ? g_look.text : g_look.dim, 1);
-        draw_glyph('s', lx, y0, 1, g_scale);
-        if (hs) layout_text(L"settings", lx + 2 * CW, y0, 9.0f * CW, 1, g_look.text_lo, 1);
+        if (hs || g_settings_open) layout_text(L"settings", lx, y0, 9.0f * CW, 1, hs ? g_look.text : g_look.text_lo, 1);
+        else {
+            r_color(g_look.dim, 1);
+            draw_glyph('s', lx, y0, 1, g_scale);
+        }
         draw_plus((float)((SB_COLS - 2) * CW) + CW / 2.0f, y0 + CH / 2.0f, hp ? g_look.text : g_look.text_lo);
     }
     if (g_settings_open) render_settings(hover, idx);
@@ -5073,7 +5082,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetCursorPos(&pt);
             ScreenToClient(hwnd, &pt);
             mouse_cell(pt.x, pt.y, &col, &row);
-            if (pt.x < sidebar_w()) SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_ARROW));
+            if (pt.x < sidebar_w()) SetCursor(LoadCursorW(NULL, (LPCWSTR)(tabbar_action(pt.x, pt.y) ? IDC_HAND : IDC_ARROW)));
             else if ((GetKeyState(VK_CONTROL) & 0x8000) && link_at(col, row, url, sizeof(url)))
                 SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
             else SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM));

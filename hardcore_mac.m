@@ -1551,6 +1551,10 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     g_mouse_y = my;
     if (was_bar || on_bar) plat_invalidate();
     if (was_bar || on_bar) settings_point();
+    if (on_bar) {                /* a hand on what clicks, an open hand where the window drags, as on a web page */
+        int idx = -1, hit = hit_tabbar(mx, my, &idx);
+        [(tabbar_action(mx, my) ? [NSCursor pointingHandCursor] : hit == HIT_BAR ? [NSCursor openHandCursor] : [NSCursor arrowCursor]) set];
+    }
     if (!on_bar && tb && tb->t.m_mouse == 1003) mouse_report(3, 1, 1, mx, my, ev_mods(e));
     if (!on_bar) [self flagsChanged:e];
 }
