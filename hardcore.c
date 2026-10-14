@@ -1,5 +1,10 @@
 /*
- * hardcore.c — a tabbed terminal for WSL on Windows 11.
+ * hardcore.c — a tabbed terminal for WSL on Windows 11, and for macOS.
+ *
+ * Win32 (ConPTY, Direct3D 11) lives in this file; the macOS layer (Cocoa,
+ * forkpty, OpenGL) is hardcore_mac.m, included at the end. The parser,
+ * scrollback, tab column and drawing are shared, and call down through the
+ * plat_* functions and the r_* backend.
  *
  * Grown out of dumbterm (an earlier, private terminal): same GNU Unifont
  * bitmap glyphs, same immediate-mode drawing, same amber cursor. What is
@@ -16,12 +21,15 @@
  *
  * Build (from WSL or MSYS2):
  *   make            → hardcore.exe
+ * Build (macOS):
+ *   make            → hardcore.app
  *
  * Usage:
  *   hardcore.exe [--cd DIR] [--distro NAME] [DIR]
  *   hardcore.exe --selftest OUT.txt     # headless ConPTY + parser check
  */
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
@@ -33,6 +41,23 @@
 #include <d3d11.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
+#else
+/* macOS: the same core, with Cocoa + forkpty + OpenGL underneath (hardcore_mac.m,
+   included at the end). The few Win32 names the core uses are mapped here. */
+#include <stdint.h>
+#include <ctype.h>
+#include <errno.h>
+#include <time.h>
+#include <unistd.h>
+#include <wctype.h>
+#include <strings.h>
+typedef uint32_t DWORD;
+#define MAX_PATH 1024
+#define _strdup strdup
+#define _stricmp strcasecmp
+#define _snwprintf swprintf      /* same argument order; wchar_t is UTF-32 here */
+static DWORD GetTickCount(void) { return (DWORD)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000); }
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,18 +66,27 @@
 
 /* ── embedded font (tools/gen_font.py output) ──────────────────────── */
 
+#ifdef __APPLE__
+#define BLOB_SECTION ".const_data\n"
+#define BLOB_SYM(name) "_" #name
+#else
+#define BLOB_SECTION ".section .rdata,\"dr\"\n"
+#define BLOB_SYM(name) #name
+#endif
+
 __asm__(
-    ".section .rdata,\"dr\"\n"
+    BLOB_SECTION
     ".balign 16\n"
-    ".global font_blob\n"
-    "font_blob:\n"
+    ".global " BLOB_SYM(font_blob) "\n"
+    BLOB_SYM(font_blob) ":\n"
     ".incbin \"" FONT_BIN "\"\n"
-    ".global font_blob_end\n"
-    "font_blob_end:\n"
+    ".global " BLOB_SYM(font_blob_end) "\n"
+    BLOB_SYM(font_blob_end) ":\n"
     ".byte 0\n"
     ".text\n");
 extern const unsigned char font_blob[], font_blob_end[];
 
+#ifdef _WIN32
 /* Windows Terminal's own ConPTY (vendor/conpty), extracted on first run. */
 __asm__(
     ".section .rdata,\"dr\"\n"
@@ -71,6 +105,7 @@ __asm__(
     ".byte 0\n"
     ".text\n");
 extern const unsigned char conpty_dll[], conpty_dll_end[], openconsole_exe[], openconsole_exe_end[];
+#endif
 
 #define FONT_W 8
 #define FONT_H 16
@@ -86,6 +121,7 @@ static const unsigned char *font_glyph(uint32_t cp) {
     return font_blob + off;
 }
 
+#ifdef _WIN32
 /* ── ConPTY (loaded at runtime so old mingw headers don't matter) ─── */
 
 typedef void *HPCON_;
@@ -97,6 +133,7 @@ static PFN_ResizePC pResizePC;
 static PFN_ClosePC  pClosePC;
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
+#endif
 #endif
 
 /* ── configuration ─────────────────────────────────────────────────── */
@@ -116,18 +153,23 @@ static PFN_ClosePC  pClosePC;
 #define SEL_BG 0x264F78
 
 static int g_scale = 1;          /* integer pixel scale, from the monitor DPI; one size, no zoom */
-static int g_dpi = 96;
-static char g_distro[128];
 static char g_start_dir[1024];   /* Windows or Linux path */
-static wchar_t g_cfg_dir[MAX_PATH];
 static int g_shell_ps;           /* shell=powershell in config.ini: tabs run PowerShell, not WSL */
 static int g_no_bash;            /* the distro has no bash: run its default shell, without rc.bash */
 static int g_have_distro = 1;    /* any WSL distro registered for this user (HKCU\...\Lxss) */
 static char g_mnt_root[64] = "/mnt/";   /* where Windows drives appear in WSL (wsl.conf automount root) */
+static char g_cfg_dir_line[1100];   /* dir= as config.ini had it, written back unchanged */
+#ifdef _WIN32
+static int g_dpi = 96;
+static char g_distro[128];
+static wchar_t g_cfg_dir[MAX_PATH];
 static wchar_t g_default_distro[128];
 static int g_win_w = 0, g_win_h = 0;
 static int g_inbox_conpty;       /* --inbox-conpty: use Windows' own conhost */
 static const char *g_conpty_kind = "inbox";
+#else
+static char g_cfg_dir[MAX_PATH]; /* ~/Library/Application Support/hardcore */
+#endif
 
 /* ── cells ─────────────────────────────────────────────────────────── */
 
@@ -263,13 +305,21 @@ typedef struct {
 typedef struct Tab {
     Term t;
     int id;
+#ifdef _WIN32
     HPCON_ hpc;
     HANDLE pin_w, pout_r, proc, reader, wait;
     CRITICAL_SECTION lock;
-    char *in;
-    int in_n, in_cap;
     volatile LONG posted;
     volatile LONG exited;
+#else
+    int fd;                      /* pty master, -1 = none */
+    pid_t pid;
+    void *rsrc;                  /* dispatch source: output ready */
+    void *wq;                    /* serial queue for writes to the pty */
+    int exited;
+#endif
+    char *in;
+    int in_n, in_cap;
     int activity;                /* output while in the background */
     int busy;                    /* term_busy(), as of the last check: drives the throbber */
     int attention;               /* bell, notification, or a busy program went quiet: the bell mark */
@@ -284,6 +334,7 @@ typedef struct Tab {
 enum { TK_WSL, TK_PS };
 enum { HELP_NONE, HELP_NO_DISTRO, HELP_FAILED };
 
+#ifdef _WIN32
 static HWND g_hwnd;
 
 /* HARDCORE_TRACE=1 writes startup phase times to %TEMP%\\hardcore-trace.txt */
@@ -307,6 +358,47 @@ static double lat_ms(LARGE_INTEGER a, LARGE_INTEGER b) { return (double)(b.QuadP
 static void tab_write(Tab *tb, const void *s, int n) {
     DWORD w;
     if (tb->pin_w && n > 0) WriteFile(tb->pin_w, s, (DWORD)n, &w, NULL);
+}
+#else
+static void tab_write(Tab *tb, const void *s, int n);
+#endif
+
+/* ── platform layer: Win32 in this file, macOS in hardcore_mac.m ───── */
+
+static void plat_invalidate(void);               /* redraw soon */
+static void plat_client_size(int *w, int *h);    /* drawable size, in pixels */
+static void plat_flash(void);                    /* ask for attention: taskbar flash, Dock bounce */
+static void plat_timer(int id, int ms);          /* one-shot (or, for TIMER_THROB, repeating) */
+static void plat_kill_timer(int id);
+static void plat_set_title(const wchar_t *title);
+static void plat_close_window(void);
+static void set_clipboard_utf8(const char *s, int n);
+static Tab *tab_create(const char *dir, int spare);
+static void tab_destroy_async(Tab *tb);
+static int tab_drain(Tab *tb);
+
+/* UTF-8 → wide, NUL-terminated and clipped to cap */
+static void utf8_to_wide(const char *s, wchar_t *out, int cap) {
+#ifdef _WIN32
+    /* too long: keep what fit (a title's first character drives the spinner check) */
+    if (!MultiByteToWideChar(CP_UTF8, 0, s, -1, out, cap) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) out[0] = 0;
+#else
+    const unsigned char *p = (const unsigned char *)s;
+    int n = 0;
+    while (*p && n < cap - 1) {
+        uint32_t cp = *p++;
+        int need = cp >= 0xF0 ? 3 : cp >= 0xE0 ? 2 : cp >= 0xC0 ? 1 : 0;
+        if (cp >= 0x80 && !need) { out[n++] = 0xFFFD; continue; }
+        cp &= need == 3 ? 0x07 : need == 2 ? 0x0F : need == 1 ? 0x1F : 0x7F;
+        while (need-- > 0) {
+            if ((*p & 0xC0) != 0x80) { cp = 0xFFFD; break; }
+            cp = (cp << 6) | (*p++ & 0x3F);
+        }
+        out[n++] = (wchar_t)cp;
+    }
+    out[n] = 0;
+#endif
+    out[cap - 1] = 0;
 }
 
 static void term_reply(Term *t, const char *s) { tab_write((Tab *)t, s, (int)strlen(s)); }
@@ -1141,8 +1233,7 @@ static void b64_to_wide(const char *in, size_t n, wchar_t *out, int cap) {
         if (bits >= 8) { bits -= 8; buf[k++] = (char)(acc >> bits); }
     }
     buf[k] = 0;
-    if (!MultiByteToWideChar(CP_UTF8, 0, buf, -1, out, cap)) out[0] = 0;
-    out[cap - 1] = 0;
+    utf8_to_wide(buf, out, cap);
     for (i = 0; out[i]; i++) if (out[i] < 32) out[i] = L' ';   /* one line */
 }
 
@@ -1263,8 +1354,7 @@ static void osc_dispatch(Term *t) {
     if (*rest == ';') rest++;
     switch (code) {
     case 0: case 2:
-        MultiByteToWideChar(CP_UTF8, 0, rest, -1, t->title, 255);
-        t->title[255] = 0;
+        utf8_to_wide(rest, t->title, 256);
         title_spin(t);
         t->dirty = 1;
         break;
@@ -1516,10 +1606,7 @@ static void term_line(const Term *t, int L, const Cell **cells, int *n, int *wra
 static long long term_base(const Term *t) { return t->hpushed - t->hcount; }
 static long long term_abs_line(const Term *t, int y) { return t->hpushed + y; }
 
-/* ── tabs: ConPTY + reader thread ─────────────────────────────────── */
-
-#define WM_APP_OUTPUT (WM_APP + 1)
-#define WM_APP_EXITED (WM_APP + 2)
+/* ── tabs ──────────────────────────────────────────────────────────── */
 
 static Tab *g_tabs[MAX_TABS];
 static Tab *g_spare;             /* pre-warmed shell for the next new tab */
@@ -1533,6 +1620,16 @@ static Tab *tab_by_id(int id) {
         if (g_tabs[i]->id == id) return g_tabs[i];
     return NULL;
 }
+
+static void term_message(Term *t, const char *msg) {
+    vt_feed(t, (const unsigned char *)msg, (int)strlen(msg));
+}
+
+#ifdef _WIN32
+/* ── ConPTY + reader thread ───────────────────────────────────────── */
+
+#define WM_APP_OUTPUT (WM_APP + 1)
+#define WM_APP_EXITED (WM_APP + 2)
 
 static DWORD WINAPI reader_thread(LPVOID arg) {
     Tab *tb = (Tab *)arg;
@@ -1721,10 +1818,6 @@ static void powershell_cmd(wchar_t *out, int cap) {
     }
     _snwprintf(out, cap, L"\"%ls\" -NoLogo -NoExit -EncodedCommand %hs", exe, b64);
     out[cap - 1] = 0;
-}
-
-static void term_message(Term *t, const char *msg) {
-    vt_feed(t, (const unsigned char *)msg, (int)strlen(msg));
 }
 
 static int tab_spawn(Tab *tb) {
@@ -1925,8 +2018,6 @@ static void config_load(void) {
     fclose(f);
 }
 
-static char g_cfg_dir_line[1100];
-
 static void config_save(void) {
     wchar_t path[MAX_PATH];
     FILE *f;
@@ -1962,6 +2053,8 @@ static void set_clipboard_utf8(const char *s, int n) {
     } else GlobalFree(h);
 }
 
+#endif /* _WIN32: ConPTY, config, clipboard */
+
 static int utf8_encode(uint32_t cp, char *o) {
     if (cp < 0x80) { o[0] = (char)cp; return 1; }
     if (cp < 0x800) { o[0] = (char)(0xC0 | (cp >> 6)); o[1] = (char)(0x80 | (cp & 63)); return 2; }
@@ -1986,7 +2079,11 @@ static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
    float over the terminal's top-right corner on smoked glass: the text runs
    underneath, only the mouse is theirs. No row is spent on a title bar. */
 static int sidebar_w(void) { return 20 * CW; }
+#ifdef _WIN32
 static int caption_h(void) { return CH + 8 * g_scale; }   /* the glass buttons' height */
+#else
+static int caption_h(void) { return 0; }   /* macOS keeps its own traffic lights, over the tab column */
+#endif
 static int term_ox(void) { return sidebar_w() + PAD; }
 static int term_oy(void) { return PAD; }
 
@@ -2005,26 +2102,23 @@ static long long g_sel_a_row, g_sel_b_row;
 static int g_sel_a_col, g_sel_b_col;
 static int g_sb_drag;
 
+static void tab_set_size(Tab *tb, int cols, int rows);   /* tell the pty */
+
 static void resize_all(void) {
-    RECT r;
-    int cols, rows, i;
-    COORD sz;
-    if (!g_hwnd) return;
-    GetClientRect(g_hwnd, &r);
-    if (r.right < 1 || r.bottom < 1) return;
-    compute_grid(r.right, r.bottom, &cols, &rows);
+    int w, h, cols, rows, i;
+    plat_client_size(&w, &h);
+    if (w < 1 || h < 1) return;
+    compute_grid(w, h, &cols, &rows);
     if (cols == g_cols && rows == g_rows) return;
     g_cols = cols;
     g_rows = rows;
     g_sel_on = 0;
-    sz.X = (SHORT)cols;
-    sz.Y = (SHORT)rows;
     for (i = 0; i <= g_ntabs; i++) {
         Tab *tb = i < g_ntabs ? g_tabs[i] : g_spare;
         if (!tb) continue;
         tab_drain(tb);
         term_resize(&tb->t, cols, rows);
-        if (tb->hpc) pResizePC(tb->hpc, sz);
+        tab_set_size(tb, cols, rows);
     }
 }
 
@@ -2086,22 +2180,21 @@ static void send_to_active(const char *s, int n) {
     if (!tb) return;
     if (tb->t.view) {
         tb->t.view = 0;
-        InvalidateRect(g_hwnd, NULL, FALSE);
+        plat_invalidate();
     }
     tab_write(tb, s, n);
 }
 
 /* Sends text the way a paste arrives: CRLF/LF become CR like a typed Enter,
    ESC is stripped so a paste can't end bracketed-paste mode early. */
-static void paste_wide(const wchar_t *w) {
+static void paste_utf8(const char *in) {
     Tab *tb = active_tab();
-    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    size_t n = strlen(in);
     char *s, *o;
     const char *p;
-    if (!tb || n <= 1) return;
+    if (!tb || !n) return;
     s = o = (char *)malloc(n + 16);
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL);
-    for (p = s; *p; p++) {
+    for (p = in; *p; p++) {
         if (*p == '\r' && p[1] == '\n') continue;
         if (*p == 0x1B) continue;
         *o++ = (*p == '\n') ? '\r' : *p;
@@ -2109,6 +2202,17 @@ static void paste_wide(const wchar_t *w) {
     if (tb->t.m_bracketed) send_to_active("\x1b[200~", 6);
     send_to_active(s, (int)(o - s));
     if (tb->t.m_bracketed) send_to_active("\x1b[201~", 6);
+    free(s);
+}
+
+#ifdef _WIN32
+static void paste_wide(const wchar_t *w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *s;
+    if (n <= 1) return;
+    s = (char *)malloc(n);
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL);
+    paste_utf8(s);
     free(s);
 }
 
@@ -2249,6 +2353,8 @@ static void paste(void) {
     CloseClipboard();
 }
 
+#endif /* _WIN32: drops, clipboard formats */
+
 /* ── glyph atlas: on-demand 16×16 slots in one texture ─────────────── */
 
 #define ATLAS 2048
@@ -2262,6 +2368,46 @@ static int g_nslots;
 
 static void glyph_cache_reset(void);
 
+/* The drawing code is immediate mode: r_color() sets the color, r_quad() /
+   r_quad_uv() append two triangles to one CPU-side vertex array, and
+   r_present() hands it to the GPU in a single draw. The backends (Direct3D 11
+   below, OpenGL in hardcore_mac.m) supply r_flush / r_upload / r_begin /
+   r_present. */
+
+typedef struct { float x, y, u, v; uint32_t rgba; } Vtx;
+
+static float g_rw = 1, g_rh = 1; /* current frame size, for pixel → clip space */
+static uint32_t g_rgba = 0xFFFFFFFF;
+#define VB_VERTS 65536           /* per Draw; a frame that needs more draws in pieces */
+static Vtx g_vtx[VB_VERTS];
+static int g_nvtx;
+
+static void r_flush(void);
+static void r_upload(int x, int y, const unsigned char *bmp);
+
+static void r_color(uint32_t rgb, float a) {
+    g_rgba = ((rgb >> 16) & 255) | (rgb & 0xFF00) | ((rgb & 255) << 16) | ((uint32_t)(a * 255.0f + 0.5f) << 24);
+}
+
+static void r_vert(float x, float y, float u, float v) {
+    Vtx *p = &g_vtx[g_nvtx++];
+    p->x = x * 2.0f / g_rw - 1.0f;
+    p->y = 1.0f - y * 2.0f / g_rh;
+    p->u = u;
+    p->v = v;
+    p->rgba = g_rgba;
+}
+
+/* textured quad; u0 < 0 means a solid one */
+static void r_quad_uv(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1) {
+    if (g_nvtx + 6 > VB_VERTS) r_flush();
+    r_vert(x0, y0, u0, v0); r_vert(x1, y0, u1, v0); r_vert(x1, y1, u1, v1);
+    r_vert(x0, y0, u0, v0); r_vert(x1, y1, u1, v1); r_vert(x0, y1, u0, v1);
+}
+
+static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1, y1, -1, -1, -1, -1); }
+
+#ifdef _WIN32
 /* ── renderer: Direct3D 11 on a flip-model swap chain ──────────────── */
 
 /* Why not OpenGL any more: a WGL window is a "redirected" surface that DWM
@@ -2271,11 +2417,8 @@ static void glyph_cache_reset(void);
    allowed Windows can promote the window to an independent flip or a
    hardware overlay plane, skipping composition altogether.
 
-   The drawing code is still immediate mode: r_color() sets the color,
-   r_quad() / r_quad_uv() append two triangles to one CPU-side vertex array,
-   and r_present() uploads it and draws everything with a single Draw. */
+   The vertex array is drawn with a single Draw per frame. */
 
-typedef struct { float x, y, u, v; uint32_t rgba; } Vtx;
 
 /* not in every mingw libuuid */
 static const GUID IID_IDXGIFactory5_ = {0x7632e1f5, 0xee65, 0x4dca, {0x87, 0xfd, 0x84, 0xcd, 0x75, 0xf8, 0x83, 0x8d}};
@@ -2296,11 +2439,6 @@ static ID3D11SamplerState *g_samp;
 static ID3D11RasterizerState *g_rs;
 static int g_tearing;            /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
 static int g_gfx_ready;          /* swap chain exists: GDI no longer paints */
-static float g_rw = 1, g_rh = 1; /* current frame size, for pixel → clip space */
-static uint32_t g_rgba = 0xFFFFFFFF;
-#define VB_VERTS 65536           /* per Draw; a frame that needs more draws in pieces */
-static Vtx g_vtx[VB_VERTS];
-static int g_nvtx;
 
 static const char HLSL[] =
     "struct VI { float2 p : POSITION; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
@@ -2314,9 +2452,6 @@ static const char HLSL[] =
 typedef HRESULT (WINAPI *PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *,
                                          LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
 
-static void r_color(uint32_t rgb, float a) {
-    g_rgba = ((rgb >> 16) & 255) | (rgb & 0xFF00) | ((rgb & 255) << 16) | ((uint32_t)(a * 255.0f + 0.5f) << 24);
-}
 
 static void r_flush(void) {
     D3D11_MAPPED_SUBRESOURCE m;
@@ -2329,23 +2464,6 @@ static void r_flush(void) {
     g_nvtx = 0;
 }
 
-static void r_vert(float x, float y, float u, float v) {
-    Vtx *p = &g_vtx[g_nvtx++];
-    p->x = x * 2.0f / g_rw - 1.0f;
-    p->y = 1.0f - y * 2.0f / g_rh;
-    p->u = u;
-    p->v = v;
-    p->rgba = g_rgba;
-}
-
-/* textured quad; u0 < 0 means a solid one */
-static void r_quad_uv(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1) {
-    if (g_nvtx + 6 > VB_VERTS) r_flush();
-    r_vert(x0, y0, u0, v0); r_vert(x1, y0, u1, v0); r_vert(x1, y1, u1, v1);
-    r_vert(x0, y0, u0, v0); r_vert(x1, y1, u1, v1); r_vert(x0, y1, u0, v1);
-}
-
-static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1, y1, -1, -1, -1, -1); }
 
 /* one 16×16 alpha glyph into the atlas */
 static void r_upload(int x, int y, const unsigned char *bmp) {
@@ -2545,6 +2663,8 @@ static void gfx_lost(void) {
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
+#endif /* _WIN32: Direct3D 11 */
+
 static void glyph_cache_reset(void) {
     r_flush();                   /* quads already queued still point at the old slots */
     memset(g_hkey, 0, sizeof(g_hkey));
@@ -2691,9 +2811,12 @@ static void tab_label(Tab *tb, wchar_t *out, int cap) {
     const char *dir = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, *b = NULL, *p;
     for (p = dir; *p; p++)
         if ((*p == '/' || *p == '\\') && p[1]) b = p + 1;
-    if (!dir[0]) _snwprintf(out, cap, L"wsl");
-    else MultiByteToWideChar(CP_UTF8, 0, b ? b : dir, -1, out, cap);
-    out[cap - 1] = 0;
+#ifdef _WIN32
+    if (!dir[0]) { _snwprintf(out, cap, L"wsl"); out[cap - 1] = 0; return; }
+#else
+    if (!dir[0]) dir = "~";
+#endif
+    utf8_to_wide(b ? b : dir, out, cap);
 }
 
 /* The throbber: braille drops fall one at a time and stack up in a single
@@ -2722,10 +2845,11 @@ static void drip_init(void) {
     g_drip[g_ndrip++] = 0x2800;
 }
 
-#define TIMER_THROB 3
 #define BELL_GLYPH 0xF8F0        /* hand-drawn, font/hardcore-extra.hex */
 
+#ifdef _WIN32
 static int caption_btn_w(void) { return 46 * g_scale; }
+#endif
 
 /* sidebar geometry, top to bottom:
      [ drag ][ – ][ □ ][ × ]     caption_h()
@@ -2734,7 +2858,11 @@ static int caption_btn_w(void) { return 46 * g_scale; }
        ... drag space (it's the title bar) ...                         */
 enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR };
 
+#ifdef _WIN32
 static int tabs_top(void) { return 8 * g_scale; }   /* the gap above the tabs drags the window */
+#else
+static int tabs_top(void) { return 30 * g_scale; }  /* under the traffic lights; the gap drags the window */
+#endif
 
 /* the dim second line under a tab's name: what Claude is doing, asking, or did */
 static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
@@ -2744,7 +2872,7 @@ static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
         if (t->ps_tasks) _snwprintf(buf, cap, L"%ls · %d bg", t->ps_msg, t->ps_tasks);
         else _snwprintf(buf, cap, L"%ls", t->ps_msg);
     } else if (t->ps_state == PS_BLOCKED) {
-        _snwprintf(buf, cap, L"%hs", t->ps_kind[0] ? t->ps_kind : "waiting for you");
+        utf8_to_wide(t->ps_kind[0] ? t->ps_kind : "waiting for you", buf, cap);
     } else if (t->ps_tasks) {
         _snwprintf(buf, cap, L"%d background task%ls", t->ps_tasks, t->ps_tasks == 1 ? L"" : L"s");
     } else return NULL;
@@ -2758,11 +2886,10 @@ static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
 static int g_row_y[MAX_TABS + 2], g_row_two[MAX_TABS + 1];   /* g_row_two: detail lines, 0..2 */
 static float detail_w(void) { return (float)(sidebar_w() - 10 * g_scale - 2 * CW - 8 * g_scale); }
 static void tab_layout(void) {
-    RECT r;
-    int base = CH + 10 * g_scale, i, need = 0, two = 1, h, y, avail;
+    int base = CH + 10 * g_scale, i, need = 0, two = 1, h, y, avail, win_w, win_h;
     wchar_t tmp[220];
-    GetClientRect(g_hwnd, &r);
-    avail = r.bottom - tabs_top() - 4 * g_scale;
+    plat_client_size(&win_w, &win_h);
+    avail = win_h - tabs_top() - 4 * g_scale;
     for (i = 0; i < g_ntabs; i++) {
         const wchar_t *d = tab_detail(g_tabs[i], tmp, 220);
         /* what Claude is asking you gets two lines; the rest get one */
@@ -2796,6 +2923,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
     return HIT_BAR;
 }
 
+#ifdef _WIN32
 /* caption buttons: HTMINBUTTON / HTMAXBUTTON / HTCLOSE, or 0 */
 static int caption_hit(int mx, int my) {
     RECT r;
@@ -2853,6 +2981,8 @@ static void render_caption_buttons(int win_w) {
     }
 }
 
+#endif /* _WIN32: caption buttons */
+
 static void render_tabbar(int win_w, int win_h) {
     int i, idx = -1, hover = HIT_NONE, sw = sidebar_w();
     float lx = (float)(10 * g_scale), textw = (float)(sw - 10 * g_scale - 3 * CW - 12 * g_scale);
@@ -2908,16 +3038,22 @@ static void render_tabbar(int win_w, int win_h) {
     }
 }
 
+static void r_begin(int w, int h);
+
 static void render(void) {
-    RECT r;
+    struct { int right, bottom; } r;
     Tab *tb = active_tab();
     Term *t;
     int y, x, ox = term_ox(), oy = term_oy();
     long long base;
-    GetClientRect(g_hwnd, &r);
+    plat_client_size(&r.right, &r.bottom);
     r_begin(r.right, r.bottom);
     render_tabbar(r.right, r.bottom);
+#ifdef _WIN32
     if (!tb) { render_caption_buttons(r.right); return; }
+#else
+    if (!tb) return;
+#endif
     t = &tb->t;
     base = term_base(t);
 
@@ -3017,7 +3153,9 @@ static void render(void) {
         fill_rect(bx, track_top + pos * (track_h - bar_h), bx + SCROLLBAR_W - 2 * g_scale,
                   track_top + pos * (track_h - bar_h) + bar_h, AMBER, t->view ? 0.8f : 0.3f);
     }
+#ifdef _WIN32
     render_caption_buttons(r.right);   /* last: glass over whatever is under it */
+#endif
 }
 
 static void update_title(void) {
@@ -3027,9 +3165,10 @@ static void update_title(void) {
     tab_label(tb, label, 256);
     _snwprintf(title, 300, L"%ls — hardcore", label);
     title[299] = 0;
-    SetWindowTextW(g_hwnd, title);
+    plat_set_title(title);
 }
 
+#ifdef _WIN32
 /* Completes the previous keypress's line once its frame has had time to reach
    the display: DXGI reports the vblank it was scanned out on (SyncQPCTime) and
    whether DWM composed it (0) or it went straight to a hardware plane (1). */
@@ -3098,13 +3237,26 @@ static void snap_backbuffer(void) {
     ID3D11Texture2D_Release(back);
 }
 
+#else
+static void snap_backbuffer(void);
+static char g_snap_path[MAX_PATH];
+#endif
+
+#define TIMER_SYNC 1
+#define TIMER_SPARE 2
+#define TIMER_THROB 3
+
+static void r_present(void);
+
 static void paint_now(void) {
     Tab *tb = active_tab();
     if (tb && tb->t.m_sync && GetTickCount() - tb->t.sync_since < 200) {
-        SetTimer(g_hwnd, 1, 20, NULL);
+        plat_timer(TIMER_SYNC, 20);
         return;
     }
+#ifdef _WIN32
     if (g_lat && g_lat_out.QuadPart) QueryPerformanceCounter(&g_lat_render);
+#endif
     render();
     if (g_snap_path[0]) {
         r_flush();
@@ -3113,6 +3265,7 @@ static void paint_now(void) {
     }
     r_present();
     g_last_paint = GetTickCount();
+#ifdef _WIN32
     if (g_lat && g_lat_out.QuadPart) {
         LARGE_INTEGER t;
         QueryPerformanceCounter(&t);
@@ -3122,6 +3275,7 @@ static void paint_now(void) {
         IDXGISwapChain1_GetLastPresentCount(g_sc, &g_lat_pid);
         g_lat_key.QuadPart = g_lat_out.QuadPart = 0;
     }
+#endif
 }
 
 /* Re-checks which tabs are animating a spinner title. A tab that stops while
@@ -3134,10 +3288,7 @@ static void update_busy(void) {
         int b = term_busy(&tb->t);
         if (tb->t.ps_state != tb->ps_seen) {
             /* Claude stopped to ask you something: say so if you aren't looking */
-            if ((tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) && !g_focused) {
-                FLASHWINFO fi = {sizeof(fi), g_hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
-                FlashWindowEx(&fi);
-            }
+            if ((tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) && !g_focused) plat_flash();
             tb->ps_seen = tb->t.ps_state;
             changed = 1;
         }
@@ -3145,19 +3296,16 @@ static void update_busy(void) {
             changed = 1;
             if (!b && (i != g_active || !g_focused)) {
                 tb->attention = 1;
-                if (!g_focused) {        /* finished while you were in another window */
-                    FLASHWINFO fi = {sizeof(fi), g_hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
-                    FlashWindowEx(&fi);
-                }
+                if (!g_focused) plat_flash();   /* finished while you were in another window */
             }
             tb->busy = b;
         }
         any |= b;
     }
-    if (any && !g_throb_on) SetTimer(g_hwnd, TIMER_THROB, DRIP_MS, NULL);
-    if (!any && g_throb_on) KillTimer(g_hwnd, TIMER_THROB);
+    if (any && !g_throb_on) plat_timer(TIMER_THROB, DRIP_MS);
+    if (!any && g_throb_on) plat_kill_timer(TIMER_THROB);
     g_throb_on = any;
-    if (any || changed) InvalidateRect(g_hwnd, NULL, FALSE);
+    if (any || changed) plat_invalidate();
 }
 
 /* ── tab management ───────────────────────────────────────────────── */
@@ -3169,14 +3317,15 @@ static void activate(int i) {
     g_tabs[i]->attention = 0;
     g_sel_on = 0;
     update_title();
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    plat_invalidate();
 }
 
-#define TIMER_SPARE 2
-
-static void schedule_spare(void) { SetTimer(g_hwnd, TIMER_SPARE, 1000, NULL); }
+static void schedule_spare(void) { plat_timer(TIMER_SPARE, 1000); }
 
 static void make_spare(void) {
+#ifndef _WIN32
+    return;                      /* macOS: a new tab starts its shell directly */
+#endif
     if (g_spare || !g_ntabs || g_shell_ps || g_no_bash || !g_have_distro) return;
     g_spare = tab_create(g_start_dir, 1);
 }
@@ -3186,6 +3335,7 @@ static void new_tab_here(void) {
     int i;
     const char *dir = (cur && cur->t.cwd[0]) ? cur->t.cwd : cur ? cur->start_dir : g_start_dir;
     if (g_ntabs >= MAX_TABS) return;
+#ifdef _WIN32
     /* the spare already has wsl.exe + bash + your profile up; it only needs a cd */
     if (g_spare && !g_spare->exited && g_spare->proc) {
         char lin[1100];
@@ -3202,6 +3352,7 @@ static void new_tab_here(void) {
         tab_destroy_async(g_spare);
         g_spare = NULL;
     }
+#endif
     if (!tb) tb = tab_create(dir, 0);
     if (!tb) return;
     schedule_spare();
@@ -3220,7 +3371,7 @@ static void close_tab(int i) {
     g_ntabs--;
     tab_destroy_async(tb);
     if (!g_ntabs) {
-        DestroyWindow(g_hwnd);
+        plat_close_window();
         return;
     }
     if (g_active > i || g_active >= g_ntabs) g_active--;
@@ -3230,27 +3381,14 @@ static void close_tab(int i) {
 
 /* ── keyboard ──────────────────────────────────────────────────────── */
 
-static int mods_param(void) {
-    int m = 0;
-    if (GetKeyState(VK_SHIFT) & 0x8000) m |= 1;
-    if (GetKeyState(VK_MENU) & 0x8000) m |= 2;
-    if (GetKeyState(VK_CONTROL) & 0x8000) m |= 4;
-    return m ? m + 1 : 0;
-}
-
 static void scroll_view(int lines) {
     Tab *tb = active_tab();
     if (!tb || tb->t.alt) return;
     tb->t.view += lines;
     if (tb->t.view > tb->t.hcount) tb->t.view = tb->t.hcount;
     if (tb->t.view < 0) tb->t.view = 0;
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    plat_invalidate();
 }
-
-static int auto_scale(void) { return g_dpi >= 144 ? (g_dpi + 48) / 96 : 1; }
-
-/* Returns 1 if the key was consumed (its WM_CHAR is then dropped). */
-static int help_key(Tab *tb, uint32_t c);
 
 /* Ctrl+Shift+J: the next tab that wants you. Claude blocked on a question
    first, then failures, then finished/rang (the bell). */
@@ -3287,8 +3425,22 @@ static void jump_mark(int dir) {
         long long v = t->hpushed - target;
         t->view = v < 0 ? 0 : v > t->hcount ? t->hcount : (int)v;
     }
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    plat_invalidate();
 }
+
+#ifdef _WIN32
+static int mods_param(void) {
+    int m = 0;
+    if (GetKeyState(VK_SHIFT) & 0x8000) m |= 1;
+    if (GetKeyState(VK_MENU) & 0x8000) m |= 2;
+    if (GetKeyState(VK_CONTROL) & 0x8000) m |= 4;
+    return m ? m + 1 : 0;
+}
+
+static int auto_scale(void) { return g_dpi >= 144 ? (g_dpi + 48) / 96 : 1; }
+
+/* Returns 1 if the key was consumed (its WM_CHAR is then dropped). */
+static int help_key(Tab *tb, uint32_t c);
 
 static int handle_keydown(WPARAM vk) {
     int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -3406,7 +3558,11 @@ static void handle_char(WPARAM wc, int alt) {
     send_to_active(buf, n);
 }
 
+#endif /* _WIN32: keys */
+
 /* ── mouse ─────────────────────────────────────────────────────────── */
+
+enum { M_SHIFT = 1, M_ALT = 2, M_CTRL = 4 };   /* the modifiers a mouse report carries */
 
 static void mouse_cell(int mx, int my, int *col, int *row) {
     Tab *tb = active_tab();
@@ -3421,17 +3577,18 @@ static void mouse_cell(int mx, int my, int *col, int *row) {
     *row = r;
 }
 
-/* reports to an app that asked for the mouse (vim, htop, tmux...) */
-static int mouse_report(int button, int press, int motion, int mx, int my, WPARAM wp) {
+/* reports to an app that asked for the mouse (vim, htop, tmux...);
+   mods: M_SHIFT | M_ALT | M_CTRL. Shift means "this one is for selecting". */
+static int mouse_report(int button, int press, int motion, int mx, int my, int mods) {
     Tab *tb = active_tab();
     char buf[64];
     int col, row, b = button, n;
-    if (!tb || !tb->t.m_mouse || (wp & MK_SHIFT)) return 0;
+    if (!tb || !tb->t.m_mouse || (mods & M_SHIFT)) return 0;
     if (motion && tb->t.m_mouse != 1003 && !(tb->t.m_mouse == 1002 && button != 3)) return 1;
     if (motion && tb->t.m_mouse == 9) return 1;
     mouse_cell(mx, my, &col, &row);
-    if (wp & MK_CONTROL) b |= 16;
-    if (GetKeyState(VK_MENU) & 0x8000) b |= 8;
+    if (mods & M_CTRL) b |= 16;
+    if (mods & M_ALT) b |= 8;
     if (motion) b |= 32;
     if (tb->t.m_mouse_sgr) {
         n = snprintf(buf, sizeof(buf), "\x1b[<%d;%d;%d%c", b, col + 1, row + 1, press ? 'M' : 'm');
@@ -3491,6 +3648,7 @@ static int link_at(int col, int row, char *out, int cap) {
     }
 }
 
+#ifdef _WIN32
 /* file:///mnt/c/x opens C:\x; anything else goes to the default handler */
 static void open_url(const char *url) {
     wchar_t w[2048];
@@ -3509,6 +3667,9 @@ static void open_url(const char *url) {
     MultiByteToWideChar(CP_UTF8, 0, url, -1, w, 2048);
     ShellExecuteW(g_hwnd, L"open", w, NULL, NULL, SW_SHOWNORMAL);
 }
+#else
+static void open_url(const char *url);
+#endif
 
 static int is_word_char(uint32_t ch) {
     return ch > ' ' && !strchr("\"'`()[]{}<>|;,", (int)(ch < 128 ? ch : 'a'));
@@ -3539,10 +3700,81 @@ static void scrollbar_set(int my) {
     if (f < 0) f = 0;
     if (f > 1) f = 1;
     tb->t.view = (int)((1.0f - f) * tb->t.hcount);
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    plat_invalidate();
 }
 
+/* Parser-only replay of one file for conformance corpora: it goes through a
+   fresh terminal the way a pty would deliver it (ONLCR: \n → \r\n), then the
+   screen is written out, one right-trimmed line per row. */
+static void replay_one(FILE *out, FILE *f, int cols, int rows) {
+    Tab *tb = (Tab *)calloc(1, sizeof(Tab));
+    char line[8192];
+    unsigned char buf[65536];
+    size_t n, k;
+    int y;
+    if (!f || !tb || !term_init(&tb->t, cols, rows)) {
+        fprintf(out, "(cannot open)\n");
+        free(tb);
+        return;
+    }
+    vt_feed(&tb->t, (const unsigned char *)"\r\n\x1b" "c\x1b[H", 7);
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        size_t s = 0;
+        for (k = 0; k < n; k++)
+            if (buf[k] == '\n') {
+                vt_feed(&tb->t, buf + s, (int)(k - s));
+                vt_feed(&tb->t, (const unsigned char *)"\r\n", 2);
+                s = k + 1;
+            }
+        vt_feed(&tb->t, buf + s, (int)(n - s));
+    }
+    for (y = 0; y < rows; y++) {
+        int x, len = 0;
+        for (x = 0; x < cols; x++) {
+            Cell *c = &tb->t.row[tb->t.alt][y][x];
+            if (c->wflag == W_CONT) continue;
+            len += utf8_encode(c->ch ? c->ch : ' ', line + len);
+        }
+        while (len && (line[len - 1] == ' ' || line[len - 1] == '\t')) len--;
+        line[len] = 0;
+        fprintf(out, "%s\n", line);
+    }
+    term_free(&tb->t);
+    free(tb);
+}
+
+#ifdef _WIN32
 /* ── window procedure ─────────────────────────────────────────────── */
+
+static void plat_invalidate(void) { InvalidateRect(g_hwnd, NULL, FALSE); }
+static void plat_timer(int id, int ms) { SetTimer(g_hwnd, (UINT_PTR)id, (UINT)ms, NULL); }
+static void plat_kill_timer(int id) { KillTimer(g_hwnd, (UINT_PTR)id); }
+static void plat_set_title(const wchar_t *title) { SetWindowTextW(g_hwnd, title); }
+static void plat_close_window(void) { DestroyWindow(g_hwnd); }
+
+static void plat_client_size(int *w, int *h) {
+    RECT r = {0, 0, 0, 0};
+    if (g_hwnd) GetClientRect(g_hwnd, &r);
+    *w = r.right;
+    *h = r.bottom;
+}
+
+static void plat_flash(void) {
+    FLASHWINFO fi = {sizeof(fi), g_hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
+    FlashWindowEx(&fi);
+}
+
+static void tab_set_size(Tab *tb, int cols, int rows) {
+    COORD sz;
+    sz.X = (SHORT)cols;
+    sz.Y = (SHORT)rows;
+    if (tb->hpc) pResizePC(tb->hpc, sz);
+}
+
+static int mouse_mods(WPARAM wp) {
+    return ((wp & MK_SHIFT) ? M_SHIFT : 0) | ((wp & MK_CONTROL) ? M_CTRL : 0) |
+           ((GetKeyState(VK_MENU) & 0x8000) ? M_ALT : 0);
+}
 
 static void save_window_size(void) {
     RECT r;
@@ -3942,9 +4174,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (!on_bar && (wp & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON)))
-            mouse_report((wp & MK_LBUTTON) ? 0 : (wp & MK_MBUTTON) ? 1 : 2, 1, 1, mx, my, wp);
+            mouse_report((wp & MK_LBUTTON) ? 0 : (wp & MK_MBUTTON) ? 1 : 2, 1, 1, mx, my, mouse_mods(wp));
         else if (!on_bar && tb && tb->t.m_mouse == 1003)
-            mouse_report(3, 1, 1, mx, my, wp);
+            mouse_report(3, 1, 1, mx, my, mouse_mods(wp));
         return 0;
     }
     case WM_MOUSELEAVE:
@@ -3974,7 +4206,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char url[2048];
             if (link_at(col, row, url, sizeof(url))) { open_url(url); return 0; }
         }
-        if (mouse_report(0, 1, 0, mx, my, wp)) return 0;
+        if (mouse_report(0, 1, 0, mx, my, mouse_mods(wp))) return 0;
         if (msg == WM_LBUTTONDBLCLK) {
             select_word(col, row);
             InvalidateRect(hwnd, NULL, FALSE);
@@ -3994,7 +4226,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ReleaseCapture();
             return 0;
         }
-        mouse_report(0, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp);
+        mouse_report(0, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_MBUTTONDOWN: {
         int idx = -1;
@@ -4003,15 +4235,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             close_tab(idx);
             return 0;
         }
-        mouse_report(1, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp);
+        mouse_report(1, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     }
     case WM_MBUTTONUP:
-        mouse_report(1, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp);
+        mouse_report(1, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_RBUTTONDOWN:
         if (GET_X_LPARAM(lp) < sidebar_w()) return 0;
-        if (mouse_report(2, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp)) return 0;
+        if (mouse_report(2, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp))) return 0;
         /* conhost habit: right-click copies a selection, or pastes */
         if (g_sel_on) {
             sel_copy();
@@ -4020,7 +4252,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else paste();
         return 0;
     case WM_RBUTTONUP:
-        mouse_report(2, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp);
+        mouse_report(2, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_MOUSEWHEEL: {
         short delta = (short)HIWORD(wp);
@@ -4032,7 +4264,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!tb) return 0;
         if (tb->t.m_mouse && !(GET_KEYSTATE_WPARAM(wp) & MK_SHIFT)) {
             for (i = 0; i < abs(notches); i++)
-                mouse_report(notches > 0 ? 64 : 65, 1, 0, pt.x, pt.y, GET_KEYSTATE_WPARAM(wp));
+                mouse_report(notches > 0 ? 64 : 65, 1, 0, pt.x, pt.y, mouse_mods(GET_KEYSTATE_WPARAM(wp)));
         } else if (tb->t.alt) {
             /* alternate scroll: less, man, git log scroll with the wheel */
             const char *seq = notches > 0 ? (tb->t.m_appcursor ? "\x1bOA" : "\x1b[A") : (tb->t.m_appcursor ? "\x1bOB" : "\x1b[B");
@@ -4223,51 +4455,17 @@ static int unit_tests(const char *out_path) {
     return fails ? 1 : 0;
 }
 
-/* Parser-only replay for conformance corpora: each input file goes through a
-   fresh terminal the way a pty would deliver it (ONLCR: \n → \r\n), then the
-   screen is written out, one right-trimmed line per row. */
 static int replay(const char *out_path, int cols, int rows, wchar_t **files, int nfiles) {
     FILE *out = fopen(out_path, "wb");
     int i;
     if (!out) return 3;
     for (i = 0; i < nfiles; i++) {
-        Tab *tb = (Tab *)calloc(1, sizeof(Tab));
         FILE *f = _wfopen(files[i], L"rb");
-        char name[MAX_PATH * 3], line[8192];
-        unsigned char buf[65536];
-        size_t n, k;
-        int y;
+        char name[MAX_PATH * 3];
         WideCharToMultiByte(CP_UTF8, 0, files[i], -1, name, sizeof(name), NULL, NULL);
         fprintf(out, "=== %s\n", name);
-        if (!f || !tb || !term_init(&tb->t, cols, rows)) {
-            fprintf(out, "(cannot open)\n");
-            continue;
-        }
-        vt_feed(&tb->t, (const unsigned char *)"\r\n\x1b" "c\x1b[H", 7);
-        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-            size_t s = 0;
-            for (k = 0; k < n; k++)
-                if (buf[k] == '\n') {
-                    vt_feed(&tb->t, buf + s, (int)(k - s));
-                    vt_feed(&tb->t, (const unsigned char *)"\r\n", 2);
-                    s = k + 1;
-                }
-            vt_feed(&tb->t, buf + s, (int)(n - s));
-        }
-        fclose(f);
-        for (y = 0; y < rows; y++) {
-            int x, len = 0;
-            for (x = 0; x < cols; x++) {
-                Cell *c = &tb->t.row[tb->t.alt][y][x];
-                if (c->wflag == W_CONT) continue;
-                len += utf8_encode(c->ch ? c->ch : ' ', line + len);
-            }
-            while (len && (line[len - 1] == ' ' || line[len - 1] == '\t')) len--;
-            line[len] = 0;
-            fprintf(out, "%s\n", line);
-        }
-        term_free(&tb->t);
-        free(tb);
+        replay_one(out, f, cols, rows);
+        if (f) fclose(f);
     }
     fclose(out);
     return 0;
@@ -4397,3 +4595,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     LocalFree(argv);
     return 0;
 }
+#endif /* _WIN32 */
+
+#ifdef __APPLE__
+#include "hardcore_mac.m"
+#endif

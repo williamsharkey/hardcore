@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Draws the hardcore icon (amber ">_" on near-black, dumbterm's phosphor color)
-as a PNG-in-ICO with 16/24/32/48/64/256 px frames. No dependencies."""
+as a PNG-in-ICO with 16/24/32/48/64/256 px frames, or, for an OUT ending in
+.iconset, the PNGs macOS's iconutil turns into an .icns. No dependencies."""
+import os
 import struct, sys, zlib
 
 AMBER = (0xFF, 0xA6, 0x0D)
@@ -39,6 +41,13 @@ def png(n):
         return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF)
     return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', n, n, 8, 6, 0, 0, 0))
             + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
+
+if sys.argv[1].endswith('.iconset'):
+    os.makedirs(sys.argv[1], exist_ok=True)
+    for n in (16, 32, 128, 256, 512):
+        open(os.path.join(sys.argv[1], f'icon_{n}x{n}.png'), 'wb').write(png(n))
+        open(os.path.join(sys.argv[1], f'icon_{n}x{n}@2x.png'), 'wb').write(png(n * 2))
+    sys.exit(0)
 
 sizes = [16, 24, 32, 48, 64, 256]
 images = [png(n) for n in sizes]
