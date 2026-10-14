@@ -18,6 +18,14 @@
 
 ## What's there
 
+The panel (after two rounds of mockups, 2026-10-14): **s** grows into
+"settings" when pointed at; the panel is two box-drawn tabs, **font** (a row
+per font: letter, name, cell size) and **theme** (a row per family: name,
+dark letter, light letter), then a rule and the name of what's picked or
+pointed at. 13 rows for fonts, 15 for themes, in the column's 20 cells.
+Clickable things get the pointing hand; on the Mac, where the window drags
+gets the open hand (Windows already shows the move cursor there).
+
 - **Fonts** (`tools/gen_fonts.py` → `build/fonts.bin`, own glyphs only;
   Unifont fills the rest, squeezed to the cell):
   `U` Unifont, `Z` Tamzen 8×15, `F` misc-fixed 7×13 (all scaled by the

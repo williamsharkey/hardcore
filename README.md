@@ -255,10 +255,12 @@ If your login shell is zsh or fish, the tab still opens bash.
 
 ## Settings
 
-Click the gray **s** under the tabs. The tab column then shows two grids:
+Point at the gray **s** under the tabs and it reads **settings**; click it.
+The tab column then shows two box-drawn tabs, **font** and **theme**, and
+under them the name of what you've picked, or of what you're pointing at.
 
-- **Fonts**, a row per cell size in device pixels (the 2×-scaled ones are
-  listed at their doubled size). Each box holds the font's letter:
+- **font**: a row per font, its letter, name and cell size in device pixels
+  (the 2×-scaled ones are listed at their doubled size):
 
   | Letter | Font | Cell |
   |---|---|---|
@@ -275,15 +277,15 @@ Click the gray **s** under the tabs. The tab column then shows two grids:
   pixel is 2×2 on a Retina screen. The 1:1 ones were drawn for the screen's
   own pixels. Sony and ETL only cover Latin-1, so the rest comes from
   Terminus 24, then Unifont.
-- **Color schemes**: a square each, in the scheme's own background with its
-  letter and four of its colors. Lowercase letters are dark, uppercase the
-  light twin of the same family: `h` hardcore (Campbell with an amber
-  cursor, the default), `d` Dracula, `m` Monokai, `n` Nord, `g`/`G` Gruvbox,
-  `s`/`S` Solarized, `o`/`O` One Dark/Light, `c`/`C` Catppuccin Mocha/Latte,
-  `k`/`K` Tokyo Night/Day, `r`/`R` Rosé Pine/Dawn.
+- **theme**: a row per family, with the dark scheme's letter and, for the
+  families that have one, the light one's: `h` hardcore (Campbell with an
+  amber cursor, the default), `d` Dracula, `m` Monokai, `n` Nord, `g`/`G`
+  Gruvbox, `s`/`S` Solarized, `o`/`O` One Dark/Light, `c`/`C` Catppuccin
+  Mocha/Latte, `k`/`K` Tokyo Night/Day, `r`/`R` Rosé Pine/Dawn. Pointing at
+  the row tries the dark one; at the light letter, the light one.
 
 Pointing at one tries it on: a font in the terminal (the tab column keeps
-the font you picked, so the grid doesn't move), a scheme on the whole window.
+the font you picked, so the list doesn't move), a scheme on the whole window.
 Clicking picks it, for every hardcore window at once. Two letters, such as
 `mT`, describe the whole setup.
 

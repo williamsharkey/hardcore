@@ -3299,10 +3299,13 @@ static int caption_btn_w(void) { return 46 * g_scale; }
      ●●●                         the traffic lights' rows (macOS)
      ▌⣿ folder-name        ×     a row per tab, and its detail lines
       s                    +     settings, new tab
-      12×24  t Y E               the settings, when open: fonts by cell size,
-       ...                       then the color schemes
+     ╭──────╮                    the settings, when open: two tabs,
+     │ font │ theme              a font per row, or a scheme family per row
+    ─┘      └───────────         with its dark and light letters,
+      U Unifont      16×32       and under them the name of what's picked
+       ...                       or pointed at
        ... drag space (it's the title bar) ...                         */
-enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT, HIT_SCHEME };
+enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT, HIT_SCHEME, HIT_STAB };
 
 static int plat_lights_bottom(void);   /* where the window's own buttons in the tab column end, in pixels */
 static void plat_settings_shown(void); /* the font or colors on screen changed */
@@ -3336,56 +3339,29 @@ static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
 static int g_row_y[MAX_TABS + 2], g_row_two[MAX_TABS + 1];   /* g_row_two: detail lines, 0..2 */
 static int g_settings_open;      /* this window's settings panel is showing */
 
-/* the panel: options in cells (col, row), labels, and two lines naming what's picked */
-typedef struct { int col, row, kind, idx; } Opt;   /* kind: HIT_FONT or HIT_SCHEME */
-static Opt g_opts[NFONTS + NSCHEMES];
-static int g_nopts;
-static struct { int row, w, h; } g_sizes[NFONTS];  /* the font rows' labels: cell size in pixels */
-static int g_nsizes, g_info_row;
+/* the panel: a row per font, or per scheme family, under two tabs */
+static int g_settings_tab;       /* 0: fonts, 1: color schemes (this window only) */
+
+/* the families, a row each: hardcore's own and the dark-only ones, then the pairs */
+static const struct { const char *name; char dark, light; } FAMILIES[] = {
+    {"hardcore", 'h', 0}, {"Dracula", 'd', 0}, {"Monokai", 'm', 0}, {"Nord", 'n', 0},
+    {"Gruvbox", 'g', 'G'}, {"Solarized", 's', 'S'}, {"One", 'o', 'O'}, {"Catppuccin", 'c', 'C'},
+    {"Tokyo Night", 'k', 'K'}, {"Rose Pine", 'r', 'R'},
+};
+#define NFAMILIES ((int)(sizeof(FAMILIES) / sizeof(FAMILIES[0])))
+#define LIGHT_COL (SB_COLS - 3)  /* a family row: name, dark letter two cells left of the light one */
+
+static int g_panel_row;          /* the tabs' top row */
+#define PANEL_LIST (g_panel_row + 3)
+static int panel_rows(void) { return 3 + (g_settings_tab ? NFAMILIES : NFONTS) + 2; }
+static int info_row(void) { return PANEL_LIST + (g_settings_tab ? NFAMILIES : NFONTS) + 1; }
 
 static float detail_w(void) { return (float)((SB_COLS - 4) * CW); }
 static float row_y(int r) { return (float)(PAD + r * CH); }
 
-/* lays out the settings from row r; returns the rows used */
-static int settings_layout(int r) {
-    int r0 = r, i, k, g, dark, n;
-    g_nopts = g_nsizes = 0;
-    r++;                                                 /* a blank row */
-    for (i = 0; i < NFONTS; i++) {                       /* a row per cell size, smallest first */
-        int w = cell_w(&FONTS[i]), h = cell_h(&FONTS[i]), seen = 0, j, at = g_nsizes;
-        for (j = 0; j < g_nsizes; j++) if (g_sizes[j].w == w && g_sizes[j].h == h) seen = 1;
-        if (seen) continue;
-        while (at > 0 && (g_sizes[at - 1].h > h || (g_sizes[at - 1].h == h && g_sizes[at - 1].w > w))) {
-            g_sizes[at] = g_sizes[at - 1];
-            at--;
-        }
-        g_sizes[at].w = w;
-        g_sizes[at].h = h;
-        g_nsizes++;
-    }
-    for (g = 0; g < g_nsizes; g++, r += 2) {             /* a blank row between rows: a space around each */
-        g_sizes[g].row = r;
-        for (k = 0, i = 0; i < NFONTS; i++) {
-            if (cell_w(&FONTS[i]) != g_sizes[g].w || cell_h(&FONTS[i]) != g_sizes[g].h) continue;
-            g_opts[g_nopts].col = 7 + 2 * k++;
-            g_opts[g_nopts].row = r;
-            g_opts[g_nopts].kind = HIT_FONT;
-            g_opts[g_nopts++].idx = i;
-        }
-    }
-    for (dark = 1; dark >= 0; dark--) {                  /* schemes: two cells square, dark ones first */
-        for (n = 0, i = 0; i < NSCHEMES; i++) {
-            if (SCHEMES[i].dark != dark) continue;
-            g_opts[g_nopts].col = 1 + 3 * (n % 6);
-            g_opts[g_nopts].row = r + 2 * (n / 6);
-            g_opts[g_nopts].kind = HIT_SCHEME;
-            g_opts[g_nopts++].idx = i;
-            n++;
-        }
-        r += 2 * ((n + 5) / 6);
-    }
-    g_info_row = r;
-    return r + 2 - r0;
+static int scheme_index(int key) {
+    const Scheme *s = scheme_by_key(key);
+    return s ? (int)(s - SCHEMES) : 0;
 }
 
 static void tab_layout(void) {
@@ -3394,7 +3370,7 @@ static void tab_layout(void) {
     UI_FONT;
     plat_client_size(&win_w, &win_h);
     r = first_row();
-    if (g_settings_open) panel = settings_layout(0);     /* how tall, for now */
+    if (g_settings_open) panel = panel_rows();
     avail = (win_h - PAD) / CH - r - 1 - panel;
     for (i = 0; i < g_ntabs; i++) {
         const wchar_t *d = tab_detail(g_tabs[i], tmp, 220);
@@ -3410,7 +3386,7 @@ static void tab_layout(void) {
     }
     g_row_y[g_ntabs] = (int)row_y(r);                    /* settings and + */
     g_row_y[g_ntabs + 1] = (int)row_y(r + 1);
-    if (g_settings_open) settings_layout(r + 1);
+    g_panel_row = r + 1;
     UI_DONE;
 }
 
@@ -3431,12 +3407,19 @@ static int hit_tabbar(int mx, int my, int *idx) {
         UI_DONE;
         return hit;
     }
-    if (g_settings_open)
-        for (i = 0; i < g_nopts; i++)
-            if (row == g_opts[i].row && col >= g_opts[i].col && col < g_opts[i].col + (g_opts[i].kind == HIT_SCHEME ? 2 : 1)) {
-                *idx = g_opts[i].idx;
-                hit = g_opts[i].kind;
-            }
+    if (g_settings_open && row >= g_panel_row && row < g_panel_row + 2 && col >= 1 && col <= 16) {
+        *idx = col <= 8 ? 0 : 1;                         /* the tabs: font, theme */
+        hit = HIT_STAB;
+    } else if (g_settings_open && row >= PANEL_LIST && col >= 1) {
+        int k = row - PANEL_LIST;
+        if (!g_settings_tab && k < NFONTS) {
+            *idx = k;
+            hit = HIT_FONT;
+        } else if (g_settings_tab && k < NFAMILIES) {    /* the light letter's cells pick light, the rest dark */
+            *idx = scheme_index(FAMILIES[k].light && col >= LIGHT_COL - 1 ? FAMILIES[k].light : FAMILIES[k].dark);
+            hit = HIT_SCHEME;
+        }
+    }
     UI_DONE;
     return hit;
 }
@@ -3444,7 +3427,8 @@ static int hit_tabbar(int mx, int my, int *idx) {
 /* things in the tab column a click does something to get the pointing hand, as on a web page */
 static int tabbar_action(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
-    return hit == HIT_SETTINGS || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_FONT || hit == HIT_SCHEME;
+    return hit == HIT_SETTINGS || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_FONT || hit == HIT_SCHEME ||
+           (hit == HIT_STAB && idx != g_settings_tab);
 }
 
 /* The terminal tries on the font or scheme under the mouse; anything else
@@ -3487,6 +3471,7 @@ static void settings_pick(int hit, int idx) {
 static void settings_click(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
     if (hit == HIT_SETTINGS) g_settings_open = !g_settings_open;
+    else if (hit == HIT_STAB) g_settings_tab = idx;
     else if (hit == HIT_FONT || hit == HIT_SCHEME) settings_pick(hit, idx);
     settings_point();
     plat_invalidate();
@@ -3601,59 +3586,80 @@ static void draw_plus(float cx, float cy, uint32_t col) {
     fill_rect(cx - th, cy - arm, cx + th, cy + arm + th, col, 1);
 }
 
-/* a frame one pixel of the scale thick, inside the rectangle */
-static void frame_rect(float x0, float y0, float x1, float y1, uint32_t col) {
-    float t = (float)g_scale;
-    fill_rect(x0, y0, x1, y0 + t, col, 1);
-    fill_rect(x0, y1 - t, x1, y1, col, 1);
-    fill_rect(x0, y0, x0 + t, y1, col, 1);
-    fill_rect(x1 - t, y0, x1, y1, col, 1);
+/* text on the grid, cell by cell from (col, row); spaces left as they are */
+static void grid_text(const wchar_t *s, int col, int row, uint32_t rgb) {
+    uint32_t cps[64];
+    uint8_t ws[64];
+    int n = text_cells(s, cps, ws, 64), i;
+    r_color(rgb, 1);
+    for (i = 0; i < n && col < SB_COLS; col += ws[i++])
+        if (cps[i] != ' ') draw_glyph(cps[i], (float)(col * CW), row_y(row), ws[i], g_scale);
 }
 
 static void render_settings(int hover, int hidx) {
-    int i;
+    int i, r = g_panel_row, sw = sidebar_w();
     wchar_t buf[96];
-    const Font *nf = hover == HIT_FONT ? &FONTS[hidx] : g_font;
-    const Scheme *ns = hover == HIT_SCHEME ? &SCHEMES[hidx] : g_scheme;
-    for (i = 0; i < g_nsizes; i++) {
-        _snwprintf(buf, 96, L"%d×%d", g_sizes[i].w, g_sizes[i].h);
-        buf[95] = 0;
-        layout_text(buf, (float)CW, row_y(g_sizes[i].row), 6.0f * CW, 1, g_look.detail, 1);
+    uint32_t line = g_look.dim, on = g_look.text, off = g_look.detail;
+    /* the tabs, drawn with box lines: the open one has a frame that opens onto the list */
+    if (!g_settings_tab) {
+        grid_text(L"╭──────╮", 1, r, line);
+        grid_text(L"│", 1, r + 1, line);
+        grid_text(L"font", 3, r + 1, on);
+        grid_text(L"│", 8, r + 1, line);
+        grid_text(L"theme", 10, r + 1, hover == HIT_STAB ? g_look.text_lo : off);
+        grid_text(L"─┘      └───────────", 0, r + 2, line);
+    } else {
+        grid_text(L"╭───────╮", 8, r, line);
+        grid_text(L"font", 3, r + 1, hover == HIT_STAB ? g_look.text_lo : off);
+        grid_text(L"│", 8, r + 1, line);
+        grid_text(L"theme", 10, r + 1, on);
+        grid_text(L"│", 16, r + 1, line);
+        grid_text(L"────────┘       └───", 0, r + 2, line);
     }
-    for (i = 0; i < g_nopts; i++) {
-        const Opt *o = &g_opts[i];
-        float x = (float)(o->col * CW), y = row_y(o->row);
-        int hov = hover == o->kind && hidx == o->idx;
-        if (o->kind == HIT_FONT) {
-            /* a box with the font's letter in it: amber is the one you picked */
-            int cur = &FONTS[o->idx] == g_font;
-            fill_rect(x, y, x + CW, y + CH, cur ? AMBER : hov ? g_look.text_lo : TAB_HOVER, 1);
-            r_color(cur || hov ? DEF_BG : g_look.text_lo, 1);
-            draw_glyph((uint32_t)(unsigned char)FONTS[o->idx].key, x, y, 1, g_scale);
-        } else {
-            /* the scheme in a square of its own background: its letter in its text color,
-               and its red, green, yellow and blue as the four quarters of a block */
-            const Scheme *sc = &SCHEMES[o->idx];
-            static const uint32_t quarter[4] = {0x2598, 0x259D, 0x2596, 0x2597};
-            int q;
-            fill_rect(x, y, x + 2 * CW, y + CH, sc->bg, 1);
-            r_color(sc->fg, 1);
-            draw_glyph((uint32_t)(unsigned char)sc->key, x, y, 1, g_scale);
-            for (q = 0; q < 4; q++) {
-                r_color(sc->pal[1 + q], 1);
-                draw_glyph(quarter[q], x + CW, y, 1, g_scale);
+    r = PANEL_LIST;
+    if (!g_settings_tab) {
+        for (i = 0; i < NFONTS; i++, r++) {
+            /* letter, name, cell size in the display's pixels; amber is the one you picked */
+            const Font *f = &FONTS[i];
+            int cur = f == g_font, hov = hover == HIT_FONT && hidx == i;
+            uint32_t fg = cur ? DEF_BG : hov ? on : g_look.text_lo;
+            if (cur || hov) fill_rect((float)CW, row_y(r), (float)sw, row_y(r) + CH, cur ? AMBER : TAB_HOVER, 1);
+            _snwprintf(buf, 96, L"%c %hs", f->key, f->name);
+            buf[95] = 0;
+            grid_text(buf, 1, r, fg);
+            _snwprintf(buf, 96, L"%d×%d", cell_w(f), cell_h(f));
+            buf[95] = 0;
+            grid_text(buf, SB_COLS - 1 - (int)wcslen(buf), r, cur ? fg : hov ? g_look.text_lo : off);
+        }
+    } else {
+        for (i = 0; i < NFAMILIES; i++, r++) {
+            /* a family per row: its dark letter and its light one; amber marks the scheme you picked */
+            int hov = hover == HIT_SCHEME && (SCHEMES[hidx].key == FAMILIES[i].dark || SCHEMES[hidx].key == FAMILIES[i].light), k;
+            if (hov) fill_rect(0, row_y(r), (float)sw, row_y(r) + CH, TAB_HOVER, 1);
+            utf8_to_wide(FAMILIES[i].name, buf, 96);
+            grid_text(buf, 1, r, hov ? on : g_look.text_lo);
+            for (k = 0; k < 2; k++) {
+                char key = k ? FAMILIES[i].light : FAMILIES[i].dark;
+                int col = k ? LIGHT_COL : LIGHT_COL - 3, pointed = hov && SCHEMES[hidx].key == key;
+                wchar_t one[2] = {(wchar_t)key, 0};
+                if (!key) continue;
+                if (key == g_scheme->key) fill_rect((float)(col * CW), row_y(r), (float)((col + 1) * CW), row_y(r) + CH, AMBER, 1);
+                else if (pointed) fill_rect((float)(col * CW), row_y(r), (float)((col + 1) * CW), row_y(r) + CH, g_look.text_lo, 1);
+                grid_text(one, col, r, key == g_scheme->key || pointed ? DEF_BG : hov ? on : g_look.text_lo);
             }
-            if (sc == g_scheme) frame_rect(x - g_scale, y - g_scale, x + 2 * CW + g_scale, y + CH + g_scale, AMBER);
-            else if (hov) frame_rect(x - g_scale, y - g_scale, x + 2 * CW + g_scale, y + CH + g_scale, g_look.text_lo);
         }
     }
-    /* what's picked, or what you're pointing at, by name and letter */
-    _snwprintf(buf, 96, L"%c %hs %d×%d", nf->key, nf->name, cell_w(nf), cell_h(nf));
+    /* a rule, then the name of what you're pointing at, or of what's picked */
+    for (i = 0; i < SB_COLS; i++) grid_text(L"─", i, info_row() - 1, line);
+    if (!g_settings_tab) {
+        const Font *f = hover == HIT_FONT ? &FONTS[hidx] : g_font;
+        _snwprintf(buf, 96, L"%c %hs %d×%d %ls", f->key, f->name, cell_w(f), cell_h(f), f->dev || g_scale == 1 ? L"1:1" : g_scale == 2 ? L"2×2" : L"3×3");
+    } else {
+        const Scheme *sc = hover == HIT_SCHEME ? &SCHEMES[hidx] : g_scheme;
+        _snwprintf(buf, 96, L"%c %hs", sc->key, sc->name);
+    }
     buf[95] = 0;
-    layout_text(buf, (float)CW, row_y(g_info_row), (float)((SB_COLS - 2) * CW), 1, hover == HIT_FONT ? g_look.text : g_look.detail, 1);
-    _snwprintf(buf, 96, L"%c %hs", ns->key, ns->name);
-    buf[95] = 0;
-    layout_text(buf, (float)CW, row_y(g_info_row + 1), (float)((SB_COLS - 2) * CW), 1, hover == HIT_SCHEME ? g_look.text : g_look.detail, 1);
+    grid_text(buf, 0, info_row(), hover == HIT_FONT || hover == HIT_SCHEME ? on : g_look.text_lo);
 }
 
 static void render_tabbar(int win_w, int win_h) {
