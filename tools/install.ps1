@@ -19,6 +19,12 @@ if (Test-Path $dest) {
 Copy-Item -Force $Exe $dest
 Write-Output "installed $dest"
 
+# `hardcore` as a command in new PowerShell and cmd windows
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (-not (($userPath -split ';') -contains $dir)) {
+    [Environment]::SetEnvironmentVariable('Path', ((@($userPath -split ';' | Where-Object { $_ }) + $dir) -join ';'), 'User')
+    Write-Output "added     $dir to your PATH (new terminals)"
+}
 foreach ($folder in 'Programs', 'Desktop') {
     $base = [Environment]::GetFolderPath($folder)
     $lnk = Join-Path $base 'hardcore.lnk'

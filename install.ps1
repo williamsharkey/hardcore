@@ -32,6 +32,13 @@ if (Test-Path $dest) {
 Move-Item -Force $tmp $dest
 Write-Host "hardcore: installed $dest"
 if (-not $quiet) {
+    # `hardcore` as a command in new PowerShell and cmd windows
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not (($userPath -split ';') -contains $dir)) {
+        [Environment]::SetEnvironmentVariable('Path', ((@($userPath -split ';' | Where-Object { $_ }) + $dir) -join ';'), 'User')
+        Write-Host "hardcore: added $dir to your PATH (new terminals)"
+    }
+
     foreach ($folder in 'Programs', 'Desktop') {
         $lnk = Join-Path ([Environment]::GetFolderPath($folder)) 'hardcore.lnk'
         $sh = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)

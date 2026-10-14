@@ -39,6 +39,7 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <winhttp.h>
+#include <tlhelp32.h>
 #include <bcrypt.h>
 #include <stdarg.h>
 #define COBJMACROS
@@ -149,7 +150,7 @@ static PFN_ClosePC  pClosePC;
 
 /* the release: `hardcore update` compares it with the latest tag, and the Mac
    build reads it into Info.plist (keep this line exactly as it is) */
-#define HARDCORE_VERSION "0.4.1"
+#define HARDCORE_VERSION "0.4.2"
 #define AMBER 0xFFA60D           /* dumbterm's phosphor cursor */
 #define DEF_FG 0xCCCCCC
 #define DEF_BG 0x0C0C0C
@@ -1995,6 +1996,11 @@ static const char RC_BASH[] =
     "[ -n \"$HARDCORE_HIST\" ] && { __hardcore_once=$HARDCORE_HIST; unset HARDCORE_HIST; }\n"
     "# hardcore itself: `hardcore` opens a new window here (or in DIR), `hardcore update`\n"
     "# installs the latest release, `hardcore --version` says which one this is\n"
+    "# and as a command in every WSL shell (Claude Code's ! too): one symlink to the\n"
+    "# installed exe in ~/.local/bin, unless something called hardcore is already there\n"
+    "case $HARDCORE_EXE in */hardcore/hardcore.exe)\n"
+    "  [ -e ~/.local/bin/hardcore ] || [ -L ~/.local/bin/hardcore ] || { mkdir -p ~/.local/bin && ln -s \"$HARDCORE_EXE\" ~/.local/bin/hardcore; } 2>/dev/null ;;\n"
+    "esac\n"
     "if [ -n \"$HARDCORE_EXE\" ] && ! declare -F hardcore >/dev/null; then\n"
     "  hardcore() {\n"
     "    case $1 in\n"
@@ -2096,6 +2102,15 @@ static void write_rc(void) {
         _snwprintf(wslenv, 2200, L"%ls%lsHARDCORE_RC/p:HARDCORE_EXE/p", old, n ? L":" : L"");
         wslenv[2199] = 0;
         SetEnvironmentVariableW(L"WSLENV", wslenv);
+    }
+    {   /* `hardcore` in this window's PowerShell and cmd tabs (and hardcore.exe in its WSL ones) */
+        wchar_t exe[MAX_PATH], *sl, path[8192] = L"", np[8400];
+        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        if ((sl = wcsrchr(exe, L'\\'))) *sl = 0;
+        GetEnvironmentVariableW(L"PATH", path, 8192);
+        _snwprintf(np, 8400, L"%ls;%ls", exe, path);
+        np[8399] = 0;
+        SetEnvironmentVariableW(L"PATH", np);
     }
     /* what PowerShell tabs (and Claude Code for Windows in them) should know */
     SetEnvironmentVariableW(L"COLORTERM", L"truecolor");
@@ -5875,6 +5890,41 @@ static int update_cmd(int force) {
     return 0;
 }
 
+/* Started from a command line (a shell, WSL, Claude Code's !) rather than
+   from Explorer (Start menu, desktop, taskbar): then `hardcore` means "a
+   window here", like any command. Explorer's launches keep the last session. */
+static int from_command_line(void) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe;
+    DWORD me = GetCurrentProcessId(), parent = 0;
+    int shell = 0, pass;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    for (pass = 0; pass < 2; pass++) {      /* find our parent, then its name */
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) do {
+            if (!pass && pe.th32ProcessID == me) { parent = pe.th32ParentProcessID; break; }
+            if (pass && pe.th32ProcessID == parent) { shell = _wcsicmp(pe.szExeFile, L"explorer.exe") != 0; break; }
+        } while (Process32NextW(snap, &pe));
+        if (!parent) break;
+    }
+    CloseHandle(snap);
+    return shell;
+}
+
+/* \\wsl.localhost\Distro\home\you (how WSL hands a Linux folder to a Windows
+   program) → /home/you; Windows folders stay as they are */
+static void folder_for_tab(const wchar_t *w, char *out, size_t cap) {
+    const wchar_t *p = NULL;
+    size_t k;
+    if (!_wcsnicmp(w, L"\\\\wsl.localhost\\", 16)) p = w + 16;
+    else if (!_wcsnicmp(w, L"\\\\wsl$\\", 7)) p = w + 7;
+    if (p && (p = wcschr(p, L'\\'))) {
+        WideCharToMultiByte(CP_UTF8, 0, p, -1, out, (int)cap, NULL, NULL);
+        for (k = 0; out[k]; k++) if (out[k] == '\\') out[k] = '/';
+    } else if (p) snprintf(out, cap, "/");
+    else WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL);
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     int argc, i, cols, rows;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -5972,6 +6022,40 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             dir_given = 1;
         }
     }
+    /* `hardcore` or `hardcore DIR` typed in a shell: a window there (the shell's
+       folder if none was named), started on its own so the shell gets its
+       prompt back (WSL waits for the Windows programs it starts) */
+    if (!selftest_out[0] && show != SW_SHOWNOACTIVATE && !_wgetenv(L"HARDCORE_DETACHED") && from_command_line()) {
+        wchar_t self[MAX_PATH], here[MAX_PATH * 2], full[MAX_PATH * 2], cl[4096], wdir[1100];
+        char dir[1100];
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        if (dir_given && g_start_dir[0] != '/') {          /* relative to the shell's folder */
+            MultiByteToWideChar(CP_UTF8, 0, g_start_dir, -1, here, MAX_PATH * 2);
+            if (!GetFullPathNameW(here, MAX_PATH * 2, full, NULL)) wcscpy(full, here);
+            folder_for_tab(full, dir, sizeof(dir));
+        } else if (dir_given) snprintf(dir, sizeof(dir), "%s", g_start_dir);
+        else {
+            GetCurrentDirectoryW(MAX_PATH * 2, here);
+            folder_for_tab(here, dir, sizeof(dir));
+        }
+        MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, 1100);
+        GetModuleFileNameW(NULL, self, MAX_PATH);
+        _snwprintf(cl, 4096, L"\"%ls\" --cd \"%ls\"", self, wdir);
+        cl[4095] = 0;
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        SetEnvironmentVariableW(L"HARDCORE_DETACHED", L"1");
+        if (CreateProcessW(self, cl, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            return 0;
+        }
+        SetEnvironmentVariableW(L"HARDCORE_DETACHED", NULL);
+        snprintf(g_start_dir, sizeof(g_start_dir), "%s", dir);  /* couldn't detach: just open here */
+        dir_given = 1;
+    }
+    SetEnvironmentVariableW(L"HARDCORE_DETACHED", NULL);   /* not for the tabs' children */
     trace("config");
     load_conpty(g_inbox_conpty);
     trace("conpty loaded");

@@ -23,8 +23,11 @@ look, one size, one layout.
   Claude comes back with `claude --resume`, with the flags you started it with.
   Exiting the last tab yourself means you're done: the next window starts
   fresh. See [Sessions](#sessions).
-- **Otherwise it opens where you left off.** A new window starts in the folder
-  the last window closed in. The very first time it's `/mnt/c/Users/<you>` (your
+- **`hardcore` in any shell opens a window right there.** It works in WSL
+  (Claude Code's `!` too), PowerShell and cmd. See [Update](#update).
+- **Otherwise it opens where you left off.** Launched from the Start menu,
+  desktop or taskbar with no saved tabs, a new window starts in the folder the
+  last window closed in. The very first time it's `/mnt/c/Users/<you>` (your
   `%USERPROFILE%`), not `~` inside the distro.
 - **Tabs run down the left edge**, like Chrome's vertical tabs: tabs, then
   **+**. The tab column is 20 cells wide and sits on the terminal's own text
@@ -113,13 +116,28 @@ shows that screen: **More info → Run anyway**. Or build it yourself (see
 
 ### Update
 
-From any hardcore tab:
+From any shell:
 
 ```
+hardcore               # a new hardcore window in this folder
+hardcore DIR           # ...or in DIR
 hardcore update        # install the latest release, like `claude update`
 hardcore --version     # which release and commit this is
-hardcore [DIR]         # a new hardcore window here (or in DIR)
 ```
+
+`hardcore` works in any WSL shell, Claude Code's `!` included, and in PowerShell
+and cmd:
+- **WSL:** hardcore's first tab adds a symlink, `~/.local/bin/hardcore`,
+  pointing at the installed exe. It isn't made if you already have something
+  by that name.
+- **PowerShell and cmd outside hardcore:** the installer adds hardcore's
+  folder to your user PATH.
+- **hardcore's own PowerShell and cmd tabs** have it on their PATH already.
+
+Started from a shell, hardcore opens in that shell's folder and hands the
+prompt straight back. WSL would otherwise wait for the window to close.
+Started from the Start menu, the desktop or the taskbar, it restores your last
+session.
 
 `hardcore update` asks GitHub for the latest release and compares it with this
 build's version. If it's newer, it downloads `hardcore.exe` and checks it
@@ -129,9 +147,6 @@ the next window you open runs the new one. Copies left behind by earlier
 updates are deleted on the next update. `--force` reinstalls the latest
 release even if this one isn't older.
 
-The `hardcore` command is a small shell function in hardcore's `rc.bash`. From
-PowerShell or cmd, use the exe itself:
-`& "$env:LOCALAPPDATA\hardcore\hardcore.exe" update`.
 
 ## Claude Code
 
