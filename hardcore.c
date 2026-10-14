@@ -12,7 +12,8 @@
  *   - Tabs. The "+" button (and Ctrl+Shift+T) opens a new WSL shell in the
  *     directory the current tab is sitting in. The shell reports $PWD on every
  *     prompt through OSC 9;9 from a small rc file hardcore writes for itself.
- *   - New windows start in %USERPROFILE% (/mnt/c/Users/<you>), not ~.
+ *   - New windows start in the folder the last window closed in, or the
+ *     first time in %USERPROFILE% (/mnt/c/Users/<you>), not ~.
  *
  * Build (from WSL or MSYS2):
  *   make            → hardcore.exe
@@ -119,6 +120,7 @@ static int g_scale = 1;          /* integer pixel scale, from the monitor DPI; o
 static int g_dpi = 96;
 static char g_distro[128];
 static char g_start_dir[1024];   /* Windows or Linux path */
+static char g_last_dir[1024];    /* where the last window closed: the next one opens there */
 static wchar_t g_cfg_dir[MAX_PATH];
 static int g_shell_ps;           /* shell=powershell in config.ini: tabs run PowerShell, not WSL */
 static int g_no_bash;            /* the distro has no bash: run its default shell, without rc.bash */
@@ -1917,6 +1919,7 @@ static void config_load(void) {
         n = strlen(v);
         while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
         if (!strcmp(line, "dir") && *v) snprintf(g_start_dir, sizeof(g_start_dir), "%s", v);
+        else if (!strcmp(line, "last")) snprintf(g_last_dir, sizeof(g_last_dir), "%s", v);
         else if (!strcmp(line, "distro")) snprintf(g_distro, sizeof(g_distro), "%s", v);
         else if (!strcmp(line, "shell")) g_shell_ps = !_stricmp(v, "powershell");
         else if (!strcmp(line, "width")) g_win_w = atoi(v);
@@ -1941,6 +1944,8 @@ static void config_save(void) {
     fprintf(f, "# shell=powershell runs PowerShell in tabs instead of WSL; empty = WSL\n");
     fprintf(f, "shell=%s\n", g_shell_ps ? "powershell" : "");
     fprintf(f, "width=%d\nheight=%d\n", g_win_w, g_win_h);
+    fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
+    fprintf(f, "last=%s\n", g_last_dir);
     fclose(f);
 }
 
@@ -2809,6 +2814,49 @@ static int caption_hit(int mx, int my) {
 }
 
 static int g_nc_hover, g_nc_press, g_win_active = 1;
+static int g_top_hover;          /* the mouse is on the top line: it drags the window */
+
+/* the top line, left of the buttons: a title bar that only shows itself on hover */
+static int in_top_line(int mx, int my) { return mx >= sidebar_w() && my >= 0 && my < caption_h(); }
+
+/* ── low disk ─────────────────────────────────────────────────────────
+   WSL's disk is a .vhdx on a Windows drive that grows as Linux writes. When
+   that drive fills, the guest still thinks it has room; its writes fail
+   underneath it, programs die with SIGBUS ("Bus error") and then the whole
+   VM goes, taking every tab with it. So the tab column warns early. */
+#define TIMER_DISK 4
+#define DISK_WARN_GB 20.0
+#define DISK_BAD_GB 5.0
+static double g_disk_free_gb = -1;
+static wchar_t g_disk_name[4] = L"C:";
+
+static void check_disk(void) {
+    wchar_t p[MAX_PATH], *la = _wgetenv(L"LOCALAPPDATA");
+    ULARGE_INTEGER avail;
+    double gb, was = g_disk_free_gb;
+    _snwprintf(p, MAX_PATH, L"%ls\\wsl\\", la ? la : L"C:");
+    p[MAX_PATH - 1] = 0;
+    if (!GetDiskFreeSpaceExW(p, &avail, NULL, NULL) && !GetDiskFreeSpaceExW(la ? la : L"C:\\", &avail, NULL, NULL)) return;
+    if (la && la[0] && la[1] == ':') { g_disk_name[0] = towupper(la[0]); g_disk_name[1] = ':'; g_disk_name[2] = 0; }
+    gb = (double)avail.QuadPart / (1024.0 * 1024 * 1024);
+    g_disk_free_gb = gb;
+    if ((was < DISK_WARN_GB) != (gb < DISK_WARN_GB) || (gb < DISK_WARN_GB && (int)(was * 10) != (int)(gb * 10)))
+        InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+static void render_disk_warning(int win_h) {
+    wchar_t l1[64], l2[64];
+    float x = (float)(10 * g_scale), w = (float)(sidebar_w() - 14 * g_scale), y = (float)(win_h - 3 * CH - 6 * g_scale);
+    uint32_t col;
+    if (g_disk_free_gb < 0 || g_disk_free_gb >= DISK_WARN_GB) return;
+    col = g_disk_free_gb < DISK_BAD_GB ? 0xE74856 : AMBER;
+    _snwprintf(l1, 64, L"%ls %.1f GB free", g_disk_name, g_disk_free_gb);
+    _snwprintf(l2, 64, L"WSL crashes when %ls fills", g_disk_name);
+    fill_rect(0, y - 4 * g_scale, (float)sidebar_w(), (float)win_h, BAR_BG, 1);
+    fill_rect(0, y - 4 * g_scale, (float)(2 * g_scale), y + 2 * CH + 4 * g_scale, col, 1);
+    layout_text(l1, x, y, w, 1, col, 1);
+    layout_text(l2, x, y + CH, w, 2, 0x8A8A8A, 1);
+}
 
 /* one-pixel-wide strokes, scaled: the caption glyphs stay as sharp as the font */
 static void px_line(float x0, float y0, int n, int dx, int dy, uint32_t rgb) {
@@ -2906,6 +2954,7 @@ static void render_tabbar(int win_w, int win_h) {
         fill_rect(cx - arm, cy - th, cx + arm + th, cy + th, col, 1);
         fill_rect(cx - th, cy - arm, cx + th, cy + arm + th, col, 1);
     }
+    render_disk_warning(win_h);
 }
 
 static void render(void) {
@@ -3017,6 +3066,8 @@ static void render(void) {
         fill_rect(bx, track_top + pos * (track_h - bar_h), bx + SCROLLBAR_W - 2 * g_scale,
                   track_top + pos * (track_h - bar_h) + bar_h, AMBER, t->view ? 0.8f : 0.3f);
     }
+    if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
+        fill_rect((float)sidebar_w(), 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
     render_caption_buttons(r.right);   /* last: glass over whatever is under it */
 }
 
@@ -3212,12 +3263,24 @@ static void new_tab_here(void) {
     activate(g_ntabs == 1 ? 0 : g_active + 1);
 }
 
+/* The folder the window is closing in, for the next window to open in. */
+static void remember_dir(Tab *tb) {
+    const char *d;
+    if (!tb || tb->help) return;
+    d = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir;
+    if (d[0]) snprintf(g_last_dir, sizeof(g_last_dir), "%s", d);
+}
+
 static void close_tab(int i) {
     Tab *tb;
     if (i < 0 || i >= g_ntabs) return;
     tb = g_tabs[i];
     memmove(&g_tabs[i], &g_tabs[i + 1], sizeof(Tab *) * (g_ntabs - i - 1));
     g_ntabs--;
+    if (!g_ntabs) {             /* the last tab: its folder is where the next window opens */
+        remember_dir(tb);
+        config_save();
+    }
     tab_destroy_async(tb);
     if (!g_ntabs) {
         DestroyWindow(g_hwnd);
@@ -3655,6 +3718,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DragAcceptFiles(hwnd, TRUE);
         return 0;
     case WM_CLOSE:
+        remember_dir(active_tab());
         save_window_size();
         config_save();
         DestroyWindow(hwnd);
@@ -3689,6 +3753,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_mouse_x = atoi(buf + 6);
                 g_mouse_y = strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1;
             } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);
+            else if (!strncmp(buf, "tophover ", 9)) g_top_hover = atoi(buf + 9);
             else return FALSE;
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (cd->dwData == 0x48430003 && g_gfx_ready) {   /* snapshot the next frame to a .bmp */
@@ -3722,19 +3787,24 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return pt.x < corner ? HTTOPLEFT : pt.x >= r.right - corner ? HTTOPRIGHT : HTTOP;
         }
         if ((cap = caption_hit(pt.x, pt.y))) return cap;
+        if (in_top_line(pt.x, pt.y)) return HTCAPTION;
         if (hit_tabbar(pt.x, pt.y, &idx) == HIT_BAR) return HTCAPTION;
         return HTCLIENT;
     }
     case WM_NCMOUSEMOVE: {
-        int h = (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) ? (int)wp : 0;
+        int h = (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) ? (int)wp : 0, top;
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE | TME_NONCLIENT, hwnd, 0};
         TrackMouseEvent(&tme);
+        ScreenToClient(hwnd, &pt);
+        top = (wp == HTCAPTION || h) && in_top_line(pt.x, pt.y);
+        if (top != g_top_hover) { g_top_hover = top; InvalidateRect(hwnd, NULL, FALSE); }
         if (g_mouse_y >= 0) { g_mouse_x = g_mouse_y = -1; InvalidateRect(hwnd, NULL, FALSE); }
         if (h != g_nc_hover) { g_nc_hover = h; InvalidateRect(hwnd, NULL, FALSE); }
         break;                   /* DefWindowProc still runs: Win11 snap layouts hang off HTMAXBUTTON */
     }
     case WM_NCMOUSELEAVE:
-        if (g_nc_hover || g_nc_press) { g_nc_hover = g_nc_press = 0; InvalidateRect(hwnd, NULL, FALSE); }
+        if (g_nc_hover || g_nc_press || g_top_hover) { g_nc_hover = g_nc_press = g_top_hover = 0; InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
     case WM_NCLBUTTONDOWN:
     case WM_NCLBUTTONDBLCLK:
@@ -3772,6 +3842,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         drop_files((HDROP)wp);
         return 0;
     case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCAPTION) {   /* the top line and the empty tab column move the window */
+            SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL));
+            return TRUE;
+        }
         if (LOWORD(lp) == HTCLIENT) {
             POINT pt;
             int col, row;
@@ -3809,6 +3883,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_TIMER:
         if (wp == TIMER_THROB) { update_busy(); return 0; }
+        if (wp == TIMER_DISK) { check_disk(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
         else InvalidateRect(hwnd, NULL, FALSE);
@@ -4128,6 +4203,18 @@ static void dark_titlebar(HWND h) {
     f(h, 36, &txt, sizeof(txt));     /* DWMWA_TEXT_COLOR */
 }
 
+/* Drive folders are checked; a folder inside the distro is taken on trust
+   (looking would mean booting WSL before the window is up). */
+static int dir_exists(const char *p) {
+    wchar_t w[MAX_PATH * 2];
+    DWORD a;
+    if (p[0] == '/' && strncmp(p, g_mnt_root, strlen(g_mnt_root))) return 1;
+    to_windows_dir(p, w, MAX_PATH * 2);
+    if (!wcsncmp(w, L"\\\\wsl", 5)) return 1;
+    a = GetFileAttributesW(w);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 static void default_start_dir(void) {
     wchar_t *up = _wgetenv(L"USERPROFILE");
     if (g_start_dir[0]) return;
@@ -4307,6 +4394,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     drip_init();
     config_load();
     snprintf(g_cfg_dir_line, sizeof(g_cfg_dir_line), "%s", g_start_dir);
+    if (g_last_dir[0] && dir_exists(g_last_dir)) snprintf(g_start_dir, sizeof(g_start_dir), "%s", g_last_dir);
     for (i = 1; i < argc; i++) {
         char a[1024];
         WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, a, sizeof(a), NULL, NULL);
@@ -4379,6 +4467,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     ShowWindow(h, show);
     UpdateWindow(h);
     trace("window shown");
+    check_disk();
+    SetTimer(h, TIMER_DISK, 60 * 1000, NULL);
     new_tab_here();              /* wsl.exe boots while the D3D device is created */
     trace("first tab spawned");
     if (gfx_thread) { WaitForSingleObject(gfx_thread, 5000); CloseHandle(gfx_thread); }

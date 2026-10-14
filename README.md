@@ -14,12 +14,22 @@ look, one size, one layout.
   +                 │
 ```
 
-- **Starts in `/mnt/c/Users/<you>`** (your `%USERPROFILE%`), not in `~` inside the distro.
+- **Opens where you left off.** A new window starts in the folder the last
+  window closed in (its active tab, or the last tab you exited). The very
+  first time it's `/mnt/c/Users/<you>` (your `%USERPROFILE%`), not `~` inside the distro.
 - **Tabs run down the left edge**, like Chrome's vertical tabs: tabs, then
   **+**. Min/max/close float over the terminal's top-right corner on smoked
   glass. Text runs underneath and only the mouse belongs to them, so no row
-  is lost to a title bar. Snap layouts appear when you hover over maximize,
-  and the empty part of the tab column drags the window.
+  is lost to a title bar. The whole top line works as a title bar: point at
+  it and it smokes over and the cursor turns into the move arrows. Drag it to
+  move the window, or double-click it to maximize. When the mouse isn't there,
+  the text shows clearly. Snap layouts appear when you hover over maximize,
+  and the empty part of the tab column drags the window too.
+- **Warns before the disk fills.** WSL's disk is a `.vhdx` on your Windows
+  drive. When that drive runs out, Linux programs die with "Bus error", and
+  then the whole WSL VM goes down, taking every tab with it. Under 20 GB free,
+  the bottom of the tab column shows how much is left (amber), and under 5 GB
+  it turns red.
 - **+** (or Ctrl+Shift+T) opens a new WSL tab **in the same folder as the
   tab you're in**.
 - **A tab's label is its folder's name.** Nothing else: no icons, no
@@ -189,6 +199,7 @@ If your login shell is zsh or fish, the tab still opens bash.
 
 ```ini
 dir=             # folder for new windows; empty = %USERPROFILE%
+last=            # the folder the last window closed in; wins over dir= (empty it to use dir=)
 distro=          # WSL distro; empty = default
 shell=           # powershell = PowerShell tabs instead of WSL
 width=… height=… # last window size
