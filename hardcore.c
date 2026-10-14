@@ -5277,7 +5277,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit == HIT_TAB) { activate(idx); return 0; }
         if (hit == HIT_CLOSE) { close_tab(idx); return 0; }
         if (hit == HIT_PLUS) { new_tab_here(); return 0; }
-        if (hit == HIT_SETTINGS || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return 0; }
+        if (hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return 0; }
         if (hit == HIT_BAR) return 0;
         GetClientRect(hwnd, &r);
         if (tb && mx >= r.right - SCROLLBAR_W - g_scale && tb->t.hcount && !tb->t.alt) {
