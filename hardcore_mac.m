@@ -2,29 +2,33 @@
  * hardcore_mac.m — the macOS platform layer, #included at the end of
  * hardcore.c (one translation unit, built with clang -x objective-c).
  *
- * Same shape as dumbterm's Mac side: a Cocoa window with an NSOpenGLView,
- * forkpty for the shell, the pasteboard for copy and paste. What hardcore.c
- * does on Win32 with ConPTY, D3D11, WM_* messages and the clipboard, this
- * does with:
+ * The shape dumbterm's Mac side has: a Cocoa window, forkpty for the shell,
+ * the pasteboard for copy and paste. What hardcore.c does on Win32 with
+ * ConPTY, D3D11, WM_* messages and the clipboard, this does with:
  *
  *   - forkpty: a real local pty; your login shell (zsh, bash or fish) with a
  *     few lines of hooks that report the folder (OSC 9;9) and mark prompts
- *     (OSC 133;A), the same two things rc.bash does under WSL.
- *   - dispatch sources: output, process exit, and a serial queue per tab for
- *     writes, so a big paste never blocks the window.
- *   - OpenGL 2.1 (legacy profile, one GLSL 1.20 shader pair): the same vertex
- *     array and glyph atlas as the Direct3D path, drawn with one glDrawArrays.
+ *     (OSC 133;A), the same two things rc.bash does under WSL. zsh and bash
+ *     also keep a pre-warmed spare shell for the next new tab.
+ *   - dispatch sources: output and process exit on the main queue; writes go
+ *     straight into the (non-blocking) pty, and only what doesn't fit waits on
+ *     a serial queue, so a big paste never blocks the window.
+ *   - Metal on a CAMetalLayer (hardcore.metal, compiled at build time): the
+ *     same vertex array and glyph atlas as the Direct3D path, one draw per
+ *     frame. Frames are built on the main thread and drawn by a render
+ *     thread, which is the one that waits for a drawable.
  *   - The standard traffic lights over the tab column instead of hardcore's
  *     own glass caption buttons.
  *
  * Mac keys follow Mac habits: Cmd+T / Cmd+W / Cmd+C / Cmd+V, Cmd+1…9,
  * Cmd+Shift+[ ], Cmd+J, Cmd+↑/↓. Left Option is Meta (ESC prefix, what Claude
  * Code and readline expect); right Option still types é, ü, @ and friends.
+ *
+ * Measured with bench/macbench (see bench/RESULTS-mac.md). HARDCORE_TRACE=1
+ * logs startup phases, HARDCORE_LAT=1 each keypress's path to the display.
  */
 
-#define GL_SILENCE_DEPRECATION
 #import <Cocoa/Cocoa.h>
-#include <OpenGL/gl.h>
 #include <util.h>
 #include <fcntl.h>
 #include <libproc.h>
@@ -34,12 +38,18 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 
 @class HCView;
 static NSWindow *g_win;
 static HCView *g_view;
-static int g_gl_ready;
-static int g_quitting;           /* skip the "programs are running" question: last tab closed */
+static int g_gfx_ready;          /* Metal device and shaders are up */
+static int g_quitting;
+static int g_paint_pending;      /* a frame is wanted: drawn when the main thread idles */
+static double uptime_ms(void);           /* skip the "programs are running" question: last tab closed */
 static NSTimer *g_timers[4];
 
 static const char *g_shell;      /* your login shell */
@@ -97,114 +107,293 @@ static void plat_close_window(void) {
     [NSApp terminate:nil];
 }
 
-/* ── renderer: OpenGL 2.1 ──────────────────────────────────────────── */
+/* ── renderer: Metal on a CAMetalLayer ─────────────────────────────── */
 
-static GLuint g_prog, g_atlas_tex;
+/* The same vertex array and 16×16-slot atlas as the Direct3D path, drawn
+   with one draw call per frame. Why Metal and not the OpenGL the first port
+   used: an NSOpenGLView frame waits for AppKit's display cycle and goes
+   through an extra surface copy, and GL is deprecated. Measured side by side
+   (bench/RESULTS-mac.md): keypress → screen 22.6 ms p50 against 27.2. A
+   CAMetalLayer frame is presented the moment it's encoded: two drawables,
+   no vsync wait on our side, and the window server takes the newest one. */
 
-static const char GLSL_VS[] =
-    "#version 120\n"
-    "varying vec2 uv; varying vec4 col;\n"
-    "void main() { gl_Position = vec4(gl_Vertex.xy, 0.0, 1.0); uv = gl_MultiTexCoord0.xy; col = gl_Color; }\n";
-static const char GLSL_FS[] =
-    "#version 120\n"
-    "uniform sampler2D t; varying vec2 uv; varying vec4 col;\n"
-    "void main() {\n"
-    "  float a = uv.x < 0.0 ? 1.0 : texture2D(t, uv).a;\n"
-    "  gl_FragColor = vec4(col.rgb, col.a * a); }\n";
+#import <Metal/Metal.h>
+#import <QuartzCore/QuartzCore.h>
 
-static GLuint gl_shader(GLenum kind, const char *src) {
-    GLuint s = glCreateShader(kind);
-    GLint ok = 0;
-    glShaderSource(s, 1, &src, NULL);
-    glCompileShader(s);
-    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[1024];
-        glGetShaderInfoLog(s, sizeof(log), NULL, log);
-        fprintf(stderr, "hardcore: shader: %s\n", log);
+static id<MTLDevice> g_mtl;
+static id<MTLCommandQueue> g_queue;
+static id<MTLRenderPipelineState> g_pipe;
+static id<MTLTexture> g_atlas;
+static CAMetalLayer *g_layer;
+static int g_lat;                /* HARDCORE_LAT=1: per key, to stderr, when the echo arrived, the frame was
+                                    committed, and it reached the display (Metal's presentedTime) */
+static double g_lat_key, g_lat_out, g_lat_down, g_lat_written;
+static void trace(const char *what);
+static int g_tracing, g_frames, g_trace_commit;
+static double g_trace_tab_t;     /* when the last Cmd+T came in */
+static double uptime_ms(void);
+static double g_t_exec;
+
+/* The shader is hardcore.metal. make compiles it ahead of time when Xcode's
+   metal compiler is there (build/hardcore.metallib), which saves ~175 ms of
+   compiling on a cold start; its source is embedded too, and compiled at
+   startup when there's no precompiled library. */
+__asm__(".const_data\n.balign 16\n.global _metal_src\n_metal_src:\n.incbin \"hardcore.metal\"\n.byte 0\n"
+#ifdef HAVE_METALLIB
+        ".balign 16\n.global _metal_lib\n_metal_lib:\n.incbin \"build/hardcore.metallib\"\n.global _metal_lib_end\n_metal_lib_end:\n"
+#endif
+        ".text\n");
+extern const char metal_src[];
+#ifdef HAVE_METALLIB
+extern const unsigned char metal_lib[], metal_lib_end[];
+#endif
+
+/* Device, shaders, atlas: no window needed, so this runs on a worker while
+   the main thread builds the window and the first shell starts. */
+static int mtl_init(void) {
+    NSError *err = nil;
+    id<MTLLibrary> lib;
+    MTLRenderPipelineDescriptor *pd;
+    MTLTextureDescriptor *td;
+    g_mtl = MTLCreateSystemDefaultDevice();
+    if (!g_mtl) return 0;
+    g_queue = [g_mtl newCommandQueue];
+#ifdef HAVE_METALLIB
+    {
+        dispatch_data_t d = dispatch_data_create(metal_lib, (size_t)(metal_lib_end - metal_lib), NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        lib = [g_mtl newLibraryWithData:d error:&err];
+        dispatch_release(d);
     }
-    return s;
+    if (!lib)
+#endif
+    lib = [g_mtl newLibraryWithSource:[NSString stringWithUTF8String:metal_src] options:nil error:&err];
+    if (!lib) {
+        fprintf(stderr, "hardcore: shader: %s\n", [[err description] UTF8String]);
+        return 0;
+    }
+    pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = [[lib newFunctionWithName:@"vs"] autorelease];
+    pd.fragmentFunction = [[lib newFunctionWithName:@"fs"] autorelease];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pd.colorAttachments[0].blendingEnabled = YES;
+    pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
+    g_pipe = [g_mtl newRenderPipelineStateWithDescriptor:pd error:&err];
+    [pd release];
+    [lib release];
+    if (!g_pipe) return 0;
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:ATLAS height:ATLAS mipmapped:NO];
+    td.storageMode = MTLStorageModeShared;
+    td.usage = MTLTextureUsageShaderRead;
+    g_atlas = [g_mtl newTextureWithDescriptor:td];
+    return g_atlas != nil;
 }
 
-/* needs the view's context current */
-static int gl_init(void) {
-    GLint ok = 0;
-    g_prog = glCreateProgram();
-    glAttachShader(g_prog, gl_shader(GL_VERTEX_SHADER, GLSL_VS));
-    glAttachShader(g_prog, gl_shader(GL_FRAGMENT_SHADER, GLSL_FS));
-    glLinkProgram(g_prog);
-    glGetProgramiv(g_prog, GL_LINK_STATUS, &ok);
-    if (!ok) return 0;
-    glGenTextures(1, &g_atlas_tex);
-    glBindTexture(GL_TEXTURE_2D, g_atlas_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, ATLAS, ATLAS, 0, GL_ALPHA, GL_UNSIGNED_BYTE, NULL);
-    g_gl_ready = 1;
-    return 1;
+/* Frames are built on the main thread (the vertex array: ~0.15 ms for a
+   full screen) and drawn by a render thread. Waiting for a free drawable
+   (up to a refresh, when one frame is already on its way to the display)
+   happens there, so input and shell output never wait on the display. The
+   newest frame wins: one the render thread hasn't started yet is replaced. */
+
+typedef struct Frame {
+    Vtx *v;
+    int n, cap, w, h;
+    int snap;                    /* test channel: write this frame to snap_path */
+    char snap_path[MAX_PATH];
+    double lat_key, lat_out, lat_down, lat_written;   /* HARDCORE_LAT, for the key this frame answers */
+    int trace_tab;               /* HARDCORE_TRACE: the new tab's first frame */
+} Frame;
+
+static Frame *g_build;           /* being built by render() */
+static Frame *g_pending;         /* built, waiting for the render thread */
+static pthread_mutex_t g_fmx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_fcv = PTHREAD_COND_INITIALIZER;
+
+static void frame_free(Frame *f) {
+    if (!f) return;
+    free(f->v);
+    free(f);
 }
 
-static void r_flush(void) {
-    if (!g_nvtx || !g_gl_ready) { g_nvtx = 0; return; }
-    glVertexPointer(2, GL_FLOAT, sizeof(Vtx), &g_vtx[0].x);
-    glTexCoordPointer(2, GL_FLOAT, sizeof(Vtx), &g_vtx[0].u);
-    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(Vtx), &g_vtx[0].rgba);
-    glDrawArrays(GL_TRIANGLES, 0, g_nvtx);
+static void r_flush(void) {      /* the whole frame goes in one draw, so this only collects */
+    Frame *f = g_build;
+    if (!f || !g_nvtx) { g_nvtx = 0; return; }
+    if (f->n + g_nvtx > f->cap) {
+        f->cap = (f->n + g_nvtx) * 2;
+        f->v = (Vtx *)realloc(f->v, sizeof(Vtx) * (size_t)f->cap);
+    }
+    memcpy(f->v + f->n, g_vtx, sizeof(Vtx) * (size_t)g_nvtx);
+    f->n += g_nvtx;
     g_nvtx = 0;
 }
 
+/* Glyph slots are written once, before the first frame that uses them is
+   handed over, so the shared texture needs no fence. (After a full-atlas
+   reset, the frame being built at that moment can show stale glyphs once.) */
 static void r_upload(int x, int y, const unsigned char *bmp) {
-    glBindTexture(GL_TEXTURE_2D, g_atlas_tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, 16, 16, GL_ALPHA, GL_UNSIGNED_BYTE, bmp);
+    [g_atlas replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, 16, 16) mipmapLevel:0 withBytes:bmp bytesPerRow:16];
 }
 
 static void r_begin(int w, int h) {
     g_rw = (float)w;
     g_rh = (float)h;
     g_nvtx = 0;
-    glViewport(0, 0, w, h);
-    glClearColor(((DEF_BG >> 16) & 255) / 255.0f, ((DEF_BG >> 8) & 255) / 255.0f, (DEF_BG & 255) / 255.0f, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDisable(GL_DEPTH_TEST);
-    glEnable(GL_BLEND);
-    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
-    glUseProgram(g_prog);
-    glUniform1i(glGetUniformLocation(g_prog, "t"), 0);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_atlas_tex);
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    glEnableClientState(GL_COLOR_ARRAY);
+    frame_free(g_build);
+    g_build = (Frame *)calloc(1, sizeof(Frame));
+    g_build->w = w;
+    g_build->h = h;
+}
+
+static void write_bmp(const char *path, const void *px, int w, int h) {
+    FILE *f = fopen(path, "wb");
+    uint32_t hdr[13];
+    if (!f) return;
+    memset(hdr, 0, sizeof(hdr));
+    fwrite("BM", 1, 2, f);
+    hdr[0] = 54 + (uint32_t)(w * h * 4); hdr[2] = 54;
+    hdr[3] = 40; hdr[4] = (uint32_t)w; hdr[5] = (uint32_t)-h;   /* top-down */
+    hdr[6] = 1 | (32 << 16);
+    fwrite(hdr, 4, 13, f);
+    fwrite(px, 4, (size_t)w * h, f);
+    fclose(f);
+}
+
+/* Encodes and presents one frame; on the render thread, or on the main
+   thread during a live resize (presentsWithTransaction wants that). */
+static void draw_frame(Frame *f) {
+    id<CAMetalDrawable> d = [g_layer nextDrawable];
+    id<MTLCommandBuffer> cb;
+    id<MTLRenderCommandEncoder> enc;
+    id<MTLBuffer> snap = nil;
+    MTLRenderPassDescriptor *rp;
+    int w, h;
+    if (!d) return;
+    w = (int)d.texture.width;
+    h = (int)d.texture.height;
+    cb = [g_queue commandBuffer];
+    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = d.texture;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(((DEF_BG >> 16) & 255) / 255.0, ((DEF_BG >> 8) & 255) / 255.0, (DEF_BG & 255) / 255.0, 1);
+    enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:g_pipe];
+    [enc setFragmentTexture:g_atlas atIndex:0];
+    if (f->n) {
+        size_t bytes = sizeof(Vtx) * (size_t)f->n;
+        if (bytes <= 4096) [enc setVertexBytes:f->v length:bytes atIndex:0];
+        else {
+            id<MTLBuffer> vb = [g_mtl newBufferWithBytes:f->v length:bytes options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+            [enc setVertexBuffer:vb offset:0 atIndex:0];
+            [vb release];        /* the command buffer keeps it until it's done */
+        }
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)f->n];
+    }
+    [enc endEncoding];
+    if (f->snap && w == f->w && h == f->h) {   /* test channel: copy this frame out before it's shown */
+        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        snap = [g_mtl newBufferWithLength:(NSUInteger)w * h * 4 options:MTLResourceStorageModeShared];
+        [bl copyFromTexture:d.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                 sourceSize:MTLSizeMake((NSUInteger)w, (NSUInteger)h, 1) toBuffer:snap destinationOffset:0
+          destinationBytesPerRow:(NSUInteger)w * 4 destinationBytesPerImage:(NSUInteger)w * h * 4];
+        [bl endEncoding];
+    }
+    if (f->lat_key && f->lat_out) {
+        double key = f->lat_key, out = f->lat_out, down = f->lat_down, written = f->lat_written;
+        double commit = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
+        [d addPresentedHandler:^(id<MTLDrawable> dd) {
+            fprintf(stderr, "lat %.2f %.2f %.2f %.2f %.2f\n", out - key, commit - key,
+                    dd.presentedTime > 0 ? dd.presentedTime * 1000.0 - key : -1.0, down - key, written - key);
+        }];
+    }
+    if (f->trace_tab || (g_tracing && uptime_ms() - g_trace_tab_t < 100)) {
+        double enc = uptime_ms();
+        [d addPresentedHandler:^(id<MTLDrawable> dd) {
+            fprintf(stderr, "%8.2f ms  frame after Cmd+T: encoded at %.2f, on screen at %.2f\n", enc - g_t_exec, enc - g_t_exec,
+                    dd.presentedTime > 0 ? dd.presentedTime * 1000.0 - g_t_exec : -1.0);
+        }];
+    }
+    if (g_tracing && g_frames < 3) {   /* when the first frames really reached the screen */
+        int k = ++g_frames;
+        [d addPresentedHandler:^(id<MTLDrawable> dd) {
+            if (dd.presentedTime > 0) fprintf(stderr, "%8.2f ms  frame %d on screen\n", dd.presentedTime * 1000.0 - g_t_exec, k);
+        }];
+    }
+    if (g_layer.presentsWithTransaction) {   /* live resize: land with the window's new size, not before */
+        [cb commit];
+        [cb waitUntilScheduled];
+        [d present];
+    } else {
+        [cb presentDrawable:d];
+        [cb commit];
+    }
+    if (snap) {
+        [cb waitUntilCompleted];
+        write_bmp(f->snap_path, [snap contents], w, h);
+        [snap release];
+    }
 }
 
 static void r_present(void) {
+    Frame *f;
     r_flush();
-    [[(NSOpenGLView *)g_view openGLContext] flushBuffer];
+    if (!(f = g_build)) return;
+    g_build = NULL;
+    if (g_lat && g_lat_key && g_lat_out) {
+        f->lat_key = g_lat_key;
+        f->lat_out = g_lat_out;
+        f->lat_down = g_lat_down;
+        f->lat_written = g_lat_written;
+        g_lat_key = g_lat_out = 0;
+    }
+    if (g_trace_commit && g_ntabs && active_tab()->t.nmarks) {
+        g_trace_commit = 0;
+        trace("new tab's first frame with its prompt, handed to the render thread");
+        f->trace_tab = 1;
+    }
+    if (g_layer.presentsWithTransaction || f->snap) {   /* in step with a live resize; or a test wants the file now */
+        @autoreleasepool { draw_frame(f); }
+        frame_free(f);
+        return;
+    }
+    pthread_mutex_lock(&g_fmx);
+    frame_free(g_pending);       /* not started yet: the newer frame replaces it */
+    g_pending = f;
+    pthread_cond_signal(&g_fcv);
+    pthread_mutex_unlock(&g_fmx);
 }
 
-/* test channel: the frame about to be presented, as a bottom-up 32-bit .bmp */
+static void *render_thread(void *unused) {
+    (void)unused;
+    for (;;) {
+        Frame *f;
+        pthread_mutex_lock(&g_fmx);
+        while (!g_pending) pthread_cond_wait(&g_fcv, &g_fmx);
+        f = g_pending;
+        g_pending = NULL;
+        pthread_mutex_unlock(&g_fmx);
+        @autoreleasepool { draw_frame(f); }   /* nextDrawable may wait here: that's the point */
+        frame_free(f);
+    }
+    return NULL;
+}
+
+static void render_thread_start(void) {
+    pthread_attr_t a;
+    pthread_t t;
+    pthread_attr_init(&a);
+    pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_create(&t, &a, render_thread, NULL);
+    pthread_attr_destroy(&a);
+}
+
+/* test channel: the next frame goes to a file, drawn synchronously */
 static void snap_backbuffer(void) {
-    int w, h, y;
-    unsigned char *px;
-    FILE *f;
-    uint32_t hdr[13];
-    plat_client_size(&w, &h);
-    if (w < 1 || h < 1 || !(f = fopen(g_snap_path, "wb"))) return;
-    px = (unsigned char *)malloc((size_t)w * h * 4);
-    glReadBuffer(GL_BACK);
-    glReadPixels(0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, px);
-    memset(hdr, 0, sizeof(hdr));
-    fwrite("BM", 1, 2, f);
-    hdr[0] = 54 + w * h * 4; hdr[2] = 54;        /* file size, pixel offset */
-    hdr[3] = 40; hdr[4] = (uint32_t)w; hdr[5] = (uint32_t)h;
-    hdr[6] = 1 | (32 << 16);                     /* planes, bits per pixel */
-    fwrite(hdr, 4, 13, f);
-    for (y = 0; y < h; y++) fwrite(px + (size_t)y * w * 4, 4, (size_t)w, f);
-    fclose(f);
-    free(px);
+    if (!g_build) return;
+    g_build->snap = 1;
+    snprintf(g_build->snap_path, sizeof(g_build->snap_path), "%s", g_snap_path);
 }
 
 /* ── shell integration ─────────────────────────────────────────────── */
@@ -218,6 +407,12 @@ static const char RC_BASH_MAC[] =
     "elif [ -r ~/.bash_login ]; then . ~/.bash_login\n"
     "elif [ -r ~/.profile ]; then . ~/.profile\n"
     "elif [ -r ~/.bashrc ]; then . ~/.bashrc\n"
+    "fi\n"
+    "# a pre-warmed spare tab: profile already loaded, wait (silently) to be told where to go\n"
+    "if [ -n \"$HARDCORE_SPARE\" ]; then\n"
+    "  unset HARDCORE_SPARE\n"
+    "  IFS= read -rs __hardcore_dir && cd -- \"$__hardcore_dir\" 2>/dev/null\n"
+    "  unset __hardcore_dir\n"
     "fi\n"
     "__hardcore_cwd() { printf '\\033]9;9;%s\\033\\\\\\033]133;A\\033\\\\' \"$PWD\"; }\n"
     "# report the folder on every cd too, so \"cd x && claude\" labels the tab x right away\n"
@@ -242,6 +437,16 @@ static const char ZSHENV[] =
     "  typeset -ag precmd_functions chpwd_functions\n"
     "  precmd_functions+=(__hardcore_cwd)\n"
     "  chpwd_functions+=(__hardcore_dir)\n"
+    "  # a pre-warmed spare tab: your startup files have all run by the first prompt;\n"
+    "  # wait there (silently) to be told where to go, once\n"
+    "  if [[ -n $HARDCORE_SPARE ]]; then\n"
+    "    unset HARDCORE_SPARE\n"
+    "    __hardcore_spare() {\n"
+    "      precmd_functions=(${precmd_functions:#__hardcore_spare})\n"
+    "      local d; IFS= builtin read -rs d && builtin cd -- \"$d\" 2>/dev/null\n"
+    "    }\n"
+    "    precmd_functions=(__hardcore_spare $precmd_functions)\n"
+    "  fi\n"
     "fi\n";
 
 /* fish: one --init-command */
@@ -289,24 +494,45 @@ static void schedule_output(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ g_output_pending = 0; on_output(); });
 }
 
-/* writes go through a serial queue per tab: a big paste into a busy program
-   blocks that queue, never the window */
+/* A keystroke goes straight into the pty (it's non-blocking). Whatever the
+   pty can't take right now (a big paste into a busy program) goes to the tab's
+   serial queue, which waits for room; later writes queue behind it so the
+   order holds. The window never blocks on a child that isn't reading. */
 static void tab_write(Tab *tb, const void *s, int n) {
     char *copy;
-    int fd = tb->fd;
+    int fd = tb->fd, off = 0;
     if (!tb->wq || fd < 0 || n <= 0) return;   /* no shell (a --replay terminal, or it's gone) */
-    copy = (char *)malloc((size_t)n);
-    memcpy(copy, s, (size_t)n);
-    dispatch_async((dispatch_queue_t)tb->wq, ^{
-        int off = 0;
+    if (!__atomic_load_n(tb->wpending, __ATOMIC_ACQUIRE)) {
         while (off < n) {
-            ssize_t w = write(fd, copy + off, (size_t)(n - off));
+            ssize_t w = write(fd, (const char *)s + off, (size_t)(n - off));
             if (w > 0) off += (int)w;
             else if (w < 0 && errno == EINTR) continue;
-            else break;
+            else break;          /* EAGAIN: full; anything else: gone */
         }
-        free(copy);
-    });
+        if (g_lat && !g_lat_written) g_lat_written = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
+        if (off == n || (errno != EAGAIN && errno != EINTR)) return;
+    }
+    n -= off;
+    copy = (char *)malloc((size_t)n);
+    memcpy(copy, (const char *)s + off, (size_t)n);
+    {
+        int *pending = tb->wpending;    /* not the Tab's own memory: a closed tab is freed while this may still run */
+        __atomic_add_fetch(pending, 1, __ATOMIC_ACQ_REL);
+        dispatch_async((dispatch_queue_t)tb->wq, ^{
+            int o = 0;
+            while (o < n) {
+                ssize_t w = write(fd, copy + o, (size_t)(n - o));
+                if (w > 0) o += (int)w;
+                else if (w < 0 && (errno == EINTR)) continue;
+                else if (w < 0 && errno == EAGAIN) {
+                    struct pollfd p = {fd, POLLOUT, 0};
+                    if (poll(&p, 1, -1) < 0 || (p.revents & (POLLHUP | POLLERR | POLLNVAL))) break;
+                } else break;
+            }
+            free(copy);
+            __atomic_sub_fetch(pending, 1, __ATOMIC_ACQ_REL);
+        });
+    }
 }
 
 static void tab_set_size(Tab *tb, int cols, int rows) {
@@ -322,16 +548,18 @@ static void tab_set_size(Tab *tb, int cols, int rows) {
 
 /* Stops reading; the fd closes once the writes already queued have gone out. */
 static void stop_reading(Tab *tb) {
-    int fd = tb->fd;
+    int fd = tb->fd, *pending = tb->wpending;
     dispatch_queue_t wq = (dispatch_queue_t)tb->wq;
+    if (fd < 0) return;
     if (tb->rsrc) {
         dispatch_source_t r = (dispatch_source_t)tb->rsrc;
-        dispatch_source_set_cancel_handler(r, ^{ dispatch_async(wq, ^{ close(fd); }); });
+        /* the close (and the counter) go last on the write queue, behind any queued writes */
+        dispatch_source_set_cancel_handler(r, ^{ dispatch_async(wq, ^{ close(fd); free(pending); }); });
         dispatch_source_cancel(r);
         dispatch_release(r);
         tb->rsrc = NULL;
-    } else if (fd >= 0) {
-        dispatch_async(wq, ^{ close(fd); });
+    } else {
+        dispatch_async(wq, ^{ close(fd); free(pending); });
     }
     tb->fd = -1;
 }
@@ -339,6 +567,7 @@ static void stop_reading(Tab *tb) {
 static void read_some(Tab *tb) {
     char buf[65536];
     ssize_t n = read(tb->fd, buf, sizeof(buf));
+    if (g_tracing) { static int k; if (k++ < 3) { char m[64]; snprintf(m, sizeof(m), "read %zd bytes from a shell", n); trace(m); } }
     if (n > 0) {
         if (tb->in_n + (int)n > tb->in_cap) {
             int cap = tb->in_cap ? tb->in_cap : 65536;
@@ -395,13 +624,19 @@ static void expand_home(const char *in, char *out, size_t cap) {
     else snprintf(out, cap, "%s", in);
 }
 
-/* in the child, after forkpty: start the shell in dir */
-static void exec_shell(const char *dir) {
+static int spare_ok(void) {
+    const char *b = shell_base();
+    return !strcmp(b, "zsh") || !strcmp(b, "bash");
+}
+
+/* in the child, after forkpty: start the shell in dir (a spare waits to be told) */
+static void exec_shell(const char *dir, int spare) {
     char cwd[MAX_PATH], zdir[MAX_PATH], argv0[256], rc[MAX_PATH];
     const char *base = shell_base();
     expand_home(dir, cwd, sizeof(cwd));
     if (chdir(cwd) != 0 && (!getenv("HOME") || chdir(getenv("HOME")) != 0)) chdir("/");
     child_env();
+    if (spare) setenv("HARDCORE_SPARE", "1", 1);
     signal(SIGPIPE, SIG_DFL);
     snprintf(argv0, sizeof(argv0), "-%s", base);   /* a login shell, like Terminal starts */
     if (!strcmp(base, "zsh")) {
@@ -439,12 +674,15 @@ static int tab_spawn(Tab *tb) {
         term_message(&tb->t, msg);
         return 0;
     }
-    if (pid == 0) exec_shell(tb->start_dir);
+    if (pid == 0) exec_shell(tb->start_dir, tb->spare);
     fcntl(fd, F_SETFD, FD_CLOEXEC);    /* later tabs' shells mustn't hold this one open */
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     tb->fd = fd;
     tb->pid = pid;
     tb->born = GetTickCount();
-    tb->wq = dispatch_queue_create("hardcore.tab.write", DISPATCH_QUEUE_SERIAL);
+    tb->wpending = (int *)calloc(1, sizeof(int));
+    tb->wq = dispatch_queue_create("hardcore.tab.write",
+                                   dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
     r = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, dispatch_get_main_queue());
     dispatch_source_set_event_handler(r, ^{
         Tab *t = tab_by_id(id);
@@ -520,6 +758,7 @@ static void paint_view_now(void);
 
 static void on_output(void) {
     int i, changed = 0;
+    if (g_lat && g_lat_key && !g_lat_out) g_lat_out = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         if (tab_drain(tb) <= 0) continue;
@@ -535,11 +774,23 @@ static void on_output(void) {
         changed = 1;
     }
     update_busy();
+    for (i = 0; g_tracing && i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        if (tb->adopted && tb->t.nmarks && tb->t.cx && !tb->traced) {
+            char m[80];
+            tb->traced = 1;
+            snprintf(m, sizeof(m), "spare adopted -> prompt printed: %u ms", GetTickCount() - tb->adopted);
+            trace(m);
+        }
+    }
+    if (g_tracing && changed) {
+        static int out, prompt;
+        if (!out++) trace("first shell output");
+        if (!prompt && g_ntabs && g_tabs[0]->t.nmarks) { prompt = 1; trace("first prompt (OSC 133;A)"); }
+    }
     if (changed) {
         update_title();
         plat_invalidate();
-        /* under a flood of output, still show a frame every ~30ms */
-        if (GetTickCount() - g_last_paint > 30) paint_view_now();
     }
 }
 
@@ -557,6 +808,13 @@ static void on_tab_exited(int id, int code) {
     Tab *tb = tab_by_id(id);
     int i;
     char buf[300];
+    if (!tb && g_spare && g_spare->id == id) {   /* the spare died waiting: drop it, the next tab makes another */
+        tb = g_spare;
+        g_spare = NULL;
+        tb->exited = 1;
+        tab_destroy_async(tb);
+        return;
+    }
     if (!tb) return;             /* already closed: this was just the reaping */
     if (tb->fd >= 0) {           /* whatever it said last */
         fcntl(tb->fd, F_SETFL, O_NONBLOCK);
@@ -744,7 +1002,7 @@ static void new_tab_mac(void) {
 
 /* ── the view: drawing, keys, mouse, drops ─────────────────────────── */
 
-@interface HCView : NSOpenGLView <NSTextInputClient> {
+@interface HCView : NSView <NSTextInputClient> {
 @public
     NSMutableAttributedString *marked;
     float scroll_acc;
@@ -752,12 +1010,45 @@ static void new_tab_mac(void) {
 }
 @end
 
-static void plat_invalidate(void) { [(NSView *)g_view setNeedsDisplay:YES]; }
+/* Redraws coalesce into one frame, drawn as soon as the current event or
+   output has been handled: a keystroke's echo is on its way to the display
+   within ~0.3 ms. But never more often than the display refreshes: under a
+   flood, painting after every chunk of output cut cat throughput to a third
+   (sampled: 75% of the main thread drawing frames nobody could see), so a
+   frame that comes too soon after the last one waits out the period.
+   (Painting from a before-sleep run loop observer instead looked equivalent
+   but measured worse: half the frames reached the screen late.) */
+static double g_refresh_ms = 1000.0 / 60;
+static double g_painted_at;
+
+static void paint_scheduled(void) {
+    if (!g_paint_pending) return;
+    g_paint_pending = 0;
+    g_painted_at = uptime_ms();
+    paint_view_now();
+}
+
+static void plat_invalidate(void) {
+    double wait;
+    if (g_paint_pending) return;
+    g_paint_pending = 1;
+    wait = g_painted_at + g_refresh_ms - uptime_ms();
+    if (wait <= 0.5) dispatch_async(dispatch_get_main_queue(), ^{ paint_scheduled(); });
+    else dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * 1e6)), dispatch_get_main_queue(), ^{ paint_scheduled(); });
+}
 
 static void paint_view_now(void) {
-    if (!g_gl_ready) return;
-    [[(NSOpenGLView *)g_view openGLContext] makeCurrentContext];
+    double t0;
+    if (!g_layer || !g_layer.device) return;   /* the worker hasn't finished setting Metal up yet */
+    t0 = g_lat ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6 : 0;
     paint_now();
+    if (g_lat) fprintf(stderr, "paint %.3f\n", clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6 - t0);
+}
+
+static void layer_fit(void) {
+    NSSize px = [(NSView *)g_view convertSizeToBacking:[(NSView *)g_view bounds].size];
+    g_layer.contentsScale = [g_win backingScaleFactor];
+    g_layer.drawableSize = CGSizeMake(px.width > 1 ? px.width : 1, px.height > 1 ? px.height : 1);
 }
 
 /* point in the view → pixels from the top left, like the Win32 client area */
@@ -780,6 +1071,19 @@ static void send_str(const char *s) {
     send_to_active(s, (int)strlen(s));
 }
 
+/* Is the current input source an ordinary keyboard layout (an ID like
+   com.apple.keylayout.US), not an input method like Pinyin or Kotoeri?
+   Cached; macOS says when it changes. */
+static int g_plain_layout = -1;
+
+static int plain_layout(void) {
+    if (g_plain_layout < 0) {
+        NSString *id = [[(NSView *)g_view inputContext] selectedKeyboardInputSource];
+        g_plain_layout = id && [id rangeOfString:@".keylayout."].location != NSNotFound;
+    }
+    return g_plain_layout;
+}
+
 @implementation HCView
 
 - (BOOL)isFlipped { return YES; }
@@ -788,30 +1092,48 @@ static void send_str(const char *s) {
 - (BOOL)acceptsFirstMouse:(NSEvent *)e { (void)e; return YES; }
 - (BOOL)mouseDownCanMoveWindow { return NO; }
 
-- (void)prepareOpenGL {
-    GLint swap = 0;
-    [super prepareOpenGL];
-    [[self openGLContext] setValues:&swap forParameter:NSOpenGLContextParameterSwapInterval];
-    if (!gl_init()) fprintf(stderr, "hardcore: OpenGL setup failed\n");
+- (BOOL)wantsUpdateLayer { return YES; }
+
+- (CALayer *)makeBackingLayer {
+    CAMetalLayer *l = [CAMetalLayer layer];
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    l.framebufferOnly = NO;      /* the test channel's snapshot reads it back */
+    l.maximumDrawableCount = 2;  /* one on screen, one on its way: a third only adds a frame of queue */
+    l.displaySyncEnabled = NO;   /* present now: display sync measured ~4 ms slower at p50 */
+    l.opaque = YES;
+    l.colorspace = cs;           /* the palette is sRGB, as on Windows */
+    l.contentsGravity = kCAGravityTopLeft;   /* mid-resize, never stretch the old frame */
+    CGColorSpaceRelease(cs);
+    g_layer = l;
+    return l;
 }
 
-- (void)reshape {
-    [super reshape];
+/* AppKit wants the layer drawn: shown, uncovered, moved to another screen */
+- (void)updateLayer { paint_view_now(); }
+
+- (void)setFrameSize:(NSSize)size {
+    [super setFrameSize:size];
+    if (!g_layer) return;
+    layer_fit();
     resize_all();
-    paint_view_now();   /* during a live resize, draw now rather than show a stretched frame */
+    /* during a live resize, draw now and land with the window's new frame */
+    g_layer.presentsWithTransaction = [self inLiveResize];
+    paint_view_now();
+}
+
+- (void)viewDidEndLiveResize {
+    [super viewDidEndLiveResize];
+    g_layer.presentsWithTransaction = NO;
 }
 
 - (void)viewDidChangeBackingProperties {
     int s = (int)([g_win backingScaleFactor] + 0.5);
     [super viewDidChangeBackingProperties];
     g_scale = s < 1 ? 1 : s;
+    if (g_layer) layer_fit();
     resize_all();
     plat_invalidate();
-}
-
-- (void)drawRect:(NSRect)r {
-    (void)r;
-    paint_view_now();
 }
 
 - (void)resetCursorRects {
@@ -942,6 +1264,11 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     NSEventModifierFlags f = [e modifierFlags];
     Tab *tb = active_tab();
     if (!tb) return;
+    if (g_lat && !g_lat_key) {
+        g_lat_key = [e timestamp] * 1000.0;
+        g_lat_down = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
+        g_lat_written = 0;
+    }
     [NSCursor setHiddenUntilMouseMoves:YES];
     if (tb->help) {
         int at;
@@ -952,11 +1279,24 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (f & NSEventModifierFlagCommand) {
         NSString *c = [e charactersIgnoringModifiers];
         unichar ch = [c length] ? [c characterAtIndex:0] : 0;
-        if (ch >= '1' && ch <= '9') { activate(ch == '9' ? g_ntabs - 1 : ch - '1'); return; }
+        if (ch >= '1' && ch <= '9') {
+            if (g_tracing) { g_trace_tab_t = uptime_ms(); trace("Cmd+digit"); }
+            activate(ch == '9' ? g_ntabs - 1 : ch - '1');
+            return;
+        }
         [self specialKey:e];     /* Cmd+←/→/Backspace; other Cmd keys belong to the menus or nobody */
         return;
     }
     if ([self specialKey:e] || [self controlKey:e]) return;
+    /* Plain typing on a plain keyboard layout goes straight out: the text-input
+       system (interpretKeyEvents) costs a few ms at p90, measured. Dead keys
+       (no characters yet), input methods and anything mid-composition still
+       take the long way. */
+    if (!marked && plain_layout() && [[e characters] length] == 1 && [[e characters] characterAtIndex:0] >= 0x20 &&
+        [[e characters] characterAtIndex:0] != 0x7F) {
+        send_str([[e characters] UTF8String]);
+        return;
+    }
     handled = 0;
     [self interpretKeyEvents:@[e]];   /* text, dead keys, input methods → insertText: */
 }
@@ -964,6 +1304,12 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 /* Ctrl+Tab and Ctrl+Shift+Tab never reach keyDown by default (the window
    uses them to move between controls) */
 - (BOOL)performKeyEquivalent:(NSEvent *)e {
+    /* Cmd+Q straight to quitting: through the menu it waits ~13 ms for the menu bar's flash */
+    if ([e type] == NSEventTypeKeyDown && ([e modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask) == NSEventModifierFlagCommand &&
+        [[e charactersIgnoringModifiers] isEqualToString:@"q"]) {
+        [NSApp terminate:nil];
+        return YES;
+    }
     if ([e type] == NSEventTypeKeyDown && [e keyCode] == 48 && ([e modifierFlags] & NSEventModifierFlagControl) &&
         [[self window] firstResponder] == self) {
         [self specialKey:e];
@@ -1187,7 +1533,18 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 
 - (void)copy:(id)sender { (void)sender; sel_copy(); g_sel_on = 0; plat_invalidate(); }
 - (void)paste:(id)sender { (void)sender; paste(); }
-- (void)newTab:(id)sender { (void)sender; new_tab_mac(); }
+- (void)newTab:(id)sender {
+    (void)sender;
+    if (g_tracing) {
+        char m[96];
+        snprintf(m, sizeof(m), "Cmd+T: event %.2f ms ago", uptime_ms() - [[NSApp currentEvent] timestamp] * 1000.0);
+        trace(m);
+        g_trace_commit = 1;
+        g_trace_tab_t = uptime_ms();
+    }
+    new_tab_mac();
+    trace("new tab made");
+}
 - (void)closeTab:(id)sender { (void)sender; user_close_tab(g_active); }
 - (void)nextTab:(id)sender { (void)sender; if (g_ntabs) activate((g_active + 1) % g_ntabs); }
 - (void)prevTab:(id)sender { (void)sender; if (g_ntabs) activate((g_active + g_ntabs - 1) % g_ntabs); }
@@ -1216,7 +1573,9 @@ static void focus_changed(int focused) {
 @end
 
 @implementation HCDelegate
-- (void)windowDidBecomeKey:(NSNotification *)n { (void)n; focus_changed(1); }
+- (void)applicationWillFinishLaunching:(NSNotification *)n { (void)n; trace("applicationWillFinishLaunching"); }
+- (void)applicationDidFinishLaunching:(NSNotification *)n { (void)n; trace("applicationDidFinishLaunching"); }
+- (void)windowDidBecomeKey:(NSNotification *)n { (void)n; trace("window key"); focus_changed(1); }
 - (void)windowDidResignKey:(NSNotification *)n { (void)n; focus_changed(0); }
 - (BOOL)windowShouldClose:(NSWindow *)w {
     (void)w;
@@ -1226,9 +1585,25 @@ static void focus_changed(int focused) {
     return NO;
 }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
+    int i;
     (void)app;
+    if (g_tracing) {
+        char m[96];
+        snprintf(m, sizeof(m), "applicationShouldTerminate: event %.2f ms ago", uptime_ms() - [[NSApp currentEvent] timestamp] * 1000.0);
+        trace(m);
+    }
     if (!g_quitting && !confirm_close(-1)) return NSTerminateCancel;
-    return NSTerminateNow;
+    trace("confirmed");
+    /* Gone now: AppKit's own teardown took ~60 ms (measured), for nothing a
+       terminal needs, and the window server drops a dead process's windows
+       faster than an orderOut round trip. The window's frame is saved
+       whenever it changes. */
+    config_save();
+    for (i = 0; i < g_ntabs; i++)   /* the ptys close as we exit, which hangs them up too */
+        if (g_tabs[i]->pid > 0 && !g_tabs[i]->exited) kill(g_tabs[i]->pid, SIGHUP);
+    if (g_spare && g_spare->pid > 0) kill(g_spare->pid, SIGHUP);
+    trace("exiting");
+    _exit(0);
 }
 - (void)applicationWillTerminate:(NSNotification *)n {
     int i;
@@ -1236,6 +1611,7 @@ static void focus_changed(int focused) {
     config_save();
     for (i = 0; i < g_ntabs; i++)   /* hang up the shells: closing the ptys does it too, this is just sure */
         if (g_tabs[i]->pid > 0 && !g_tabs[i]->exited) kill(g_tabs[i]->pid, SIGHUP);
+    if (g_spare && g_spare->pid > 0) kill(g_spare->pid, SIGHUP);
 }
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)app hasVisibleWindows:(BOOL)v {
     (void)app; (void)v;
@@ -1341,7 +1717,7 @@ static void ctl_line(char *s) {
         else tab_write(tb, s, (int)(o - s));
     } else if (!strncmp(s, "cmd ", 4)) {
         const char *c = s + 4;
-        if (!strcmp(c, "newtab")) new_tab_mac();
+        if (!strcmp(c, "newtab")) { g_trace_tab_t = uptime_ms(); trace("ctl newtab"); new_tab_mac(); }
         else if (!strcmp(c, "nexttab") && g_ntabs) activate((g_active + 1) % g_ntabs);
         else if (!strcmp(c, "closetab")) close_tab(g_active);
         else if (!strcmp(c, "jump")) jump_to_attention();
@@ -1515,15 +1891,55 @@ static int replay(const char *out_path, int cols, int rows, char **files, int nf
 
 /* ── startup ───────────────────────────────────────────────────────── */
 
+/* The first shell has usually printed its prompt (~20 ms after the fork) long
+   before AppKit lets the main queue run (~165 ms after exec, measured). Take
+   it straight from the pty, waiting up to wait_ms for the prompt, so the
+   window's first frame already shows it. */
+static void first_prompt_now(int wait_ms) {
+    Tab *tb = g_ntabs ? g_tabs[0] : NULL;
+    double end = uptime_ms() + wait_ms;
+    while (tb && tb->fd >= 0 && (!tb->t.nmarks || tb->t.cx == 0)) {
+        struct pollfd p = {tb->fd, POLLIN, 0};
+        int left = (int)(end - uptime_ms());
+        if (left <= 0 || poll(&p, 1, left) <= 0) break;
+        read_some(tb);
+        tab_drain(tb);
+    }
+    if (tb) update_title();
+}
+
+/* HARDCORE_TRACE=1: startup phases, in ms since the process was exec'd, to
+   stderr (the Mac side of %TEMP%\hardcore-trace.txt) */
+
+static double uptime_ms(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6; }
+
+static void trace(const char *what) {
+    if (g_tracing) fprintf(stderr, "%8.2f ms  %s\n", uptime_ms() - g_t_exec, what);
+}
+
+static void trace_init(void) {
+    struct kinfo_proc kp;
+    size_t n = sizeof(kp);
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    struct timeval now;
+    g_tracing = getenv("HARDCORE_TRACE") != NULL;
+    g_t_exec = uptime_ms();
+    if (!g_tracing || sysctl(mib, 4, &kp, &n, NULL, 0) != 0) return;
+    gettimeofday(&now, NULL);    /* p_starttime is wall clock: carry the gap over to uptime */
+    g_t_exec -= (now.tv_sec - kp.kp_proc.p_starttime.tv_sec) * 1000.0 + (now.tv_usec - kp.kp_proc.p_starttime.tv_usec) / 1000.0;
+}
+
 int main(int argc, char **argv) {
-    int i, cols, rows;
+    int i;
     char selftest_out[MAX_PATH] = "";
     HCDelegate *dlg;
     NSRect frame;
-    NSOpenGLPixelFormatAttribute attrs[] = {NSOpenGLPFADoubleBuffer, NSOpenGLPFAColorSize, 24, NSOpenGLPFAAlphaSize, 8, 0};
-    NSOpenGLPixelFormat *pf;
+    dispatch_group_t gfx = dispatch_group_create();
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 
+    trace_init();
+    trace("main");
+    g_lat = getenv("HARDCORE_LAT") != NULL;
     signal(SIGPIPE, SIG_IGN);    /* a write to a pty whose shell just died returns EIO instead */
     palette_init();
     drip_init();
@@ -1549,11 +1965,38 @@ int main(int argc, char **argv) {
     if (!g_start_dir[0]) snprintf(g_start_dir, sizeof(g_start_dir), "%s", getenv("HOME") ? getenv("HOME") : "/");
     write_rc();
     if (selftest_out[0]) return selftest(selftest_out);
+    /* The first shell starts before AppKit does (that's ~60 ms of loading and
+       launching): its grid comes from where the window was last time, and the
+       display's scale, both known without AppKit. If the window comes up a
+       different size, resize_all sends the shell a SIGWINCH. */
+    {
+        NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"NSWindow Frame hardcore"];
+        CGDisplayModeRef mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+        int w = 0, h = 0;
+        if (mode) {
+            size_t pw = CGDisplayModeGetPixelWidth(mode), lw = CGDisplayModeGetWidth(mode);
+            g_scale = lw ? (int)((double)pw / lw + 0.5) : 1;
+            if (g_scale < 1) g_scale = 1;
+            CGDisplayModeRelease(mode);
+        }
+        if (saved) {
+            NSArray *v = [saved componentsSeparatedByString:@" "];
+            if ([v count] >= 4) { w = [v[2] intValue] * g_scale; h = [v[3] intValue] * g_scale; }
+        }
+        if (w < 100 || h < 100) { w = sidebar_w() + 2 * PAD + SCROLLBAR_W + 120 * CW; h = 2 * PAD + 36 * CH; }
+        compute_grid(w, h, &g_cols, &g_rows);
+        new_tab_here();
+        trace("first tab spawned");
+    }
+    /* the Metal device and shaders on a worker, while the window and the first shell get going */
+    dispatch_group_async(gfx, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{ g_gfx_ready = mtl_init(); });
+    trace("config, rc");
 
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     dlg = [[HCDelegate alloc] init];
     [NSApp setDelegate:dlg];
+    trace("NSApp");
 
     g_scale = (int)([[NSScreen mainScreen] backingScaleFactor] + 0.5);
     if (g_scale < 1) g_scale = 1;
@@ -1563,11 +2006,15 @@ int main(int argc, char **argv) {
                                         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
                                                   NSWindowStyleMaskResizable | NSWindowStyleMaskFullSizeContentView
                                           backing:NSBackingStoreBuffered defer:NO];
+    [g_win center];
+    [g_win setFrameAutosaveName:@"hardcore"];   /* size and place come back next time */
+    g_scale = (int)([g_win backingScaleFactor] + 0.5);
+    if (g_scale < 1) g_scale = 1;
     /* the tab column is the title bar: no title text, the traffic lights over the tabs */
     [g_win setTitlebarAppearsTransparent:YES];
     [g_win setTitleVisibility:NSWindowTitleHidden];
-    [g_win setBackgroundColor:[NSColor colorWithSRGBRed:((BAR_BG >> 16) & 255) / 255.0 green:((BAR_BG >> 8) & 255) / 255.0
-                                                   blue:(BAR_BG & 255) / 255.0 alpha:1]];
+    [g_win setBackgroundColor:[NSColor colorWithSRGBRed:((DEF_BG >> 16) & 255) / 255.0 green:((DEF_BG >> 8) & 255) / 255.0
+                                                   blue:(DEF_BG & 255) / 255.0 alpha:1]];
     [g_win setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
     [g_win setContentMinSize:NSMakeSize(300, 160)];
     [g_win setAnimationBehavior:NSWindowAnimationBehaviorNone];
@@ -1575,28 +2022,42 @@ int main(int argc, char **argv) {
     [g_win setDelegate:dlg];
     [g_win setAcceptsMouseMovedEvents:YES];
     [g_win setTitle:@"hardcore"];
-    [g_win center];
-    [g_win setFrameAutosaveName:@"hardcore"];   /* size and place come back next time */
 
-    pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
-    g_view = [[HCView alloc] initWithFrame:frame pixelFormat:pf];
-    [g_view setWantsBestResolutionOpenGLSurface:YES];
+    g_view = [[HCView alloc] initWithFrame:[[g_win contentView] frame]];
+    [g_view setWantsLayer:YES];
+    [g_view setLayerContentsRedrawPolicy:NSViewLayerContentsRedrawDuringViewResize];
     [g_view registerForDraggedTypes:@[NSPasteboardTypeFileURL, NSPasteboardTypeString]];
     [g_win setContentView:g_view];
     [g_win makeFirstResponder:g_view];
     build_menus();
-    g_scale = (int)([g_win backingScaleFactor] + 0.5);
-    if (g_scale < 1) g_scale = 1;
     {
-        int w, h;
-        plat_client_size(&w, &h);
-        compute_grid(w, h, &cols, &rows);
-        g_cols = cols;
-        g_rows = rows;
+        if (@available(macOS 12.0, *))   /* 120 Hz ProMotion screens get 8 ms frames */
+            if ([[g_win screen] maximumFramesPerSecond] > 0) g_refresh_ms = 1000.0 / [[g_win screen] maximumFramesPerSecond];
     }
+    [[NSNotificationCenter defaultCenter] addObserverForName:NSTextInputContextKeyboardSelectionDidChangeNotification
+                                                      object:nil queue:nil
+                                                  usingBlock:^(NSNotification *n) { (void)n; g_plain_layout = -1; }];
     if (getenv("HARDCORE_CTL")) ctl_start(getenv("HARDCORE_CTL"));
-    new_tab_here();
+    trace("window built");
+    dispatch_group_wait(gfx, DISPATCH_TIME_FOREVER);
+    trace("Metal ready");
+    if (!g_gfx_ready) {
+        NSAlert *a = [[NSAlert alloc] init];
+        [a setMessageText:@"hardcore couldn't start Metal."];
+        [a runModal];
+        return 1;
+    }
+    g_layer.device = g_mtl;
+    render_thread_start();
+    layer_fit();
+    resize_all();
+    first_prompt_now(40);
+    trace("first prompt read");
     [g_win makeKeyAndOrderFront:nil];
+    /* on screen now, not after AppKit finishes launching (~30 ms more) */
+    [CATransaction flush];
+    paint_view_now();
+    trace("window shown");
     if (!getenv("HARDCORE_NO_ACTIVATE")) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
     [NSApp run];
     [pool release];

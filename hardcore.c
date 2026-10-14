@@ -315,7 +315,8 @@ typedef struct Tab {
     int fd;                      /* pty master, -1 = none */
     pid_t pid;
     void *rsrc;                  /* dispatch source: output ready */
-    void *wq;                    /* serial queue for writes to the pty */
+    void *wq;                    /* serial queue for writes the pty can't take right away */
+    int *wpending;               /* writes waiting on that queue (atomic; the queue frees it last) */
     int exited;
 #endif
     char *in;
@@ -328,6 +329,8 @@ typedef struct Tab {
     int help;                    /* a help screen instead of a shell: HELP_* */
     DWORD born;                  /* GetTickCount() at spawn: a quick death means a setup problem */
     int spare;                   /* pre-warmed, waiting on stdin for its directory */
+    DWORD adopted;               /* when a spare became this tab: hold its first frame for the prompt */
+    int traced;
     char start_dir[1024];
 } Tab;
 
@@ -3254,6 +3257,19 @@ static void paint_now(void) {
         plat_timer(TIMER_SYNC, 20);
         return;
     }
+    /* a spare that just became this tab answers with its prompt within a
+       few milliseconds: hold the frame so the tab and its prompt arrive
+       together, instead of an empty tab a refresh or two before it. The mark
+       (OSC 133;A) comes before your prompt hooks run; the cursor leaving
+       column 0 means the prompt itself has been printed. */
+    if (tb && tb->adopted && (!tb->t.nmarks || tb->t.cx == 0) && GetTickCount() - tb->adopted < 50) {
+        plat_timer(TIMER_SYNC, 2);
+        return;
+    }
+    if (tb && tb->adopted) {     /* held long enough: no stray repaint after this frame */
+        tb->adopted = 0;
+        plat_kill_timer(TIMER_SYNC);
+    }
 #ifdef _WIN32
     if (g_lat && g_lat_out.QuadPart) QueryPerformanceCounter(&g_lat_render);
 #endif
@@ -3322,11 +3338,16 @@ static void activate(int i) {
 
 static void schedule_spare(void) { plat_timer(TIMER_SPARE, 1000); }
 
-static void make_spare(void) {
-#ifndef _WIN32
-    return;                      /* macOS: a new tab starts its shell directly */
+#ifdef _WIN32
+static int spare_ok(void) { return !g_shell_ps && !g_no_bash && g_have_distro; }
+static int tab_running(const Tab *tb) { return tb->proc != NULL; }
+#else
+static int spare_ok(void);       /* macOS: your shell is zsh or bash (they have the hook that waits) */
+static int tab_running(const Tab *tb) { return tb->fd >= 0; }
 #endif
-    if (g_spare || !g_ntabs || g_shell_ps || g_no_bash || !g_have_distro) return;
+
+static void make_spare(void) {
+    if (g_spare || !g_ntabs || !spare_ok()) return;
     g_spare = tab_create(g_start_dir, 1);
 }
 
@@ -3335,9 +3356,8 @@ static void new_tab_here(void) {
     int i;
     const char *dir = (cur && cur->t.cwd[0]) ? cur->t.cwd : cur ? cur->start_dir : g_start_dir;
     if (g_ntabs >= MAX_TABS) return;
-#ifdef _WIN32
-    /* the spare already has wsl.exe + bash + your profile up; it only needs a cd */
-    if (g_spare && !g_spare->exited && g_spare->proc) {
+    /* the spare already has its shell (and wsl.exe) and your profile up; it only needs a cd */
+    if (g_spare && !g_spare->exited && tab_running(g_spare)) {
         char lin[1100];
         tb = g_spare;
         g_spare = NULL;
@@ -3348,11 +3368,11 @@ static void new_tab_here(void) {
         tab_write(tb, lin, (int)strlen(lin));
         tab_drain(tb);
         tb->spare = 0;
+        tb->adopted = GetTickCount();
     } else if (g_spare) {
         tab_destroy_async(g_spare);
         g_spare = NULL;
     }
-#endif
     if (!tb) tb = tab_create(dir, 0);
     if (!tb) return;
     schedule_spare();

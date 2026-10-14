@@ -26,7 +26,7 @@ endif
 MAC_CC    ?= clang
 MAC_FLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-deprecated-declarations \
              -mmacosx-version-min=11.0 -arch arm64 -arch x86_64
-MAC_LIBS   = -framework Cocoa -framework OpenGL -lutil
+MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -lutil
 APP        = hardcore.app
 
 .PHONY: all clean selftest install test mac-test
@@ -87,7 +87,20 @@ win-install: hardcore.exe
 
 # ── macOS ──────────────────────────────────────────────────────────────
 
-build/hardcore: hardcore.c hardcore_mac.m build/font.bin build/width.inc
+# The shader, compiled ahead of time when Xcode's metal compiler is there
+# (the app compiles the same source at startup when it isn't).
+HAVE_METAL := $(shell xcrun --find metal >/dev/null 2>&1 && echo 1)
+ifeq ($(HAVE_METAL),1)
+METALLIB = build/hardcore.metallib
+MAC_FLAGS += -DHAVE_METALLIB
+endif
+
+build/hardcore.metallib: hardcore.metal
+	@mkdir -p build
+	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
+	xcrun metallib build/hardcore.air -o $@
+
+build/hardcore: hardcore.c hardcore_mac.m hardcore.metal build/font.bin build/width.inc $(METALLIB)
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
