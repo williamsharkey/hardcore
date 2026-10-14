@@ -312,6 +312,7 @@ typedef struct {
     int side;                    /* something the tab column shows changed: folder, program status */
     char claude[40];             /* Claude Code session running here (rc.bash's wrapper says), "?" = unknown */
     char claude_args[400];       /* the flags it was started with, shell-quoted, to start it with again */
+    char cmd[400];               /* the command running in the shell (rc.bash's PS0), "" at a prompt */
 } Term;
 
 /* Term is the first member so the parser can find its tab for replies. */
@@ -345,6 +346,7 @@ typedef struct Tab {
     DWORD adopted;               /* when a spare became this tab: hold its first frame for the prompt */
     int traced;
     char run[600];               /* a command for the shell to run first (a restored claude --resume) */
+    char hist[400];              /* ...or one only to offer: put in its history, not run */
     int inherit;                 /* restored text above: ConPTY starts at our cursor, not at the top */
     char start_dir[1024];
 } Tab;
@@ -1547,6 +1549,8 @@ static void osc_dispatch(Term *t) {
         if (!strncmp(rest, "claude=", 7)) {      /* claude=ID as Claude Code starts, claude= as it exits */
             snprintf(t->claude, sizeof(t->claude), "%s", rest + 7);
             if (!t->claude[0]) t->claude_args[0] = 0;
+        } else if (!strncmp(rest, "cmd=", 4)) {
+            snprintf(t->cmd, sizeof(t->cmd), "%s", rest + 4);
         } else if (!strncmp(rest, "claude-args=", 12)) {
             snprintf(t->claude_args, sizeof(t->claude_args), "%s", rest + 12);
         } else if (!strncmp(rest, "mnt=", 4) && rest[4] == '/') {
@@ -1967,9 +1971,23 @@ static const char RC_BASH[] =
     "  pushd() { builtin pushd \"$@\" && __hardcore_cwd; }\n"
     "  popd() { builtin popd \"$@\" && __hardcore_cwd; }\n"
     "fi\n"
-    "case \";${PROMPT_COMMAND[0]};\" in *\";__hardcore_cwd;\"*) ;; *)\n"
-    "  PROMPT_COMMAND=\"__hardcore_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;;\n"
+    "# at each prompt: the folder, nothing running any more, and (once, in a restored\n"
+    "# tab) the command to put in history, so up-arrow offers it\n"
+    "__hardcore_prompt() {\n"
+    "  __hardcore_cwd\n"
+    "  printf '\\033]7700;cmd=\\033\\\\'\n"
+    "  if [ -n \"$__hardcore_once\" ]; then history -s \"$__hardcore_once\"; unset __hardcore_once; fi\n"
+    "}\n"
+    "case \";${PROMPT_COMMAND[0]};\" in *\";__hardcore_prompt;\"*) ;; *)\n"
+    "  PROMPT_COMMAND=\"__hardcore_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;;\n"
     "esac\n"
+    "# as each command starts (PS0): the line as typed, for a restored tab to offer again\n"
+    "__hardcore_preexec() {\n"
+    "  local c; c=$(fc -ln -0 2>/dev/null); c=${c//$'\\n'/ }; c=${c#\"${c%%[![:space:]]*}\"}\n"
+    "  printf '\\033]7700;cmd=%.400s\\033\\\\' \"$c\"\n"
+    "}\n"
+    "case $PS0 in *__hardcore_preexec*) ;; *) PS0=\"${PS0}\\$(__hardcore_preexec)\" ;; esac\n"
+    "[ -n \"$HARDCORE_HIST\" ] && { __hardcore_once=$HARDCORE_HIST; unset HARDCORE_HIST; }\n"
     "# Claude Code: tell hardcore which session runs in this tab (OSC 7700;claude=ID), so\n"
     "# closing hardcore and opening it again resumes it. New sessions get their id up\n"
     "# front (--session-id); --resume ID is known; --continue is looked up; subcommands,\n"
@@ -2035,7 +2053,7 @@ static const char RC_BASH[] =
     "  case $__hardcore_run in *\" --resume \"*)\n"
     "    ls ~/.claude/projects/*/\"${__hardcore_run##* --resume }.jsonl\" >/dev/null 2>&1 || __hardcore_run=${__hardcore_run% --resume *} ;;\n"
     "  esac\n"
-    "  history -s \"$__hardcore_run\"; eval \"$__hardcore_run\"; unset __hardcore_run\n"
+    "  __hardcore_once=$__hardcore_run; eval \"$__hardcore_run\"; unset __hardcore_run\n"
     "fi\n";
 
 static void write_rc(void) {
@@ -2202,13 +2220,13 @@ static int tab_spawn(Tab *tb) {
     memset(&pi, 0, sizeof(pi));
     /* tabs are only spawned from the UI thread, so a temporary env var is safe;
        WSLENV carries it across into Linux */
-    if (tb->spare || (tb->run[0] && tb->kind == TK_WSL)) {
+    if (tb->spare || ((tb->run[0] || tb->hist[0]) && tb->kind == TK_WSL)) {
         wchar_t old[2048] = L"", wslenv[2100], run[620];
-        const wchar_t *name = tb->spare ? L"HARDCORE_SPARE" : L"HARDCORE_RUN";
+        const wchar_t *name = tb->spare ? L"HARDCORE_SPARE" : tb->run[0] ? L"HARDCORE_RUN" : L"HARDCORE_HIST";
         DWORD n = GetEnvironmentVariableW(L"WSLENV", old, 2048);
         _snwprintf(wslenv, 2100, L"%ls%ls%ls", old, n ? L":" : L"", name);
         wslenv[2099] = 0;
-        utf8_to_wide(tb->run, run, 620);
+        utf8_to_wide(tb->run[0] ? tb->run : tb->hist, run, 620);
         SetEnvironmentVariableW(name, tb->spare ? L"1" : run);
         SetEnvironmentVariableW(L"WSLENV", wslenv);
         ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
@@ -2269,7 +2287,8 @@ static void show_help(Tab *tb, int what, DWORD code) {
 
 /* A tab from a saved session: its text replayed first, then the shell (with
    the command to run first, if any) starts below it. kind < 0: the default. */
-static Tab *tab_create_ex(const char *dir, int spare, int kind, const char *run, const char *text, size_t text_n) {
+static Tab *tab_create_ex(const char *dir, int spare, int kind, const char *run, const char *hist,
+                          const char *text, size_t text_n) {
     Tab *tb = (Tab *)calloc(1, sizeof(Tab));
     if (!tb || !term_init(&tb->t, g_cols, g_rows)) {
         free(tb);
@@ -2282,10 +2301,21 @@ static Tab *tab_create_ex(const char *dir, int spare, int kind, const char *run,
     snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", dir && *dir ? dir : g_start_dir);
     if (tb->start_dir[1] == ':' || tb->start_dir[0] == '/') set_cwd(&tb->t, tb->start_dir);
     if (run) snprintf(tb->run, sizeof(tb->run), "%s", run);
-    if (text && text_n) {
-        static const char sep[] = "\x1b[0m\x1b[2m\xe2\x94\x80\xe2\x94\x80 restored \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n";
-        vt_feed(&tb->t, (const unsigned char *)text, (int)text_n);
-        vt_feed(&tb->t, (const unsigned char *)sep, (int)sizeof(sep) - 1);
+    if (hist) snprintf(tb->hist, sizeof(tb->hist), "%s", hist);
+    if ((text && text_n) || run || hist) {
+        /* "── restored ──", and what comes next: Claude resuming, or the command
+           that was running, waiting in history (never run for you) */
+        char sep[600], shown[200];
+        int k = 0, max = tb->t.cols - 30;
+        const char *c;
+        for (c = hist ? hist : ""; *c && k < (int)sizeof(shown) - 4 && k < (max > 10 ? max : 10); c++)
+            shown[k++] = (unsigned char)*c < 0x20 ? ' ' : *c;   /* it's displayed: no control characters */
+        if (*c) shown[k++] = '.', shown[k++] = '.', shown[k++] = '.';
+        shown[k] = 0;
+        snprintf(sep, sizeof(sep), "\x1b[0m\x1b[2m\xe2\x94\x80\xe2\x94\x80 restored%s%s \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n",
+                 run ? " \xc2\xb7 resuming Claude" : hist ? " \xc2\xb7 \xe2\x86\x91 reruns: " : "", run ? "" : shown);
+        if (text && text_n) vt_feed(&tb->t, (const unsigned char *)text, (int)text_n);
+        vt_feed(&tb->t, (const unsigned char *)sep, (int)strlen(sep));
         tb->inherit = 1;
     }
     if (tb->kind == TK_WSL && !g_have_distro) show_help(tb, HELP_NO_DISTRO, 0);
@@ -2293,7 +2323,7 @@ static Tab *tab_create_ex(const char *dir, int spare, int kind, const char *run,
     return tb;
 }
 
-static Tab *tab_create(const char *dir, int spare) { return tab_create_ex(dir, spare, -1, NULL, NULL, 0); }
+static Tab *tab_create(const char *dir, int spare) { return tab_create_ex(dir, spare, -1, NULL, NULL, NULL, 0); }
 
 /* Closing ConPTY can block until conhost drains, so tear down off the UI thread. */
 static DWORD WINAPI tab_teardown(LPVOID arg) {
@@ -3915,8 +3945,15 @@ static void session_save(void) {
             term_dump(&tb->t, v, 3000);
             fclose(v);
         }
-        fprintf(f, "\n[tab]\nkind=%s\ndir=%s\nclaude=%s\nclaude_args=%s\ntext=tab%d.txt\n", tb->kind == TK_PS ? "powershell" : "wsl",
-                tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude, tb->t.claude[0] ? tb->t.claude_args : "", n);
+        {
+            char cmd[400];
+            int k;
+            snprintf(cmd, sizeof(cmd), "%s", tb->t.claude[0] ? "" : tb->t.cmd);   /* Claude comes back on its own */
+            for (k = 0; cmd[k]; k++) if (cmd[k] == '\r' || cmd[k] == '\n') cmd[k] = ' ';
+            fprintf(f, "\n[tab]\nkind=%s\ndir=%s\nclaude=%s\nclaude_args=%s\ncmd=%s\ntext=tab%d.txt\n",
+                    tb->kind == TK_PS ? "powershell" : "wsl", tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude,
+                    tb->t.claude[0] ? tb->t.claude_args : "", cmd, n);
+        }
         n++;
     }
     fclose(f);
@@ -3955,7 +3992,8 @@ static int session_id_ok(const char *id) {
     return 1;
 }
 
-static void session_add_tab(const char *kind, const char *dir, const char *claude, const char *args, const char *text) {
+static void session_add_tab(const char *kind, const char *dir, const char *claude, const char *args, const char *cmd,
+                            const char *text) {
     wchar_t p[MAX_PATH], wname[64];
     char run[600] = "", *data = NULL;
     size_t n = 0;
@@ -3970,7 +4008,7 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
         data = read_file(p, &n);
     }
     tb = tab_create_ex(dir_exists(dir) ? dir : NULL, 0, !strcmp(kind, "powershell") ? TK_PS : TK_WSL,
-                       run[0] ? run : NULL, data, n);
+                       run[0] ? run : NULL, !run[0] && cmd[0] && strcmp(kind, "powershell") ? cmd : NULL, data, n);
     free(data);
     if (tb) g_tabs[g_ntabs++] = tb;
 }
@@ -3979,7 +4017,7 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
 static int session_restore(void) {
     wchar_t p[MAX_PATH];
     size_t n;
-    char *d, *line, *next, kind[16] = "", dir[1024] = "", claude[72] = "", args[400] = "", text[64] = "";
+    char *d, *line, *next, kind[16] = "", dir[1024] = "", claude[72] = "", args[400] = "", cmd[400] = "", text[64] = "";
     int active = 0, intab = 0;
     if (g_session_off) return 0;
     session_path(p, L"session.txt");
@@ -3990,9 +4028,9 @@ static int session_restore(void) {
         if (next) *next++ = 0;
         if ((e = strchr(line, '\r'))) *e = 0;
         if (!strcmp(line, "[tab]")) {
-            if (intab) session_add_tab(kind, dir, claude, args, text);
+            if (intab) session_add_tab(kind, dir, claude, args, cmd, text);
             intab = 1;
-            kind[0] = dir[0] = claude[0] = args[0] = text[0] = 0;
+            kind[0] = dir[0] = claude[0] = args[0] = cmd[0] = text[0] = 0;
             continue;
         }
         if (line[0] == '#' || !(v = strchr(line, '='))) continue;
@@ -4002,9 +4040,10 @@ static int session_restore(void) {
         else if (!strcmp(line, "dir")) snprintf(dir, sizeof(dir), "%s", v);
         else if (!strcmp(line, "claude")) snprintf(claude, sizeof(claude), "%s", v);
         else if (!strcmp(line, "claude_args")) snprintf(args, sizeof(args), "%s", v);
+        else if (!strcmp(line, "cmd")) snprintf(cmd, sizeof(cmd), "%s", v);
         else if (!strcmp(line, "text")) snprintf(text, sizeof(text), "%s", v);
     }
-    if (intab) session_add_tab(kind, dir, claude, args, text);
+    if (intab) session_add_tab(kind, dir, claude, args, cmd, text);
     free(d);
     if (g_ntabs) activate(active >= 0 && active < g_ntabs ? active : 0);
     return g_ntabs;

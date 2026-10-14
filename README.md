@@ -157,7 +157,8 @@ On close, hardcore writes `%LOCALAPPDATA%\hardcore\session\`: `session.txt`
 rows of text. On the next start, each tab is rebuilt:
 - **Its text is replayed** with colors and wraps, and rewraps to the new width.
 - **The shell starts below it.** ConPTY's inherit-cursor mode makes it start at
-  the cursor, not the top.
+  the cursor, not the top. The `── restored ──` line says what comes next:
+  Claude resuming, or the command waiting behind ↑.
 - **A Claude tab runs `claude <flags> --resume <id>`**, which is also put in the
   shell's history. A session closed before its first message has no transcript
   yet, so it gets a fresh `claude` with the same flags instead.
@@ -165,8 +166,21 @@ rows of text. On the next start, each tab is rebuilt:
 On restore, an id must be letters, digits and dashes, and flags may contain
 only characters plain flags use, because the command goes through `eval`.
 
-Programs other than Claude, such as vim or a running build, don't come back,
-but their tab, folder and text do. A folder on the command line
+Other programs, such as vim or a running build, aren't run again for you.
+A command can be one you shouldn't rerun, like a push, a deploy or an `rm`.
+Instead, the shell reports each command line as you start it (bash's `PS0`,
+`OSC 7700 ; cmd=`), and the restored tab puts the one that was running into its
+history and says so:
+
+```
+── restored · ↑ reruns: vim -O hardcore.c hardcore_mac.m ──
+wm@w11:~/github/wsl-easy$ █
+```
+
+One up-arrow brings it back exactly as you typed it, flags and quotes
+included, and Enter runs it. It's added at the first prompt, so it's the
+newest entry even though bash loads its history file after hardcore's
+startup file. A folder on the command line
 (`hardcore.exe DIR`) opens there instead of restoring. With several windows
 open, the last one closed is the one restored. Sessions are Windows-only for
 now.
