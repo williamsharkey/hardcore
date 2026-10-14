@@ -1,6 +1,7 @@
 # hardcore
 
-A terminal for WSL on Windows 11, built for running Claude Code. It does one
+A terminal for WSL on Windows 11, built for running Claude Code. It also runs
+natively on macOS (see [macOS](#macos)). It does one
 job, running your WSL shell, and it isn't a jack of all trades. There are no options, themes or settings UI: one font, one
 look, one size, one layout.
 
@@ -122,6 +123,58 @@ Claude Code turns on mouse reporting, so a plain drag goes to Claude. Hold
   Claude Code for Windows gets the same integration.
 
 See [PRODUCT.md](PRODUCT.md) for what sharing it more widely would take.
+
+## macOS
+
+The same terminal runs natively on a Mac: same parser, tab column, Unifont
+and Claude Code integration, on Cocoa, `forkpty` and OpenGL instead of
+Win32, ConPTY and Direct3D. It's one universal (arm64 + x86_64) app.
+
+```bash
+make            # → hardcore.app (needs the Xcode command line tools and python3)
+make install    # → ~/Applications/hardcore.app
+make test       # unit tests, xterm.js fixtures, headless forkpty + shell selftest
+```
+
+What's different on the Mac:
+- **Your login shell, not bash.**
+  - zsh tabs get two hooks (prompt marks and the folder) through a
+    `ZDOTDIR` that hands straight back to your own `.zshenv`, `.zprofile`,
+    `.zshrc` and `.zlogin`.
+  - bash gets `rc.bash` as under WSL.
+  - fish gets an `--init-command`.
+  - Anything else runs plain, and new tabs ask the kernel where its shell is.
+  - Your dotfiles are never edited.
+- **Starts in your home folder.** Override it with `dir=` in
+  `~/Library/Application Support/hardcore/config.ini`, or with
+  `hardcore.app/Contents/MacOS/hardcore DIR`. A folder dropped on the Dock
+  icon opens a tab there.
+- **The window's own traffic lights** sit over the tab column. The empty
+  part of the column still drags the window, and double-clicking it zooms.
+- **Mac keys:**
+
+  | Keys | Action |
+  |---|---|
+  | Cmd+T, Cmd+W | New tab in the current folder, close tab |
+  | Cmd+Shift+] / [, Ctrl+Tab | Next / previous tab |
+  | Cmd+1…9 | Jump to tab (9 = last) |
+  | Cmd+J | Jump to the tab that needs you |
+  | Cmd+↑ / ↓ | Previous / next prompt or Claude turn |
+  | Cmd+C, Cmd+V | Copy, paste (an image pastes as a saved PNG's path; Claude Code's own Ctrl+V image paste still works) |
+  | Cmd+click | Open a link |
+  | Left Option | Meta: Option+B/F/D/Backspace, Option+←/→ by word, Option+Enter for a newline in Claude Code |
+  | Right Option | Types é, ü, @, { and the rest, as usual |
+  | Cmd+←/→, Cmd+Backspace | Start / end of line, delete to start of line |
+  | Shift or Option + drag | Select text inside mouse-aware programs |
+
+- **Closing asks only when something is running.** A tab (or the window)
+  with claude, vim or a build in the foreground asks before it closes. A
+  tab sitting at a prompt just closes.
+- Pasted images go to `~/Library/Application Support/hardcore/pasted`.
+
+`HARDCORE_CTL=/path/fifo` turns on a test channel. It's the Mac side of
+`termbench`: `type`, `key`, `cmd`, `snap` and `winid` lines drive a window
+that doesn't have focus (see the comment in `hardcore_mac.m`).
 
 ## Build
 
