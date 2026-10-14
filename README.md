@@ -16,9 +16,16 @@ look, one size, one layout.
                   + │
 ```
 
-- **Opens where you left off.** A new window starts in the folder the last
-  window closed in (its active tab, or the last tab you exited). The very
-  first time it's `/mnt/c/Users/<you>` (your `%USERPROFILE%`), not `~` inside the distro.
+- **Close it, open it, and your tabs come back.** Closing the window (or
+  Windows shutting down or restarting) saves every tab: its shell, folder and
+  text, and the Claude Code session running in it. The next start rebuilds
+  them. Each tab's text is replayed under a dim `── restored ──` line, and
+  Claude comes back with `claude --resume`, with the flags you started it with.
+  Exiting the last tab yourself means you're done: the next window starts
+  fresh. See [Sessions](#sessions).
+- **Otherwise it opens where you left off.** A new window starts in the folder
+  the last window closed in. The very first time it's `/mnt/c/Users/<you>` (your
+  `%USERPROFILE%`), not `~` inside the distro.
 - **Tabs run down the left edge**, like Chrome's vertical tabs: tabs, then
   **+**. The tab column is 20 cells wide and sits on the terminal's own text
   grid, so each of its rows lines up with a terminal row. Row 0 is a grip of
@@ -124,6 +131,45 @@ and forth between them.
 
 Claude Code turns on mouse reporting, so a plain drag goes to Claude. Hold
 **Shift** to select text with the terminal instead.
+
+## Sessions
+
+hardcore's `rc.bash` wraps `claude` in a small shell function. When Claude Code
+starts, the function tells hardcore which session it is
+(`OSC 7700 ; claude=ID`), and again when it exits:
+- **A new session:** the wrapper picks the id and passes it as `--session-id`.
+- **`--resume ID`:** that id.
+- **`--continue`:** the newest transcript in that folder.
+- **The picker (`-r` with no id):** unknown, so the tab comes back with
+  `claude --continue`.
+
+Subcommands (`claude mcp …`, `claude doctor`), `-p` and `--version` pass
+straight through. So does a one-word prompt like `claude hello`, which looks
+like a subcommand. Your own `claude` alias or function, if you have one, takes
+precedence, and then sessions aren't tracked.
+
+The wrapper also remembers the flags you started Claude with
+(`--dangerously-skip-permissions`, `--model opus`, …), but not the session flags
+or the first prompt, so that prompt isn't sent again.
+
+On close, hardcore writes `%LOCALAPPDATA%\hardcore\session\`: `session.txt`
+(each tab's shell, folder, Claude session and flags) plus each tab's last 3,000
+rows of text. On the next start, each tab is rebuilt:
+- **Its text is replayed** with colors and wraps, and rewraps to the new width.
+- **The shell starts below it.** ConPTY's inherit-cursor mode makes it start at
+  the cursor, not the top.
+- **A Claude tab runs `claude <flags> --resume <id>`**, which is also put in the
+  shell's history. A session closed before its first message has no transcript
+  yet, so it gets a fresh `claude` with the same flags instead.
+
+On restore, an id must be letters, digits and dashes, and flags may contain
+only characters plain flags use, because the command goes through `eval`.
+
+Programs other than Claude, such as vim or a running build, don't come back,
+but their tab, folder and text do. A folder on the command line
+(`hardcore.exe DIR`) opens there instead of restoring. With several windows
+open, the last one closed is the one restored. Sessions are Windows-only for
+now.
 
 ## What it needs
 

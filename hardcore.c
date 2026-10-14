@@ -310,6 +310,8 @@ typedef struct {
     int nmarks;
     int dirty;
     int side;                    /* something the tab column shows changed: folder, program status */
+    char claude[40];             /* Claude Code session running here (rc.bash's wrapper says), "?" = unknown */
+    char claude_args[400];       /* the flags it was started with, shell-quoted, to start it with again */
 } Term;
 
 /* Term is the first member so the parser can find its tab for replies. */
@@ -342,6 +344,8 @@ typedef struct Tab {
     int spare;                   /* pre-warmed, waiting on stdin for its directory */
     DWORD adopted;               /* when a spare became this tab: hold its first frame for the prompt */
     int traced;
+    char run[600];               /* a command for the shell to run first (a restored claude --resume) */
+    int inherit;                 /* restored text above: ConPTY starts at our cursor, not at the top */
     char start_dir[1024];
 } Tab;
 
@@ -1540,7 +1544,12 @@ static void osc_dispatch(Term *t) {
         else program_status(t, rest);
         break;
     case 7700:                   /* from rc.bash: mnt=<wslpath -u C:\>, when drives aren't under /mnt */
-        if (!strncmp(rest, "mnt=", 4) && rest[4] == '/') {
+        if (!strncmp(rest, "claude=", 7)) {      /* claude=ID as Claude Code starts, claude= as it exits */
+            snprintf(t->claude, sizeof(t->claude), "%s", rest + 7);
+            if (!t->claude[0]) t->claude_args[0] = 0;
+        } else if (!strncmp(rest, "claude-args=", 12)) {
+            snprintf(t->claude_args, sizeof(t->claude_args), "%s", rest + 12);
+        } else if (!strncmp(rest, "mnt=", 4) && rest[4] == '/') {
             char *e;
             snprintf(g_mnt_root, sizeof(g_mnt_root), "%s", rest + 4);
             e = g_mnt_root + strlen(g_mnt_root);
@@ -1781,6 +1790,60 @@ static void term_line(const Term *t, int L, const Cell **cells, int *n, int *wra
 static long long term_base(const Term *t) { return t->hpushed - t->hcount; }
 static long long term_abs_line(const Term *t, int y) { return t->hpushed + y; }
 
+/* The main screen and its scrollback, the newest max_rows rows of it, back
+   out as text with its colors: what a restored tab replays. Wrapped rows run
+   on (so they rewrap at whatever width the next window has); wide-char gaps
+   (W_PAD) are left out, the replay makes them again. */
+static void sgr_color(char *o, size_t cap, uint32_t spec, int bg) {
+    if (!spec) o[0] = 0;
+    else if (spec & 0x01000000u) snprintf(o, cap, ";%d;5;%u", bg ? 48 : 38, spec & 255);
+    else snprintf(o, cap, ";%d;2;%u;%u;%u", bg ? 48 : 38, (spec >> 16) & 255, (spec >> 8) & 255, spec & 255);
+}
+
+static int utf8_encode(uint32_t cp, char *o);
+
+static void term_dump(Term *t, FILE *f, int max_rows) {
+    static const int abit[8] = {1, 2, 3, 4, 5, 7, 8, 9};     /* A_BOLD.. A_STRIKE → SGR */
+    int alt = t->alt, last, L, first, total;
+    uint32_t pfg = 0, pbg = 0;
+    uint8_t pat = 0;
+    t->alt = 0;                  /* the main screen, even under a full-screen program */
+    last = alt ? t->saved[0].cy : t->cy;
+    for (L = t->rows - 1; L > last; L--) {      /* down to the cursor or the last row with text */
+        int x;
+        for (x = 0; x < t->rlen[0][L] && row_is_blank_default(&t->row[0][L][x]); x++) {}
+        if (x < t->rlen[0][L]) { last = L; break; }
+    }
+    total = t->hcount + last + 1;
+    first = total > max_rows ? total - max_rows : 0;
+    for (L = first; L < total; L++) {
+        const Cell *c;
+        int n, wr, x;
+        term_line(t, L, &c, &n, &wr);
+        if (!wr) while (n > 0 && row_is_blank_default(&c[n - 1])) n--;
+        for (x = 0; c && x < n; x++) {
+            char ch[8], sg[96], fs[32], bs[32];
+            int k, m;
+            if (c[x].wflag == W_CONT || c[x].wflag == W_PAD) continue;
+            if (c[x].fg != pfg || c[x].bg != pbg || c[x].attr != pat) {
+                m = snprintf(sg, sizeof(sg), "\x1b[0");
+                for (k = 0; k < 8; k++) if (c[x].attr & (1 << k)) m += snprintf(sg + m, sizeof(sg) - m, ";%d", abit[k]);
+                sgr_color(fs, sizeof(fs), c[x].fg, 0);
+                sgr_color(bs, sizeof(bs), c[x].bg, 1);
+                snprintf(sg + m, sizeof(sg) - m, "%s%sm", fs, bs);
+                fputs(sg, f);
+                pfg = c[x].fg; pbg = c[x].bg; pat = c[x].attr;
+            }
+            fwrite(ch, 1, (size_t)utf8_encode(c[x].ch ? c[x].ch : ' ', ch), f);
+        }
+        if (!wr || L == total - 1) {
+            fputs(pfg || pbg || pat ? "\x1b[0m\r\n" : "\r\n", f);
+            pfg = pbg = 0; pat = 0;
+        }
+    }
+    t->alt = alt;
+}
+
 /* ── tabs ──────────────────────────────────────────────────────────── */
 
 static Tab *g_tabs[MAX_TABS];
@@ -1906,7 +1969,74 @@ static const char RC_BASH[] =
     "fi\n"
     "case \";${PROMPT_COMMAND[0]};\" in *\";__hardcore_cwd;\"*) ;; *)\n"
     "  PROMPT_COMMAND=\"__hardcore_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\" ;;\n"
-    "esac\n";
+    "esac\n"
+    "# Claude Code: tell hardcore which session runs in this tab (OSC 7700;claude=ID), so\n"
+    "# closing hardcore and opening it again resumes it. New sessions get their id up\n"
+    "# front (--session-id); --resume ID is known; --continue is looked up; subcommands,\n"
+    "# -p and the like pass straight through.\n"
+    "__hardcore_claude_mode() {\n"
+    "  local a prev= id= mode=new\n"
+    "  case $1 in [a-z]*) case $1 in *[!a-z-]*) ;; *) mode=sub ;; esac ;; esac\n"
+    "  for a in \"$@\"; do\n"
+    "    case $prev in -r|--resume) case $a in -*) ;; *) id=$a; mode=known ;; esac ;; --session-id) id=$a; mode=known ;; esac\n"
+    "    case $a in\n"
+    "      -p|--print|-h|--help|-v|--version) mode=sub ;;\n"
+    "      --resume=*|--session-id=*) id=${a#*=}; mode=known ;;\n"
+    "      -r|--resume) [ \"$mode\" = known ] || mode=pick ;;\n"
+    "      -c|--continue) [ \"$mode\" = known ] || mode=continue ;;\n"
+    "      --fork-session) mode=pick ;;\n"
+    "    esac\n"
+    "    prev=$a\n"
+    "  done\n"
+    "  printf '%s %s\\n' \"$mode\" \"$id\"\n"
+    "}\n"
+    "# the flags to start it with again (not the session ones, not the first prompt),\n"
+    "# shell-quoted; how many words each flag takes follows claude --help\n"
+    "__hardcore_claude_keep() {\n"
+    "  local a take=0 opt=0 var=0 drop=0 out=()\n"
+    "  for a in \"$@\"; do\n"
+    "    if [ $take = 1 ]; then out+=(\"$a\"); take=0; continue; fi\n"
+    "    if [ $opt = 1 ]; then opt=0; case $a in -*) ;; *) out+=(\"$a\"); continue ;; esac; fi\n"
+    "    if [ $var = 1 ]; then case $a in -*) var=0 ;; *) out+=(\"$a\"); continue ;; esac; fi\n"
+    "    if [ $drop = 1 ]; then drop=0; case $a in -*) ;; *) continue ;; esac; fi\n"
+    "    case $a in\n"
+    "      --session-id|--resume|-r) drop=1 ;;\n"
+    "      --session-id=*|--resume=*|-c|--continue|--fork-session) ;;\n"
+    "      --add-dir|--betas|--file|--mcp-config|--tools|--allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools) out+=(\"$a\"); var=1 ;;\n"
+    "      --agent|--agents|--append-system-prompt|--autocompact|--debug-file|--effort|--environment|--fallback-model|--input-format|--json-schema|--max-budget-usd|--model|-n|--name|--output-format|--permission-mode|--permission-prompts|--plugin-dir|--plugin-url|--setting-sources|--settings|--system-prompt|--system-prompt-snapshot) out+=(\"$a\"); take=1 ;;\n"
+    "      -d|--debug|--cloud|--from-pr|--prompt-suggestions|--remote-control|--teleport|-w|--worktree) out+=(\"$a\"); opt=1 ;;\n"
+    "      -*) out+=(\"$a\") ;;\n"
+    "    esac\n"
+    "  done\n"
+    "  [ ${#out[@]} -gt 0 ] && printf '%q ' \"${out[@]}\"\n"
+    "}\n"
+    "if ! declare -F claude >/dev/null && ! alias claude >/dev/null 2>&1; then\n"
+    "  claude() {\n"
+    "    local m id d rc keep\n"
+    "    read -r m id < <(__hardcore_claude_mode \"$@\")\n"
+    "    keep=$(__hardcore_claude_keep \"$@\")\n"
+    "    case $m in\n"
+    "      sub) command claude \"$@\"; return ;;\n"
+    "      new) id=$(cat /proc/sys/kernel/random/uuid); set -- --session-id \"$id\" \"$@\" ;;\n"
+    "      continue) d=~/.claude/projects/$(printf '%s' \"$PWD\" | sed 's/[^A-Za-z0-9]/-/g')\n"
+    "                id=$(ls -t \"$d\"/*.jsonl 2>/dev/null | head -1); id=${id##*/}; id=${id%.jsonl} ;;\n"
+    "      pick) id= ;;\n"
+    "    esac\n"
+    "    printf '\\033]7700;claude-args=%s\\033\\\\\\033]7700;claude=%s\\033\\\\' \"$keep\" \"${id:-?}\"\n"
+    "    command claude \"$@\"; rc=$?\n"
+    "    printf '\\033]7700;claude=\\033\\\\'\n"
+    "    return $rc\n"
+    "  }\n"
+    "fi\n"
+    "# a restored tab: hardcore hands over a command to run first (claude --resume ...)\n"
+    "if [ -n \"$HARDCORE_RUN\" ]; then\n"
+    "  __hardcore_run=$HARDCORE_RUN; unset HARDCORE_RUN\n"
+    "  # a session closed before its first message has no transcript yet: start a fresh one\n"
+    "  case $__hardcore_run in *\" --resume \"*)\n"
+    "    ls ~/.claude/projects/*/\"${__hardcore_run##* --resume }.jsonl\" >/dev/null 2>&1 || __hardcore_run=${__hardcore_run% --resume *} ;;\n"
+    "  esac\n"
+    "  history -s \"$__hardcore_run\"; eval \"$__hardcore_run\"; unset __hardcore_run\n"
+    "fi\n";
 
 static void write_rc(void) {
     wchar_t path[MAX_PATH];
@@ -2034,7 +2164,8 @@ static int tab_spawn(Tab *tb) {
     sz.X = (SHORT)tb->t.cols;
     sz.Y = (SHORT)tb->t.rows;
     /* OpenConsole can measure glyphs with wcswidth, which is what our grid uses */
-    hr = pCreatePC(sz, in_r, out_w, g_conpty_kind[0] == 'O' ? 0x10 /* GLYPH_WIDTH_WCSWIDTH */ : 0, &tb->hpc);
+    hr = pCreatePC(sz, in_r, out_w, (g_conpty_kind[0] == 'O' ? 0x10 /* GLYPH_WIDTH_WCSWIDTH */ : 0) |
+                   (tb->inherit ? 0x1 /* PSEUDOCONSOLE_INHERIT_CURSOR: restored text is above */ : 0), &tb->hpc);
     CloseHandle(in_r);
     CloseHandle(out_w);
     if (FAILED(hr)) {
@@ -2071,17 +2202,19 @@ static int tab_spawn(Tab *tb) {
     memset(&pi, 0, sizeof(pi));
     /* tabs are only spawned from the UI thread, so a temporary env var is safe;
        WSLENV carries it across into Linux */
-    if (tb->spare) {
-        wchar_t old[2048] = L"", wslenv[2100];
+    if (tb->spare || (tb->run[0] && tb->kind == TK_WSL)) {
+        wchar_t old[2048] = L"", wslenv[2100], run[620];
+        const wchar_t *name = tb->spare ? L"HARDCORE_SPARE" : L"HARDCORE_RUN";
         DWORD n = GetEnvironmentVariableW(L"WSLENV", old, 2048);
-        _snwprintf(wslenv, 2100, L"%ls%lsHARDCORE_SPARE", old, n ? L":" : L"");
+        _snwprintf(wslenv, 2100, L"%ls%ls%ls", old, n ? L":" : L"", name);
         wslenv[2099] = 0;
-        SetEnvironmentVariableW(L"HARDCORE_SPARE", L"1");
+        utf8_to_wide(tb->run, run, 620);
+        SetEnvironmentVariableW(name, tb->spare ? L"1" : run);
         SetEnvironmentVariableW(L"WSLENV", wslenv);
         ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                             NULL, tb->kind == TK_PS && GetFileAttributesW(wdir) != INVALID_FILE_ATTRIBUTES ? wdir : NULL,
                             &si.StartupInfo, &pi);
-        SetEnvironmentVariableW(L"HARDCORE_SPARE", NULL);
+        SetEnvironmentVariableW(name, NULL);
         SetEnvironmentVariableW(L"WSLENV", n ? old : NULL);
     } else {
         ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
@@ -2134,7 +2267,9 @@ static void show_help(Tab *tb, int what, DWORD code) {
     t->dirty = 1;
 }
 
-static Tab *tab_create(const char *dir, int spare) {
+/* A tab from a saved session: its text replayed first, then the shell (with
+   the command to run first, if any) starts below it. kind < 0: the default. */
+static Tab *tab_create_ex(const char *dir, int spare, int kind, const char *run, const char *text, size_t text_n) {
     Tab *tb = (Tab *)calloc(1, sizeof(Tab));
     if (!tb || !term_init(&tb->t, g_cols, g_rows)) {
         free(tb);
@@ -2143,13 +2278,22 @@ static Tab *tab_create(const char *dir, int spare) {
     tb->id = g_next_id++;
     InitializeCriticalSection(&tb->lock);
     tb->spare = spare;
-    tb->kind = g_shell_ps ? TK_PS : TK_WSL;
+    tb->kind = kind >= 0 ? kind : g_shell_ps ? TK_PS : TK_WSL;
     snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", dir && *dir ? dir : g_start_dir);
     if (tb->start_dir[1] == ':' || tb->start_dir[0] == '/') set_cwd(&tb->t, tb->start_dir);
+    if (run) snprintf(tb->run, sizeof(tb->run), "%s", run);
+    if (text && text_n) {
+        static const char sep[] = "\x1b[0m\x1b[2m\xe2\x94\x80\xe2\x94\x80 restored \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n";
+        vt_feed(&tb->t, (const unsigned char *)text, (int)text_n);
+        vt_feed(&tb->t, (const unsigned char *)sep, (int)sizeof(sep) - 1);
+        tb->inherit = 1;
+    }
     if (tb->kind == TK_WSL && !g_have_distro) show_help(tb, HELP_NO_DISTRO, 0);
     else tab_spawn(tb);
     return tb;
 }
+
+static Tab *tab_create(const char *dir, int spare) { return tab_create_ex(dir, spare, -1, NULL, NULL, 0); }
 
 /* Closing ConPTY can block until conhost drains, so tear down off the UI thread. */
 static DWORD WINAPI tab_teardown(LPVOID arg) {
@@ -3727,6 +3871,146 @@ static void new_tab_here(void) {
     activate(g_ntabs == 1 ? 0 : g_active + 1);
 }
 
+#ifdef _WIN32
+/* ── sessions: close hardcore, open it again, and the tabs come back ──
+   On close (and when Windows shuts down) every tab's shell, folder, text and
+   the Claude Code session running in it go to %LOCALAPPDATA%\hardcore\session.
+   The next start rebuilds them: the text replayed, the shell started under
+   it, and claude --resume ID where Claude was running. Exiting the last tab
+   yourself clears it. Test copies (--no-activate) leave it alone. */
+static int g_session_off;
+static int dir_exists(const char *p);
+
+static void session_path(wchar_t *out, const wchar_t *name) {
+    _snwprintf(out, MAX_PATH, L"%ls\\session\\%ls", g_cfg_dir, name);
+    out[MAX_PATH - 1] = 0;
+}
+
+static void session_clear(void) {
+    wchar_t p[MAX_PATH];
+    if (g_session_off) return;
+    session_path(p, L"session.txt");
+    DeleteFileW(p);
+}
+
+static void session_save(void) {
+    wchar_t dir[MAX_PATH], p[MAX_PATH];
+    FILE *f;
+    int i, n = 0;
+    if (g_session_off || !g_ntabs) return;
+    _snwprintf(dir, MAX_PATH, L"%ls\\session", g_cfg_dir);
+    CreateDirectoryW(dir, NULL);
+    session_path(p, L"session.txt");
+    if (!(f = _wfopen(p, L"wb"))) return;
+    fprintf(f, "# hardcore: the tabs open when the window closed, restored on the next start\n");
+    fprintf(f, "active=%d\n", g_active);
+    for (i = 0; i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        wchar_t name[32];
+        FILE *v;
+        if (tb->help) continue;
+        _snwprintf(name, 32, L"tab%d.txt", n);
+        session_path(p, name);
+        if ((v = _wfopen(p, L"wb"))) {
+            term_dump(&tb->t, v, 3000);
+            fclose(v);
+        }
+        fprintf(f, "\n[tab]\nkind=%s\ndir=%s\nclaude=%s\nclaude_args=%s\ntext=tab%d.txt\n", tb->kind == TK_PS ? "powershell" : "wsl",
+                tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude, tb->t.claude[0] ? tb->t.claude_args : "", n);
+        n++;
+    }
+    fclose(f);
+}
+
+static char *read_file(const wchar_t *path, size_t *n) {
+    FILE *f = _wfopen(path, L"rb");
+    char *d;
+    long len;
+    *n = 0;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    d = (char *)malloc((size_t)len + 1);
+    if (d && fread(d, 1, (size_t)len, f) == (size_t)len) { d[len] = 0; *n = (size_t)len; }
+    else { free(d); d = NULL; }
+    fclose(f);
+    return d;
+}
+
+/* the flags go into it too: what printf %q makes of plain flags, nothing that
+   could start another command (no $ ` ; & | < > quotes or newlines) */
+static int session_args_ok(const char *a) {
+    const char *p;
+    for (p = a; *p; p++)
+        if (!isalnum((unsigned char)*p) && !strchr(" -_./:=,@%+\\", *p)) return 0;
+    return 1;
+}
+
+/* the id goes into a command bash evals: letters, digits and dashes only */
+static int session_id_ok(const char *id) {
+    const char *p;
+    if (!id[0] || strlen(id) > 64) return 0;
+    for (p = id; *p; p++) if (!isalnum((unsigned char)*p) && *p != '-') return 0;
+    return 1;
+}
+
+static void session_add_tab(const char *kind, const char *dir, const char *claude, const char *args, const char *text) {
+    wchar_t p[MAX_PATH], wname[64];
+    char run[600] = "", *data = NULL;
+    size_t n = 0;
+    Tab *tb;
+    if (g_ntabs >= MAX_TABS || !dir[0]) return;
+    if (!session_args_ok(args)) args = "";
+    if (!strcmp(claude, "?")) snprintf(run, sizeof(run), "claude %s--continue", args);
+    else if (session_id_ok(claude)) snprintf(run, sizeof(run), "claude %s--resume %s", args, claude);
+    if (text[0]) {
+        utf8_to_wide(text, wname, 64);
+        session_path(p, wname);
+        data = read_file(p, &n);
+    }
+    tb = tab_create_ex(dir_exists(dir) ? dir : NULL, 0, !strcmp(kind, "powershell") ? TK_PS : TK_WSL,
+                       run[0] ? run : NULL, data, n);
+    free(data);
+    if (tb) g_tabs[g_ntabs++] = tb;
+}
+
+/* Returns how many tabs came back. */
+static int session_restore(void) {
+    wchar_t p[MAX_PATH];
+    size_t n;
+    char *d, *line, *next, kind[16] = "", dir[1024] = "", claude[72] = "", args[400] = "", text[64] = "";
+    int active = 0, intab = 0;
+    if (g_session_off) return 0;
+    session_path(p, L"session.txt");
+    if (!(d = read_file(p, &n))) return 0;
+    for (line = d; line && *line; line = next) {
+        char *v, *e;
+        next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        if ((e = strchr(line, '\r'))) *e = 0;
+        if (!strcmp(line, "[tab]")) {
+            if (intab) session_add_tab(kind, dir, claude, args, text);
+            intab = 1;
+            kind[0] = dir[0] = claude[0] = args[0] = text[0] = 0;
+            continue;
+        }
+        if (line[0] == '#' || !(v = strchr(line, '='))) continue;
+        *v++ = 0;
+        if (!strcmp(line, "active")) active = atoi(v);
+        else if (!strcmp(line, "kind")) snprintf(kind, sizeof(kind), "%s", v);
+        else if (!strcmp(line, "dir")) snprintf(dir, sizeof(dir), "%s", v);
+        else if (!strcmp(line, "claude")) snprintf(claude, sizeof(claude), "%s", v);
+        else if (!strcmp(line, "claude_args")) snprintf(args, sizeof(args), "%s", v);
+        else if (!strcmp(line, "text")) snprintf(text, sizeof(text), "%s", v);
+    }
+    if (intab) session_add_tab(kind, dir, claude, args, text);
+    free(d);
+    if (g_ntabs) activate(active >= 0 && active < g_ntabs ? active : 0);
+    return g_ntabs;
+}
+#endif
+
 /* The folder the window is closing in, for the next window to open in. */
 static void remember_dir(Tab *tb) {
     const char *d;
@@ -3744,6 +4028,9 @@ static void close_tab(int i) {
     if (!g_ntabs) {             /* the last tab: its folder is where the next window opens */
         remember_dir(tb);
         config_save();
+#ifdef _WIN32
+        session_clear();         /* you closed them all yourself: the next window starts fresh */
+#endif
     }
     tab_destroy_async(tb);
     if (!g_ntabs) {
@@ -4667,11 +4954,17 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DragAcceptFiles(hwnd, TRUE);
         return 0;
     case WM_CLOSE:
+        session_save();
         remember_dir(active_tab());
         save_window_size();
         config_save();
         DestroyWindow(hwnd);
         return 0;
+    case WM_QUERYENDSESSION:     /* Windows is shutting down or restarting: keep the tabs */
+        session_save();
+        remember_dir(active_tab());
+        config_save();
+        return TRUE;
     case WM_DESTROY:
         /* No per-tab teardown: when this process exits its pseudoconsoles
            close, and conhost takes the shells down with it. Closing stays instant. */
@@ -4704,6 +4997,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             else if (!strcmp(buf, "nexttab")) activate((g_active + 1) % g_ntabs);
             else if (!strcmp(buf, "closetab")) close_tab(g_active);
+            else if (!strcmp(buf, "close")) PostMessageW(hwnd, WM_CLOSE, 0, 0);   /* as the × does */
             else if (!strcmp(buf, "jump")) jump_to_attention();
             else if (!strncmp(buf, "tab ", 4)) activate(atoi(buf + 4));
             else if (!strncmp(buf, "hover ", 6)) {
@@ -5338,6 +5632,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     RECT r;
     MSG msg;
     char selftest_out[MAX_PATH] = "";
+    int dir_given = 0;           /* a folder on the command line: open there, don't restore the last session */
     HWND h;
     HANDLE gfx_thread = NULL;
     (void)prev; (void)cmdline;
@@ -5378,6 +5673,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, a, sizeof(a), NULL, NULL);
         if ((!strcmp(a, "--cd") || !strcmp(a, "-d")) && i + 1 < argc) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, g_start_dir, sizeof(g_start_dir), NULL, NULL);
+            dir_given = 1;
         } else if (!strcmp(a, "--distro") && i + 1 < argc) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, g_distro, sizeof(g_distro), NULL, NULL);
         } else if (!strcmp(a, "--unit") && i + 1 < argc) {
@@ -5390,6 +5686,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             return bench_resize(out);
         } else if (!strcmp(a, "--no-activate")) {
             show = SW_SHOWNOACTIVATE;       /* tests: open behind, never take the keyboard */
+            g_session_off = !_wgetenv(L"HARDCORE_SESSIONS");   /* ...and never touch your saved tabs */
         } else if (!strcmp(a, "--inbox-conpty")) {
             g_inbox_conpty = 1;
         } else if (!strcmp(a, "--reflow-bench") && i + 1 < argc) {
@@ -5411,6 +5708,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, selftest_out, sizeof(selftest_out), NULL, NULL);
         } else if (a[0] != '-') {
             snprintf(g_start_dir, sizeof(g_start_dir), "%s", a);
+            dir_given = 1;
         }
     }
     trace("config");
@@ -5461,7 +5759,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     trace("window shown");
     check_disk();
     SetTimer(h, TIMER_DISK, 60 * 1000, NULL);
-    new_tab_here();              /* wsl.exe boots while the D3D device is created */
+    /* wsl.exe boots while the D3D device is created; the tabs from last time
+       if there are any (unless a folder was asked for), else one new tab */
+    if (dir_given || !session_restore()) new_tab_here();
+    else schedule_spare();
     trace("first tab spawned");
     if (gfx_thread) { WaitForSingleObject(gfx_thread, 5000); CloseHandle(gfx_thread); }
     trace("D3D device ready");
