@@ -69,11 +69,11 @@ Still assumed, deliberately:
 ## macOS (done, 2026-10-13)
 
 The port that this section recommended waiting on turned out to be small,
-because the core really was free of Win32. `hardcore_mac.m` is about 1,600
+because the core really was free of Win32. `hardcore_mac.m` is about 2,100
 lines:
 - Cocoa;
 - `forkpty` with dispatch sources;
-- OpenGL 2.1 drawing the same vertex array and atlas as the Direct3D path;
+- Metal drawing the same vertex array and atlas as the Direct3D path;
 - zsh, bash and fish hooks.
 
 The edge on a Mac is the Claude Code tab column, not WSL. See the README's

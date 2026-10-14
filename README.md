@@ -127,11 +127,12 @@ See [PRODUCT.md](PRODUCT.md) for what sharing it more widely would take.
 ## macOS
 
 The same terminal runs natively on a Mac: same parser, tab column, Unifont
-and Claude Code integration, on Cocoa, `forkpty` and OpenGL instead of
+and Claude Code integration, on Cocoa, `forkpty` and Metal instead of
 Win32, ConPTY and Direct3D. It's one universal (arm64 + x86_64) app.
 
 ```bash
-make            # → hardcore.app (needs the Xcode command line tools and python3)
+make            # → hardcore.app (needs the Xcode command line tools and python3;
+                #   with full Xcode the shader is compiled ahead of time)
 make install    # → ~/Applications/hardcore.app
 make test       # unit tests, xterm.js fixtures, headless forkpty + shell selftest
 ```
