@@ -1,20 +1,20 @@
 # hardcore
 
-Experimental branch `experiment/right-underlay-tabs`: the terminal uses the full
-window width. Tabs and grip rows sit on the right, visible over whitespace;
-content in their area collapses each tab to its last-cell initial. Hover a tab
-to bring its name and details forward. The initial stays visible, with the
-throbber overlaid while busy. The right-edge cells overlay the terminal without
-reserving columns. Settings and **+** sit below the tabs; the open settings panel
-comes forward for interaction. All text shares a font-sized grid beginning at
-the drawable canvas origin (0, 0), with no insets or reserved scrollbar strip.
-Only incomplete cells at the right and bottom remain background.
+The **Tab underlay** checkbox in Settings enables a full-width terminal with
+right-side tabs beneath the content. Tabs show over whitespace; text obscuring
+a tab leaves its initial visible, with the throbber overlaid while busy. Hover
+a tab to bring it forward. Unchecked (the default), tabs occupy a fixed left
+sidebar. The choice is saved and shared by all windows.
+
+Both layouts use one font-sized grid from the drawable origin (0, 0), with no
+padding or reserved scrollbar strip. Only incomplete cells at the right and
+bottom remain background.
 
 A terminal for WSL on Windows 11, built for running Claude Code. It also runs
 natively on macOS (see [macOS](#macos)). It does one
 job, running your WSL shell, and it isn't a jack of all trades. The only
-settings are a font and a color scheme, picked from a grid under the tabs and
-the same in every window: one size, one layout.
+settings are a font, a color scheme, and the tab underlay checkbox, shared
+by every window.
 
 ```
 ⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕ │ wm@w11:~/github/thing$ claude          ░ ─  □  × ░
@@ -448,8 +448,9 @@ under them the name of what you've picked, or of what you're pointing at.
 
 Pointing at a scheme previews it on the whole window. Fonts apply on click,
 keeping the terminal and tab controls on the same grid at all times.
-Clicking picks it, for every hardcore window at once. Two letters, such as
-`mT`, describe the whole setup.
+Clicking picks it for every hardcore window at once. The **Tab underlay**
+checkbox below the list switches between the fixed left sidebar and the
+right-side underlay; it is saved as `tab_underlay=0` or `tab_underlay=1`.
 
 `%LOCALAPPDATA%\hardcore\config.ini` (on a Mac,
 `~/Library/Application Support/hardcore/config.ini`) holds them, along with

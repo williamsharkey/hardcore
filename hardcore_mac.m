@@ -1449,14 +1449,14 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (hit == HIT_TAB) { activate(idx); return; }
     if (hit == HIT_CLOSE) { user_close_tab(idx); return; }
     if (hit == HIT_PLUS) { new_tab_mac(); return; }
-    if (hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_SCLOSE || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return; }
+    if (hit == HIT_UNDERLAY || hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_SCLOSE || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return; }
     if (hit == HIT_BAR) {        /* the tab column's empty part is the title bar */
         if ([e clickCount] == 2) [g_win performZoom:nil];
         else [g_win performWindowDragWithEvent:e];
         return;
     }
     plat_client_size(&w, &h);
-    if (tb && mx >= tb->t.cols * CW - SCROLLBAR_W && mx < tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
+    if (tb && mx >= term_ox() + tb->t.cols * CW - SCROLLBAR_W && mx < term_ox() + tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
         g_sb_drag = 1;
         scrollbar_set(my);
         return;

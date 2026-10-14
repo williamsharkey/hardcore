@@ -354,9 +354,12 @@ static void palette_init(void) {
     }
 }
 
+static int g_tab_underlay; /* opt in: right-side tabs beneath terminal content */
+
 /* config.ini's font= and theme=: a letter each */
 static void config_look(const char *key, const char *v) {
     if (!strcmp(key, "font") && font_by_key(v[0])) g_font = g_tfont = g_cf = font_by_key(v[0]);
+    else if (!strcmp(key, "tab_underlay")) g_tab_underlay = !strcmp(v, "1");
     else if (!strcmp(key, "theme") && scheme_by_key(v[0])) look_set(g_scheme = scheme_by_key(v[0]));
 }
 
@@ -366,7 +369,7 @@ static void config_look_save(FILE *f) {
     for (i = 0; i < NFONTS; i++) fprintf(f, " %c=%s %dx%d", FONTS[i].key, FONTS[i].name, cell_w(&FONTS[i]), cell_h(&FONTS[i]));
     fprintf(f, "\nfont=%c\n#", g_font->key);
     for (i = 0; i < NSCHEMES; i++) fprintf(f, " %c=%s", SCHEMES[i].key, SCHEMES[i].name);
-    fprintf(f, "\ntheme=%c\n", g_scheme->key);
+    fprintf(f, "\ntheme=%c\ntab_underlay=%d\n", g_scheme->key, g_tab_underlay);
 }
 
 /* wcwidth from Unicode 17 (tools/gen_width.py → build/width.inc): the same
@@ -2910,16 +2913,17 @@ static int caption_h(void) { return 0; }   /* macOS keeps its own traffic lights
 static int sidebar_x(void) {
     int w, h;
     plat_client_size(&w, &h);
+    if (!g_tab_underlay) return 0;
     return (w / cell_w(g_font) - SB_COLS) * cell_w(g_font);
 }
 static int in_sidebar(int x) { return x >= sidebar_x() && x < sidebar_x() + sidebar_w(); }
 /* (0,0) is the native drawable surface, inside any system-owned border.
    Rounded corners may obscure cells; they never shift the grid. */
-static int term_ox(void) { return 0; }
+static int term_ox(void) { return g_tab_underlay ? 0 : sidebar_w(); }
 static int term_oy(void) { return 0; }
 
 static void compute_grid(int w, int h, int *cols, int *rows) {
-    *cols = w / CW;
+    *cols = (w - term_ox()) / CW;
     *rows = h / CH;
     if (*cols < 10) *cols = 10;
     if (*rows < 3) *rows = 3;
@@ -3828,7 +3832,7 @@ static int caption_btn_w(void) { return 46 * g_scale; }
       U Unifont      16×32       and under them the name of what's picked
        ...                       or pointed at
        ... drag space (it's the title bar) ...                         */
-enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT, HIT_SCHEME, HIT_STAB, HIT_SCLOSE };
+enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT, HIT_SCHEME, HIT_STAB, HIT_SCLOSE, HIT_UNDERLAY };
 
 static int plat_lights_bottom(void);   /* where the window's own buttons in the tab column end, in pixels */
 static void plat_settings_shown(void); /* the font or colors on screen changed */
@@ -3882,7 +3886,7 @@ static const struct { const char *name; char dark, light; } FAMILIES[] = {
 
 static int g_panel_row;          /* the tabs' top row */
 #define PANEL_LIST (g_panel_row + 3)
-static int panel_rows(void) { return 3 + (g_settings_tab ? NFAMILIES : NFONTS) + 2; }
+static int panel_rows(void) { return 3 + (g_settings_tab ? NFAMILIES : NFONTS) + 3; }
 static int info_row(void) { return PANEL_LIST + (g_settings_tab ? NFAMILIES : NFONTS) + 1; }
 
 static float detail_w(void) { return (float)((SB_COLS - 2) * CW); }
@@ -3937,7 +3941,9 @@ static int hit_tabbar(int mx, int my, int *idx) {
         UI_DONE;
         return hit;
     }
-    if (g_settings_open && row >= g_panel_row && row < g_panel_row + 2 && col >= SB_COLS - 3) {
+    if (g_settings_open && row == info_row() + 1) {
+        hit = HIT_UNDERLAY;
+    } else if (g_settings_open && row >= g_panel_row && row < g_panel_row + 2 && col >= SB_COLS - 3) {
         hit = HIT_SCLOSE;                                /* the × beside the tabs: back to the s */
     } else if (g_settings_open && row >= g_panel_row && row < g_panel_row + 2 && col >= 1 && col <= 16) {
         *idx = col <= 8 ? 0 : 1;                         /* the tabs: font, theme */
@@ -3952,7 +3958,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
             hit = HIT_SCHEME;
         }
     }
-    if (hit == HIT_BAR && row >= first_row()) hit = HIT_NONE;
+    if (g_tab_underlay && hit == HIT_BAR && row >= first_row()) hit = HIT_NONE;
     UI_DONE;
     return hit;
 }
@@ -3965,7 +3971,7 @@ static int over_chrome(int x, int y) {
 /* things in the tab column a click does something to get the pointing hand, as on a web page */
 static int tabbar_action(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
-    return hit == HIT_SETTINGS || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_FONT || hit == HIT_SCHEME || hit == HIT_SCLOSE ||
+    return hit == HIT_UNDERLAY || hit == HIT_SETTINGS || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_FONT || hit == HIT_SCHEME || hit == HIT_SCLOSE ||
            (hit == HIT_STAB && idx != g_settings_tab);
 }
 
@@ -4005,6 +4011,13 @@ static void settings_click(int mx, int my) {
     if (hit == HIT_SETTINGS) g_settings_open = !g_settings_open;
     else if (hit == HIT_SCLOSE) g_settings_open = 0;
     else if (hit == HIT_STAB) g_settings_tab = idx;
+    else if (hit == HIT_UNDERLAY) {
+        g_tab_underlay = !g_tab_underlay;
+        g_mouse_x = g_mouse_y = -1; /* the settings move to the other side */
+        config_save();
+        plat_settings_tell();
+        settings_apply();
+    }
     else if (hit == HIT_FONT || hit == HIT_SCHEME) settings_pick(hit, idx);
     settings_point();
     plat_invalidate();
@@ -4190,6 +4203,10 @@ static void render_settings(int hover, int hidx) {
     }
     buf[95] = 0;
     grid_text(buf, 0, info_row(), hover == HIT_FONT || hover == HIT_SCHEME ? on : g_look.text_lo);
+    if (hover == HIT_UNDERLAY)
+        fill_rect(0, row_y(info_row() + 1), (float)sw, row_y(info_row() + 2), TAB_HOVER, 1);
+    grid_text(g_tab_underlay ? L"[x] Tab underlay" : L"[ ] Tab underlay", 0, info_row() + 1,
+              hover == HIT_UNDERLAY ? on : g_look.text_lo);
 }
 
 /* Does terminal content occupy this screen rectangle? Check the displayed
@@ -4234,6 +4251,8 @@ static int chrome_obscured(int x0, int y0, int x1, int y1) {
 static int unit_underlay(FILE *f) {
     Tab *tb = (Tab *)calloc(1, sizeof(Tab)), *saved = g_tabs[0];
     int ntabs = g_ntabs, active = g_active, fails = 0, cols, rows, cw = cell_w(g_tfont), ch = cell_h(g_tfont);
+    int saved_underlay = g_tab_underlay;
+    g_tab_underlay = 1;
     if (!tb || !term_init(&tb->t, 40, 4)) { free(tb); return 1; }
     g_tabs[0] = tb; g_ntabs = 1; g_active = 0;
     tb->t.m_cursor_vis = 0;
@@ -4262,6 +4281,23 @@ static int unit_underlay(FILE *f) {
         fails += cols != 121 || rows != 25;
     }
     g_cf = saved_font;
+    config_look("tab_underlay", "0");
+    compute_grid(sidebar_w() + 120 * CW, 24 * CH, &cols, &rows);
+    fails += cols != 120 || rows != 24 || term_ox() != sidebar_w();
+    config_look("tab_underlay", "1");
+    fails += !g_tab_underlay;
+    { /* The same config writer is used on Windows and macOS. */
+        FILE *cfg = tmpfile();
+        char line[256];
+        int found = 0;
+        if (cfg) {
+            config_look_save(cfg); rewind(cfg);
+            while (fgets(line, sizeof(line), cfg)) if (!strcmp(line, "tab_underlay=1\n")) found = 1;
+            fclose(cfg);
+        }
+        fails += !found;
+    }
+    g_tab_underlay = saved_underlay;
     term_free(&tb->t); free(tb);
     g_tabs[0] = saved; g_ntabs = ntabs; g_active = active;
     fprintf(f, "%s underlay: whitespace, text, detail rows, wide cells, cursor, full-width grid\n", fails ? "FAIL" : "ok  ");
@@ -4275,12 +4311,13 @@ static void render_tabbar(int win_w, int win_h) {
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
     g_chrome_x = sx;
+    if (!g_tab_underlay) fill_rect(0, 0, (float)sw, (float)win_h, BAR_BG, 1);
     /* Grip rows share the underlay rule; only the hovered row comes forward. */
     for (i = 0; i < first_row(); i++) {
         int y = i * CH, c;
         int hov = hover == HIT_BAR && g_mouse_y >= y && g_mouse_y < y + CH;
         if (hov) fill_rect(0, (float)y, (float)sw, (float)(y + CH), TAB_HOVER, 1);
-        if (hov || !chrome_obscured(sx, y, sx + sw, y + CH)) {
+        if (!g_tab_underlay || hov || !chrome_obscured(sx, y, sx + sw, y + CH)) {
             r_color(g_look.dim, 1);
             for (c = 0; c < SB_COLS; c++) draw_glyph(c % 2 ? 0x2895 : 0x286A, (float)(c * CW), (float)y, 1, g_scale);
         } else {
@@ -4294,10 +4331,10 @@ static void render_tabbar(int win_w, int win_h) {
         wchar_t label[256], detail[220];
         float y0 = (float)g_row_y[i], y1 = (float)g_row_y[i + 1];
         int act = i == g_active, hov = idx == i && (hover == HIT_TAB || hover == HIT_CLOSE);
-        int full = hov || !chrome_obscured(sx, (int)y0, sx + sw, (int)y1);
+        int full = !g_tab_underlay || hov || !chrome_obscured(sx, (int)y0, sx + sw, (int)y1);
         uint32_t fg = act ? g_look.text : g_look.text_lo;
         tab_label(tb, label, 256);
-        if (hov) fill_rect(0, y0, (float)sw, y1, TAB_HOVER, 1);
+        if (hov || (!g_tab_underlay && act)) fill_rect(0, y0, (float)sw, y1, hov ? TAB_HOVER : DEF_BG, 1);
         if (full) {
             draw_label(label, 0, y0, (float)((SB_COLS - 3) * CW), fg);
             if (g_row_two[i] && tab_detail(tb, detail, 220))
@@ -4325,7 +4362,7 @@ static void render_tabbar(int win_w, int win_h) {
         float y = (float)g_row_y[g_ntabs];
         int hov = hover == HIT_SETTINGS || hover == HIT_PLUS;
         if (hov) fill_rect(0, y, (float)sw, y + CH, TAB_HOVER, 1);
-        if (hov || g_settings_open || !chrome_obscured(sx, (int)y, sx + sw, (int)y + CH))
+        if (!g_tab_underlay || hov || g_settings_open || !chrome_obscured(sx, (int)y, sx + sw, (int)y + CH))
             layout_text(L"settings", (float)CW, y, 9.0f * CW, 1, g_look.text_lo, 1);
         fill_rect((float)(sw - CW), y, (float)sw, y + CH, DEF_BG, 1);
         r_color(g_look.text, 1);
@@ -4456,7 +4493,7 @@ static void render(void) {
     if (t->hcount > 0 && !t->alt) {
         float track_top = (float)caption_h(), track_h = (float)(oy + t->rows * CH - caption_h());   /* starts under the glass */
         float total = (float)(t->hcount + t->rows);
-        float bar_h = track_h * t->rows / total, pos, bx = (float)(t->cols * CW - SCROLLBAR_W + g_scale);
+        float bar_h = track_h * t->rows / total, pos, bx = (float)(term_ox() + t->cols * CW - SCROLLBAR_W + g_scale);
         if (bar_h < 12 * g_scale) bar_h = (float)(12 * g_scale);
         pos = 1.0f - (float)t->view / t->hcount;
         fill_rect(bx, track_top, bx + SCROLLBAR_W - 2 * g_scale, track_top + track_h, TAB_HOVER, 0.5f);
@@ -6557,10 +6594,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit == HIT_TAB) { activate(idx); return 0; }
         if (hit == HIT_CLOSE) { close_tab(idx); return 0; }
         if (hit == HIT_PLUS) { new_tab_here(); return 0; }
-        if (hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_SCLOSE || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return 0; }
+        if (hit == HIT_UNDERLAY || hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_SCLOSE || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return 0; }
         if (hit == HIT_BAR) return 0;
         GetClientRect(hwnd, &r);
-        if (tb && mx >= tb->t.cols * CW - SCROLLBAR_W && mx < tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
+        if (tb && mx >= term_ox() + tb->t.cols * CW - SCROLLBAR_W && mx < term_ox() + tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
             g_sb_drag = 1;
             SetCapture(hwnd);
             scrollbar_set(my);
