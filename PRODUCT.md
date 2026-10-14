@@ -1,7 +1,7 @@
 # hardcore as a product
 
 Who it's for, what it assumes, what's handled, and what sharing it would
-still take. Written 2026-10-13.
+still take. Updated 2026-10-14.
 
 ## Who it's for
 
@@ -38,11 +38,32 @@ Still assumed, deliberately:
 |---|---|
 | WSL 2 (default today), WSL 1 | same: `wsl.exe` hides the difference |
 | Store WSL vs inbox WSL | same `wsl.exe` and same registry key |
-| Several distros | `distro=` in config.ini. One per window, on purpose |
+| Several distros | `distro=` in config.ini selects the distro for new tabs; `hardcore slurp` can gather existing sessions from multiple running distros |
 | Custom distros (imported tarballs) | fine, if they have bash; otherwise the fallback above |
 | Root-only distros | fine |
 | `[automount] root=/` | handled (see above) |
-| `[interop] appendWindowsPath=false` | fine: nothing of ours runs inside Linux except bash |
+| `[interop] appendWindowsPath=false` | supported: shell startup and the bundled slurp helper do not require Windows executables on Linux's `PATH` |
+
+## Attach existing terminals
+
+`hardcore slurp --list` previews eligible sessions; `hardcore slurp` gathers
+them as tabs. It preserves running processes and their in-memory shell history.
+This is a Windows feature, separate from saving and restoring sessions after
+restarting Hardcore.
+
+| Source | What transfers | What happens to the source |
+|---|---|---|
+| Direct WSL terminal, including WSL in Windows Terminal | The live PTY, shell and jobs, working directory, environment and terminal settings | After successful attachment the old connection can close; shared host windows are not automatically closed |
+| Classic PowerShell or cmd console window | The live console, available screen buffer and scrollback, cursor, colors and partial input | Hidden after the first frame; detaching or exiting Hardcore reveals it with processes still alive |
+| Native PowerShell/cmd in Windows Terminal or an IDE | Unsupported; reported and skipped | Left running in its original host |
+
+WSL attachment uses an adapted MIT-licensed reptyr source subset, built into
+the delivery binary as an x86-64 Linux helper. It needs root inside the distro
+to take over WSL's relay. It cannot recover scrollback or selections held by
+the old terminal emulator. Native console attachment retains the source's
+buffer dimensions and displays its Win32 cells; it does not reproduce every
+terminal UI feature. See the [usage and limits](README.md#slurp-attach-running-sessions)
+and [implementation notes](slurp/README.md).
 
 ## Not handled yet
 
@@ -57,15 +78,16 @@ Still assumed, deliberately:
 ## What sharing takes
 
 1. **A license.** Done: MIT. The bundled parts allow it: Unifont is
-   OFL/GPL-with-font-exception, and ConPTY is MIT.
+   OFL/GPL-with-font-exception, and ConPTY and the adapted reptyr subset are MIT.
 2. **Public repo and releases.** Done: the repo is public and `hardcore.exe`
-   is a GitHub release. It's one file, about 6 MB, with nothing to install.
+   is a GitHub release. The current build is one file, about 8 MB, with nothing
+   to install.
 3. **SmartScreen.** An unsigned exe gets "Windows protected your PC" on
    download. The fix is code signing (Azure Trusted Signing is about
    $10/month); winget and Scoop help with reputation too.
 4. **winget / Scoop manifests,** once there's a release URL.
-5. **No auto-update, no telemetry.** That fits the product. Releases are
-   enough.
+5. **Manual updates, no telemetry.** `hardcore update` installs a release
+   when requested; there are no automatic updates.
 
 ## macOS (done, 2026-10-13)
 

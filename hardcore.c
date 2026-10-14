@@ -477,6 +477,10 @@ typedef struct Tab {
 #ifdef _WIN32
     HPCON_ hpc;
     HANDLE pin_w, pout_r, proc, reader, wait;
+    HWND slurp_hwnd;             /* live native console; closing this tab detaches */
+    int slurp_ready, slurp_committed, slurp_wsl;
+    int slurp_sel_on, slurp_sel_top, slurp_sel_bottom, slurp_sel_left, slurp_sel_right;
+    wchar_t slurp_command[4096]; /* source-built Linux attachment, bypass shell startup */
     CRITICAL_SECTION lock;
     volatile LONG posted;
     volatile LONG exited;
@@ -509,7 +513,7 @@ typedef struct Tab {
 } Tab;
 
 enum { TK_WSL, TK_PS, TK_CMD };
-enum { HELP_NONE, HELP_NO_DISTRO, HELP_FAILED };
+enum { HELP_NONE, HELP_NO_DISTRO, HELP_FAILED, HELP_SLURP };
 
 #ifdef _WIN32
 static HWND g_hwnd;
@@ -559,8 +563,17 @@ static void perf_tick(void) {
     g_pf.t0 = now;
 }
 
+static void slurp_write(Tab *tb, const void *s, int n);
+static int slurp_drain(Tab *tb);
+static void slurp_detach(Tab *tb);
+static void slurp_commit_all(void);
+static int slurp_key(Tab *tb, WPARAM vk);
+static int slurp_start(int list_only);
+static void slurp_selection(Tab *tb);
+
 static void tab_write(Tab *tb, const void *s, int n) {
     DWORD w;
+    if (tb->slurp_hwnd) { slurp_write(tb, s, n); return; }
     if (tb->pin_w && n > 0) WriteFile(tb->pin_w, s, (DWORD)n, &w, NULL);
 }
 #else
@@ -2316,6 +2329,7 @@ static long long g_vtoff;
 static int tab_drain(Tab *tb) {
     char *data;
     int n;
+    if (tb->slurp_hwnd) return slurp_drain(tb);
     EnterCriticalSection(&tb->lock);
     data = tb->in;
     n = tb->in_n;
@@ -2641,7 +2655,10 @@ static int tab_spawn(Tab *tb) {
     InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_sz);
     UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, tb->hpc, sizeof(HPCON_), NULL, NULL);
 
-    if (tb->kind == TK_PS) {
+    if (tb->slurp_command[0]) {
+        wcscpy(wcmd, tb->slurp_command);
+        wdir[0] = 0;
+    } else if (tb->kind == TK_PS) {
         powershell_cmd(wcmd, 4096);
         to_windows_dir(tb->start_dir, wdir, MAX_PATH * 2);
     } else if (tb->kind == TK_CMD) {
@@ -2772,6 +2789,7 @@ static Tab *tab_create(const char *dir, int spare) { return tab_create_ex(dir, s
 /* Closing ConPTY can block until conhost drains, so tear down off the UI thread. */
 static DWORD WINAPI tab_teardown(LPVOID arg) {
     Tab *tb = (Tab *)arg;
+    if (tb->slurp_hwnd) slurp_detach(tb);
     if (tb->wait) UnregisterWaitEx(tb->wait, INVALID_HANDLE_VALUE);
     if (tb->hpc) pClosePC(tb->hpc);
     if (tb->reader) {
@@ -4287,7 +4305,17 @@ static int unit_underlay(FILE *f) {
     config_look("tab_underlay", "1");
     fails += !g_tab_underlay;
     { /* The same config writer is used on Windows and macOS. */
+#ifdef _WIN32
+        /* The Windows CRT's tmpfile() tries the drive root, which is often
+           unwritable. Use the user's temporary directory for this fixture. */
+        wchar_t tmpdir[MAX_PATH], tmppath[MAX_PATH] = L"";
+        DWORD len = GetTempPathW(MAX_PATH, tmpdir);
+        FILE *cfg = NULL;
+        if (len && len < MAX_PATH && GetTempFileNameW(tmpdir, L"hct", 0, tmppath))
+            cfg = _wfopen(tmppath, L"w+b");
+#else
         FILE *cfg = tmpfile();
+#endif
         char line[256];
         int found = 0;
         if (cfg) {
@@ -4295,6 +4323,9 @@ static int unit_underlay(FILE *f) {
             while (fgets(line, sizeof(line), cfg)) if (!strcmp(line, "tab_underlay=1\n")) found = 1;
             fclose(cfg);
         }
+#ifdef _WIN32
+        if (tmppath[0]) DeleteFileW(tmppath);
+#endif
         fails += !found;
     }
     g_tab_underlay = saved_underlay;
@@ -4631,6 +4662,7 @@ static void paint_now(void) {
 #endif
     r_present();
 #ifdef _WIN32
+    slurp_commit_all();
     if (g_perf) {
         QueryPerformanceCounter(&p2);
         g_pf.build += g_pf_last_build = lat_ms(p0, p1);
@@ -4710,6 +4742,9 @@ static void activate(int i) {
     g_tabs[i]->activity = 0;
     g_tabs[i]->attention = 0;
     g_sel_on = 0;
+#ifdef _WIN32
+    slurp_selection(g_tabs[i]);
+#endif
     update_title();
     plat_invalidate();
 }
@@ -4733,6 +4768,9 @@ static void new_tab_here(void) {
     Tab *cur = active_tab(), *tb = NULL;
     int i;
     const char *dir = (cur && cur->t.cwd[0]) ? cur->t.cwd : cur ? cur->start_dir : g_start_dir;
+#ifdef _WIN32
+    if (cur && cur->slurp_hwnd && !cur->t.cwd[0]) dir = g_start_dir;
+#endif
     if (g_ntabs >= MAX_TABS) return;
     /* the spare already has its shell (and wsl.exe) and your profile up; it only needs a cd */
     if (g_spare && !g_spare->exited && tab_running(g_spare)) {
@@ -4805,7 +4843,7 @@ static void session_save(void) {
         Tab *tb = g_tabs[i];
         wchar_t name[32];
         FILE *v;
-        if (tb->help) continue;
+        if (tb->help || tb->slurp_hwnd) continue;
         _snwprintf(name, 32, L"tab%d.txt", n);
         session_path(p, name);
         if ((v = _wfopen(p, L"wb"))) {
@@ -5018,6 +5056,9 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
     DWORD w, got = 0, avail;
     int i, n = 0, active = 0, k;
     wchar_t cl[MAX_PATH + 4];
+    for (i = 0; i < g_ntabs; i++) if (g_tabs[i]->slurp_hwnd) {
+        snprintf(why, cap, "detach native slurped consoles before reloading"); return 0;
+    }
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         if (tb->help || tb->exited || !tb->hpc) continue;           /* nothing running: not carried over */
@@ -5251,6 +5292,9 @@ static void adopt_done(void) {
 static void remember_dir(Tab *tb) {
     const char *d;
     if (!tb || tb->help) return;
+#ifdef _WIN32
+    if (tb->slurp_hwnd) return;
+#endif
     d = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir;
     if (d[0]) snprintf(g_last_dir, sizeof(g_last_dir), "%s", d);
 }
@@ -5380,6 +5424,8 @@ static int handle_keydown(WPARAM vk) {
         }
     }
     if (ctrl && !shift && vk == VK_INSERT) { sel_copy(); return 1; }
+
+    if (tb->slurp_hwnd && slurp_key(tb, vk)) return 1;
 
     switch (vk) {
     case VK_UP: case VK_DOWN: case VK_RIGHT: case VK_LEFT: case VK_HOME: case VK_END: {
@@ -6099,6 +6145,7 @@ static void diagnose(Tab *tb, DWORD code) {
 /* keys on a help screen: I install, P PowerShell, Enter retry */
 static int help_key(Tab *tb, uint32_t c) {
     int i, at = -1;
+    if (tb->help == HELP_SLURP) return 1;
     for (i = 0; i < g_ntabs; i++) if (g_tabs[i] == tb) at = i;
     if (at < 0) return 0;
     if ((c == 'i' || c == 'I') && tb->help == HELP_NO_DISTRO) {
@@ -6195,6 +6242,8 @@ static int reflow_bench(const char *out_path) {
 }
 
 
+#include "hardcore_slurp.h"
+
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE:
@@ -6215,6 +6264,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         config_save();
         return TRUE;
     case WM_DESTROY:
+        for (int i = 0; i < g_ntabs; i++) if (g_tabs[i]->slurp_hwnd) slurp_detach(g_tabs[i]);
         /* No per-tab teardown: when this process exits its pseudoconsoles
            close, and conhost takes the shells down with it. Closing stays instant. */
         PostQuitMessage(0);
@@ -6228,6 +6278,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Tab *tb = active_tab();
         memcpy(buf, cd->lpData, n);
         buf[n] = 0;
+        if (n && !buf[n - 1]) n--; /* WM_COPYDATA text senders include the terminator */
         if (cd->dwData == 0x48430001 && tb && tb->help) {   /* a help screen takes keys, not text */
             help_key(tb, buf[0] == '\n' ? '\r' : (unsigned char)buf[0]);
         } else if (cd->dwData == 0x48430001 && tb) {   /* type: \n becomes Enter */
@@ -6239,6 +6290,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (i = 0; i < n; i++) if (buf[i] == '\n') buf[i] = '\r';
             tab_write(tb, buf, (int)n);
         } else if (cd->dwData == 0x48430002) {          /* a hardcore command */
+            if (!strncmp(buf, "slurp", 5)) return slurp_filter(buf) && slurp_start(0);
             if (!strcmp(buf, "newtab")) {
                 if (g_lat) { QueryPerformanceCounter(&g_nt_t0); g_nt_shown = -1; }
                 new_tab_here();
@@ -6456,6 +6508,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
+    case WM_APP_SLURP:
+        if (wp) InterlockedExchange(&g_slurp_running, 0);
+        else if (lp) slurp_receive((SlurpTarget *)lp);
+        return 0;
     case WM_APP_OUTPUT: {
         /* Hidden tabs are parsed (their state and scrollback stay current) but
            only cause a frame when something the tab column shows changes:
@@ -6517,6 +6573,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!tb) return 0;
         tab_drain(tb);
         if (tb->proc) GetExitCodeProcess(tb->proc, &code);
+        if ((tb->slurp_wsl || tb->slurp_hwnd) && (code || (tb->slurp_hwnd && !tb->slurp_ready))) {
+            if (tb->slurp_hwnd) slurp_detach(tb);
+            tb->help = HELP_SLURP;
+            term_message(&tb->t, "\r\nAttachment failed or disconnected. The original terminal was not closed.\r\n");
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         /* died within 3 s with an error: a setup problem, not you typing exit.
            Keep the tab and say what's wrong instead of vanishing. */
         if (code != 0 && GetTickCount() - tb->born < 3000 && !tb->help) {
@@ -7142,9 +7205,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     MSG msg;
     char selftest_out[MAX_PATH] = "";
     int dir_given = 0;           /* a folder on the command line: open there, don't restore the last session */
+    int slurp_window = 0;
     HWND h;
     HANDLE gfx_thread = NULL;
     (void)prev; (void)cmdline;
+
+    if (argc == 2 && !wcscmp(argv[1], L"--slurp-fixture")) return slurp_fixture();
+    if (argc == 2 && !wcscmp(argv[1], L"--slurp-owner-fixture")) { Sleep(INFINITE); return 0; }
+    if (argc == 3 && !wcscmp(argv[1], L"--slurp-probe")) return slurp_probe(wcstoul(argv[2], NULL, 10));
+    if (argc == 8 && !wcscmp(argv[1], L"--slurp-bridge"))
+        return slurp_bridge(wcstoul(argv[2], NULL, 10), wcstoull(argv[3], NULL, 10),
+            (HWND)(uintptr_t)wcstoull(argv[4], NULL, 10), (HANDLE)(uintptr_t)wcstoull(argv[5], NULL, 10),
+            (HANDLE)(uintptr_t)wcstoull(argv[6], NULL, 10), (HANDLE)(uintptr_t)wcstoull(argv[7], NULL, 10));
 
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_t0);
@@ -7198,6 +7270,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             char out[MAX_PATH * 3];
             WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
             return bench_resize(out);
+        } else if (!strcmp(a, "slurp")) {
+            return slurp_cmd(argc - i - 1, argv + i + 1);
+        } else if (!strcmp(a, "--slurp-selftest") && i + 1 < argc) {
+            return slurp_selftest(argv[i + 1]);
+        } else if (!strcmp(a, "--slurp-wsl-selftest") && i + 1 < argc) {
+            return slurp_wsl_selftest(argv[i + 1]);
+        } else if (!strcmp(a, "--slurp-window")) {
+            slurp_window = 1; dir_given = 1;
+            if (i + 1 < argc && !wcsncmp(argv[i + 1], L"slurp", 5)) {
+                char request[600];
+                if (!WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, request, sizeof(request), NULL, NULL) || !slurp_filter(request)) return 2;
+            }
         } else if (!strcmp(a, "update") || !strcmp(a, "--update")) {
             return update_cmd(i + 1 < argc && !wcscmp(argv[i + 1], L"--force"));
         } else if (!strcmp(a, "version") || !strcmp(a, "--version") || !strcmp(a, "-v")) {
@@ -7207,6 +7291,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             cli("hardcore %s: a terminal for WSL\n"
                 "  hardcore [DIR]          a new window in DIR (from a tab: this folder)\n"
                 "  hardcore update         install the latest release (--force: even if current)\n"
+                "  hardcore slurp          attach running WSL and classic Windows consoles\n"
+                "  hardcore slurp --list   discover eligible sessions without attaching\n"
                 "  hardcore --version      this build's version\n", HARDCORE_VERSION);
             return 0;
         } else if (!strcmp(a, "--no-activate")) {
@@ -7239,7 +7325,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* `hardcore` or `hardcore DIR` typed in a shell: a window there (the shell's
        folder if none was named), started on its own so the shell gets its
        prompt back (WSL waits for the Windows programs it starts) */
-    if (!selftest_out[0] && show != SW_SHOWNOACTIVATE && !g_adopting && !_wgetenv(L"HARDCORE_DETACHED") && from_command_line()) {
+    if (!slurp_window && !selftest_out[0] && show != SW_SHOWNOACTIVATE && !g_adopting && !_wgetenv(L"HARDCORE_DETACHED") && from_command_line()) {
         wchar_t self[MAX_PATH], here[MAX_PATH * 2], full[MAX_PATH * 2], cl[4096], wdir[1100];
         char dir[1100];
         STARTUPINFOW si;
@@ -7335,7 +7421,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     if (g_adopting && adopt_tabs()) {
         tab_fit(g_tabs[g_active]);               /* a different size only if the screen's DPI changed */
         schedule_spare();
-    } else if (dir_given || !session_restore()) new_tab_here();
+    } else if (slurp_window) { /* discovery starts after graphics initialization below */ }
+    else if (dir_given || !session_restore()) new_tab_here();
     else schedule_spare();
     trace("first tab spawned");
     if (gfx_thread) { WaitForSingleObject(gfx_thread, 5000); CloseHandle(gfx_thread); }
@@ -7345,6 +7432,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         return 1;
     }
     trace("swap chain ready");
+    if (slurp_window && !slurp_start(0)) new_tab_here();
     InvalidateRect(h, NULL, FALSE);
     if (g_adopting) {                            /* drawn on top of the old window, then tell it */
         paint_now();

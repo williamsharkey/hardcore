@@ -1,9 +1,9 @@
-# hardcore — build for Windows from WSL (mingw-w64 cross compiler) or MSYS2,
+# hardcore — build for Windows from x86-64 WSL (mingw-w64 and Linux C compilers),
 # and for macOS with the Xcode command line tools.
 #
-# Windows (from WSL, or from a Mac with brew's mingw-w64):
+# Windows (cross-builds also need LINUX_CC targeting x86-64 Linux with static libc):
 #   make hardcore.exe → hardcore.exe          (the default everywhere but macOS)
-#   make test         → unit tests + xterm.js fixtures + headless ConPTY/WSL selftest
+#   make test         → unit tests + xterm.js fixtures + ConPTY/WSL and slurp tests
 #   make bench/termbench.exe → the measuring tool (see bench/RESULTS.md)
 #   make install      → copy to %LOCALAPPDATA%\hardcore\ and add Start menu + desktop shortcuts
 #
@@ -29,7 +29,7 @@ MAC_FLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initiali
 MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -lutil
 APP        = hardcore.app
 
-.PHONY: all clean selftest install test mac-test
+.PHONY: all clean selftest install test mac-test slurp-test
 
 ifeq ($(UNAME),Darwin)
 all: $(APP)
@@ -74,10 +74,26 @@ build/res.o: hardcore.rc build/hardcore.ico
 	$(WINDRES) $< -O coff -o $@
 
 CONPTY_VER = 1.25.260930003
+LINUX_CC ?= gcc
+SLURP_SRC = slurp/linux.c slurp/reptyr/attach.c slurp/reptyr/reallocarray.c \
+            slurp/reptyr/platform/linux/linux.c slurp/reptyr/platform/linux/linux_ptrace.c
+SLURP_HEADERS = $(wildcard slurp/reptyr/*.h slurp/reptyr/platform/*.h slurp/reptyr/platform/linux/*.h slurp/reptyr/platform/linux/arch/*.h)
+
+build/slurp-license.h: slurp/reptyr/COPYING
+	@mkdir -p build
+	python3 -c 'import json,pathlib; print("static const char slurp_license[] = "+json.dumps(pathlib.Path("slurp/reptyr/COPYING").read_text())+";")' > $@
+
+build/slurp-linux: $(SLURP_SRC) $(SLURP_HEADERS) build/slurp-license.h
+	@mkdir -p build
+	$(LINUX_CC) -D_GNU_SOURCE -Os -Wall -Wextra -Wno-unused-parameter -static -s \
+		-ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ $(SLURP_SRC)
+
+build/slurp-version.h: build/slurp-linux
+	python3 -c 'import hashlib,pathlib; p=pathlib.Path("build/slurp-linux"); print("#define SLURP_VERSION L\""+hashlib.sha256(p.read_bytes()).hexdigest()[:16]+"\"")' > $@
 # which commit a build is (hardcore --version); the release number is HARDCORE_VERSION in hardcore.c
 BUILD := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
-hardcore.exe: hardcore.c build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
+hardcore.exe: hardcore.c hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c build/res.o $(LIBS)
 
@@ -85,6 +101,12 @@ win-test: hardcore.exe
 	./hardcore.exe --unit "$$(wslpath -w build/unit.txt)"; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
 	python3 tests/run_xtermjs.py
 	$(MAKE) --no-print-directory selftest
+	$(MAKE) --no-print-directory slurp-test
+
+slurp-test: hardcore.exe build/slurp-linux
+	python3 tests/test_slurp_linux.py
+	./hardcore.exe --slurp-selftest build/slurp-native-test.txt; rc=$$?; cat build/slurp-native-test.txt; [ $$rc = 0 ]
+	./hardcore.exe --slurp-wsl-selftest build/slurp-wsl-test.txt; rc=$$?; cat build/slurp-wsl-test.txt; [ $$rc = 0 ]
 
 bench/termbench.exe: bench/termbench.c
 	$(CC) -O2 -Wall -o $@ $< -ld3d11 -ldxgi -lgdi32 -luser32 -luuid

@@ -92,9 +92,10 @@ by every window.
   Powerline symbols. Or one of seven hand-drawn bitmap fonts (see
   [Settings](#settings)), with Unifont filling in whatever they lack. On a
   Retina or 200% screen, box-drawing lines are 1 device pixel thin.
-- **One static `.exe`** (about 6 MB) with the font and Windows Terminal's own
-  ConPTY built in. Nothing to install, no runtime dependencies. It draws with
-  Direct3D 11 on a flip-model swap chain.
+- **One static `.exe`** (about 8 MB) with the fonts, Windows Terminal's own
+  ConPTY and the WSL attachment helper built in. Nothing to install, no
+  runtime dependencies to download. It draws with Direct3D 11 on a flip-model
+  swap chain.
 
 ## Install
 
@@ -136,6 +137,8 @@ From any shell:
 hardcore               # a new hardcore window in this folder
 hardcore DIR           # ...or in DIR
 hardcore update        # install the latest release, like `claude update`
+hardcore slurp         # gather live WSL and classic Windows console sessions
+hardcore slurp --list  # preview eligible sessions without attaching
 hardcore --version     # which release and commit this is
 ```
 
@@ -183,6 +186,67 @@ tabs come back through [sessions](#sessions). Copies left behind by earlier
 updates are deleted on the next update. `--force` reinstalls the latest
 release even if this one isn't older.
 
+### Slurp: attach running sessions
+
+`hardcore slurp` discovers sessions and adds them to an existing Hardcore
+window, or opens a new window. A **slurp** tab reports candidates and skipped
+hosts; individual attachment errors remain visible in their tabs. It does not
+restart the programs or replay their commands. To select just one session:
+
+```text
+hardcore slurp --windows 1234
+hardcore slurp --wsl 5678 --distro Debian
+```
+
+Add `--list` to either command for read-only discovery. Use the Linux session
+leader PID from the listing for `--wsl`, and a Windows console client PID for
+`--windows`.
+
+- **WSL:** takes over the existing Linux PTY, including its shell, foreground
+  program and background jobs. PIDs, in-memory command history, variables,
+  working directory, terminal settings and job control remain intact. This
+  works with WSL sessions originally displayed by Windows Terminal as well as
+  classic console windows. Discovery visits already-running distributions,
+  selects the distro's default user's direct WSL terminals, and excludes
+  Hardcore's own sessions, SSH and tmux sessions. Once the tab says **attached
+  live WSL session**, the old terminal connection is no longer needed. Shared
+  terminal windows are never automatically closed.
+- **Classic PowerShell and cmd consoles:** attaches to the original console
+  and displays its live screen buffer in a Hardcore tab. The original console
+  is hidden only after the screen has been captured and Hardcore has drawn.
+  Closing that tab, closing Hardcore, or Hardcore exiting unexpectedly reveals
+  the original console again; it does not kill the shell. This preserves
+  process memory, shell history, partially edited command lines, cursor, colors
+  and available scrollback. QuickEdit selection is captured where the column
+  widths match, then cleared in conhost so its paused input/output can resume.
+- **Native PowerShell/cmd tabs inside Windows Terminal, IDE terminals and other
+  pseudoconsole hosts:** skipped with a report. Those hosts do not expose the
+  handoff needed to transfer their native console connection safely. The WSL
+  attachment path above is separate and does not have this restriction.
+
+WSL attachment uses the relevant MIT-licensed **reptyr** source routines, built
+as part of Hardcore; there is no reptyr installation or download. The static
+Linux helper is carried in `hardcore.exe` and extracted into Hardcore's local
+application directory when needed. It runs through WSL as root to access WSL's
+root-owned relay, checks the target user and process creation time, and leaves
+the system's ptrace policy unchanged. It uses whole-terminal takeover rather
+than injecting Ctrl-Z, `bg`, `fg` or restart commands. See
+[the source and attribution](slurp/README.md).
+`hardcore slurp --license` prints the included reptyr license.
+
+Some presentation state cannot transfer. A Linux PTY has no saved screen,
+scrollback, selection, hyperlinks or terminal-emulator modes to read; full-screen
+programs receive a redraw signal, but may still need their own redraw shortcut.
+The original terminal retains its old scrollback. Native console capture is
+limited to 20,000 rows / four million cells, the console API's 16-color cell
+representation and the currently active screen buffer. It polls at about 10 Hz
+and retains the source console's dimensions; Hardcore reflows its display, so
+full-screen layouts may differ at another width. Application mouse reporting
+and rectangular selections are not translated. Native attached tabs detach
+instead of becoming saved/restarted sessions, and must be detached before an
+in-place update. WSL attachment currently requires x86-64 Linux and an executable
+Windows drive mount inside WSL.
+
 
 ## Claude Code
 
@@ -228,6 +292,12 @@ Claude Code turns on mouse reporting, so a plain drag goes to Claude. Hold
 
 ## Sessions
 
+Session restoration starts new processes after reopening Hardcore.
+[Slurp](#slurp-attach-running-sessions) attaches processes that are already
+running. Imported native consoles are excluded from session restoration and
+return to their original windows when detached. Attaching a WSL shell does not
+install the shell hooks described below into that running shell.
+
 hardcore's `rc.bash` wraps `claude` in a small shell function. When Claude Code
 starts, the function tells hardcore which session it is
 (`OSC 7700 ; claude=ID`), and again when it exits:
@@ -270,7 +340,7 @@ history and says so:
 
 ```
 ── restored · ↑ reruns: vim -O hardcore.c hardcore_mac.m ──
-wm@w11:~/github/wsl-easy$ █
+wm@w11:~/github/hardcore$ █
 ```
 
 One up-arrow brings it back exactly as you typed it, flags and quotes
@@ -357,13 +427,20 @@ that doesn't have focus (see the comment in `hardcore_mac.m`).
 
 ## Build
 
-From WSL, with `mingw-w64` and `python3` installed:
+From x86-64 WSL, with `mingw-w64`, a native Linux C compiler with static libc
+development files, and `python3` installed:
 
 ```bash
 make            # → hardcore.exe
-make test       # unit tests, xterm.js conformance fixtures, headless ConPTY selftest
+make test       # unit tests, xterm.js fixtures, ConPTY and live-attachment tests
 make install    # copy to %LOCALAPPDATA%\hardcore + Start menu and desktop shortcuts
 ```
+
+The Windows build also compiles the WSL attachment code from source using
+`LINUX_CC` (default `gcc`). Cross-builds need an x86-64 Linux compiler for that
+step. No prebuilt reptyr executable is checked in or downloaded. `make slurp-test`
+tests synthetic Linux and Windows consoles, including actual WSL takeover and
+closing its original ConPTY; it never attaches to your existing sessions.
 
 ## Keys
 
@@ -554,5 +631,7 @@ measures with.
 ## License
 
 MIT, see [LICENSE](LICENSE). The embedded Unifont (GPLv2+ with the font
-embedding exception, or OFL 1.1), the other fonts (see [Font](#font)) and
-ConPTY (MIT) keep their own licenses.
+embedding exception, or OFL 1.1), the other fonts (see [Font](#font)),
+ConPTY (MIT), and the adapted [reptyr source](slurp/reptyr/COPYING) (MIT) keep
+their own licenses. See [attachment source and attribution](slurp/README.md)
+for the reptyr revision and local changes.
