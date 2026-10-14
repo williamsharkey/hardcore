@@ -90,6 +90,28 @@ the taskbar. The exe isn't code-signed yet, so the first run shows Windows'
 Or build it yourself (see [Build](#build)); `make install` adds Start menu
 and desktop shortcuts.
 
+### Update
+
+From any hardcore tab:
+
+```
+hardcore update        # install the latest release, like `claude update`
+hardcore --version     # which release and commit this is
+hardcore [DIR]         # a new hardcore window here (or in DIR)
+```
+
+`hardcore update` asks GitHub for the latest release and compares it with this
+build's version. If it's newer, it downloads `hardcore.exe` and checks it
+against the SHA-256 GitHub publishes for it, then swaps it in. A running exe can
+be renamed but not overwritten, so open windows keep running the old copy and
+the next window you open runs the new one. Copies left behind by earlier
+updates are deleted on the next update. `--force` reinstalls the latest
+release even if this one isn't older.
+
+The `hardcore` command is a small shell function in hardcore's `rc.bash`. From
+PowerShell or cmd, use the exe itself:
+`& "$env:LOCALAPPDATA\hardcore\hardcore.exe" update`.
+
 ## Claude Code
 
 hardcore was checked against what Claude Code 2.1 actually sends and asks

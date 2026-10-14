@@ -38,6 +38,9 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <winhttp.h>
+#include <bcrypt.h>
+#include <stdarg.h>
 #define COBJMACROS
 #include <d3d11.h>
 #include <dxgi1_5.h>
@@ -144,7 +147,7 @@ static PFN_ClosePC  pClosePC;
 #define MAX_PARAMS   32
 #define OSC_MAX      8192
 
-#define HARDCORE_VERSION "0.3"
+#define HARDCORE_VERSION "0.4"    /* the release; `hardcore update` compares it with the latest tag */
 #define AMBER 0xFFA60D           /* dumbterm's phosphor cursor */
 #define DEF_FG 0xCCCCCC
 #define DEF_BG 0x0C0C0C
@@ -1988,6 +1991,17 @@ static const char RC_BASH[] =
     "}\n"
     "case $PS0 in *__hardcore_preexec*) ;; *) PS0=\"${PS0}\\$(__hardcore_preexec)\" ;; esac\n"
     "[ -n \"$HARDCORE_HIST\" ] && { __hardcore_once=$HARDCORE_HIST; unset HARDCORE_HIST; }\n"
+    "# hardcore itself: `hardcore` opens a new window here (or in DIR), `hardcore update`\n"
+    "# installs the latest release, `hardcore --version` says which one this is\n"
+    "if [ -n \"$HARDCORE_EXE\" ] && ! declare -F hardcore >/dev/null; then\n"
+    "  hardcore() {\n"
+    "    case $1 in\n"
+    "      update|--update|version|--version|-v|help|--help|-h) \"$HARDCORE_EXE\" \"$@\" | cat ;;\n"
+    "      *) local d; d=$(cd -- \"${1:-.}\" 2>/dev/null && pwd) || { echo \"hardcore: no folder $1\" >&2; return 1; }\n"
+    "         ( \"$HARDCORE_EXE\" --cd \"$d\" </dev/null >/dev/null 2>&1 & ) ;;\n"
+    "    esac\n"
+    "  }\n"
+    "fi\n"
     "# Claude Code: tell hardcore which session runs in this tab (OSC 7700;claude=ID), so\n"
     "# closing hardcore and opening it again resumes it. New sessions get their id up\n"
     "# front (--session-id); --resume ID is known; --continue is looked up; subcommands,\n"
@@ -2073,8 +2087,11 @@ static void write_rc(void) {
     {
         wchar_t old[2048] = L"", wslenv[2200];
         DWORD n = GetEnvironmentVariableW(L"WSLENV", old, 2048);
+        wchar_t exe[MAX_PATH];
         SetEnvironmentVariableW(L"HARDCORE_RC", path);
-        _snwprintf(wslenv, 2200, L"%ls%lsHARDCORE_RC/p", old, n ? L":" : L"");
+        GetModuleFileNameW(NULL, exe, MAX_PATH);   /* for rc.bash's `hardcore` (new window, update) */
+        SetEnvironmentVariableW(L"HARDCORE_EXE", exe);
+        _snwprintf(wslenv, 2200, L"%ls%lsHARDCORE_RC/p:HARDCORE_EXE/p", old, n ? L":" : L"");
         wslenv[2199] = 0;
         SetEnvironmentVariableW(L"WSLENV", wslenv);
     }
@@ -5664,6 +5681,187 @@ static double bench_now_ms(void) {
     return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 
+/* ── hardcore update / --version ───────────────────────────────────
+   Like `claude update`: asks GitHub for the latest release, downloads its
+   hardcore.exe, checks it against the SHA-256 GitHub publishes for it, and
+   swaps it in. A running hardcore.exe can't be overwritten but can be
+   renamed, so windows that are open keep running the old copy and the next
+   one starts the new. Run from a tab as `hardcore update` (rc.bash). */
+#ifndef HARDCORE_BUILD
+#define HARDCORE_BUILD "unknown"  /* git describe, from the Makefile: which commit this is */
+#endif
+#define UPDATE_REPO L"/repos/williamsharkey/hardcore/releases/latest"
+
+static HANDLE g_cli_out;
+static void cli(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    DWORD w;
+    int n;
+    if (!g_cli_out) {            /* a GUI exe: write to whatever started it (WSL's pipe, or the console) */
+        g_cli_out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (!g_cli_out || g_cli_out == INVALID_HANDLE_VALUE) {
+            if (AttachConsole(ATTACH_PARENT_PROCESS))
+                g_cli_out = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        }
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0 && g_cli_out && g_cli_out != INVALID_HANDLE_VALUE) WriteFile(g_cli_out, buf, (DWORD)strlen(buf), &w, NULL);
+}
+
+/* GET over HTTPS (redirects followed): the body, malloc'd; NULL on failure */
+static char *https_get(const wchar_t *url, size_t *len, int json) {
+    URL_COMPONENTS u;
+    wchar_t host[256], path[2048];
+    HINTERNET s = NULL, c = NULL, r = NULL;
+    char *body = NULL;
+    size_t n = 0, cap = 0;
+    DWORD status = 0, sz = sizeof(status), got;
+    memset(&u, 0, sizeof(u));
+    u.dwStructSize = sizeof(u);
+    u.lpszHostName = host; u.dwHostNameLength = 256;
+    u.lpszUrlPath = path; u.dwUrlPathLength = 2048;
+    if (!WinHttpCrackUrl(url, 0, 0, &u)) return NULL;
+    s = WinHttpOpen(L"hardcore-update", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, NULL, NULL, 0);
+    if (s) c = WinHttpConnect(s, host, u.nPort, 0);
+    if (c) r = WinHttpOpenRequest(c, L"GET", path, NULL, NULL, NULL, u.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    if (r && json) WinHttpAddRequestHeaders(r, L"Accept: application/vnd.github+json", (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    if (r && WinHttpSendRequest(r, NULL, 0, NULL, 0, 0, 0) && WinHttpReceiveResponse(r, NULL) &&
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &sz, NULL) && status == 200) {
+        for (;;) {
+            DWORD avail = 0;
+            if (!WinHttpQueryDataAvailable(r, &avail) || !avail) break;
+            if (n + avail + 1 > cap) {
+                char *b;
+                cap = (n + avail + 1) * 2;
+                if (!(b = (char *)realloc(body, cap))) { free(body); body = NULL; break; }
+                body = b;
+            }
+            if (!WinHttpReadData(r, body + n, avail, &got) || !got) break;
+            n += got;
+        }
+        if (body) body[n] = 0;
+    } else if (status) cli("hardcore: %ls answered HTTP %lu\n", host, status);
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    *len = n;
+    return body;
+}
+
+/* "key":"value" in a JSON blob, from `from` on (enough for GitHub's release JSON) */
+static const char *json_str(const char *from, const char *key, char *out, size_t cap) {
+    char pat[64];
+    const char *p, *e;
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    if (!(p = strstr(from, pat))) return NULL;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p != '"') return NULL;
+    e = strchr(++p, '"');
+    if (!e || (size_t)(e - p) >= cap) return NULL;
+    memcpy(out, p, (size_t)(e - p));
+    out[e - p] = 0;
+    return e;
+}
+
+/* v0.4 or v0.4.1 (and v0.4-3-gabc: three commits past v0.4) → comparable */
+static long ver_num(const char *v, int *ahead) {
+    int a = 0, b = 0, c = 0, k = 0;
+    const char *d;
+    if (*v == 'v') v++;
+    sscanf(v, "%d.%d.%d", &a, &b, &c);
+    d = strchr(v, '-');
+    if (d) sscanf(d + 1, "%d", &k);
+    if (ahead) *ahead = k;
+    return (long)a * 1000000 + b * 1000 + c;
+}
+
+static int sha256_hex(const char *data, size_t n, char out[65]) {
+    BCRYPT_ALG_HANDLE alg;
+    unsigned char h[32];
+    int i, ok;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0)) return 0;
+    ok = !BCryptHash(alg, NULL, 0, (PUCHAR)data, (ULONG)n, h, 32);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    for (i = 0; ok && i < 32; i++) sprintf(out + i * 2, "%02x", h[i]);
+    return ok;
+}
+
+static int update_cmd(int force) {
+    char *json, *bin, tag[64], url[1024], digest[96] = "", hex[65];
+    const char *asset;
+    size_t jn, bn;
+    wchar_t wurl[1024], exe[MAX_PATH], tmp[MAX_PATH], old[MAX_PATH];
+    long mine, latest;
+    int ahead;
+    FILE *f;
+    SYSTEMTIME st;
+    cli("hardcore %s: checking github.com/williamsharkey/hardcore for the latest release...\n", HARDCORE_VERSION);
+    if (!(json = https_get(L"https://api.github.com" UPDATE_REPO, &jn, 1))) { cli("hardcore: couldn't reach GitHub\n"); return 1; }
+    if (!json_str(json, "tag_name", tag, sizeof(tag))) { cli("hardcore: no release found\n"); free(json); return 1; }
+    /* the asset named hardcore.exe: its download URL and digest come after its name */
+    if (!(asset = strstr(json, "\"name\":\"hardcore.exe\"")) && !(asset = strstr(json, "\"name\": \"hardcore.exe\""))) {
+        cli("hardcore: release %s has no hardcore.exe\n", tag); free(json); return 1;
+    }
+    if (!json_str(asset, "browser_download_url", url, sizeof(url))) { cli("hardcore: release %s: no download link\n", tag); free(json); return 1; }
+    json_str(asset, "digest", digest, sizeof(digest));
+    free(json);
+    mine = ver_num(HARDCORE_VERSION, &ahead);
+    latest = ver_num(tag, NULL);
+    (void)ahead;
+    if (!force && latest <= mine) {
+        cli("hardcore: up to date (%s; latest release %s)\n", HARDCORE_VERSION, tag);
+        return 0;
+    }
+    cli("hardcore: downloading %s...\n", tag);
+    MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 1024);
+    if (!(bin = https_get(wurl, &bn, 0)) || bn < 100000 || bin[0] != 'M' || bin[1] != 'Z') {
+        cli("hardcore: download failed\n"); free(bin); return 1;
+    }
+    if (!strncmp(digest, "sha256:", 7)) {
+        if (!sha256_hex(bin, bn, hex) || _stricmp(hex, digest + 7)) {
+            cli("hardcore: the download doesn't match GitHub's SHA-256, not installing it\n"); free(bin); return 1;
+        }
+        cli("hardcore: SHA-256 checks out\n");
+    }
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    {   /* copies left by earlier updates, once nothing runs them any more */
+        WIN32_FIND_DATAW fd;
+        wchar_t pat[MAX_PATH], dir[MAX_PATH], *sl;
+        HANDLE h;
+        _snwprintf(dir, MAX_PATH, L"%ls", exe);
+        if ((sl = wcsrchr(dir, L'\\'))) *sl = 0;
+        _snwprintf(pat, MAX_PATH, L"%ls\\hardcore.old-*.exe", dir);
+        if ((h = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
+            do {
+                _snwprintf(old, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+                DeleteFileW(old);     /* fails, harmlessly, for one still running */
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
+    _snwprintf(tmp, MAX_PATH, L"%ls.new", exe);
+    tmp[MAX_PATH - 1] = 0;
+    if (!(f = _wfopen(tmp, L"wb")) || fwrite(bin, 1, bn, f) != bn) {
+        if (f) fclose(f);
+        cli("hardcore: can't write next to %ls\n", exe); free(bin); return 1;
+    }
+    fclose(f);
+    free(bin);
+    GetLocalTime(&st);              /* this exe may be running (it is now): move it aside, don't overwrite */
+    _snwprintf(old, MAX_PATH, L"%.*ls.old-%04d%02d%02d%02d%02d%02d.exe", (int)(wcslen(exe) - 4), exe,
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    old[MAX_PATH - 1] = 0;
+    if (!MoveFileExW(exe, old, MOVEFILE_REPLACE_EXISTING) || !MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING)) {
+        cli("hardcore: couldn't swap in the new exe (error %lu)\n", GetLastError()); return 1;
+    }
+    cli("hardcore: updated %s -> %s. New windows run it; open ones keep the old one until closed.\n", HARDCORE_VERSION, tag);
+    return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     int argc, i, cols, rows;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -5723,6 +5921,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             char out[MAX_PATH * 3];
             WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
             return bench_resize(out);
+        } else if (!strcmp(a, "update") || !strcmp(a, "--update")) {
+            return update_cmd(i + 1 < argc && !wcscmp(argv[i + 1], L"--force"));
+        } else if (!strcmp(a, "version") || !strcmp(a, "--version") || !strcmp(a, "-v")) {
+            cli("hardcore %s (build %s)\n", HARDCORE_VERSION, HARDCORE_BUILD);
+            return 0;
+        } else if (!strcmp(a, "help") || !strcmp(a, "--help") || !strcmp(a, "-h")) {
+            cli("hardcore %s: a terminal for WSL\n"
+                "  hardcore [DIR]          a new window in DIR (from a tab: this folder)\n"
+                "  hardcore update         install the latest release (--force: even if current)\n"
+                "  hardcore --version      this build's version\n", HARDCORE_VERSION);
+            return 0;
         } else if (!strcmp(a, "--no-activate")) {
             show = SW_SHOWNOACTIVATE;       /* tests: open behind, never take the keyboard */
             g_session_off = !_wgetenv(L"HARDCORE_SESSIONS");   /* ...and never touch your saved tabs */

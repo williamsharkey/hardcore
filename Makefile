@@ -17,7 +17,7 @@ UNAME := $(shell uname -s)
 CC      ?= x86_64-w64-mingw32-gcc
 WINDRES ?= x86_64-w64-mingw32-windres
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
-LIBS     = -mwindows -municode -ld3d11 -ldxgi -luuid -lgdi32 -luser32 -lkernel32 -lshell32 -static
+LIBS     = -mwindows -municode -ld3d11 -ldxgi -luuid -lgdi32 -luser32 -lkernel32 -lshell32 -lwinhttp -lbcrypt -static
 
 ifeq ($(origin CC),default)
 CC = x86_64-w64-mingw32-gcc
@@ -66,10 +66,12 @@ build/res.o: hardcore.rc build/hardcore.ico
 	$(WINDRES) $< -O coff -o $@
 
 CONPTY_VER = 1.25.260930003
+# which commit a build is (hardcore --version); the release number is HARDCORE_VERSION in hardcore.c
+BUILD := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
 hardcore.exe: hardcore.c build/font.bin build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
-		-o $@ hardcore.c build/res.o $(LIBS)
+		-DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c build/res.o $(LIBS)
 
 win-test: hardcore.exe
 	./hardcore.exe --unit "$$(wslpath -w build/unit.txt)"; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
