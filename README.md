@@ -17,8 +17,8 @@ look, one size, one layout.
 ```
 
 - **Close it, open it, and your tabs come back.** Closing the window (or
-  Windows shutting down or restarting) saves every tab: its shell, folder and
-  text, and the Claude Code session running in it. The next start rebuilds
+  Windows shutting down or restarting) saves every tab: its shell (bash,
+  PowerShell or cmd), folder and text, and the Claude Code session running in it. The next start rebuilds
   them. Each tab's text is replayed under a dim `── restored ──` line, and
   Claude comes back with `claude --resume`, with the flags you started it with.
   Exiting the last tab yourself means you're done: the next window starts
@@ -81,14 +81,35 @@ look, one size, one layout.
 
 ## Install
 
-Download `hardcore.exe` from
-[Releases](https://github.com/williamsharkey/hardcore/releases) and run it.
-It's one file with nothing to install; put it wherever you like and pin it to
-the taskbar. The exe isn't code-signed yet, so the first run shows Windows'
-"Windows protected your PC" screen: **More info → Run anyway**.
+In PowerShell:
 
-Or build it yourself (see [Build](#build)); `make install` adds Start menu
-and desktop shortcuts.
+```powershell
+irm https://raw.githubusercontent.com/williamsharkey/hardcore/main/install.ps1 | iex
+```
+
+Or from a WSL shell:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/williamsharkey/hardcore/main/install.sh | sh
+```
+
+Either one:
+- downloads the latest release's `hardcore.exe` and checks it against the
+  SHA-256 GitHub publishes for it;
+- puts it in `%LOCALAPPDATA%\hardcore`;
+- adds Start menu and desktop shortcuts;
+- starts it.
+
+hardcore is that one exe. Its font, Windows Terminal's ConPTY and everything
+else it needs are built in, and there's nothing else to install. A file
+downloaded this way doesn't get the "downloaded from the internet" mark a
+browser adds, so there's no "Windows protected your PC" screen.
+
+You can also download `hardcore.exe` from
+[Releases](https://github.com/williamsharkey/hardcore/releases) and run it from
+anywhere. It isn't code-signed yet, so the first run of a browser download
+shows that screen: **More info → Run anyway**. Or build it yourself (see
+[Build](#build)); `make install` adds the shortcuts.
 
 ### Update
 

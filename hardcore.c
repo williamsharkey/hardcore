@@ -147,7 +147,9 @@ static PFN_ClosePC  pClosePC;
 #define MAX_PARAMS   32
 #define OSC_MAX      8192
 
-#define HARDCORE_VERSION "0.4"    /* the release; `hardcore update` compares it with the latest tag */
+/* the release: `hardcore update` compares it with the latest tag, and the Mac
+   build reads it into Info.plist (keep this line exactly as it is) */
+#define HARDCORE_VERSION "0.4.1"
 #define AMBER 0xFFA60D           /* dumbterm's phosphor cursor */
 #define DEF_FG 0xCCCCCC
 #define DEF_BG 0x0C0C0C
@@ -354,7 +356,7 @@ typedef struct Tab {
     char start_dir[1024];
 } Tab;
 
-enum { TK_WSL, TK_PS };
+enum { TK_WSL, TK_PS, TK_CMD };
 enum { HELP_NONE, HELP_NO_DISTRO, HELP_FAILED };
 
 #ifdef _WIN32
@@ -2155,7 +2157,9 @@ static void powershell_cmd(wchar_t *out, int cap) {
         "$global:__hc_prompt = $function:prompt\n"
         "function global:prompt { $e = [char]27; "
         "[Console]::Write(\"$e]9;9;$($executionContext.SessionState.Path.CurrentLocation.ProviderPath)$e\\$e]133;A$e\\\"); "
-        "& $global:__hc_prompt }\n";
+        "& $global:__hc_prompt }\n"
+        "if ($env:HARDCORE_RUN) { $c = $env:HARDCORE_RUN; Remove-Item env:HARDCORE_RUN; "     /* restored/slurped: claude --resume */
+        "try { [Microsoft.PowerShell.PSConsoleReadLine]::AddToHistory($c) } catch {}; Invoke-Expression $c }\n";
     wchar_t exe[MAX_PATH], w[1024];
     char b64[3000];
     static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -2226,6 +2230,13 @@ static int tab_spawn(Tab *tb) {
     if (tb->kind == TK_PS) {
         powershell_cmd(wcmd, 4096);
         to_windows_dir(tb->start_dir, wdir, MAX_PATH * 2);
+    } else if (tb->kind == TK_CMD) {
+        /* cmd.exe; its PROMPT reports the folder and marks the prompt, the way
+           rc.bash does for bash (OSC 9;9, OSC 133;A); /k runs a restored command first */
+        wchar_t run[620];
+        utf8_to_wide(tb->run, run, 620);
+        _snwprintf(wcmd, 4096, L"cmd.exe%ls%ls", tb->run[0] ? L" /k " : L"", tb->run[0] ? run : L"");
+        to_windows_dir(tb->start_dir, wdir, MAX_PATH * 2);
     } else {
         /* bash with our rc (its path arrives through WSLENV, translated), or,
            in a distro without bash, whatever its default shell is */
@@ -2237,7 +2248,8 @@ static int tab_spawn(Tab *tb) {
     memset(&pi, 0, sizeof(pi));
     /* tabs are only spawned from the UI thread, so a temporary env var is safe;
        WSLENV carries it across into Linux */
-    if (tb->spare || ((tb->run[0] || tb->hist[0]) && tb->kind == TK_WSL)) {
+    if (tb->kind == TK_CMD) SetEnvironmentVariableW(L"PROMPT", L"$e]9;9;$P$e\\$e]133;A$e\\$P$G");
+    if (tb->spare || ((tb->run[0] || tb->hist[0]) && (tb->kind == TK_WSL || tb->kind == TK_PS))) {
         wchar_t old[2048] = L"", wslenv[2100], run[620];
         const wchar_t *name = tb->spare ? L"HARDCORE_SPARE" : tb->run[0] ? L"HARDCORE_RUN" : L"HARDCORE_HIST";
         DWORD n = GetEnvironmentVariableW(L"WSLENV", old, 2048);
@@ -2247,19 +2259,20 @@ static int tab_spawn(Tab *tb) {
         SetEnvironmentVariableW(name, tb->spare ? L"1" : run);
         SetEnvironmentVariableW(L"WSLENV", wslenv);
         ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                            NULL, tb->kind == TK_PS && GetFileAttributesW(wdir) != INVALID_FILE_ATTRIBUTES ? wdir : NULL,
+                            NULL, tb->kind != TK_WSL && GetFileAttributesW(wdir) != INVALID_FILE_ATTRIBUTES ? wdir : NULL,
                             &si.StartupInfo, &pi);
         SetEnvironmentVariableW(name, NULL);
         SetEnvironmentVariableW(L"WSLENV", n ? old : NULL);
     } else {
         ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                            NULL, tb->kind == TK_PS && GetFileAttributesW(wdir) != INVALID_FILE_ATTRIBUTES ? wdir : NULL,
+                            NULL, tb->kind != TK_WSL && GetFileAttributesW(wdir) != INVALID_FILE_ATTRIBUTES ? wdir : NULL,
                             &si.StartupInfo, &pi);
     }
+    if (tb->kind == TK_CMD) SetEnvironmentVariableW(L"PROMPT", NULL);
     if (!ok) {
         char msg[256];
         snprintf(msg, sizeof(msg), "\x1b[31mhardcore: could not start %s (error %lu)\x1b[0m\r\n",
-                 tb->kind == TK_PS ? "PowerShell" : "wsl.exe", GetLastError());
+                 tb->kind == TK_PS ? "PowerShell" : tb->kind == TK_CMD ? "cmd.exe" : "wsl.exe", GetLastError());
         term_message(&tb->t, msg);
         DeleteProcThreadAttributeList(si.lpAttributeList);
         HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
@@ -3968,7 +3981,7 @@ static void session_save(void) {
             snprintf(cmd, sizeof(cmd), "%s", tb->t.claude[0] ? "" : tb->t.cmd);   /* Claude comes back on its own */
             for (k = 0; cmd[k]; k++) if (cmd[k] == '\r' || cmd[k] == '\n') cmd[k] = ' ';
             fprintf(f, "\n[tab]\nkind=%s\ndir=%s\nclaude=%s\nclaude_args=%s\ncmd=%s\ntext=tab%d.txt\n",
-                    tb->kind == TK_PS ? "powershell" : "wsl", tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude,
+                    tb->kind == TK_PS ? "powershell" : tb->kind == TK_CMD ? "cmd" : "wsl", tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude,
                     tb->t.claude[0] ? tb->t.claude_args : "", cmd, n);
         }
         n++;
@@ -4024,8 +4037,8 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
         session_path(p, wname);
         data = read_file(p, &n);
     }
-    tb = tab_create_ex(dir_exists(dir) ? dir : NULL, 0, !strcmp(kind, "powershell") ? TK_PS : TK_WSL,
-                       run[0] ? run : NULL, !run[0] && cmd[0] && strcmp(kind, "powershell") ? cmd : NULL, data, n);
+    tb = tab_create_ex(dir_exists(dir) ? dir : NULL, 0, !strcmp(kind, "powershell") ? TK_PS : !strcmp(kind, "cmd") ? TK_CMD : TK_WSL,
+                       run[0] ? run : NULL, !run[0] && cmd[0] && !strcmp(kind, "wsl") ? cmd : NULL, data, n);
     free(data);
     if (tb) g_tabs[g_ntabs++] = tb;
 }
