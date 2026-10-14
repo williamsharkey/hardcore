@@ -115,6 +115,21 @@ presenting.
 | Input → frame handed to the compositor, p50 / p99 (n=121) | 1.33 / 2.28 ms | 1.26 / 1.97 ms |
 | `cat` of the `seq` file, wall time | 0.85 s | 0.91 s |
 
+Timed inside hardcore with `HARDCORE_LAT=1` and no focus taken
+(`bench/newtab-bg.sh`; `NOTP=1 NLAT=200 bench/run-bg.sh`):
+
+| | p50 | p90 | p99 |
+|---|---|---|---|
+| New tab → first frame showing it (pre-warmed shell waiting, the normal case) | 0.9 ms | | |
+| New tab → prompt drawn (pre-warmed) | 4.4 ms | 5.7 ms | |
+| New tab → prompt drawn, right behind another tab (no spare yet: wsl.exe + bash start) | 72 ms | 76 ms | |
+| Input → frame handed to the compositor (n=201) | 1.27 ms | 1.60 ms | 2.53 ms |
+| Input → that frame scanned out (DXGI `SyncQPCTime`) | 15.8 ms | 27.2 ms | 35.6 ms |
+
+The new-tab times stop at the frame being handed to the compositor. Add the
+compositor and the display's ~16 ms per frame on top to get the time to the
+screen, the same as for a keystroke.
+
 What changed:
 - **Per-row extent (`rlen`).** Each screen row records where its default-blank tail
   starts. A line feed used to scan all 178 cells of the row going into scrollback

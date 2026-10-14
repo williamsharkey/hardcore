@@ -34,24 +34,24 @@ $B send q $T
 sleep 0.5
 lat=$(tr -d '\r' < "$tmpl/hardcore-lat.txt" 2>/dev/null)
 
-# throughput
-: > "$tmpl/hardcore-perf.txt.mark"
-$B send "bash $PWD/bench/throughput.sh hcbench\n" $T
-for i in $(seq 1 480); do [ "$(wc -l < /tmp/termbench-hcbench.txt 2>/dev/null)" = 3 ] && break; sleep 0.25; done
-sleep 1.2
+# throughput (NOTP=1 skips it)
+if [ -z "${NOTP:-}" ]; then
+  $B send "bash $PWD/bench/throughput.sh hcbench\n" $T
+  for i in $(seq 1 480); do [ "$(wc -l < /tmp/termbench-hcbench.txt 2>/dev/null)" = 3 ] && break; sleep 0.25; done
+  sleep 1.2
+fi
 /mnt/c/Windows/System32/taskkill.exe /F /IM hcbench.exe >/dev/null 2>&1
 
-echo "== throughput ($size)"
-awk '{printf "  %-8s %6.1f MB  %5.2f s  %6.1f MB/s\n", $1, $2/1e6, $3, $2/1e6/$3}' /tmp/termbench-hcbench.txt
+[ -z "${NOTP:-}" ] && echo "== throughput ($size)" && awk '{printf "  %-8s %6.1f MB  %5.2f s  %6.1f MB/s\n", $1, $2/1e6, $3, $2/1e6/$3}' /tmp/termbench-hcbench.txt
 echo "== perf log (busy seconds)"
 tr -d '\r' < "$tmpl/hardcore-perf.txt" | awk '$3+0 > 1 || $5+0 > 100' | sed 's/^/  /'
 echo "== latency, ms (n=$(echo "$lat" | grep -c .)): p50 / p90 / p99"
 echo "$lat" | python3 -c '
 import sys
-rows=[list(map(float,l.split()[:3])) for l in sys.stdin if l.strip()]
-names=["input -> echo back","input -> frame start","input -> presented"]
+rows=[list(map(float,l.split()[:4])) for l in sys.stdin if l.strip()]
+names=["input -> echo back","input -> frame start","input -> presented","input -> scanned out"]
 for k,n in enumerate(names):
-    v=sorted(r[k] for r in rows)
+    v=sorted(r[k] for r in rows if len(r) > k and r[k] >= 0)   # scanout: -1 when DXGI had no stats
     if not v: continue
     q=lambda p: v[min(len(v)-1,int(p*len(v)))]
     print("  %-22s %5.2f / %5.2f / %5.2f" % (n,q(.5),q(.9),q(.99)))'

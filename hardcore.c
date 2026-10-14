@@ -308,6 +308,11 @@ static void trace(const char *what) {
 static double lat_ms(LARGE_INTEGER a, LARGE_INTEGER b) { return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpf.QuadPart; }
 static FILE *g_lat;
 static LARGE_INTEGER g_lat_key, g_lat_out, g_lat_render;
+/* HARDCORE_LAT, new tabs: from the "newtab" command to the first frame that
+   shows the tab, and to the first frame with its prompt on it */
+static LARGE_INTEGER g_nt_t0;
+static double g_nt_shown;
+static int g_nt_id;
 
 /* HARDCORE_PERF=1: once a second, to %TEMP%\\hardcore-perf.txt, what the UI
    thread did: bytes parsed, frames drawn, and where the time went. */
@@ -3268,6 +3273,22 @@ static void paint_now(void) {
         perf_tick();
     }
     QueryPerformanceCounter(&g_last_paint);
+    if (g_lat && g_nt_t0.QuadPart && active_tab() && active_tab()->id == g_nt_id) {
+        LARGE_INTEGER t;
+        Term *nt = &active_tab()->t;
+        int y, x, ink = 0;
+        QueryPerformanceCounter(&t);
+        if (g_nt_shown < 0) g_nt_shown = lat_ms(g_nt_t0, t);
+        for (y = 0; y < nt->rows && !ink; y++)
+            for (x = 0; x < nt->rlen[nt->alt][y] && !ink; x++) ink = CELL(nt, x, y)->ch > ' ';
+        if (ink) {
+            FILE *f;
+            wchar_t tp[MAX_PATH];
+            _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-newtab.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
+            if ((f = _wfopen(tp, L"ab"))) { fprintf(f, "%.2f %.2f\n", g_nt_shown, lat_ms(g_nt_t0, t)); fclose(f); }
+            g_nt_t0.QuadPart = 0;
+        }
+    }
     if (g_lat && g_lat_out.QuadPart) {
         LARGE_INTEGER t;
         QueryPerformanceCounter(&t);
@@ -3852,7 +3873,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (i = 0; i < n; i++) if (buf[i] == '\n') buf[i] = '\r';
             tab_write(tb, buf, (int)n);
         } else if (cd->dwData == 0x48430002) {          /* a hardcore command */
-            if (!strcmp(buf, "newtab")) new_tab_here();
+            if (!strcmp(buf, "newtab")) {
+                if (g_lat) { QueryPerformanceCounter(&g_nt_t0); g_nt_shown = -1; }
+                new_tab_here();
+                if (g_lat) g_nt_id = active_tab() ? active_tab()->id : 0;
+            }
             else if (!strcmp(buf, "nexttab")) activate((g_active + 1) % g_ntabs);
             else if (!strcmp(buf, "closetab")) close_tab(g_active);
             else if (!strcmp(buf, "jump")) jump_to_attention();
