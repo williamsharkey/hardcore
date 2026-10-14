@@ -1,5 +1,10 @@
 /*
- * hardcore.c — a tabbed terminal for WSL on Windows 11.
+ * hardcore.c — a tabbed terminal for WSL on Windows 11, and for macOS.
+ *
+ * Win32 (ConPTY, Direct3D 11) lives in this file; the macOS layer (Cocoa,
+ * forkpty, OpenGL) is hardcore_mac.m, included at the end. The parser,
+ * scrollback, tab column and drawing are shared, and call down through the
+ * plat_* functions and the r_* backend.
  *
  * Grown out of dumbterm (an earlier, private terminal): same GNU Unifont
  * bitmap glyphs, same immediate-mode drawing, same amber cursor. What is
@@ -17,12 +22,15 @@
  *
  * Build (from WSL or MSYS2):
  *   make            → hardcore.exe
+ * Build (macOS):
+ *   make            → hardcore.app
  *
  * Usage:
  *   hardcore.exe [--cd DIR] [--distro NAME] [DIR]
  *   hardcore.exe --selftest OUT.txt     # headless ConPTY + parser check
  */
 
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
@@ -34,6 +42,23 @@
 #include <d3d11.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
+#else
+/* macOS: the same core, with Cocoa + forkpty + OpenGL underneath (hardcore_mac.m,
+   included at the end). The few Win32 names the core uses are mapped here. */
+#include <stdint.h>
+#include <ctype.h>
+#include <errno.h>
+#include <time.h>
+#include <unistd.h>
+#include <wctype.h>
+#include <strings.h>
+typedef uint32_t DWORD;
+#define MAX_PATH 1024
+#define _strdup strdup
+#define _stricmp strcasecmp
+#define _snwprintf swprintf      /* same argument order; wchar_t is UTF-32 here */
+static DWORD GetTickCount(void) { return (DWORD)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000); }
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,18 +67,27 @@
 
 /* ── embedded font (tools/gen_font.py output) ──────────────────────── */
 
+#ifdef __APPLE__
+#define BLOB_SECTION ".const_data\n"
+#define BLOB_SYM(name) "_" #name
+#else
+#define BLOB_SECTION ".section .rdata,\"dr\"\n"
+#define BLOB_SYM(name) #name
+#endif
+
 __asm__(
-    ".section .rdata,\"dr\"\n"
+    BLOB_SECTION
     ".balign 16\n"
-    ".global font_blob\n"
-    "font_blob:\n"
+    ".global " BLOB_SYM(font_blob) "\n"
+    BLOB_SYM(font_blob) ":\n"
     ".incbin \"" FONT_BIN "\"\n"
-    ".global font_blob_end\n"
-    "font_blob_end:\n"
+    ".global " BLOB_SYM(font_blob_end) "\n"
+    BLOB_SYM(font_blob_end) ":\n"
     ".byte 0\n"
     ".text\n");
 extern const unsigned char font_blob[], font_blob_end[];
 
+#ifdef _WIN32
 /* Windows Terminal's own ConPTY (vendor/conpty), extracted on first run. */
 __asm__(
     ".section .rdata,\"dr\"\n"
@@ -72,6 +106,7 @@ __asm__(
     ".byte 0\n"
     ".text\n");
 extern const unsigned char conpty_dll[], conpty_dll_end[], openconsole_exe[], openconsole_exe_end[];
+#endif
 
 #define FONT_W 8
 #define FONT_H 16
@@ -87,6 +122,7 @@ static const unsigned char *font_glyph(uint32_t cp) {
     return font_blob + off;
 }
 
+#ifdef _WIN32
 /* ── ConPTY (loaded at runtime so old mingw headers don't matter) ─── */
 
 typedef void *HPCON_;
@@ -98,6 +134,7 @@ static PFN_ResizePC pResizePC;
 static PFN_ClosePC  pClosePC;
 #ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
+#endif
 #endif
 
 /* ── configuration ─────────────────────────────────────────────────── */
@@ -117,19 +154,24 @@ static PFN_ClosePC  pClosePC;
 #define SEL_BG 0x264F78
 
 static int g_scale = 1;          /* integer pixel scale, from the monitor DPI; one size, no zoom */
-static int g_dpi = 96;
-static char g_distro[128];
 static char g_start_dir[1024];   /* Windows or Linux path */
 static char g_last_dir[1024];    /* where the last window closed: the next one opens there */
-static wchar_t g_cfg_dir[MAX_PATH];
 static int g_shell_ps;           /* shell=powershell in config.ini: tabs run PowerShell, not WSL */
 static int g_no_bash;            /* the distro has no bash: run its default shell, without rc.bash */
 static int g_have_distro = 1;    /* any WSL distro registered for this user (HKCU\...\Lxss) */
 static char g_mnt_root[64] = "/mnt/";   /* where Windows drives appear in WSL (wsl.conf automount root) */
+static char g_cfg_dir_line[1100];   /* dir= as config.ini had it, written back unchanged */
+#ifdef _WIN32
+static int g_dpi = 96;
+static char g_distro[128];
+static wchar_t g_cfg_dir[MAX_PATH];
 static wchar_t g_default_distro[128];
 static int g_win_w = 0, g_win_h = 0;
 static int g_inbox_conpty;       /* --inbox-conpty: use Windows' own conhost */
 static const char *g_conpty_kind = "inbox";
+#else
+static char g_cfg_dir[MAX_PATH]; /* ~/Library/Application Support/hardcore */
+#endif
 
 /* ── cells ─────────────────────────────────────────────────────────── */
 
@@ -138,8 +180,10 @@ static const char *g_conpty_kind = "inbox";
 #define C_RGB(r, g, b) (0x02000000u | ((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
 
 enum { A_BOLD = 1, A_DIM = 2, A_ITALIC = 4, A_UNDER = 8, A_BLINK = 16, A_INV = 32, A_HIDDEN = 64, A_STRIKE = 128 };
-enum { W_WIDE = 1, W_CONT = 2, W_PAD = 3 };   /* W_PAD: the blank left in the last column
-                                                 when a wide char wrapped; not text */
+/* W_PAD: the blank left at the end of a row when a wide char didn't fit and
+   went to the next one. It isn't text: reflow mustn't turn it into a space
+   (before it was marked, every resize added one before such characters). */
+enum { W_WIDE = 1, W_CONT = 2, W_PAD = 4 };
 
 typedef struct {
     uint32_t ch, fg, bg;
@@ -149,17 +193,10 @@ typedef struct {
 
 #define MAX_LINKS 4096           /* per tab, reused round-robin */
 
-/* A scrollback line is a whole logical line, never pre-wrapped: a resize only
-   recounts how many rows each one takes. The physical rows are cut out of it
-   when they're drawn or copied (term_line). Also used, one physical row per
-   entry, as the scratch list while the screen is reflowed. */
 typedef struct {
     Cell *c;
-    int n, wrapped;              /* wrapped: the line goes on (onto the next entry, or the screen) */
+    int n, wrapped;              /* wrapped: the width it wrapped at (its trailing blanks are text), 0 = it didn't */
     int cap;                     /* cells allocated: a recycled line keeps its buffer */
-    int rows;                    /* rows it takes at the terminal's width */
-    uint8_t wide;                /* has wide chars, so rows need a scan, not a division */
-    long long row0;              /* its first row, counted from an arbitrary origin */
 } HLine;
 
 static uint32_t PAL[256];
@@ -245,12 +282,13 @@ typedef struct {
     uint32_t utf8_acc;
     char osc[OSC_MAX];
     int osc_n;
-    /* scrollback: a ring of hlines logical lines starting at hstart, taking
-       hcount rows at the current width; hpushed counts rows ever added */
+    /* scrollback */
     HLine *hist;
-    int hcount, hstart, hlines;
+    int hcount, hstart;
     long long hpushed;
     int view;                    /* lines scrolled back from live */
+    int hist_cols;               /* the width the scrollback is wrapped at... */
+    int hist_stale;              /* ...or 1: older lines still wrap at an earlier width (term_settle) */
     /* reported by the shell / apps */
     wchar_t title[256];
     char cwd[1024];
@@ -278,13 +316,22 @@ typedef struct {
 typedef struct Tab {
     Term t;
     int id;
+#ifdef _WIN32
     HPCON_ hpc;
     HANDLE pin_w, pout_r, proc, reader, wait;
     CRITICAL_SECTION lock;
-    char *in;
-    int in_n, in_cap;
     volatile LONG posted;
     volatile LONG exited;
+#else
+    int fd;                      /* pty master, -1 = none */
+    pid_t pid;
+    void *rsrc;                  /* dispatch source: output ready */
+    void *wq;                    /* serial queue for writes the pty can't take right away */
+    int *wpending;               /* writes waiting on that queue (atomic; the queue frees it last) */
+    int exited;
+#endif
+    char *in;
+    int in_n, in_cap;
     int activity;                /* output while in the background */
     int busy;                    /* term_busy(), as of the last check: drives the throbber */
     int attention;               /* bell, notification, or a busy program went quiet: the bell mark */
@@ -293,12 +340,15 @@ typedef struct Tab {
     int help;                    /* a help screen instead of a shell: HELP_* */
     DWORD born;                  /* GetTickCount() at spawn: a quick death means a setup problem */
     int spare;                   /* pre-warmed, waiting on stdin for its directory */
+    DWORD adopted;               /* when a spare became this tab: hold its first frame for the prompt */
+    int traced;
     char start_dir[1024];
 } Tab;
 
 enum { TK_WSL, TK_PS };
 enum { HELP_NONE, HELP_NO_DISTRO, HELP_FAILED };
 
+#ifdef _WIN32
 static HWND g_hwnd;
 
 /* HARDCORE_TRACE=1 writes startup phase times to %TEMP%\\hardcore-trace.txt */
@@ -350,6 +400,54 @@ static void tab_write(Tab *tb, const void *s, int n) {
     DWORD w;
     if (tb->pin_w && n > 0) WriteFile(tb->pin_w, s, (DWORD)n, &w, NULL);
 }
+#else
+static void tab_write(Tab *tb, const void *s, int n);
+#endif
+
+/* ── platform layer: Win32 in this file, macOS in hardcore_mac.m ───── */
+
+static void plat_invalidate(void);               /* redraw soon */
+static void plat_client_size(int *w, int *h);    /* drawable size, in pixels */
+static void plat_flash(void);                    /* ask for attention: taskbar flash, Dock bounce */
+static void plat_timer(int id, int ms);          /* one-shot (or, for TIMER_THROB, repeating) */
+
+#define TIMER_SYNC 1
+#define TIMER_SPARE 2
+#define TIMER_THROB 3
+#define TIMER_DISK 4              /* Win32: the low-disk check, every minute */
+#define TIMER_SETTLE 5            /* resizing stopped: rewrap the rest of every tab's scrollback */
+static void plat_kill_timer(int id);
+static void plat_set_title(const wchar_t *title);
+static void plat_close_window(void);
+static void set_clipboard_utf8(const char *s, int n);
+static void config_save(void);
+static Tab *tab_create(const char *dir, int spare);
+static void tab_destroy_async(Tab *tb);
+static int tab_drain(Tab *tb);
+
+/* UTF-8 → wide, NUL-terminated and clipped to cap */
+static void utf8_to_wide(const char *s, wchar_t *out, int cap) {
+#ifdef _WIN32
+    /* too long: keep what fit (a title's first character drives the spinner check) */
+    if (!MultiByteToWideChar(CP_UTF8, 0, s, -1, out, cap) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) out[0] = 0;
+#else
+    const unsigned char *p = (const unsigned char *)s;
+    int n = 0;
+    while (*p && n < cap - 1) {
+        uint32_t cp = *p++;
+        int need = cp >= 0xF0 ? 3 : cp >= 0xE0 ? 2 : cp >= 0xC0 ? 1 : 0;
+        if (cp >= 0x80 && !need) { out[n++] = 0xFFFD; continue; }
+        cp &= need == 3 ? 0x07 : need == 2 ? 0x0F : need == 1 ? 0x1F : 0x7F;
+        while (need-- > 0) {
+            if ((*p & 0xC0) != 0x80) { cp = 0xFFFD; break; }
+            cp = (cp << 6) | (*p++ & 0x3F);
+        }
+        out[n++] = (wchar_t)cp;
+    }
+    out[n] = 0;
+#endif
+    out[cap - 1] = 0;
+}
 
 static void term_reply(Term *t, const char *s) { tab_write((Tab *)t, s, (int)strlen(s)); }
 
@@ -398,116 +496,51 @@ static int row_is_blank_default(const Cell *c) {
 
 static void hist_clear(Term *t) {
     int i;
-    for (i = 0; i < HIST_LINES; i++) {      /* recycled buffers live past hlines too */
+    for (i = 0; i < HIST_LINES; i++) {      /* recycled buffers live past hcount too */
         free(t->hist[i].c);
         t->hist[i].c = NULL;
         t->hist[i].cap = t->hist[i].n = 0;
     }
-    t->hcount = t->hstart = t->hlines = 0;
+    t->hcount = t->hstart = 0;
     t->view = 0;
 }
 
-/* Where the next row of line h starts, given it starts at pos: at most cols
-   cells, one fewer if the row would end on the first half of a wide char. */
-static int hrow_take(const HLine *h, int pos, int cols) {
-    int take = h->n - pos > cols ? cols : h->n - pos;
-    if (h->wide && take == cols && pos + take < h->n && h->c[pos + take - 1].wflag == W_WIDE) take--;
-    return take > 0 ? take : 1;
+/* the width a wrapped screen row really used: its end, less any W_PAD */
+static int wrap_width(const Cell *row, int cols) {
+    int w = cols;
+    while (w > 1 && row[w - 1].wflag == W_PAD) w--;
+    return w;
 }
 
-static int hline_rows(const HLine *h, int cols) {
-    int pos = 0, r = 0;
-    if (!h->wide) return h->n ? (h->n + cols - 1) / cols : 1;
-    do { pos += hrow_take(h, pos, cols); r++; } while (pos < h->n);
-    return r;
-}
-
-static HLine *hist_at(const Term *t, int i) {
-    i += t->hstart;              /* both < HIST_LINES: no division needed */
-    return &t->hist[i >= HIST_LINES ? i - HIST_LINES : i];
-}
-
-/* A screen row scrolled off the top. A row that wraps is kept at the full
-   width (its trailing blanks are text) and the next one is appended to it, so
-   history holds logical lines. */
 static void hist_push(Term *t, const Cell *row, int len, int wrapped) {
-    int n = wrapped ? t->cols : len, x;
-    HLine *h = t->hlines ? hist_at(t, t->hlines - 1) : NULL;
-    if (!wrapped) while (n > 0 && row_is_blank_default(&row[n - 1])) n--;
-    else while (n > 0 && row[n - 1].wflag == W_PAD) n--;   /* a wide char's wrap gap isn't text */
-    if (h && h->wrapped) {       /* continues the last line */
-        if (h->n + n > h->cap) {
-            int cap = (h->n + n) * 2;
-            Cell *c = (Cell *)realloc(h->c, sizeof(Cell) * cap);
-            if (!c) return;
-            h->c = c;
-            h->cap = cap;
-        }
-        memcpy(h->c + h->n, row, sizeof(Cell) * n);
-        h->n += n;
-        h->rows++;               /* each full-width row adds exactly one */
-    } else {
-        long long row0 = h ? h->row0 + h->rows : 0;
-        if (t->hlines == HIST_LINES) {          /* the oldest line falls off; its buffer is reused */
-            HLine *o = hist_at(t, 0);
-            t->hcount -= o->rows;
-            if (++t->hstart == HIST_LINES) t->hstart = 0;
-            t->hlines--;
-            if (t->view > t->hcount) t->view = t->hcount;
-        }
-        h = hist_at(t, t->hlines++);
-        if (n > h->cap) {
-            int cap = n < 16 ? 16 : n;
-            free(h->c);
-            h->c = (Cell *)malloc(sizeof(Cell) * cap);
-            h->cap = h->c ? cap : 0;
-            if (!h->c) n = 0;
-        }
-        if (n) memcpy(h->c, row, sizeof(Cell) * n);
-        h->n = n;
-        h->rows = 1;
-        h->wide = 0;
-        h->row0 = row0;
+    int n = len, idx;
+    HLine *h;
+    if (wrapped) wrapped = wrap_width(row, t->cols);
+    /* a row that wraps keeps its trailing blanks: they're text (the space
+       between two words that fell at the edge), and selection reads them */
+    if (wrapped) n = wrapped;
+    else while (n > 0 && row_is_blank_default(&row[n - 1])) n--;
+    if (t->hcount < HIST_LINES) {
+        idx = (t->hstart + t->hcount) % HIST_LINES;
+        t->hcount++;
+    } else {                     /* the oldest line falls off; its buffer is reused */
+        idx = t->hstart;
+        t->hstart = (t->hstart + 1) % HIST_LINES;
+        if (t->view > 0) t->view--;
     }
-    for (x = 0; x < n && !h->wide; x++) if (row[x].wflag) h->wide = 1;
+    h = &t->hist[idx];
+    if (n > h->cap) {
+        int cap = n < 16 ? 16 : n;
+        free(h->c);
+        h->c = (Cell *)malloc(sizeof(Cell) * cap);
+        h->cap = h->c ? cap : 0;
+        if (!h->c) n = 0;
+    }
+    h->n = n;
     h->wrapped = wrapped;
-    t->hcount++;
+    if (n) memcpy(h->c, row, sizeof(Cell) * n);
     t->hpushed++;
     if (t->view > 0 && t->view < t->hcount) t->view++;  /* keep the viewport still */
-}
-
-/* After a width change: every line's rows again, and their starts. */
-static void hist_recount(Term *t) {
-    int i;
-    long long r = 0;
-    for (i = 0; i < t->hlines; i++) {
-        HLine *h = hist_at(t, i);
-        h->rows = hline_rows(h, t->cols);
-        h->row0 = r;
-        r += h->rows;
-    }
-    t->hcount = (int)r;
-}
-
-/* Physical history row L (0 = oldest kept): which line, and its k-th row. */
-static void hist_row(const Term *t, int L, const Cell **cells, int *n, int *wrapped) {
-    int lo = 0, hi = t->hlines - 1, k, pos = 0;
-    long long target = hist_at(t, 0)->row0 + L;
-    const HLine *h;
-    while (lo < hi) {            /* the last line starting at or before the target */
-        int mid = (lo + hi + 1) / 2;
-        if (hist_at(t, mid)->row0 <= target) lo = mid;
-        else hi = mid - 1;
-    }
-    h = hist_at(t, lo);
-    k = (int)(target - h->row0);
-    if (!h->wide) pos = k * t->cols;
-    else while (k-- > 0) pos += hrow_take(h, pos, t->cols);
-    k = (int)(target - h->row0);
-    *cells = h->c ? h->c + (pos < h->n ? pos : h->n) : NULL;
-    *n = pos < h->n ? hrow_take(h, pos, t->cols) : 0;
-    if (pos >= h->n) *n = 0;
-    *wrapped = k < h->rows - 1 || h->wrapped;
 }
 
 /* Rotates rows [top, bot] by n: positive moves content up (rows leaving at
@@ -593,6 +626,7 @@ static int term_init(Term *t, int cols, int rows) {
     memset(t, 0, sizeof(*t));
     t->cols = cols;
     t->rows = rows;
+    t->hist_cols = cols;
     t->hist = (HLine *)calloc(HIST_LINES, sizeof(HLine));
     for (s = 0; s < 2; s++) {
         int y;
@@ -653,13 +687,31 @@ static void ll_add(LineList *l, const Cell *c, int n, int wrapped) {
     if (n) memcpy(h->c, c, sizeof(Cell) * n);
 }
 
+/* Appends a line to the scrollback ring, letting the oldest go when it's
+   full. Returns 1 if one went. */
+static int hist_append(Term *t, HLine h) {
+    if (t->hcount < HIST_LINES) {
+        HLine *slot = &t->hist[(t->hstart + t->hcount++) % HIST_LINES];
+        free(slot->c);           /* a recycled buffer may still sit past hcount */
+        *slot = h;
+        return 0;
+    }
+    free(t->hist[t->hstart].c);
+    t->hist[t->hstart] = h;
+    t->hstart = (t->hstart + 1) % HIST_LINES;
+    return 1;
+}
+
 /* Rewraps the main screen and its scrollback to a new width, the way Windows
    Terminal does: wrapped rows are joined into logical lines and split again.
-   The cursor keeps its place in the text. */
-static void reflow_main(Term *t, int cols, int rows) {
+   The cursor keeps its place in the text. Only history from line `from` (the
+   start of a logical line) on is rewrapped; older lines keep the width they
+   wrapped at until term_settle. */
+static void reflow_main(Term *t, int cols, int rows, int from) {
     int oc = t->cols, orows = t->rows, y, L, i;
     int ccx = t->alt ? t->saved[0].cx : t->cx, ccy = t->alt ? t->saved[0].cy : t->cy;
-    int last = ccy, cur_line = -1, cur_off = 0, cur_prow = 0, start;
+    int last = ccy, cur_line = -1, cur_off = 0, cur_prow = 0, start, evicted = 0;
+    long long base = t->hpushed - t->hcount;   /* absolute number of the oldest line: stays put */
     Cell *acc = NULL;
     int acc_n = 0, acc_cap = 0;
     LineList out = {0};
@@ -672,56 +724,28 @@ static void reflow_main(Term *t, int cols, int rows) {
         for (x = 0; x < oc && row_is_blank_default(&t->row[0][y][x]); x++) {}
         if (x < oc) { last = y; break; }
     }
-    /* Only the screen is rewrapped here: history is logical lines and just
-       gets recounted. A line that starts in history and runs onto the screen
-       is taken back out of history and rewrapped with the screen rows. */
-    /* Lines come back out of history too, enough to fill the new screen: a
-       taller window shows more of what scrolled away (and agrees with what
-       ConPTY repaints). Rows that still don't fit go straight back. */
-    if (t->hlines && rows > 0) {
-        int npull = 0, have = 0, k, open;
-        while (npull < t->hlines && have < rows) {     /* newest first, until a screenful */
-            npull++;
-            have += hline_rows(hist_at(t, t->hlines - npull), cols);
-        }
-        open = hist_at(t, t->hlines - 1)->wrapped;     /* the newest runs onto the screen */
-        for (k = npull; k > (open ? 1 : 0); k--) {     /* oldest first: whole lines, split at the new width */
-            const HLine *h = hist_at(t, t->hlines - k);
-            int pos = 0;
-            do {
-                int take = pos < h->n ? hrow_take(h, pos, cols) : 0;
-                ll_add(&out, h->c ? h->c + pos : NULL, take, pos + take < h->n);
-                pos += take;
-            } while (pos < h->n);
-        }
-        if (open) {              /* it starts the screen's first logical line */
-            const HLine *h = hist_at(t, t->hlines - 1);
-            acc_cap = h->n + oc * 2;
-            acc = (Cell *)malloc(sizeof(Cell) * acc_cap);
-            if (h->n) memcpy(acc, h->c, sizeof(Cell) * h->n);
-            acc_n = h->n;
-        }
-        for (k = 0; k < npull; k++) {                  /* off the ring; their buffers stay for reuse */
-            t->hcount -= hist_at(t, t->hlines - 1)->rows;
-            t->hlines--;
-        }
-    }
-    for (L = 0; L < last + 1; L++) {
+    for (L = from; L < t->hcount + last + 1; L++) {
         const Cell *c;
         int n, wrapped;
-        {
-            y = L;
-            c = t->row[0][y]; n = oc; wrapped = t->wrapf[0][y];
+        if (L < t->hcount) {
+            const HLine *h = &t->hist[(t->hstart + L) % HIST_LINES];
+            c = h->c; n = h->n; wrapped = h->wrapped;
+        } else {
+            y = L - t->hcount;
+            c = t->row[0][y]; n = oc; wrapped = t->wrapf[0][y] ? wrap_width(c, oc) : 0;
             if (y == ccy) { cur_line = 1; cur_off = acc_n + ccx; }
         }
-        if (acc_n + oc > acc_cap) {
-            acc_cap = (acc_n + oc) * 2;
+        if (acc_n + (wrapped > n ? wrapped : n) > acc_cap) {
+            acc_cap = (acc_n + (wrapped > n ? wrapped : n)) * 2;
             acc = (Cell *)realloc(acc, sizeof(Cell) * acc_cap);
         }
-        if (wrapped) while (n > 0 && c[n - 1].wflag == W_PAD) n--;   /* not text */
-        memcpy(acc + acc_n, c, sizeof(Cell) * n);
+        if (wrapped && n > wrapped) n = wrapped;   /* not the padding */
+        if (n) memcpy(acc + acc_n, c, sizeof(Cell) * n);   /* (an empty line has no cells, and acc may be none yet) */
         acc_n += n;
-        if (wrapped) continue;   /* a wrapped row's trailing blanks are real text */
+        if (wrapped) {           /* a wrapped row's trailing blanks are real text, up to the width it wrapped at */
+            for (; n < wrapped; n++) acc[acc_n++] = blank;
+            continue;
+        }
         /* end of a logical line: trim and split it at the new width */
         {
             int len = acc_n, pos = 0;
@@ -735,7 +759,7 @@ static void reflow_main(Term *t, int cols, int rows) {
                     ccx = (cur_off - pos) % cols;
                     cur_line = 2;
                 }
-                ll_add(&out, acc + pos, take, pos + take < len);
+                ll_add(&out, take ? acc + pos : NULL, take, pos + take < len ? take : 0);   /* take < cols: a wide char went on */
                 pos += take;
             } while (pos < len);
             if (cur_line == 2 && cur_prow >= out.n) {  /* cursor beyond the text, on rows of its own */
@@ -750,28 +774,23 @@ static void reflow_main(Term *t, int cols, int rows) {
     start = out.n - rows;
     if (start > cur_prow) start = cur_prow;
     if (start < 0) start = 0;
-    /* history: recount at the new width, then the rows that no longer fit on
-       the screen go onto it, joining into logical lines as they would scrolling */
-    t->cols = cols;              /* for the recount and hist_push; resize_alt still needs the old width */
-    hist_recount(t);
-    for (i = 0; i < start; i++) {
-        Cell pad[1];
-        const Cell *c = out.v[i].c ? out.v[i].c : pad;
-        int n = out.v[i].n;
-        if (out.v[i].wrapped && n < cols) {     /* a wrapped row is full width: pad it */
-            Cell *f = (Cell *)malloc(sizeof(Cell) * cols);
-            int x;
-            if (n) memcpy(f, c, sizeof(Cell) * n);
-            for (x = n; x < cols; x++) { f[x] = blank; f[x].wflag = W_PAD; }   /* dropped again by hist_push */
-            hist_push(t, f, cols, 1);
-            free(f);
-        } else hist_push(t, c, n, out.v[i].wrapped);
-        free(out.v[i].c);
+    /* history: lines before `from` stay as they are; the rewrapped rest follows */
+    for (L = from; L < t->hcount; L++) {   /* hist_clear frees every slot, used or not: leave none dangling */
+        HLine *h = &t->hist[(t->hstart + L) % HIST_LINES];
+        free(h->c);
+        h->c = NULL;
+        h->n = h->cap = 0;
     }
-    t->cols = oc;
-    t->view = 0;
-    t->hpushed = t->hcount;
-    t->nmarks = 0;               /* line numbers changed under them; reflow doesn't track marks */
+    t->hcount = from;
+    for (i = 0; i < start; i++) evicted += hist_append(t, out.v[i]);
+    base += evicted;
+    t->hpushed = base + t->hcount;
+    {   /* prompt marks above the rewrapped part keep their lines; the rest are gone */
+        int k, n = 0;
+        for (k = 0; k < t->nmarks; k++)
+            if (t->marks[k] >= base && t->marks[k] < base + from - evicted) t->marks[n++] = t->marks[k];
+        t->nmarks = n;
+    }
     for (y = 0; y < orows; y++) free(t->row[0][y]);
     free(t->row[0]);
     free(t->wrapf[0]);
@@ -785,10 +804,10 @@ static void reflow_main(Term *t, int cols, int rows) {
         for (x = 0; x < cols; x++) t->row[0][y][x] = blank;
         if (idx < out.n) {
             memcpy(t->row[0][y], out.v[idx].c, sizeof(Cell) * out.v[idx].n);
-            t->wrapf[0][y] = (uint8_t)out.v[idx].wrapped;
+            t->wrapf[0][y] = out.v[idx].wrapped != 0;
             t->rlen[0][y] = (uint16_t)out.v[idx].n;
-            if (out.v[idx].wrapped && out.v[idx].n < cols) {   /* the gap before a wide char: as term_put leaves it */
-                for (x = out.v[idx].n; x < cols; x++) t->row[0][y][x].wflag = W_PAD;
+            if (out.v[idx].wrapped) {    /* a wide char went on: the rest of the row is padding, and counts as used */
+                for (x = out.v[idx].wrapped; x < cols; x++) t->row[0][y][x].wflag = W_PAD;
                 t->rlen[0][y] = (uint16_t)cols;
             }
             free(out.v[idx].c);
@@ -831,10 +850,24 @@ static void resize_alt(Term *t, int cols, int rows) {
     }
 }
 
+/* While a window is being resized only the newest REFLOW_TAIL lines of
+   scrollback are rewrapped at each step, so a step costs the same with 20,000
+   lines as with 200 (measured: 2.2 ms a step per full tab before, 14-16 ms
+   for eight tabs). The rest catches up once, in term_settle, after the
+   resizing stops; a height-only resize never needs it. */
+#define REFLOW_TAIL 500
+static int g_reflow_all;         /* tests: rewrap everything at every step, the old way */
+
 static void term_resize(Term *t, int cols, int rows) {
-    int s, x;
+    int s, x, from = 0;
     if (cols == t->cols && rows == t->rows) return;
-    reflow_main(t, cols, rows);
+    if (t->hcount > REFLOW_TAIL && !g_reflow_all) {
+        from = t->hcount - REFLOW_TAIL;
+        while (from > 0 && t->hist[(t->hstart + from - 1) % HIST_LINES].wrapped) from--;   /* a logical line's start */
+    }
+    reflow_main(t, cols, rows, from);
+    if (!from) t->hist_cols = cols;
+    else if (cols != t->hist_cols) t->hist_stale = 1;
     resize_alt(t, cols, rows);
     {
         uint8_t *nt = (uint8_t *)malloc((size_t)cols);
@@ -854,6 +887,17 @@ static void term_resize(Term *t, int cols, int rows) {
     t->wrapnext = 0;
     t->view = 0;
     t->dirty = 1;
+}
+
+/* The rest of the scrollback, rewrapped to the current width. Returns 1 if
+   there was anything to do. */
+static int term_settle(Term *t) {
+    if (!t->hist_stale) return 0;
+    reflow_main(t, t->cols, t->rows, 0);
+    t->hist_cols = t->cols;
+    t->hist_stale = 0;
+    t->dirty = 1;
+    return 1;
 }
 
 /* Writing over half of a wide char leaves the other half orphaned. */
@@ -894,7 +938,6 @@ static void term_put(Term *t, uint32_t cp) {
         if (!t->m_autowrap) return;
         clear_span(t, t->cy, t->cx, t->cols);
         CELL(t, t->cx, t->cy)->wflag = W_PAD;
-        row_used(t, t->cy, t->cols);
         t->wrapf[t->alt][t->cy] = 1;
         t->cx = 0;
         term_lf(t);
@@ -1358,8 +1401,7 @@ static void b64_to_wide(const char *in, size_t n, wchar_t *out, int cap) {
         if (bits >= 8) { bits -= 8; buf[k++] = (char)(acc >> bits); }
     }
     buf[k] = 0;
-    if (!MultiByteToWideChar(CP_UTF8, 0, buf, -1, out, cap)) out[0] = 0;
-    out[cap - 1] = 0;
+    utf8_to_wide(buf, out, cap);
     for (i = 0; out[i]; i++) if (out[i] < 32) out[i] = L' ';   /* one line */
 }
 
@@ -1486,8 +1528,7 @@ static void osc_dispatch(Term *t) {
     if (*rest == ';') rest++;
     switch (code) {
     case 0: case 2:
-        MultiByteToWideChar(CP_UTF8, 0, rest, -1, t->title, 255);
-        t->title[255] = 0;
+        utf8_to_wide(rest, t->title, 256);
         title_spin(t);
         t->dirty = 1;
         break;
@@ -1724,8 +1765,10 @@ static void vt_feed(Term *t, const unsigned char *s, int n) {
 /* L counts from the oldest kept history line; screen rows follow history. */
 static void term_line(const Term *t, int L, const Cell **cells, int *n, int *wrapped) {
     if (L < t->hcount && !t->alt) {
-        if (L < 0) { *cells = NULL; *n = 0; *wrapped = 0; return; }
-        hist_row(t, L, cells, n, wrapped);
+        const HLine *h = &t->hist[(t->hstart + L) % HIST_LINES];
+        *cells = h->c;
+        *n = h->n;
+        *wrapped = h->wrapped;
     } else {
         int y = L - t->hcount;
         if (y < 0 || y >= t->rows) { *cells = NULL; *n = 0; *wrapped = 0; return; }
@@ -1738,11 +1781,7 @@ static void term_line(const Term *t, int L, const Cell **cells, int *n, int *wra
 static long long term_base(const Term *t) { return t->hpushed - t->hcount; }
 static long long term_abs_line(const Term *t, int y) { return t->hpushed + y; }
 
-/* ── tabs: ConPTY + reader thread ─────────────────────────────────── */
-
-#define WM_APP_OUTPUT (WM_APP + 1)
-#define WM_APP_EXITED (WM_APP + 2)
-#define WM_APP_FIT (WM_APP + 3)          /* resize the next background tab to the window */
+/* ── tabs ──────────────────────────────────────────────────────────── */
 
 static Tab *g_tabs[MAX_TABS];
 static Tab *g_spare;             /* pre-warmed shell for the next new tab */
@@ -1756,6 +1795,16 @@ static Tab *tab_by_id(int id) {
         if (g_tabs[i]->id == id) return g_tabs[i];
     return NULL;
 }
+
+static void term_message(Term *t, const char *msg) {
+    vt_feed(t, (const unsigned char *)msg, (int)strlen(msg));
+}
+
+#ifdef _WIN32
+/* ── ConPTY + reader thread ───────────────────────────────────────── */
+
+#define WM_APP_OUTPUT (WM_APP + 1)
+#define WM_APP_EXITED (WM_APP + 2)
 
 static DWORD WINAPI reader_thread(LPVOID arg) {
     Tab *tb = (Tab *)arg;
@@ -1965,10 +2014,6 @@ static void powershell_cmd(wchar_t *out, int cap) {
     out[cap - 1] = 0;
 }
 
-static void term_message(Term *t, const char *msg) {
-    vt_feed(t, (const unsigned char *)msg, (int)strlen(msg));
-}
-
 static int tab_spawn(Tab *tb) {
     HANDLE in_r = NULL, in_w = NULL, out_r = NULL, out_w = NULL;
     COORD sz;
@@ -2168,8 +2213,6 @@ static void config_load(void) {
     fclose(f);
 }
 
-static char g_cfg_dir_line[1100];
-
 static void config_save(void) {
     wchar_t path[MAX_PATH];
     FILE *f;
@@ -2207,6 +2250,8 @@ static void set_clipboard_utf8(const char *s, int n) {
     } else GlobalFree(h);
 }
 
+#endif /* _WIN32: ConPTY, config, clipboard */
+
 static int utf8_encode(uint32_t cp, char *o) {
     if (cp < 0x80) { o[0] = (char)cp; return 1; }
     if (cp < 0x800) { o[0] = (char)(0xC0 | (cp >> 6)); o[1] = (char)(0x80 | (cp & 63)); return 2; }
@@ -2219,7 +2264,11 @@ static int utf8_encode(uint32_t cp, char *o) {
 
 static int g_focused = 1;
 static int g_mouse_x = -1, g_mouse_y = -1;
+#ifdef _WIN32
 static LARGE_INTEGER g_last_paint;   /* QPC: GetTickCount only moves every ~15.6 ms */
+#else
+static DWORD g_last_paint;
+#endif
 
 static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 
@@ -2231,7 +2280,11 @@ static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
    float over the terminal's top-right corner on smoked glass: the text runs
    underneath, only the mouse is theirs. No row is spent on a title bar. */
 static int sidebar_w(void) { return 20 * CW; }
+#ifdef _WIN32
 static int caption_h(void) { return CH + 8 * g_scale; }   /* the glass buttons' height */
+#else
+static int caption_h(void) { return 0; }   /* macOS keeps its own traffic lights, over the tab column */
+#endif
 static int term_ox(void) { return sidebar_w() + PAD; }
 static int term_oy(void) { return PAD; }
 
@@ -2250,54 +2303,57 @@ static long long g_sel_a_row, g_sel_b_row;
 static int g_sel_a_col, g_sel_b_col;
 static int g_sb_drag;
 
-/* A tab (and its ConPTY) to the window's grid, if it isn't there yet. */
+static void tab_set_size(Tab *tb, int cols, int rows);   /* tell the pty */
+
+/* A tab (and its pty) to the window's grid, if it isn't there yet. */
 static void tab_fit(Tab *tb) {
-    COORD sz;
     if (!tb || (tb->t.cols == g_cols && tb->t.rows == g_rows)) return;
     tab_drain(tb);
     term_resize(&tb->t, g_cols, g_rows);
-    sz.X = (SHORT)g_cols;
-    sz.Y = (SHORT)g_rows;
-    if (tb->hpc) pResizePC(tb->hpc, sz);
+    tab_set_size(tb, g_cols, g_rows);
 }
 
-static int g_in_sizemove, g_fit_posted;
-
-/* The rest of the tabs, after the visible one has been drawn: one per
-   message, so input and frames get in between. Not during a live drag,
-   where each would be redone at every step; WM_EXITSIZEMOVE starts it. */
-static void fit_rest_later(void) {
-    if (g_in_sizemove || g_fit_posted) return;
-    g_fit_posted = 1;
-    PostMessageW(g_hwnd, WM_APP_FIT, 0, 0);
-}
-
-static void fit_next(void) {
-    int i;
-    g_fit_posted = 0;
-    for (i = 0; i <= g_ntabs; i++) {
-        Tab *tb = i < g_ntabs ? g_tabs[i] : g_spare;
-        if (tb && (tb->t.cols != g_cols || tb->t.rows != g_rows)) {
-            tab_fit(tb);
-            fit_rest_later();    /* there may be more */
-            return;
-        }
-    }
-}
-
-/* Only the tab you're looking at is resized now; the rest follow (fit_rest_later). */
+/* While the window is being resized only the tab you see follows each step.
+   The others, and the spare, wait until it stops (settle_all): each pty
+   resize makes ConPTY repaint that tab, and with 16 tabs doing it at every
+   step a drag step took 177 ms. */
 static void resize_all(void) {
-    RECT r;
-    int cols, rows;
-    if (!g_hwnd) return;
-    GetClientRect(g_hwnd, &r);
-    if (r.right < 1 || r.bottom < 1) return;
-    compute_grid(r.right, r.bottom, &cols, &rows);
+    int w, h, cols, rows;
+    plat_client_size(&w, &h);
+    if (w < 1 || h < 1) return;
+    compute_grid(w, h, &cols, &rows);
     if (cols == g_cols && rows == g_rows) return;
     g_cols = cols;
     g_rows = rows;
     g_sel_on = 0;
     if (g_ntabs) tab_fit(g_tabs[g_active]);
+    plat_timer(TIMER_SETTLE, 250);   /* re-armed by every step: fires once the resizing stops */
+}
+
+/* Once a resize has settled, one step per tick, so even sixteen full tabs
+   never hold a frame up for long: the hidden tabs to the new size, then the
+   rest of each one's scrollback rewrapped, the tab you see first (all at
+   once measured 69 ms; one tab ~4 ms). */
+static void settle_all(void) {
+    Tab *tb = active_tab();
+    int i;
+    if (tb && term_settle(&tb->t)) {
+        g_sel_on = 0;            /* line numbers moved under the selection */
+        plat_timer(TIMER_SETTLE, 16);
+        return;
+    }
+    for (i = 0; i <= g_ntabs; i++) {
+        tb = i < g_ntabs ? g_tabs[i] : g_spare;
+        if (tb && (tb->t.cols != g_cols || tb->t.rows != g_rows)) {
+            tab_fit(tb);
+            plat_timer(TIMER_SETTLE, 16);
+            return;
+        }
+        if (tb && term_settle(&tb->t)) {
+            plat_timer(TIMER_SETTLE, 16);
+            return;
+        }
+    }
 }
 
 static void sel_norm(long long *r0, int *c0, long long *r1, int *c1) {
@@ -2347,22 +2403,21 @@ static void send_to_active(const char *s, int n) {
     if (!tb) return;
     if (tb->t.view) {
         tb->t.view = 0;
-        InvalidateRect(g_hwnd, NULL, FALSE);
+        plat_invalidate();
     }
     tab_write(tb, s, n);
 }
 
 /* Sends text the way a paste arrives: CRLF/LF become CR like a typed Enter,
    ESC is stripped so a paste can't end bracketed-paste mode early. */
-static void paste_wide(const wchar_t *w) {
+static void paste_utf8(const char *in) {
     Tab *tb = active_tab();
-    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    size_t n = strlen(in);
     char *s, *o;
     const char *p;
-    if (!tb || n <= 1) return;
+    if (!tb || !n) return;
     s = o = (char *)malloc(n + 16);
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL);
-    for (p = s; *p; p++) {
+    for (p = in; *p; p++) {
         if (*p == '\r' && p[1] == '\n') continue;
         if (*p == 0x1B) continue;
         *o++ = (*p == '\n') ? '\r' : *p;
@@ -2370,6 +2425,17 @@ static void paste_wide(const wchar_t *w) {
     if (tb->t.m_bracketed) send_to_active("\x1b[200~", 6);
     send_to_active(s, (int)(o - s));
     if (tb->t.m_bracketed) send_to_active("\x1b[201~", 6);
+    free(s);
+}
+
+#ifdef _WIN32
+static void paste_wide(const wchar_t *w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *s;
+    if (n <= 1) return;
+    s = (char *)malloc(n);
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL);
+    paste_utf8(s);
     free(s);
 }
 
@@ -2510,6 +2576,8 @@ static void paste(void) {
     CloseClipboard();
 }
 
+#endif /* _WIN32: drops, clipboard formats */
+
 /* ── glyph atlas: on-demand 16×16 slots in one texture ─────────────── */
 
 #define ATLAS 2048
@@ -2524,6 +2592,48 @@ static int g_nslots;
 
 static void glyph_cache_reset(void);
 
+/* The drawing code is immediate mode: r_color() sets the color, and quad() /
+   r_quad_uv() append one 20-byte instance (pixel rectangle, atlas rectangle,
+   color) to a CPU-side array. The backend's vertex shader turns each instance
+   into two triangles, and r_present() hands the array over and draws it all
+   at once: a full screen of text is a few hundred KB, not the 120 bytes per
+   quad that six float vertices took. The backends (Direct3D 11 below, Metal
+   in hardcore_mac.m) supply r_flush / r_upload / r_begin / r_present. */
+
+typedef struct {
+    int16_t x0, y0, x1, y1;      /* pixels */
+    uint16_t u0, v0, u1, v1;     /* atlas pixels; u0 == 0xFFFF: a solid quad */
+    uint32_t rgba;
+} Inst;
+
+static uint32_t g_rgba = 0xFFFFFFFF;
+#define VB_INST 65536            /* per draw; a frame that needs more draws in pieces */
+static Inst g_inst[VB_INST];
+static int g_ninst;
+
+static void r_flush(void);
+static void r_upload(int x, int y, const unsigned char *bmp);
+
+static void r_color(uint32_t rgb, float a) {
+    g_rgba = ((rgb >> 16) & 255) | (rgb & 0xFF00) | ((rgb & 255) << 16) | ((uint32_t)(a * 255.0f + 0.5f) << 24);
+}
+
+/* pixel positions round to whole pixels: the font is a bitmap, it should land on the grid */
+static int16_t px(float v) { return (int16_t)(v < 0 ? v - 0.5f : v + 0.5f); }
+
+/* textured quad, atlas rectangle in atlas pixels */
+static void r_quad_uv(float x0, float y0, float x1, float y1, int u0, int v0, int u1, int v1) {
+    Inst *q;
+    if (g_ninst == VB_INST) r_flush();
+    q = &g_inst[g_ninst++];
+    q->x0 = px(x0); q->y0 = px(y0); q->x1 = px(x1); q->y1 = px(y1);
+    q->u0 = (uint16_t)u0; q->v0 = (uint16_t)v0; q->u1 = (uint16_t)u1; q->v1 = (uint16_t)v1;
+    q->rgba = g_rgba;
+}
+
+static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1, y1, 0xFFFF, 0, 0, 0); }
+
+#ifdef _WIN32
 /* ── renderer: Direct3D 11 on a flip-model swap chain ──────────────── */
 
 /* Why not OpenGL any more: a WGL window is a "redirected" surface that DWM
@@ -2533,18 +2643,8 @@ static void glyph_cache_reset(void);
    allowed Windows can promote the window to an independent flip or a
    hardware overlay plane, skipping composition altogether.
 
-   The drawing code is still immediate mode: r_color() sets the color, and
-   quad() / r_quad_uv() append one 20-byte instance (pixel rectangle, atlas
-   rectangle, color) to a CPU-side array. The vertex shader turns each
-   instance into two triangles, and r_present() uploads the array and draws it
-   all with one DrawInstanced: a full screen of text is a few hundred KB, not
-   the 120 bytes per quad that six float vertices took. */
+   The instance array (see quad() above) is drawn with one DrawInstanced per frame. */
 
-typedef struct {
-    int16_t x0, y0, x1, y1;      /* pixels */
-    uint16_t u0, v0, u1, v1;     /* atlas pixels; u0 == 0xFFFF: a solid quad */
-    uint32_t rgba;
-} Inst;
 
 /* not in every mingw libuuid */
 static const GUID IID_IDXGIFactory5_ = {0x7632e1f5, 0xee65, 0x4dca, {0x87, 0xfd, 0x84, 0xcd, 0x75, 0xf8, 0x83, 0x8d}};
@@ -2567,10 +2667,6 @@ static int g_tearing;            /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
 static int g_gfx_ready;          /* swap chain exists: GDI no longer paints */
 static ID3D11Buffer *g_cb;       /* the frame size, for pixel → clip space */
 static int g_cb_w, g_cb_h;
-static uint32_t g_rgba = 0xFFFFFFFF;
-#define VB_INST 65536            /* per draw; a frame that needs more draws in pieces */
-static Inst g_inst[VB_INST];
-static int g_ninst;
 
 static const char HLSL[] =
     "cbuffer F : register(b0) { float2 inv; };\n"     /* 2 / frame size */
@@ -2591,9 +2687,6 @@ static const char HLSL[] =
 typedef HRESULT (WINAPI *PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *,
                                          LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
 
-static void r_color(uint32_t rgb, float a) {
-    g_rgba = ((rgb >> 16) & 255) | (rgb & 0xFF00) | ((rgb & 255) << 16) | ((uint32_t)(a * 255.0f + 0.5f) << 24);
-}
 
 static void r_flush(void) {
     D3D11_MAPPED_SUBRESOURCE m;
@@ -2606,20 +2699,6 @@ static void r_flush(void) {
     g_ninst = 0;
 }
 
-/* pixel positions round to whole pixels: the font is a bitmap, it should land on the grid */
-static int16_t px(float v) { return (int16_t)(v < 0 ? v - 0.5f : v + 0.5f); }
-
-/* textured quad, atlas rectangle in atlas pixels */
-static void r_quad_uv(float x0, float y0, float x1, float y1, int u0, int v0, int u1, int v1) {
-    Inst *q;
-    if (g_ninst == VB_INST) r_flush();
-    q = &g_inst[g_ninst++];
-    q->x0 = px(x0); q->y0 = px(y0); q->x1 = px(x1); q->y1 = px(y1);
-    q->u0 = (uint16_t)u0; q->v0 = (uint16_t)v0; q->u1 = (uint16_t)u1; q->v1 = (uint16_t)v1;
-    q->rgba = g_rgba;
-}
-
-static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1, y1, 0xFFFF, 0, 0, 0); }
 
 /* one 16×16 alpha glyph into the atlas */
 static void r_upload(int x, int y, const unsigned char *bmp) {
@@ -2827,6 +2906,8 @@ static void gfx_lost(void) {
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
 
+#endif /* _WIN32: Direct3D 11 */
+
 static void glyph_cache_reset(void) {
     r_flush();                   /* quads already queued still point at the old slots */
     memset(g_hkey, 0, sizeof(g_hkey));
@@ -2972,9 +3053,12 @@ static void tab_label(Tab *tb, wchar_t *out, int cap) {
     const char *dir = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, *b = NULL, *p;
     for (p = dir; *p; p++)
         if ((*p == '/' || *p == '\\') && p[1]) b = p + 1;
-    if (!dir[0]) _snwprintf(out, cap, L"wsl");
-    else MultiByteToWideChar(CP_UTF8, 0, b ? b : dir, -1, out, cap);
-    out[cap - 1] = 0;
+#ifdef _WIN32
+    if (!dir[0]) { _snwprintf(out, cap, L"wsl"); out[cap - 1] = 0; return; }
+#else
+    if (!dir[0]) dir = "~";
+#endif
+    utf8_to_wide(b ? b : dir, out, cap);
 }
 
 /* The throbber: braille drops fall one at a time and stack up in a single
@@ -3003,10 +3087,11 @@ static void drip_init(void) {
     g_drip[g_ndrip++] = 0x2800;
 }
 
-#define TIMER_THROB 3
 #define BELL_GLYPH 0xF8F0        /* hand-drawn, font/hardcore-extra.hex */
 
+#ifdef _WIN32
 static int caption_btn_w(void) { return 46 * g_scale; }
+#endif
 
 /* sidebar geometry, top to bottom:
      [ drag ][ – ][ □ ][ × ]     caption_h()
@@ -3016,9 +3101,15 @@ static int caption_btn_w(void) { return 46 * g_scale; }
 enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR };
 
 /* The tab column sits on the terminal's character grid: row k of it is at
-   the same height as terminal row k, and it's SB_COLS cells wide. Row 0 is
-   a grip (drag the window there); the tabs start on row 1. */
+   the same height as terminal row k, and it's SB_COLS cells wide. The first
+   SB_GRIP_ROWS rows drag the window: a grip of braille dots on Windows, the
+   space under the traffic lights on the Mac. The tabs start below them. */
 #define SB_COLS 20
+#ifdef _WIN32
+#define SB_GRIP_ROWS 1
+#else
+#define SB_GRIP_ROWS 2           /* the traffic lights are ~30 px tall */
+#endif
 static int sb_row_y(int k) { return term_oy() + k * CH; }
 
 /* the dim second line under a tab's name: what Claude is doing, asking, or did */
@@ -3029,7 +3120,7 @@ static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
         if (t->ps_tasks) _snwprintf(buf, cap, L"%ls · %d bg", t->ps_msg, t->ps_tasks);
         else _snwprintf(buf, cap, L"%ls", t->ps_msg);
     } else if (t->ps_state == PS_BLOCKED) {
-        _snwprintf(buf, cap, L"%hs", t->ps_kind[0] ? t->ps_kind : "waiting for you");
+        utf8_to_wide(t->ps_kind[0] ? t->ps_kind : "waiting for you", buf, cap);
     } else if (t->ps_tasks) {
         _snwprintf(buf, cap, L"%d background task%ls", t->ps_tasks, t->ps_tasks == 1 ? L"" : L"s");
     } else return NULL;
@@ -3043,12 +3134,11 @@ static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
 static int g_row_y[MAX_TABS + 2], g_row_two[MAX_TABS + 1];   /* g_row_two: detail lines, 0..2 */
 static float detail_w(void) { return (float)((SB_COLS - 2) * CW); }   /* cols 1..18 */
 static void tab_layout(void) {
-    RECT r;
-    int i, need = 0, two = 1, y, total, avail;
+    int i, need = 0, two = 1, y, total, avail, win_w, win_h;
     wchar_t tmp[220];
-    GetClientRect(g_hwnd, &r);
-    total = (r.bottom - term_oy()) / CH;           /* whole grid rows in the window */
-    avail = total - 2;                             /* minus the grip row and the + row */
+    plat_client_size(&win_w, &win_h);
+    total = (win_h - term_oy()) / CH;              /* whole grid rows in the window */
+    avail = total - SB_GRIP_ROWS - 1;              /* minus the grip and the + row */
     for (i = 0; i < g_ntabs; i++) {
         const wchar_t *d = tab_detail(g_tabs[i], tmp, 220);
         /* what Claude is asking you gets two lines; the rest get one */
@@ -3056,15 +3146,15 @@ static void tab_layout(void) {
         need += 1 + g_row_two[i];
     }
     if (need > avail) two = 0;                     /* details go first */
-    y = sb_row_y(1);
-    if (g_ntabs + 1 <= avail + 1 || !g_ntabs) {
+    y = sb_row_y(SB_GRIP_ROWS);
+    if (g_ntabs <= avail) {
         for (i = 0; i <= g_ntabs; i++) {
             if (i < g_ntabs && !two) g_row_two[i] = 0;
             g_row_y[i] = y;
             y += (1 + (i < g_ntabs ? g_row_two[i] : 0)) * CH;
         }
     } else {                     /* more tabs than rows: squeeze them, off the grid */
-        int h = (r.bottom - y) / (g_ntabs + 1);
+        int h = (win_h - y) / (g_ntabs + 1);
         if (h < CH / 2) h = CH / 2;
         for (i = 0; i <= g_ntabs; i++) {
             if (i < g_ntabs) g_row_two[i] = 0;
@@ -3089,6 +3179,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
     return HIT_BAR;              /* the grip row and the empty column below move the window */
 }
 
+#ifdef _WIN32
 /* caption buttons: HTMINBUTTON / HTMAXBUTTON / HTCLOSE, or 0 */
 static int caption_hit(int mx, int my) {
     RECT r;
@@ -3112,7 +3203,6 @@ static int in_top_line(int mx, int my) { return mx >= sidebar_w() && my >= 0 && 
    that drive fills, the guest still thinks it has room; its writes fail
    underneath it, programs die with SIGBUS ("Bus error") and then the whole
    VM goes, taking every tab with it. So the tab column warns early. */
-#define TIMER_DISK 4
 #define DISK_WARN_GB 20.0
 #define DISK_BAD_GB 5.0
 static double g_disk_free_gb = -1;
@@ -3190,6 +3280,8 @@ static void render_caption_buttons(int win_w) {
     }
 }
 
+#endif /* _WIN32: caption buttons */
+
 static void render_tabbar(int win_w, int win_h) {
     int i, idx = -1, hover = HIT_NONE, sw = sidebar_w();
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
@@ -3197,12 +3289,14 @@ static void render_tabbar(int win_w, int win_h) {
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
     fill_rect(0, 0, (float)sw, (float)win_h, BAR_BG, 1);
+#ifdef _WIN32
     {   /* row 0: a grip of dim braille dots (drag here; one day maybe a menu) */
         float gy = (float)sb_row_y(0);
         int c;
         r_color(0x4A4A4A, 1);
         for (c = 0; c < SB_COLS; c++) draw_glyph(c % 2 ? 0x2895 : 0x286A, (float)(c * CW), gy, 1, g_scale);
     }
+#endif
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         wchar_t label[256], detail[220];
@@ -3248,20 +3342,28 @@ static void render_tabbar(int win_w, int win_h) {
         r_color(hov ? 0xF2F2F2 : 0x9A9A9A, 1);
         draw_glyph('+', (float)((SB_COLS - 2) * CW), y0, 1, g_scale);
     }
-    render_disk_warning(win_h);
+#ifdef _WIN32
+    render_disk_warning(win_h);  /* WSL's disk: the Mac has no VM to take down */
+#endif
     (void)win_w;
 }
 
+static void r_begin(int w, int h);
+
 static void render(void) {
-    RECT r;
+    struct { int right, bottom; } r;
     Tab *tb = active_tab();
     Term *t;
     int y, x, ox = term_ox(), oy = term_oy();
     long long base;
-    GetClientRect(g_hwnd, &r);
+    plat_client_size(&r.right, &r.bottom);
     r_begin(r.right, r.bottom);
     render_tabbar(r.right, r.bottom);
+#ifdef _WIN32
     if (!tb) { render_caption_buttons(r.right); return; }
+#else
+    if (!tb) return;
+#endif
     t = &tb->t;
     base = term_base(t);
 
@@ -3363,9 +3465,11 @@ static void render(void) {
         fill_rect(bx, track_top + pos * (track_h - bar_h), bx + SCROLLBAR_W - 2 * g_scale,
                   track_top + pos * (track_h - bar_h) + bar_h, AMBER, t->view ? 0.8f : 0.3f);
     }
+#ifdef _WIN32
     if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
         fill_rect((float)sidebar_w(), 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
     render_caption_buttons(r.right);   /* last: glass over whatever is under it */
+#endif
 }
 
 static void update_title(void) {
@@ -3375,9 +3479,10 @@ static void update_title(void) {
     tab_label(tb, label, 256);
     _snwprintf(title, 300, L"%ls — hardcore", label);
     title[299] = 0;
-    SetWindowTextW(g_hwnd, title);
+    plat_set_title(title);
 }
 
+#ifdef _WIN32
 /* Completes the previous keypress's line once its frame has had time to reach
    the display: DXGI reports the vblank it was scanned out on (SyncQPCTime) and
    whether DWM composed it (0) or it went straight to a hardware plane (1). */
@@ -3446,23 +3551,51 @@ static void snap_backbuffer(void) {
     ID3D11Texture2D_Release(back);
 }
 
+#else
+static void snap_backbuffer(void);
+static char g_snap_path[MAX_PATH];
+#endif
+
+
+static void r_present(void);
+
 static void paint_now(void) {
     Tab *tb = active_tab();
+#ifdef _WIN32
+    LARGE_INTEGER p0, p1, p2;
+#endif
     if (tb && tb->t.m_sync && GetTickCount() - tb->t.sync_since < 200) {
-        SetTimer(g_hwnd, 1, 20, NULL);
+        plat_timer(TIMER_SYNC, 20);
         return;
     }
-    LARGE_INTEGER p0, p1, p2;
+    /* a spare that just became this tab answers with its prompt within a
+       few milliseconds: hold the frame so the tab and its prompt arrive
+       together, instead of an empty tab a refresh or two before it. The mark
+       (OSC 133;A) comes before your prompt hooks run; the cursor leaving
+       column 0 means the prompt itself has been printed. */
+    if (tb && tb->adopted && (!tb->t.nmarks || tb->t.cx == 0) && GetTickCount() - tb->adopted < 50) {
+        plat_timer(TIMER_SYNC, 2);
+        return;
+    }
+    if (tb && tb->adopted) {     /* held long enough: no stray repaint after this frame */
+        tb->adopted = 0;
+        plat_kill_timer(TIMER_SYNC);
+    }
+#ifdef _WIN32
     if (g_lat && g_lat_out.QuadPart) QueryPerformanceCounter(&g_lat_render);
     if (g_perf) QueryPerformanceCounter(&p0);
+#endif
     render();
     if (g_snap_path[0]) {
         r_flush();
         snap_backbuffer();
         g_snap_path[0] = 0;
     }
+#ifdef _WIN32
     if (g_perf) QueryPerformanceCounter(&p1);
+#endif
     r_present();
+#ifdef _WIN32
     if (g_perf) {
         QueryPerformanceCounter(&p2);
         g_pf.build += g_pf_last_build = lat_ms(p0, p1);
@@ -3496,6 +3629,9 @@ static void paint_now(void) {
         IDXGISwapChain1_GetLastPresentCount(g_sc, &g_lat_pid);
         g_lat_key.QuadPart = g_lat_out.QuadPart = 0;
     }
+#else
+    g_last_paint = GetTickCount();
+#endif
 }
 
 /* Re-checks which tabs are animating a spinner title. A tab that stops while
@@ -3508,10 +3644,7 @@ static void update_busy(int tick) {
         int b = term_busy(&tb->t);
         if (tb->t.ps_state != tb->ps_seen) {
             /* Claude stopped to ask you something: say so if you aren't looking */
-            if ((tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) && !g_focused) {
-                FLASHWINFO fi = {sizeof(fi), g_hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
-                FlashWindowEx(&fi);
-            }
+            if ((tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) && !g_focused) plat_flash();
             tb->ps_seen = tb->t.ps_state;
             changed = 1;
         }
@@ -3519,41 +3652,45 @@ static void update_busy(int tick) {
             changed = 1;
             if (!b && (i != g_active || !g_focused)) {
                 tb->attention = 1;
-                if (!g_focused) {        /* finished while you were in another window */
-                    FLASHWINFO fi = {sizeof(fi), g_hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
-                    FlashWindowEx(&fi);
-                }
+                if (!g_focused) plat_flash();   /* finished while you were in another window */
             }
             tb->busy = b;
         }
         any |= b;
     }
-    if (any && !g_throb_on) SetTimer(g_hwnd, TIMER_THROB, DRIP_MS, NULL);
-    if (!any && g_throb_on) KillTimer(g_hwnd, TIMER_THROB);
+    if (any && !g_throb_on) plat_timer(TIMER_THROB, DRIP_MS);
+    if (!any && g_throb_on) plat_kill_timer(TIMER_THROB);
     g_throb_on = any;
     /* the throbber moves on its timer's ticks; output only redraws on a change */
-    if ((tick && any) || changed) InvalidateRect(g_hwnd, NULL, FALSE);
+    if ((tick && any) || changed) plat_invalidate();
 }
 
 /* ── tab management ───────────────────────────────────────────────── */
 
 static void activate(int i) {
     if (i < 0 || i >= g_ntabs) return;
+    term_settle(&g_tabs[i]->t);  /* a tab not caught up since a resize: before it shows */
     g_active = i;
     tab_fit(g_tabs[i]);          /* still at an old size if the window changed while it was hidden */
     g_tabs[i]->activity = 0;
     g_tabs[i]->attention = 0;
     g_sel_on = 0;
     update_title();
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    plat_invalidate();
 }
 
-#define TIMER_SPARE 2
+static void schedule_spare(void) { plat_timer(TIMER_SPARE, 1000); }
 
-static void schedule_spare(void) { SetTimer(g_hwnd, TIMER_SPARE, 1000, NULL); }
+#ifdef _WIN32
+static int spare_ok(void) { return !g_shell_ps && !g_no_bash && g_have_distro; }
+static int tab_running(const Tab *tb) { return tb->proc != NULL; }
+#else
+static int spare_ok(void);       /* macOS: your shell is zsh or bash (they have the hook that waits) */
+static int tab_running(const Tab *tb) { return tb->fd >= 0; }
+#endif
 
 static void make_spare(void) {
-    if (g_spare || !g_ntabs || g_shell_ps || g_no_bash || !g_have_distro) return;
+    if (g_spare || !g_ntabs || !spare_ok()) return;
     g_spare = tab_create(g_start_dir, 1);
 }
 
@@ -3562,8 +3699,8 @@ static void new_tab_here(void) {
     int i;
     const char *dir = (cur && cur->t.cwd[0]) ? cur->t.cwd : cur ? cur->start_dir : g_start_dir;
     if (g_ntabs >= MAX_TABS) return;
-    /* the spare already has wsl.exe + bash + your profile up; it only needs a cd */
-    if (g_spare && !g_spare->exited && g_spare->proc) {
+    /* the spare already has its shell (and wsl.exe) and your profile up; it only needs a cd */
+    if (g_spare && !g_spare->exited && tab_running(g_spare)) {
         char lin[1100];
         tab_fit(g_spare);        /* before its prompt: the window may have changed since it was made */
         tb = g_spare;
@@ -3575,6 +3712,7 @@ static void new_tab_here(void) {
         tab_write(tb, lin, (int)strlen(lin));
         tab_drain(tb);
         tb->spare = 0;
+        tb->adopted = GetTickCount();
     } else if (g_spare) {
         tab_destroy_async(g_spare);
         g_spare = NULL;
@@ -3609,7 +3747,7 @@ static void close_tab(int i) {
     }
     tab_destroy_async(tb);
     if (!g_ntabs) {
-        DestroyWindow(g_hwnd);
+        plat_close_window();
         return;
     }
     if (g_active > i || g_active >= g_ntabs) g_active--;
@@ -3619,27 +3757,15 @@ static void close_tab(int i) {
 
 /* ── keyboard ──────────────────────────────────────────────────────── */
 
-static int mods_param(void) {
-    int m = 0;
-    if (GetKeyState(VK_SHIFT) & 0x8000) m |= 1;
-    if (GetKeyState(VK_MENU) & 0x8000) m |= 2;
-    if (GetKeyState(VK_CONTROL) & 0x8000) m |= 4;
-    return m ? m + 1 : 0;
-}
-
 static void scroll_view(int lines) {
     Tab *tb = active_tab();
     if (!tb || tb->t.alt) return;
+    term_settle(&tb->t);         /* scrolling back: the old lines at today's width first */
     tb->t.view += lines;
     if (tb->t.view > tb->t.hcount) tb->t.view = tb->t.hcount;
     if (tb->t.view < 0) tb->t.view = 0;
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    plat_invalidate();
 }
-
-static int auto_scale(void) { return g_dpi >= 144 ? (g_dpi + 48) / 96 : 1; }
-
-/* Returns 1 if the key was consumed (its WM_CHAR is then dropped). */
-static int help_key(Tab *tb, uint32_t c);
 
 /* Ctrl+Shift+J: the next tab that wants you. Claude blocked on a question
    first, then failures, then finished/rang (the bell). */
@@ -3662,6 +3788,7 @@ static void jump_mark(int dir) {
     int i;
     if (!tb) return;
     t = &tb->t;
+    term_settle(t);
     base = term_base(t);
     top = t->hpushed - t->view;
     if (dir < 0) {
@@ -3676,8 +3803,22 @@ static void jump_mark(int dir) {
         long long v = t->hpushed - target;
         t->view = v < 0 ? 0 : v > t->hcount ? t->hcount : (int)v;
     }
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    plat_invalidate();
 }
+
+#ifdef _WIN32
+static int mods_param(void) {
+    int m = 0;
+    if (GetKeyState(VK_SHIFT) & 0x8000) m |= 1;
+    if (GetKeyState(VK_MENU) & 0x8000) m |= 2;
+    if (GetKeyState(VK_CONTROL) & 0x8000) m |= 4;
+    return m ? m + 1 : 0;
+}
+
+static int auto_scale(void) { return g_dpi >= 144 ? (g_dpi + 48) / 96 : 1; }
+
+/* Returns 1 if the key was consumed (its WM_CHAR is then dropped). */
+static int help_key(Tab *tb, uint32_t c);
 
 static int handle_keydown(WPARAM vk) {
     int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -3795,7 +3936,11 @@ static void handle_char(WPARAM wc, int alt) {
     send_to_active(buf, n);
 }
 
+#endif /* _WIN32: keys */
+
 /* ── mouse ─────────────────────────────────────────────────────────── */
+
+enum { M_SHIFT = 1, M_ALT = 2, M_CTRL = 4 };   /* the modifiers a mouse report carries */
 
 static void mouse_cell(int mx, int my, int *col, int *row) {
     Tab *tb = active_tab();
@@ -3810,17 +3955,18 @@ static void mouse_cell(int mx, int my, int *col, int *row) {
     *row = r;
 }
 
-/* reports to an app that asked for the mouse (vim, htop, tmux...) */
-static int mouse_report(int button, int press, int motion, int mx, int my, WPARAM wp) {
+/* reports to an app that asked for the mouse (vim, htop, tmux...);
+   mods: M_SHIFT | M_ALT | M_CTRL. Shift means "this one is for selecting". */
+static int mouse_report(int button, int press, int motion, int mx, int my, int mods) {
     Tab *tb = active_tab();
     char buf[64];
     int col, row, b = button, n;
-    if (!tb || !tb->t.m_mouse || (wp & MK_SHIFT)) return 0;
+    if (!tb || !tb->t.m_mouse || (mods & M_SHIFT)) return 0;
     if (motion && tb->t.m_mouse != 1003 && !(tb->t.m_mouse == 1002 && button != 3)) return 1;
     if (motion && tb->t.m_mouse == 9) return 1;
     mouse_cell(mx, my, &col, &row);
-    if (wp & MK_CONTROL) b |= 16;
-    if (GetKeyState(VK_MENU) & 0x8000) b |= 8;
+    if (mods & M_CTRL) b |= 16;
+    if (mods & M_ALT) b |= 8;
     if (motion) b |= 32;
     if (tb->t.m_mouse_sgr) {
         n = snprintf(buf, sizeof(buf), "\x1b[<%d;%d;%d%c", b, col + 1, row + 1, press ? 'M' : 'm');
@@ -3880,6 +4026,7 @@ static int link_at(int col, int row, char *out, int cap) {
     }
 }
 
+#ifdef _WIN32
 /* file:///mnt/c/x opens C:\x; anything else goes to the default handler */
 static void open_url(const char *url) {
     wchar_t w[2048];
@@ -3898,6 +4045,9 @@ static void open_url(const char *url) {
     MultiByteToWideChar(CP_UTF8, 0, url, -1, w, 2048);
     ShellExecuteW(g_hwnd, L"open", w, NULL, NULL, SW_SHOWNORMAL);
 }
+#else
+static void open_url(const char *url);
+#endif
 
 static int is_word_char(uint32_t ch) {
     return ch > ' ' && !strchr("\"'`()[]{}<>|;,", (int)(ch < 128 ? ch : 'a'));
@@ -3928,10 +4078,427 @@ static void scrollbar_set(int my) {
     if (f < 0) f = 0;
     if (f > 1) f = 1;
     tb->t.view = (int)((1.0f - f) * tb->t.hcount);
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    plat_invalidate();
 }
 
+/* Parser-only replay of one file for conformance corpora: it goes through a
+   fresh terminal the way a pty would deliver it (ONLCR: \n → \r\n), then the
+   screen is written out, one right-trimmed line per row. */
+static void replay_one(FILE *out, FILE *f, int cols, int rows) {
+    Tab *tb = (Tab *)calloc(1, sizeof(Tab));
+    char line[8192];
+    unsigned char buf[65536];
+    size_t n, k;
+    int y;
+    if (!f || !tb || !term_init(&tb->t, cols, rows)) {
+        fprintf(out, "(cannot open)\n");
+        free(tb);
+        return;
+    }
+    vt_feed(&tb->t, (const unsigned char *)"\r\n\x1b" "c\x1b[H", 7);
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        size_t s = 0;
+        for (k = 0; k < n; k++)
+            if (buf[k] == '\n') {
+                vt_feed(&tb->t, buf + s, (int)(k - s));
+                vt_feed(&tb->t, (const unsigned char *)"\r\n", 2);
+                s = k + 1;
+            }
+        vt_feed(&tb->t, buf + s, (int)(n - s));
+    }
+    for (y = 0; y < rows; y++) {
+        int x, len = 0;
+        for (x = 0; x < cols; x++) {
+            Cell *c = &tb->t.row[tb->t.alt][y][x];
+            if (c->wflag == W_CONT) continue;
+            len += utf8_encode(c->ch ? c->ch : ' ', line + len);
+        }
+        while (len && (line[len - 1] == ' ' || line[len - 1] == '\t')) len--;
+        line[len] = 0;
+        fprintf(out, "%s\n", line);
+    }
+    term_free(&tb->t);
+    free(tb);
+}
+
+/* --bench-resize OUT: what a window drag costs the layout. A terminal with
+   full scrollback (HIST_LINES) of transcript-like text, mixed lengths, color
+   and CJK, many lines long enough to wrap, is reflowed through the sizes a
+   drag passes through, one step at a time, and each step is timed. */
+static double bench_now_ms(void);
+
+static void bench_fill(Term *t, int lines) {
+    static const char *words[] = {"the", "terminal", "Claude", "\x1b[1mbuild\x1b[0m", "\x1b[32mpassed\x1b[0m", "src/hardcore.c:2810",
+                                  "\x1b[38;2;255;166;13mwarning\x1b[0m", "日本語", "→", "✓", "reflow", "scrollback", "a", "of", "and"};
+    char line[2048];
+    unsigned seed = 1;
+    int i;
+    for (i = 0; i < lines; i++) {
+        int n = 0, len, w;
+        seed = seed * 1103515245u + 12345u;
+        len = (int)((seed >> 16) % 7 == 0 ? 200 + (seed >> 8) % 300 : (seed >> 16) % 110);   /* 1 in 7 lines wraps */
+        while (n < len && n < (int)sizeof(line) - 64) {
+            seed = seed * 1103515245u + 12345u;
+            w = (int)((seed >> 16) % (sizeof(words) / sizeof(words[0])));
+            n += snprintf(line + n, sizeof(line) - n, "%s ", words[w]);
+        }
+        n += snprintf(line + n, sizeof(line) - n, "\r\n");
+        vt_feed(t, (const unsigned char *)line, n);
+    }
+}
+
+static void bench_series(FILE *out, const char *name, Term **ts, int nt, const int (*sizes)[2], int n) {
+    double *v = (double *)malloc(sizeof(double) * n), total = 0, tmp;
+    int i, j, k;
+    for (i = 0; i < n; i++) {
+        double t0 = bench_now_ms();
+        for (k = 0; k < nt; k++) term_resize(ts[k], sizes[i][0], sizes[i][1]);   /* resize_all: every tab */
+        v[i] = bench_now_ms() - t0;
+        total += v[i];
+    }
+    for (i = 1; i < n; i++)      /* insertion sort: n is small */
+        for (j = i; j > 0 && v[j] < v[j - 1]; j--) { tmp = v[j]; v[j] = v[j - 1]; v[j - 1] = tmp; }
+    fprintf(out, "%-26s %4d steps  p50 %7.2f  p90 %7.2f  max %7.2f ms  total %8.1f ms\n", name, n, v[n / 2], v[n * 9 / 10], v[n - 1], total);
+    free(v);
+}
+
+/* --unit, both platforms: what each kind of row leaves in history (rlen
+   bookkeeping), and recycling past HIST_LINES. Returns the failures. */
+static int unit_scrollback(FILE *f) {
+    int fails = 0;
+    {   /* scrollback: what each kind of row leaves in history (rlen bookkeeping) */
+        static const struct { const char *in, *want; int n; } sb[] = {
+            {"abc\r\n", "abc", 3},
+            {"\x1b[41m\x1b[K\x1b[0m\r\n", "", 20},          /* colored blanks are kept */
+            {"abcdefghij\r\x1b[K\r\n", "", 0},
+            {"abcdefghij\x1b[5G\x1b[K\r\n", "abcd", 4},
+            {"abc\x1b[1G\x1b[2@\r\n", "  abc", 5},
+            {"abcdef\x1b[1G\x1b[2P\r\n", "cdef", 4},
+            {"\xe6\x97\xa5\xe6\x9c\xac\r\n", "\xe6\x97\xa5\xe6\x9c\xac", 4},
+            {"abcdefghijklmnopqrstuvwxyz\r\n", "abcdefghijklmnopqrst", 20},
+        };
+        int k;
+        for (k = 0; k < (int)(sizeof(sb) / sizeof(sb[0])); k++) {
+            Term t;
+            char got[256];
+            int len = 0, x, ok;
+            const HLine *h;
+            if (!term_init(&t, 20, 4)) return fails + 1;
+            vt_feed(&t, (const unsigned char *)sb[k].in, (int)strlen(sb[k].in));
+            vt_feed(&t, (const unsigned char *)"\x1b[4H\n\n\n\n", 8);   /* push it up into history */
+            h = t.hcount ? &t.hist[t.hstart] : NULL;
+            for (x = 0; h && x < h->n; x++)
+                if (h->c[x].wflag != W_CONT) len += utf8_encode(h->c[x].ch, got + len);
+            while (len && got[len - 1] == ' ') len--;
+            got[len] = 0;
+            ok = h && h->n == sb[k].n && !strcmp(got, sb[k].want);
+            fprintf(f, "%s hist  #%d n=%d \"%s\"\n", ok ? "ok  " : "FAIL", k, h ? h->n : -1, got);
+            fails += !ok;
+            term_free(&t);
+        }
+        {   /* past HIST_LINES: the oldest lines go, their buffers are reused */
+            Term t;
+            char line[32];
+            const HLine *h;
+            int ok;
+            if (!term_init(&t, 20, 4)) return fails + 1;
+            for (k = 0; k < HIST_LINES + 10; k++) {
+                int n = snprintf(line, sizeof(line), "line %d\r\n", k);
+                vt_feed(&t, (const unsigned char *)line, n);
+            }
+            h = &t.hist[(t.hstart + t.hcount - 1) % HIST_LINES];
+            ok = t.hcount == HIST_LINES && h->n == 10 && h->c[5].ch == '2' && h->c[9].ch == '6';   /* "line 20006" */
+            fprintf(f, "%s hist  recycled, count %d\n", ok ? "ok  " : "FAIL", t.hcount);
+            fails += !ok;
+            term_free(&t);
+        }
+    }
+    {   /* reflow: everything (history + screen) read back as text, one string per
+           logical line, must survive any sequence of widths unchanged; includes
+           a wide char that wraps at 20 cols and leaves a W_PAD gap */
+        static const char *feed =
+            "short\r\n"
+            "a line that is long enough to wrap several times at twenty columns wide\r\n"
+            "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e wide x\r\n"
+            "\r\n"
+            "a\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5 odd\r\n"
+            "tail line one\r\n"
+            "the last line also wraps around the edge of the screen";
+        static const int widths[] = {13, 7, 31, 20, 9, 40, 20};
+        char want[2048], got[2048];
+        Term t;
+        int w, ok = 1;
+        if (!term_init(&t, 20, 4)) return fails + 1;
+        vt_feed(&t, (const unsigned char *)feed, (int)strlen(feed));
+        for (w = -1; w < (int)(sizeof(widths) / sizeof(widths[0])); w++) {
+            int L, len = 0;
+            if (w >= 0) { term_resize(&t, widths[w], w % 2 ? 3 : 5); term_settle(&t); }
+            for (L = 0; L < t.hcount + t.rows; L++) {   /* logical lines, joined on wrapped */
+                const Cell *c;
+                int n, wr, x;
+                term_line(&t, L, &c, &n, &wr);
+                for (x = 0; c && x < n; x++)
+                    if (c[x].wflag != W_CONT && c[x].wflag != W_PAD) len += utf8_encode(c[x].ch, got + len);
+                if (!wr) {
+                    while (len > 0 && got[len - 1] == ' ') len--;
+                    got[len++] = '|';
+                }
+            }
+            while (len > 0 && (got[len - 1] == '|' || got[len - 1] == ' ')) len--;
+            got[len] = 0;
+            if (w < 0) memcpy(want, got, (size_t)len + 1);
+            else if (strcmp(want, got)) {
+                ok = 0;
+                fprintf(f, "FAIL reflow at %d cols:\n  want %s\n  got  %s\n", widths[w], want, got);
+            }
+        }
+        fprintf(f, "%s reflow through %d widths, history %d rows\n", ok ? "ok  " : "FAIL",
+                (int)(sizeof(widths) / sizeof(widths[0])), t.hcount);
+        fails += !ok;
+        term_free(&t);
+    }
+    {   /* a taller window pulls lines back out of history; shorter pushes them again */
+        Term t;
+        char line[32];
+        const Cell *c;
+        int k, n, wr, ok;
+        if (!term_init(&t, 20, 4)) return fails + 1;
+        for (k = 0; k < 10; k++) {
+            int m = snprintf(line, sizeof(line), k < 9 ? "L%d\r\n" : "L%d", k);
+            vt_feed(&t, (const unsigned char *)line, m);
+        }
+        term_resize(&t, 20, 8); term_settle(&t);
+        term_line(&t, t.hcount, &c, &n, &wr);            /* screen row 0 */
+        ok = t.hcount == 2 && n >= 2 && c[1].ch == '2' && t.cy == 7;
+        term_resize(&t, 20, 3); term_settle(&t);
+        term_resize(&t, 20, 8); term_settle(&t);
+        term_line(&t, t.hcount, &c, &n, &wr);
+        ok = ok && t.hcount == 2 && n >= 2 && c[1].ch == '2' && t.cy == 7;
+        fprintf(f, "%s reflow taller screen pulls history back (history %d, cursor row %d)\n", ok ? "ok  " : "FAIL", t.hcount, t.cy);
+        fails += !ok;
+        term_free(&t);
+    }
+    return fails;
+}
+
+/* --bench OUT COLS ROWS FILE: parser speed on a captured output stream
+   (HARDCORE_VTLOG on Windows), fed in 64 KB chunks the way the reader does;
+   HARDCORE_BENCH_CHUNK=N feeds N bytes at a time instead. */
+static int parse_bench(const char *out_path, int cols, int rows, const char *file) {
+    FILE *out = fopen(out_path, "wb"), *f = fopen(file, "rb");
+    Tab *tb = (Tab *)calloc(1, sizeof(Tab));
+    unsigned char *data;
+    long n, k;
+    int rep, best = 0, chunk = getenv("HARDCORE_BENCH_CHUNK") ? atoi(getenv("HARDCORE_BENCH_CHUNK")) : 65536;
+    double best_ms = 1e9;
+    if (!out || !f || !tb || !term_init(&tb->t, cols, rows) || chunk < 1) return 3;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    data = (unsigned char *)malloc((size_t)n);
+    if (!data || fread(data, 1, (size_t)n, f) != (size_t)n) return 3;
+    fclose(f);
+    for (rep = 0; rep < 5; rep++) {
+        double t0 = bench_now_ms(), ms;
+        for (k = 0; k < n; k += chunk) vt_feed(&tb->t, data + k, (int)(n - k < chunk ? n - k : chunk));
+        ms = bench_now_ms() - t0;
+        fprintf(out, "run %d: %.1f ms\n", rep, ms);
+        if (ms < best_ms) { best_ms = ms; best = rep; }
+    }
+    fprintf(out, "%.1f MB in %.1f ms best of 5 (run %d): %.1f MB/s\n", n / 1e6, best_ms, best, n / 1e3 / best_ms);
+    fclose(out);
+    return 0;
+}
+
+#define BENCH_TABS 16             /* the stress case: this many tabs, each with full scrollback */
+
+/* 1 if two terminals hold the same text: every screen row and every
+   scrollback line they both still have (counted from the newest), the wraps
+   and the cursor. *extra = how many more old lines a kept than b. */
+static int term_same(const Term *a, const Term *b, int *extra) {
+    int L, x, d = a->hcount - b->hcount;
+    *extra = d;
+    if (d < 0 || a->cols != b->cols || a->rows != b->rows || a->cx != b->cx || a->cy != b->cy) return 0;
+    for (L = 0; L < b->hcount + b->rows; L++) {
+        const Cell *ca, *cb;
+        int na, nb, wa, wb;
+        term_line(a, L + d, &ca, &na, &wa);
+        term_line(b, L, &cb, &nb, &wb);
+        if (!wa != !wb) return 0;
+        for (x = 0; x < (na > nb ? na : nb); x++) {
+            uint32_t ch_a = x < na ? ca[x].ch : ' ', ch_b = x < nb ? cb[x].ch : ' ';
+            uint32_t fg_a = x < na ? ca[x].fg : 0, fg_b = x < nb ? cb[x].fg : 0;
+            if (ch_a != ch_b || fg_a != fg_b) return 0;
+        }
+    }
+    return 1;
+}
+
+/* The text of every logical line (wrapped rows joined), one per line: what
+   a resize must never change */
+static char *term_text(const Term *t) {
+    size_t cap = 1 << 20, n = 0;
+    char *out = (char *)malloc(cap);
+    int L, x;
+    for (L = 0; L < t->hcount + t->rows; L++) {
+        const Cell *c;
+        int len, wrapped;
+        term_line(t, L, &c, &len, &wrapped);
+        if (wrapped && len > wrapped) len = wrapped;
+        if (!wrapped) while (len > 0 && c[len - 1].ch == ' ') len--;
+        for (x = 0; x < len; x++) {
+            if (c[x].wflag == W_CONT) continue;
+            if (n + 8 >= cap) out = (char *)realloc(out, cap *= 2);
+            n += utf8_encode(c[x].ch ? c[x].ch : ' ', out + n);
+        }
+        if (wrapped && len < wrapped) for (; x < wrapped; x++) out[n++] = ' ';   /* trimmed, but text */
+        if (!wrapped) {
+            if (n + 2 >= cap) out = (char *)realloc(out, cap *= 2);
+            out[n++] = '\n';
+        }
+    }
+    out[n] = 0;
+    return out;
+}
+
+/* Resizing through many widths and back gives back the same text: no space
+   gained or lost at a wrap (wide chars at the edge, trailing blanks). */
+static int reflow_roundtrip(void) {
+    Term *a = (Term *)calloc(1, sizeof(Tab)), *b = (Term *)calloc(1, sizeof(Tab));
+    char *ta, *tb;
+    int i, same;
+    if (!a || !b || !term_init(a, 120, 40) || !term_init(b, 120, 40)) return 0;
+    bench_fill(a, 3000);
+    bench_fill(b, 3000);
+    for (i = 0; i < 60; i++) term_resize(a, 120 - (i * 37) % 70, 40 - i % 9);
+    term_resize(a, 120, 40);
+    term_settle(a);
+    ta = term_text(a);
+    tb = term_text(b);
+    same = !strcmp(ta, tb);
+    free(ta);
+    free(tb);
+    term_free(a);
+    term_free(b);
+    free(a);
+    free(b);
+    return same;
+}
+
+/* Tail-only reflow plus term_settle gives exactly what rewrapping everything
+   at every step gives: the same drag on two full terminals, compared. With
+   full scrollback the old way also lost the oldest lines at every narrowing
+   step (they overflowed HIST_LINES); the tail-only way keeps them, so it may
+   hold more: *extra says how many. */
+static int reflow_check(int lines, int *extra) {
+    Term *a = (Term *)calloc(1, sizeof(Tab)), *b = (Term *)calloc(1, sizeof(Tab));
+    int i, same;
+    if (!a || !b || !term_init(a, 120, 40) || !term_init(b, 120, 40)) return 0;
+    bench_fill(a, lines);
+    bench_fill(b, lines);
+    for (i = 0; i < 60; i++) {   /* narrower, shorter, then back out past where it started */
+        int c = i < 30 ? 120 - i * 2 : 60 + (i - 30) * 3, r = i < 30 ? 40 - i / 3 : 30 + (i - 30) / 2;
+        term_resize(a, c, r);
+        g_reflow_all = 1;
+        term_resize(b, c, r);
+        g_reflow_all = 0;
+    }
+    term_settle(a);
+    same = term_same(a, b, extra) && a->hist_cols == a->cols && !a->hist_stale;
+    term_free(a);
+    term_free(b);
+    free(a);
+    free(b);
+    return same;
+}
+
+static int bench_resize(const char *out_path) {
+    static int drag[240][2], tall[120][2], wide[120][2];
+    Term *ts[BENCH_TABS];
+    FILE *out = fopen(out_path, "wb");
+    int i, k;
+    double t0;
+    if (!out) return 3;
+    for (k = 0; k < BENCH_TABS; k++) {
+        ts[k] = (Term *)calloc(1, sizeof(Tab));   /* a Tab's worth: the parser's replies look for one */
+        if (!ts[k] || !term_init(ts[k], 120, 40)) return 3;
+        t0 = bench_now_ms();
+        bench_fill(ts[k], HIST_LINES + 40);
+        if (!k) fprintf(out, "filled %d lines of scrollback + %dx%d screen in %.1f ms\n", ts[k]->hcount, ts[k]->cols, ts[k]->rows, bench_now_ms() - t0);
+    }
+    for (i = 0; i < 240; i++) {  /* a corner drag: narrower and shorter, then wider and taller */
+        int d = i < 120 ? i : 239 - i;
+        drag[i][0] = 120 - d / 2 - (i & 1);   /* every step a new size, as a drag delivers them */
+        drag[i][1] = 40 - d / 6;
+    }
+    for (i = 0; i < 120; i++) {
+        tall[i][0] = 120;        /* the bottom edge only: the width never changes */
+        tall[i][1] = 40 - (i < 60 ? i / 3 : (119 - i) / 3) - (i & 1);
+        wide[i][0] = 120 - (i < 60 ? i : 119 - i);   /* the side edge only */
+        wide[i][1] = 40;
+    }
+    {
+        int e1, e2, ok1 = reflow_check(5000, &e1), ok2 = reflow_check(HIST_LINES + 40, &e2);
+        fprintf(out, "tail reflow + settle == full reflow: %s (5,000 lines), %s (full scrollback; it kept %d more old lines)\n",
+                ok1 && !e1 ? "yes" : "NO", ok2 ? "yes" : "NO", e2);
+    }
+    fprintf(out, "60 resizes and back == never resized: %s\n", reflow_roundtrip() ? "yes" : "NO");
+    for (k = 1; k <= BENCH_TABS; k *= BENCH_TABS) {
+        char name[64];
+        double t1;
+        fprintf(out, "-- %d tab%s, each with full scrollback\n", k, k > 1 ? "s" : "");
+        snprintf(name, sizeof(name), "corner drag (cols+rows)");
+        bench_series(out, name, ts, k, drag, 240);
+        bench_series(out, "bottom edge (rows only)", ts, k, tall, 120);
+        bench_series(out, "side edge (cols only)", ts, k, wide, 120);
+        bench_series(out, "corner drag (cols+rows)", ts, k, drag, 240);   /* leave it narrower than it started */
+        t1 = bench_now_ms();
+        {
+            int j, did = 0;
+            for (j = 0; j < k; j++) did += term_settle(ts[j]);
+            fprintf(out, "%-26s %4d tabs   once, after the drag: %.2f ms\n", "settle (rest of history)", did, bench_now_ms() - t1);
+        }
+    }
+    fclose(out);
+    for (k = 0; k < BENCH_TABS; k++) {
+        term_free(ts[k]);
+        free(ts[k]);
+    }
+    return 0;
+}
+
+#ifdef _WIN32
 /* ── window procedure ─────────────────────────────────────────────── */
+
+static void plat_invalidate(void) { InvalidateRect(g_hwnd, NULL, FALSE); }
+static void plat_timer(int id, int ms) { SetTimer(g_hwnd, (UINT_PTR)id, (UINT)ms, NULL); }
+static void plat_kill_timer(int id) { KillTimer(g_hwnd, (UINT_PTR)id); }
+static void plat_set_title(const wchar_t *title) { SetWindowTextW(g_hwnd, title); }
+static void plat_close_window(void) { DestroyWindow(g_hwnd); }
+
+static void plat_client_size(int *w, int *h) {
+    RECT r = {0, 0, 0, 0};
+    if (g_hwnd) GetClientRect(g_hwnd, &r);
+    *w = r.right;
+    *h = r.bottom;
+}
+
+static void plat_flash(void) {
+    FLASHWINFO fi = {sizeof(fi), g_hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0};
+    FlashWindowEx(&fi);
+}
+
+static void tab_set_size(Tab *tb, int cols, int rows) {
+    COORD sz;
+    sz.X = (SHORT)cols;
+    sz.Y = (SHORT)rows;
+    if (tb->hpc) pResizePC(tb->hpc, sz);
+}
+
+static int mouse_mods(WPARAM wp) {
+    return ((wp & MK_SHIFT) ? M_SHIFT : 0) | ((wp & MK_CONTROL) ? M_CTRL : 0) |
+           ((GetKeyState(VK_MENU) & 0x8000) ? M_ALT : 0);
+}
 
 static void save_window_size(void) {
     RECT r;
@@ -4035,6 +4602,62 @@ static int metric_for(HWND h, int index) {
 static int frame_thickness(HWND h) {
     return metric_for(h, SM_CYFRAME) + metric_for(h, 92 /* SM_CXPADDEDBORDER */);
 }
+/* --reflow-bench OUT: a full scrollback (HIST_LINES colored lines of mixed
+   length, many wider than the window) at 178x55, then a drag: width steps
+   down to 100 and back, then height steps, timing each term_resize. */
+static int reflow_bench(const char *out_path) {
+    FILE *out = fopen(out_path, "wb");
+    Term t;
+    char line[1024];
+    int i, k, w;
+    double sum_w = 0, max_w = 0, sum_h = 0, max_h = 0;
+    int n_w = 0, n_h = 0, cycles = _wgetenv(L"HARDCORE_BENCH_CYCLES") ? _wtoi(_wgetenv(L"HARDCORE_BENCH_CYCLES")) : 1;
+    unsigned seed = 1;
+    if (!out || !term_init(&t, 178, 55)) return 3;
+    QueryPerformanceFrequency(&g_qpf);
+    for (i = 0; i < HIST_LINES + 55; i++) {
+        int len, n = 0;
+        seed = seed * 1103515245u + 12345u;
+        len = (int)((seed >> 16) % 400);           /* 0..399 chars: up to 3 rows at 178 */
+        n += snprintf(line + n, sizeof(line) - n, "\x1b[3%dm%06d ", i % 8, i);
+        for (k = 0; k < len && n < (int)sizeof(line) - 16; k++) line[n++] = (char)('a' + (k * 7 + i) % 26);
+        n += snprintf(line + n, sizeof(line) - n, "\x1b[0m\r\n");
+        vt_feed(&t, (const unsigned char *)line, n);
+    }
+    fprintf(out, "history %d lines at %dx%d\n", t.hcount, t.cols, t.rows);
+    for (k = 0; k < 2 * cycles; k++) {
+        for (w = (k % 2 ? 100 : 176); k % 2 ? w <= 178 : w >= 100; w += k % 2 ? 2 : -2) {   /* width drag */
+            LARGE_INTEGER a, b;
+            double ms;
+            QueryPerformanceCounter(&a);
+            term_resize(&t, w, 55);
+            QueryPerformanceCounter(&b);
+            ms = lat_ms(a, b);
+            sum_w += ms; n_w++;
+            if (ms > max_w) max_w = ms;
+        }
+    }
+    for (k = 0; k < 2; k++) {
+        int h;
+        for (h = (k ? 20 : 54); k ? h <= 55 : h >= 20; h += k ? 1 : -1) {      /* height drag */
+            LARGE_INTEGER a, b;
+            double ms;
+            QueryPerformanceCounter(&a);
+            term_resize(&t, 178, h);
+            QueryPerformanceCounter(&b);
+            ms = lat_ms(a, b);
+            sum_h += ms; n_h++;
+            if (ms > max_h) max_h = ms;
+        }
+    }
+    fprintf(out, "width steps:  %d, avg %.2f ms, max %.2f ms\n", n_w, sum_w / n_w, max_w);
+    fprintf(out, "height steps: %d, avg %.2f ms, max %.2f ms\n", n_h, sum_h / n_h, max_h);
+    fprintf(out, "after: history %d lines at %dx%d\n", t.hcount, t.cols, t.rows);
+    term_free(&t);
+    fclose(out);
+    return 0;
+}
+
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -4227,7 +4850,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_DISK) { check_disk(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
-        else InvalidateRect(hwnd, NULL, FALSE);
+        else if (wp == TIMER_SETTLE) settle_all();
+        InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) {
@@ -4242,7 +4866,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_gfx_ready) paint_now();
             else InvalidateRect(hwnd, NULL, FALSE);
             QueryPerformanceCounter(&d);
-            fit_rest_later();
             if (g_perf) {
                 fprintf(g_perf, "resize %dx%d: buffers %.2f ms  terminal %.2f ms  frame %.2f ms  (build %.2f present %.2f)\n",
                         LOWORD(lp), HIWORD(lp), lat_ms(a, b), lat_ms(b, c), lat_ms(c, d), g_pf_last_build, g_pf_last_present);
@@ -4250,16 +4873,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return 0;
-    case WM_ENTERSIZEMOVE:
-        g_in_sizemove = 1;
-        return 0;
     case WM_EXITSIZEMOVE:
-        g_in_sizemove = 0;
-        fit_rest_later();
         save_window_size();
-        return 0;
-    case WM_APP_FIT:
-        fit_next();
         return 0;
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mm = (MINMAXINFO *)lp;
@@ -4393,9 +5008,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (!on_bar && (wp & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON)))
-            mouse_report((wp & MK_LBUTTON) ? 0 : (wp & MK_MBUTTON) ? 1 : 2, 1, 1, mx, my, wp);
+            mouse_report((wp & MK_LBUTTON) ? 0 : (wp & MK_MBUTTON) ? 1 : 2, 1, 1, mx, my, mouse_mods(wp));
         else if (!on_bar && tb && tb->t.m_mouse == 1003)
-            mouse_report(3, 1, 1, mx, my, wp);
+            mouse_report(3, 1, 1, mx, my, mouse_mods(wp));
         return 0;
     }
     case WM_MOUSELEAVE:
@@ -4425,7 +5040,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char url[2048];
             if (link_at(col, row, url, sizeof(url))) { open_url(url); return 0; }
         }
-        if (mouse_report(0, 1, 0, mx, my, wp)) return 0;
+        if (mouse_report(0, 1, 0, mx, my, mouse_mods(wp))) return 0;
         if (msg == WM_LBUTTONDBLCLK) {
             select_word(col, row);
             InvalidateRect(hwnd, NULL, FALSE);
@@ -4445,7 +5060,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ReleaseCapture();
             return 0;
         }
-        mouse_report(0, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp);
+        mouse_report(0, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_MBUTTONDOWN: {
         int idx = -1;
@@ -4454,15 +5069,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             close_tab(idx);
             return 0;
         }
-        mouse_report(1, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp);
+        mouse_report(1, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     }
     case WM_MBUTTONUP:
-        mouse_report(1, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp);
+        mouse_report(1, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_RBUTTONDOWN:
         if (GET_X_LPARAM(lp) < sidebar_w()) return 0;
-        if (mouse_report(2, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp)) return 0;
+        if (mouse_report(2, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp))) return 0;
         /* conhost habit: right-click copies a selection, or pastes */
         if (g_sel_on) {
             sel_copy();
@@ -4471,7 +5086,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else paste();
         return 0;
     case WM_RBUTTONUP:
-        mouse_report(2, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), wp);
+        mouse_report(2, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_MOUSEWHEEL: {
         short delta = (short)HIWORD(wp);
@@ -4483,7 +5098,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!tb) return 0;
         if (tb->t.m_mouse && !(GET_KEYSTATE_WPARAM(wp) & MK_SHIFT)) {
             for (i = 0; i < abs(notches); i++)
-                mouse_report(notches > 0 ? 64 : 65, 1, 0, pt.x, pt.y, GET_KEYSTATE_WPARAM(wp));
+                mouse_report(notches > 0 ? 64 : 65, 1, 0, pt.x, pt.y, mouse_mods(GET_KEYSTATE_WPARAM(wp)));
         } else if (tb->t.alt) {
             /* alternate scroll: less, man, git log scroll with the wheel */
             const char *seq = notches > 0 ? (tb->t.m_appcursor ? "\x1bOA" : "\x1b[A") : (tb->t.m_appcursor ? "\x1bOB" : "\x1b[B");
@@ -4674,119 +5289,7 @@ static int unit_tests(const char *out_path) {
         fprintf(f, "%s drop  %s\n", strcmp(a, b) ? "FAIL" : "ok  ", a);
         fails += strcmp(a, b) != 0;
     }
-    {   /* scrollback: what each kind of row leaves in history (rlen bookkeeping) */
-        static const struct { const char *in, *want; int n; } sb[] = {
-            {"abc\r\n", "abc", 3},
-            {"\x1b[41m\x1b[K\x1b[0m\r\n", "", 20},          /* colored blanks are kept */
-            {"abcdefghij\r\x1b[K\r\n", "", 0},
-            {"abcdefghij\x1b[5G\x1b[K\r\n", "abcd", 4},
-            {"abc\x1b[1G\x1b[2@\r\n", "  abc", 5},
-            {"abcdef\x1b[1G\x1b[2P\r\n", "cdef", 4},
-            {"\xe6\x97\xa5\xe6\x9c\xac\r\n", "\xe6\x97\xa5\xe6\x9c\xac", 4},
-            {"abcdefghijklmnopqrstuvwxyz\r\n", "abcdefghijklmnopqrst", 20},
-        };
-        int k;
-        for (k = 0; k < (int)(sizeof(sb) / sizeof(sb[0])); k++) {
-            Term t;
-            char got[256];
-            int len = 0, x, ok;
-            const Cell *cells = NULL;
-            int n = -1, wr;
-            if (!term_init(&t, 20, 4)) return 3;
-            vt_feed(&t, (const unsigned char *)sb[k].in, (int)strlen(sb[k].in));
-            vt_feed(&t, (const unsigned char *)"\x1b[4H\n\n\n\n", 8);   /* push it up into history */
-            if (t.hcount) term_line(&t, 0, &cells, &n, &wr);
-            for (x = 0; cells && x < n; x++)
-                if (cells[x].wflag != W_CONT) len += utf8_encode(cells[x].ch, got + len);
-            while (len && got[len - 1] == ' ') len--;
-            got[len] = 0;
-            ok = (cells || !n) && t.hcount && n == sb[k].n && !strcmp(got, sb[k].want);
-            fprintf(f, "%s hist  #%d n=%d \"%s\"\n", ok ? "ok  " : "FAIL", k, n, got);
-            fails += !ok;
-            term_free(&t);
-        }
-        {   /* past HIST_LINES: the oldest lines go, their buffers are reused */
-            Term t;
-            char line[32];
-            const Cell *c;
-            int ok, n, wr;
-            if (!term_init(&t, 20, 4)) return 3;
-            for (k = 0; k < HIST_LINES + 10; k++) {
-                n = snprintf(line, sizeof(line), "line %d\r\n", k);
-                vt_feed(&t, (const unsigned char *)line, n);
-            }
-            term_line(&t, t.hcount - 1, &c, &n, &wr);
-            ok = t.hcount == HIST_LINES && n == 10 && c[5].ch == '2' && c[9].ch == '6';   /* "line 20006" */
-            fprintf(f, "%s hist  recycled, count %d\n", ok ? "ok  " : "FAIL", t.hcount);
-            fails += !ok;
-            term_free(&t);
-        }
-        {   /* reflow: everything (history + screen) read back as text, one string per
-               logical line, must survive any sequence of widths unchanged */
-            static const char *feed =
-                "short\r\n"
-                "a line that is long enough to wrap several times at twenty columns wide\r\n"
-                "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e wide x\r\n"
-                "\r\n"
-                "a\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5 odd\r\n"   /* wraps with a pad cell at 20 */
-                "tail line one\r\n"
-                "the last line also wraps around the edge of the screen";
-            static const int widths[] = {13, 7, 31, 20, 9, 40, 20};
-            char want[2048], got[2048];
-            Term t;
-            int w, ok = 1;
-            if (!term_init(&t, 20, 4)) return 3;
-            vt_feed(&t, (const unsigned char *)feed, (int)strlen(feed));
-            for (w = -1; w < (int)(sizeof(widths) / sizeof(widths[0])); w++) {
-                int L, len = 0;
-                if (w >= 0) term_resize(&t, widths[w], w % 2 ? 3 : 5);
-                for (L = 0; L < t.hcount + t.rows; L++) {   /* logical lines, joined on wrapped */
-                    const Cell *c;
-                    int n, wr, x, keep = len;
-                    term_line(&t, L, &c, &n, &wr);
-                    for (x = 0; c && x < n; x++)
-                        if (c[x].wflag != W_CONT && c[x].wflag != W_PAD) len += utf8_encode(c[x].ch, got + len);
-                    if (!wr) {
-                        while (len > keep && got[len - 1] == ' ') len--;
-                        while (len > 0 && got[len - 1] == ' ') len--;
-                        got[len++] = '|';
-                    }
-                }
-                while (len > 0 && (got[len - 1] == '|' || got[len - 1] == ' ')) len--;
-                got[len] = 0;
-                if (w < 0) memcpy(want, got, (size_t)len + 1);
-                else if (strcmp(want, got)) {
-                    ok = 0;
-                    fprintf(f, "FAIL reflow at %d cols:\n  want %s\n  got  %s\n", widths[w], want, got);
-                }
-            }
-            fprintf(f, "%s reflow through %d widths, history %d rows, cursor %d,%d\n", ok ? "ok  " : "FAIL",
-                    (int)(sizeof(widths) / sizeof(widths[0])), t.hcount, t.cx, t.cy);
-            fails += !ok;
-            term_free(&t);
-        }
-    }
-    {   /* a taller window pulls lines back out of history; shorter pushes them again */
-        Term t;
-        char line[32];
-        const Cell *c;
-        int k, n, wr, ok;
-        if (!term_init(&t, 20, 4)) return 3;
-        for (k = 0; k < 10; k++) {
-            int m = snprintf(line, sizeof(line), k < 9 ? "L%d\r\n" : "L%d", k);
-            vt_feed(&t, (const unsigned char *)line, m);
-        }
-        term_resize(&t, 20, 8);
-        term_line(&t, t.hcount, &c, &n, &wr);            /* screen row 0 */
-        ok = t.hcount == 2 && n >= 2 && c[1].ch == '2' && t.cy == 7;
-        term_resize(&t, 20, 3);
-        term_resize(&t, 20, 8);
-        term_line(&t, t.hcount, &c, &n, &wr);
-        ok = ok && t.hcount == 2 && n >= 2 && c[1].ch == '2' && t.cy == 7;
-        fprintf(f, "%s reflow taller screen pulls history back (history %d, cursor row %d)\n", ok ? "ok  " : "FAIL", t.hcount, t.cy);
-        fails += !ok;
-        term_free(&t);
-    }
+    fails += unit_scrollback(f);
     for (i = 0; i < (int)(sizeof(urls) / sizeof(urls[0])); i++) {
         char got[256] = "";
         int hit = url_in_word(urls[i].word, urls[i].at, got, sizeof(got));
@@ -4794,147 +5297,38 @@ static int unit_tests(const char *out_path) {
         fprintf(f, "%s url   %s @%d -> %s\n", ok ? "ok  " : "FAIL", urls[i].word, urls[i].at, hit ? got : "(none)");
         fails += !ok;
     }
+    {
+        int e, ok = reflow_check(5000, &e) && !e, rt = reflow_roundtrip();
+        fprintf(f, "%s reflow tail-only + settle == full reflow\n", ok ? "ok  " : "FAIL");
+        fprintf(f, "%s reflow 60 resizes and back == never resized\n", rt ? "ok  " : "FAIL");
+        fails += !ok + !rt;
+    }
     fprintf(f, "%d failed\n", fails);
     fclose(f);
     return fails ? 1 : 0;
 }
 
-/* --bench OUT COLS ROWS FILE: parser speed on a captured ConPTY stream (see
-   HARDCORE_VTLOG), fed in 64 KB chunks the way the reader thread does. */
-/* --reflow-bench OUT: a full scrollback (HIST_LINES colored lines of mixed
-   length, many wider than the window) at 178x55, then a drag: width steps
-   down to 100 and back, then height steps, timing each term_resize. */
-static int reflow_bench(const char *out_path) {
-    FILE *out = fopen(out_path, "wb");
-    Term t;
-    char line[1024];
-    int i, k, w;
-    double sum_w = 0, max_w = 0, sum_h = 0, max_h = 0;
-    int n_w = 0, n_h = 0, cycles = _wgetenv(L"HARDCORE_BENCH_CYCLES") ? _wtoi(_wgetenv(L"HARDCORE_BENCH_CYCLES")) : 1;
-    unsigned seed = 1;
-    if (!out || !term_init(&t, 178, 55)) return 3;
-    QueryPerformanceFrequency(&g_qpf);
-    for (i = 0; i < HIST_LINES + 55; i++) {
-        int len, n = 0;
-        seed = seed * 1103515245u + 12345u;
-        len = (int)((seed >> 16) % 400);           /* 0..399 chars: up to 3 rows at 178 */
-        n += snprintf(line + n, sizeof(line) - n, "\x1b[3%dm%06d ", i % 8, i);
-        for (k = 0; k < len && n < (int)sizeof(line) - 16; k++) line[n++] = (char)('a' + (k * 7 + i) % 26);
-        n += snprintf(line + n, sizeof(line) - n, "\x1b[0m\r\n");
-        vt_feed(&t, (const unsigned char *)line, n);
-    }
-    fprintf(out, "history %d lines at %dx%d\n", t.hcount, t.cols, t.rows);
-    for (k = 0; k < 2 * cycles; k++) {
-        for (w = (k % 2 ? 100 : 176); k % 2 ? w <= 178 : w >= 100; w += k % 2 ? 2 : -2) {   /* width drag */
-            LARGE_INTEGER a, b;
-            double ms;
-            QueryPerformanceCounter(&a);
-            term_resize(&t, w, 55);
-            QueryPerformanceCounter(&b);
-            ms = lat_ms(a, b);
-            sum_w += ms; n_w++;
-            if (ms > max_w) max_w = ms;
-        }
-    }
-    for (k = 0; k < 2; k++) {
-        int h;
-        for (h = (k ? 20 : 54); k ? h <= 55 : h >= 20; h += k ? 1 : -1) {      /* height drag */
-            LARGE_INTEGER a, b;
-            double ms;
-            QueryPerformanceCounter(&a);
-            term_resize(&t, 178, h);
-            QueryPerformanceCounter(&b);
-            ms = lat_ms(a, b);
-            sum_h += ms; n_h++;
-            if (ms > max_h) max_h = ms;
-        }
-    }
-    fprintf(out, "width steps:  %d, avg %.2f ms, max %.2f ms\n", n_w, sum_w / n_w, max_w);
-    fprintf(out, "height steps: %d, avg %.2f ms, max %.2f ms\n", n_h, sum_h / n_h, max_h);
-    fprintf(out, "after: history %d lines at %dx%d\n", t.hcount, t.cols, t.rows);
-    term_free(&t);
-    fclose(out);
-    return 0;
-}
-
-static int parse_bench(const char *out_path, int cols, int rows, const wchar_t *file) {
-    FILE *out = fopen(out_path, "wb"), *f = _wfopen(file, L"rb");
-    Tab *tb = (Tab *)calloc(1, sizeof(Tab));
-    unsigned char *data;
-    long n, k;
-    int rep, best = 0, chunk = _wgetenv(L"HARDCORE_BENCH_CHUNK") ? _wtoi(_wgetenv(L"HARDCORE_BENCH_CHUNK")) : 65536;
-    double best_ms = 1e9;
-    if (!out || !f || !tb || !term_init(&tb->t, cols, rows)) return 3;
-    fseek(f, 0, SEEK_END);
-    n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    data = (unsigned char *)malloc((size_t)n);
-    if (!data || fread(data, 1, (size_t)n, f) != (size_t)n) return 3;
-    fclose(f);
-    QueryPerformanceFrequency(&g_qpf);
-    for (rep = 0; rep < 5; rep++) {
-        LARGE_INTEGER a, b;
-        double ms;
-        QueryPerformanceCounter(&a);
-        for (k = 0; k < n; k += chunk) vt_feed(&tb->t, data + k, (int)(n - k < chunk ? n - k : chunk));
-        QueryPerformanceCounter(&b);
-        ms = lat_ms(a, b);
-        fprintf(out, "run %d: %.1f ms\n", rep, ms);
-        if (ms < best_ms) { best_ms = ms; best = rep; }
-    }
-    fprintf(out, "%.1f MB in %.1f ms best of 5 (run %d): %.1f MB/s\n", n / 1e6, best_ms, best, n / 1e3 / best_ms);
-    fclose(out);
-    return 0;
-}
-
-/* Parser-only replay for conformance corpora: each input file goes through a
-   fresh terminal the way a pty would deliver it (ONLCR: \n → \r\n), then the
-   screen is written out, one right-trimmed line per row. */
 static int replay(const char *out_path, int cols, int rows, wchar_t **files, int nfiles) {
     FILE *out = fopen(out_path, "wb");
     int i;
     if (!out) return 3;
     for (i = 0; i < nfiles; i++) {
-        Tab *tb = (Tab *)calloc(1, sizeof(Tab));
         FILE *f = _wfopen(files[i], L"rb");
-        char name[MAX_PATH * 3], line[8192];
-        unsigned char buf[65536];
-        size_t n, k;
-        int y;
+        char name[MAX_PATH * 3];
         WideCharToMultiByte(CP_UTF8, 0, files[i], -1, name, sizeof(name), NULL, NULL);
         fprintf(out, "=== %s\n", name);
-        if (!f || !tb || !term_init(&tb->t, cols, rows)) {
-            fprintf(out, "(cannot open)\n");
-            continue;
-        }
-        vt_feed(&tb->t, (const unsigned char *)"\r\n\x1b" "c\x1b[H", 7);
-        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-            size_t s = 0;
-            for (k = 0; k < n; k++)
-                if (buf[k] == '\n') {
-                    vt_feed(&tb->t, buf + s, (int)(k - s));
-                    vt_feed(&tb->t, (const unsigned char *)"\r\n", 2);
-                    s = k + 1;
-                }
-            vt_feed(&tb->t, buf + s, (int)(n - s));
-        }
-        fclose(f);
-        for (y = 0; y < rows; y++) {
-            int x, len = 0;
-            for (x = 0; x < cols; x++) {
-                Cell *c = &tb->t.row[tb->t.alt][y][x];
-                if (c->wflag == W_CONT) continue;
-                len += utf8_encode(c->ch ? c->ch : ' ', line + len);
-            }
-            while (len && (line[len - 1] == ' ' || line[len - 1] == '\t')) len--;
-            line[len] = 0;
-            fprintf(out, "%s\n", line);
-        }
-        term_free(&tb->t);
-        free(tb);
+        replay_one(out, f, cols, rows);
+        if (f) fclose(f);
     }
     fclose(out);
     return 0;
+}
+
+static double bench_now_ms(void) {
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
@@ -4990,6 +5384,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             char out[MAX_PATH * 3];
             WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
             return unit_tests(out);
+        } else if (!strcmp(a, "--bench-resize") && i + 1 < argc) {
+            char out[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
+            return bench_resize(out);
         } else if (!strcmp(a, "--no-activate")) {
             show = SW_SHOWNOACTIVATE;       /* tests: open behind, never take the keyboard */
         } else if (!strcmp(a, "--inbox-conpty")) {
@@ -5001,7 +5399,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         } else if (!strcmp(a, "--bench") && i + 4 < argc) {
             char out[MAX_PATH * 3];
             WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
-            return parse_bench(out, _wtoi(argv[i + 2]), _wtoi(argv[i + 3]), argv[i + 4]);
+            char in[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, argv[i + 4], -1, in, sizeof(in), NULL, NULL);
+            return parse_bench(out, _wtoi(argv[i + 2]), _wtoi(argv[i + 3]), in);
         } else if (!strcmp(a, "--replay") && i + 3 < argc) {
             /* --replay OUT COLS ROWS FILE... */
             char out[MAX_PATH * 3];
@@ -5079,3 +5479,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     LocalFree(argv);
     return 0;
 }
+#endif /* _WIN32 */
+
+#ifdef __APPLE__
+#include "hardcore_mac.m"
+#endif

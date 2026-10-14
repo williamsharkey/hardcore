@@ -4,3 +4,5 @@ build/
 selftest.txt
 bench/*.exe
 !vendor/conpty/*.exe
+hardcore.app/
+bench/macbench

@@ -179,20 +179,22 @@ Opening the `/` menu is one 579–1,285-byte frame. So typing costs the parser a
 nothing, and hardcore redraws the whole screen each frame anyway (~0.3 ms). The heavy
 cases are streaming replies and resizing.
 
-**Scrollback is now stored as logical lines.** Each history entry is a whole
-unwrapped line, plus the number of rows it takes at the current width and its first
-row. `term_line()` finds a row by binary search and slices it out. A resize recounts
-rows (integer math) and rewraps only the screen, plus the line that runs from
-history onto it. A taller window takes whole lines back out of history to fill the
-screen, as before. The blank a wide char leaves in the last column when it wraps is
-marked (`W_PAD`) and dropped when rows are joined, so CJK text reflows without
-stray spaces.
+**Resizing with full scrollback.** Merged with the macOS port's fix (see
+[RESULTS-mac.md](RESULTS-mac.md#resizing-with-full-scrollback)):
+- Each drag step rewraps only the newest 500 lines plus the screen.
+- `term_settle` catches up the rest after the drag.
+- Each scrollback line remembers the width it wrapped at.
+
+On top of that, hardcore resizes only the visible tab during a drag (below). This
+side also fixed a bug: a wrapped row's trailing blanks were trimmed on the way into
+scrollback. So a space that fell at the edge was lost until the next reflow, and a
+selection copied across the wrap read "longenough".
 
 | `--reflow-bench`: 20,000 colored lines of 0–400 chars at 178×55 | before | after |
 |---|---|---|
-| Width step (176 → 100 → 178, by 2) | 13.4 ms avg, 21.9 max | **0.09 ms** avg, 0.29 max |
-| Height step (54 → 20 → 55) | 9.6 ms avg | **0.08 ms** |
-| Scrollback after one drag narrower and back | 13,233 of 20,000 rows left | **all kept** (the cap now counts lines, not rows) |
+| Width step (176 → 100 → 178, by 2) | 13.4 ms avg, 21.9 max | **0.15 ms** avg, 0.57 max |
+| Height step (54 → 20 → 55) | 9.6 ms avg | **0.10 ms** |
+| Scrollback after one drag narrower and back | 13,233 of 20,000 rows left | all kept |
 
 `bench/resize-bg.sh EXE TABS` fills each tab with 25,000 mixed-length lines, then
 drags the window 1600×900 → 1000×600 and back in 80 steps, bracketed by
@@ -201,15 +203,17 @@ drags the window 1600×900 → 1000×600 and back in 80 steps, bracketed by
 
 | Drag step, p50 / p90 | before | after |
 |---|---|---|
-| 1 tab | 19.0 / 24.5 ms | **3.8 / 6–14 ms** |
-| 16 tabs | 177 / 210 ms | **3.8 / 12 ms** |
+| 1 tab | 19.0 / 24.5 ms | **4.6 / 14–27 ms** |
+| 16 tabs | 177 / 210 ms | **4.8 / 14 ms** |
 
-Only the visible tab is resized during a drag. The other tabs and the pre-warmed spare
-follow after it ends (or right away for a maximize or snap), one per posted message,
-so input and frames get in between. A tab you switch to before then is resized first.
-What's left of a step is the swap chain's `ResizeBuffers` (~1 ms) and `Present` (it
-sometimes waits 8–30 ms while DWM syncs the new size with the window frame). The
-reflow itself is 0.2 ms.
+During a drag, only the visible tab follows each step. Every pty resize makes ConPTY
+repaint that tab, so with 16 tabs doing it at every step, a drag step took 177 ms.
+The hidden tabs and the spare catch up once the drag has settled (`settle_all`, 250
+ms after the last step): one per 16 ms tick, then their scrollback. A tab you switch
+to before then is resized first. What's left of a step:
+- the swap chain's `ResizeBuffers`, ~1 ms;
+- `Present`, which sometimes waits 8–30 ms while DWM syncs the new size with the
+  window frame.
 
 **The gauntlet.** `bench/gauntlet.sh EXE TABS` runs `bench/ccsim.py` in every tab
 but the first. That's a simulated Claude Code session doing ~60 synchronized frames
@@ -222,7 +226,7 @@ redraws:
 |---|---|---|---|
 | Key → frame presented, p50 / p99 | 1.22 / 1.83 ms | 1.15 / 2.25 ms | 1.26 / 2.69 ms |
 | Full-screen redraw (176×55) | 522 fps | 615 fps | 548 fps |
-| Drag step p50 (16 tabs) | | 4.2 ms | |
+| Drag step p50 (16 tabs) | | 3.9 ms | |
 | Frames hardcore drew per second | 9 | 46 (was 175) | **60 (was 1,830)** |
 | UI-thread time in `Present` per second | 4 ms | 15 ms (was 48) | **20 ms (was 668)** |
 

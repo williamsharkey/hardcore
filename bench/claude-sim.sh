@@ -3,7 +3,7 @@
 # 2.1 sends once the terminal answers "OSC 7501 ; ?"), to check the sidebar.
 #   claude-sim.sh [working|blocked|done|error|clear|demo]
 st() { printf '\e]7501;state=%s:app=claude-code%s\e\\' "$1" "$2"; }
-b64() { printf '%s' "$1" | base64 -w0; }
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }   # GNU and BSD (macOS) base64 alike
 case ${1:-demo} in
   working) st working ":progress=40:msg=$(b64 'Refactoring the VT parser')" ;;
   blocked) st blocked ":kind=permission:msg=$(b64 'approve Bash: rm -rf build')" ;;

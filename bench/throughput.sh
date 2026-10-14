@@ -13,7 +13,7 @@ print('\n'.join(''.join(random.choice(ch) for _ in range(100)) for _ in range(10
 TIMEFORMAT=%R
 : > $out
 for f in plain color unicode; do
-  s=$(stat -c %s /tmp/tb-$f.txt)
+  s=$(wc -c < /tmp/tb-$f.txt | tr -d " ")   # GNU and BSD alike
   t=$( { time cat /tmp/tb-$f.txt; } 2>&1 >/dev/tty )
   echo "$f $s $t" >> $out
 done

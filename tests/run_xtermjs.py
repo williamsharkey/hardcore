@@ -14,7 +14,13 @@ FIX = os.path.join(HERE, 'xtermjs')
 # fixture depends on behavior xterm.js deliberately doesn't match.
 SKIP = {'t0055-EL', 't0084-CBT', 't0101-NLM', 't0103-reverse_wrap', 't0504-vim'}
 
+# Under WSL the exe wants Windows paths; on macOS the binary takes them as they are.
+MAC = sys.platform == 'darwin'
+EXE = os.path.join(ROOT, 'build', 'hardcore') if MAC else os.path.join(ROOT, 'hardcore.exe')
+
 def winpath(p):
+    if MAC:
+        return p
     return subprocess.check_output(['wslpath', '-w', p], text=True).strip()
 
 verbose = '-v' in sys.argv
@@ -23,7 +29,7 @@ names = sorted(f[:-3] for f in os.listdir(FIX) if f.endswith('.in'))
 names = [n for n in names if not filters or any(f in n for f in filters)]
 out = os.path.join(ROOT, 'build', 'replay.txt')
 os.makedirs(os.path.dirname(out), exist_ok=True)
-subprocess.run([os.path.join(ROOT, 'hardcore.exe'), '--replay', winpath(out), '80', '25']
+subprocess.run([EXE, '--replay', winpath(out), '80', '25']
                + [winpath(os.path.join(FIX, n + '.in')) for n in names], check=True)
 
 screens, cur = {}, None

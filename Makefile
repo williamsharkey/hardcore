@@ -1,9 +1,18 @@
-# hardcore — build from WSL (mingw-w64 cross compiler) or MSYS2.
+# hardcore — build for Windows from WSL (mingw-w64 cross compiler) or MSYS2,
+# and for macOS with the Xcode command line tools.
 #
-#   make             → hardcore.exe
-#   make test        → unit tests + xterm.js fixtures + headless ConPTY/WSL selftest
+# Windows (from WSL, or from a Mac with brew's mingw-w64):
+#   make hardcore.exe → hardcore.exe          (the default everywhere but macOS)
+#   make test         → unit tests + xterm.js fixtures + headless ConPTY/WSL selftest
 #   make bench/termbench.exe → the measuring tool (see bench/RESULTS.md)
-#   make install     → copy to %LOCALAPPDATA%\hardcore\ and add Start menu + desktop shortcuts
+#   make install      → copy to %LOCALAPPDATA%\hardcore\ and add Start menu + desktop shortcuts
+#
+# macOS:
+#   make              → hardcore.app (and build/hardcore, the bare binary)
+#   make test         → unit tests + xterm.js fixtures + headless forkpty/shell selftest
+#   make install      → hardcore.app into ~/Applications
+
+UNAME := $(shell uname -s)
 
 CC      ?= x86_64-w64-mingw32-gcc
 WINDRES ?= x86_64-w64-mingw32-windres
@@ -14,9 +23,27 @@ ifeq ($(origin CC),default)
 CC = x86_64-w64-mingw32-gcc
 endif
 
-.PHONY: all clean selftest install test
+MAC_CC    ?= clang
+MAC_FLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-deprecated-declarations \
+             -mmacosx-version-min=11.0 -arch arm64 -arch x86_64
+MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -lutil
+APP        = hardcore.app
 
+.PHONY: all clean selftest install test mac-test
+
+ifeq ($(UNAME),Darwin)
+all: $(APP)
+test: mac-test
+install: $(APP)
+	mkdir -p "$(HOME)/Applications"
+	rm -rf "$(HOME)/Applications/$(APP)"
+	cp -R $(APP) "$(HOME)/Applications/"
+	@echo "installed $(HOME)/Applications/$(APP)"
+else
 all: hardcore.exe
+test: win-test
+install: win-install
+endif
 
 FONT = font/unifont-18.0.01.hex.gz font/hardcore-extra.hex
 
@@ -44,7 +71,7 @@ hardcore.exe: hardcore.c build/font.bin build/width.inc build/res.o vendor/conpt
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-o $@ hardcore.c build/res.o $(LIBS)
 
-test: hardcore.exe
+win-test: hardcore.exe
 	./hardcore.exe --unit "$$(wslpath -w build/unit.txt)"; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
 	python3 tests/run_xtermjs.py
 	$(MAKE) --no-print-directory selftest
@@ -55,8 +82,45 @@ bench/termbench.exe: bench/termbench.c
 selftest: hardcore.exe
 	./hardcore.exe --selftest selftest.txt; rc=$$?; cat selftest.txt; exit $$rc
 
-install: hardcore.exe
+win-install: hardcore.exe
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/install.ps1 -Exe "$$(wslpath -w hardcore.exe 2>/dev/null || echo hardcore.exe)"
 
+# ── macOS ──────────────────────────────────────────────────────────────
+
+# The shader, compiled ahead of time when Xcode's metal compiler is there
+# (the app compiles the same source at startup when it isn't).
+HAVE_METAL := $(shell xcrun --find metal >/dev/null 2>&1 && echo 1)
+ifeq ($(HAVE_METAL),1)
+METALLIB = build/hardcore.metallib
+MAC_FLAGS += -DHAVE_METALLIB
+endif
+
+build/hardcore.metallib: hardcore.metal
+	@mkdir -p build
+	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
+	xcrun metallib build/hardcore.air -o $@
+
+build/hardcore: hardcore.c hardcore_mac.m hardcore.metal build/font.bin build/width.inc $(METALLIB)
+	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -o $@ hardcore.c $(MAC_LIBS)
+
+build/hardcore.icns: tools/gen_icon.py
+	@mkdir -p build
+	rm -rf build/hardcore.iconset
+	python3 tools/gen_icon.py build/hardcore.iconset
+	iconutil -c icns -o $@ build/hardcore.iconset
+
+$(APP): build/hardcore build/hardcore.icns tools/Info.plist
+	rm -rf $@
+	mkdir -p $@/Contents/MacOS $@/Contents/Resources
+	cp build/hardcore $@/Contents/MacOS/hardcore
+	cp build/hardcore.icns $@/Contents/Resources/hardcore.icns
+	sed 's/@VERSION@/$(shell sed -n 's/^#define HARDCORE_VERSION "\(.*\)"/\1/p' hardcore.c)/' tools/Info.plist > $@/Contents/Info.plist
+	codesign --force --sign - $@ 2>/dev/null || true
+
+mac-test: build/hardcore
+	build/hardcore --unit build/unit.txt; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
+	python3 tests/run_xtermjs.py
+	build/hardcore --selftest build/selftest.txt; rc=$$?; cat build/selftest.txt; exit $$rc
+
 clean:
-	rm -rf build hardcore.exe selftest.txt
+	rm -rf build hardcore.exe selftest.txt $(APP)

@@ -66,6 +66,19 @@ Still assumed, deliberately:
 5. **No auto-update, no telemetry.** That fits the product. Releases are
    enough.
 
+## macOS (done, 2026-10-13)
+
+The port that this section recommended waiting on turned out to be small,
+because the core really was free of Win32. `hardcore_mac.m` is about 2,100
+lines:
+- Cocoa;
+- `forkpty` with dispatch sources;
+- Metal drawing the same vertex array and atlas as the Direct3D path;
+- zsh, bash and fish hooks.
+
+The edge on a Mac is the Claude Code tab column, not WSL. See the README's
+macOS section and `issues/macos-port.md`.
+
 ## Without Windows: Debian and other Linux
 
 The portable core is maybe 70% of the code:
