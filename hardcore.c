@@ -3579,13 +3579,6 @@ static void render_caption_buttons(int win_w) {
 
 #endif /* _WIN32: caption buttons */
 
-/* "+": a plain plus, drawn rather than taken from the font */
-static void draw_plus(float cx, float cy, uint32_t col) {
-    float arm = 4.0f * g_scale, th = (float)g_scale;
-    fill_rect(cx - arm, cy - th, cx + arm + th, cy + th, col, 1);
-    fill_rect(cx - th, cy - arm, cx + th, cy + arm + th, col, 1);
-}
-
 /* text on the grid, cell by cell from (col, row); spaces left as they are */
 static void grid_text(const wchar_t *s, int col, int row, uint32_t rgb) {
     uint32_t cps[64];
@@ -3719,7 +3712,8 @@ static void render_tabbar(int win_w, int win_h) {
             r_color(g_look.dim, 1);
             draw_glyph('s', lx, y0, 1, g_scale);
         }
-        draw_plus((float)((SB_COLS - 2) * CW) + CW / 2.0f, y0 + CH / 2.0f, hp ? g_look.text : g_look.text_lo);
+        r_color(hp ? g_look.text : g_look.text_lo, 1);
+        draw_glyph('+', (float)((SB_COLS - 2) * CW), y0, 1, g_scale);   /* the font's own plus */
     }
     if (g_settings_open) render_settings(hover, idx);
 #ifdef _WIN32
