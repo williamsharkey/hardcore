@@ -47,10 +47,10 @@
 static NSWindow *g_win;
 static HCView *g_view;
 static int g_gfx_ready;          /* Metal device and shaders are up */
-static int g_quitting;
-static int g_paint_pending;      /* a frame is wanted: drawn when the main thread idles */
-static double uptime_ms(void);           /* skip the "programs are running" question: last tab closed */
-static NSTimer *g_timers[4];
+static int g_quitting;           /* skip the "programs are running" question: last tab closed */
+static int g_paint_pending;      /* a frame is wanted (see plat_invalidate) */
+static double uptime_ms(void);
+static NSTimer *g_timers[8];
 
 static const char *g_shell;      /* your login shell */
 
@@ -77,7 +77,8 @@ static void timer_fired(int id) {
     if (id == TIMER_THROB) { update_busy(); return; }
     plat_kill_timer(id);
     if (id == TIMER_SPARE) make_spare();
-    else plat_invalidate();
+    else if (id == TIMER_SETTLE) settle_all();
+    plat_invalidate();
 }
 
 static void plat_timer(int id, int ms) {
@@ -564,23 +565,37 @@ static void stop_reading(Tab *tb) {
     tb->fd = -1;
 }
 
+/* A macOS pty hands out at most 1 KB per read, so anything bigger than a
+   keystroke's echo (Claude Code's slash menu: 3.2 KB in four writes over
+   2.3 ms, recorded) arrives in pieces. Everything that's there is read at
+   once; and a read that came back full means more of the same redraw is on
+   its way, so the paint waits a moment for it (see plat_invalidate) instead
+   of showing half a menu for a frame. */
+#define PTY_CHUNK 1024
+static double g_more_at;         /* when a read last came back full */
+
 static void read_some(Tab *tb) {
     char buf[65536];
-    ssize_t n = read(tb->fd, buf, sizeof(buf));
-    if (g_tracing) { static int k; if (k++ < 3) { char m[64]; snprintf(m, sizeof(m), "read %zd bytes from a shell", n); trace(m); } }
-    if (n > 0) {
-        if (tb->in_n + (int)n > tb->in_cap) {
-            int cap = tb->in_cap ? tb->in_cap : 65536;
-            while (cap < tb->in_n + (int)n) cap *= 2;
-            tb->in = (char *)realloc(tb->in, cap);
-            tb->in_cap = cap;
+    int k;
+    for (k = 0; k < 64; k++) {   /* at most 64 reads (or 4 MB) before letting the window breathe */
+        ssize_t n = read(tb->fd, buf, sizeof(buf));
+        if (g_tracing) { static int t; if (t++ < 3) { char m[64]; snprintf(m, sizeof(m), "read %zd bytes from a shell", n); trace(m); } }
+        if (n > 0) {
+            if (tb->in_n + (int)n > tb->in_cap) {
+                int cap = tb->in_cap ? tb->in_cap : 65536;
+                while (cap < tb->in_n + (int)n) cap *= 2;
+                tb->in = (char *)realloc(tb->in, cap);
+                tb->in_cap = cap;
+            }
+            memcpy(tb->in + tb->in_n, buf, (size_t)n);
+            tb->in_n += (int)n;
+            if (n >= PTY_CHUNK) g_more_at = uptime_ms();
+            continue;
         }
-        memcpy(tb->in + tb->in_n, buf, (size_t)n);
-        tb->in_n += (int)n;
-        schedule_output();
-    } else if (n == 0 || (errno != EAGAIN && errno != EINTR)) {
-        stop_reading(tb);        /* EIO: every copy of the slave side is closed */
+        if (n == 0 || (errno != EAGAIN && errno != EINTR)) stop_reading(tb);   /* EIO: every copy of the slave side is closed */
+        break;
     }
+    if (tb->in_n) schedule_output();
 }
 
 static int tab_drain(Tab *tb) {
@@ -1021,8 +1036,17 @@ static void new_tab_mac(void) {
 static double g_refresh_ms = 1000.0 / 60;
 static double g_painted_at;
 
+#define SETTLE_MS 2.0           /* wait this long after a full read for the rest of a redraw */
+#define SETTLE_MAX 8.0          /* ...but never hold a frame longer than this for it */
+static double g_paint_wanted;    /* when the pending paint was first asked for */
+
 static void paint_scheduled(void) {
+    double now = uptime_ms(), settle = g_more_at + SETTLE_MS - now;
     if (!g_paint_pending) return;
+    if (settle > 0.1 && now - g_paint_wanted < SETTLE_MAX) {   /* still arriving */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(settle * 1e6)), dispatch_get_main_queue(), ^{ paint_scheduled(); });
+        return;
+    }
     g_paint_pending = 0;
     g_painted_at = uptime_ms();
     paint_view_now();
@@ -1032,7 +1056,9 @@ static void plat_invalidate(void) {
     double wait;
     if (g_paint_pending) return;
     g_paint_pending = 1;
-    wait = g_painted_at + g_refresh_ms - uptime_ms();
+    g_paint_wanted = uptime_ms();
+    wait = g_painted_at + g_refresh_ms - g_paint_wanted;
+    if (g_more_at + SETTLE_MS - g_paint_wanted > wait) wait = g_more_at + SETTLE_MS - g_paint_wanted;
     if (wait <= 0.5) dispatch_async(dispatch_get_main_queue(), ^{ paint_scheduled(); });
     else dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * 1e6)), dispatch_get_main_queue(), ^{ paint_scheduled(); });
 }
@@ -1113,13 +1139,17 @@ static int plain_layout(void) {
 - (void)updateLayer { paint_view_now(); }
 
 - (void)setFrameSize:(NSSize)size {
+    double t0 = g_lat ? uptime_ms() : 0, t1;
     [super setFrameSize:size];
     if (!g_layer) return;
     layer_fit();
     resize_all();
+    t1 = g_lat ? uptime_ms() : 0;
     /* during a live resize, draw now and land with the window's new frame */
     g_layer.presentsWithTransaction = [self inLiveResize];
     paint_view_now();
+    /* the main thread's whole step, and of it the reflow (the rest is drawing, and waiting for the display) */
+    if (g_lat) fprintf(stderr, "resize %dx%d %.3f %.3f\n", g_cols, g_rows, uptime_ms() - t0, t1 - t0);
 }
 
 - (void)viewDidEndLiveResize {
@@ -1771,6 +1801,8 @@ static void ctl_start(const char *path) {
 
 /* ── tests ─────────────────────────────────────────────────────────── */
 
+static double bench_now_ms(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6; }
+
 /* Headless check of the whole child path: forkpty → your shell → our hooks → parser. */
 static int selftest(const char *out_path) {
     Tab *tb;
@@ -1870,6 +1902,12 @@ static int unit_tests(const char *out_path) {
         fprintf(f, "%s utf8  #%d\n", ok ? "ok  " : "FAIL", i);
         fails += !ok;
     }
+    {
+        int e, ok = reflow_check(5000, &e) && !e, rt = reflow_roundtrip();
+        fprintf(f, "%s reflow tail-only + settle == full reflow\n", ok ? "ok  " : "FAIL");
+        fprintf(f, "%s reflow 60 resizes and back == never resized\n", rt ? "ok  " : "FAIL");
+        fails += !ok + !rt;
+    }
     fprintf(f, "%d failed\n", fails);
     fclose(f);
     return fails ? 1 : 0;
@@ -1940,6 +1978,7 @@ int main(int argc, char **argv) {
     trace_init();
     trace("main");
     g_lat = getenv("HARDCORE_LAT") != NULL;
+    g_reflow_all = getenv("HARDCORE_REFLOW_ALL") != NULL;   /* bench: every resize step rewraps all history, as before */
     signal(SIGPIPE, SIG_IGN);    /* a write to a pty whose shell just died returns EIO instead */
     palette_init();
     drip_init();
@@ -1953,6 +1992,8 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--replay") && i + 3 < argc) {
             /* --replay OUT COLS ROWS FILE... */
             return replay(argv[i + 1], atoi(argv[i + 2]), atoi(argv[i + 3]), argv + i + 4, argc - i - 4);
+        } else if (!strcmp(argv[i], "--bench-resize") && i + 1 < argc) {
+            return bench_resize(argv[i + 1]);
         } else if (!strcmp(argv[i], "--selftest") && i + 1 < argc) {
             snprintf(selftest_out, sizeof(selftest_out), "%s", argv[++i]);
         } else if (!strncmp(argv[i], "-psn_", 5)) {

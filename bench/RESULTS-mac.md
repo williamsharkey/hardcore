@@ -68,6 +68,70 @@ measured, so don't spend effort there first.
 | First shell forked before AppKit loads; its prompt read straight from the pty; window flushed onto the screen before `finishLaunching` | launch → window ~151 → ~115 ms; launch → prompt ~168 → ~132 ms. AppKit alone costs ~70 ms (38 to start, 32 to finish launching) |
 | Cmd+Q handled before the menu; exit without AppKit's teardown | close 55 → 31 ms. Inside hardcore it's 4 ms from the key to `_exit` |
 
+## Resizing with full scrollback
+
+`hardcore --bench-resize OUT` fills terminals with 20,000 lines of scrollback each, plus a
+screen, of transcript-like text: mixed lengths, colour, CJK, and one line in seven long
+enough to wrap. It then times the reflow through the sizes a drag passes through.
+`macbench drag` does the same in the real app: it grabs the window's corner with real mouse
+events, and hardcore logs each step's main-thread time with `HARDCORE_LAT=1`.
+`HARDCORE_REFLOW_ALL=1` brings back the old behaviour for comparison.
+
+| | before | after |
+|---|---|---|
+| reflow, 1 tab, per drag step (bench, p50) | 2.2 ms | **0.05 ms** |
+| reflow, 16 tabs, per drag step (bench, p50 / max) | ~35 ms (8 tabs measured 16 / 34 ms) | **0.9 / 2.3 ms** |
+| live drag, 16 tabs, reflow per step (app, p50 / p90 / max) | 49.5 / 62.9 / 123 ms | **2.5 / 3.2 / 8.0 ms** |
+| live drag, 16 tabs: drag moves handled, steps longer than a 60 Hz frame | 46 of 120, 45 of 46 | **118–120 of 120, 0** |
+| catching up the rest of the history after the drag | — | 3.3 ms per tab, one tab per tick, the visible one first |
+
+How:
+- **Tail-only reflow while resizing.** Each step rewraps only the newest 500 lines of
+  scrollback (from a logical line's start) plus the screen, so a step costs the same with
+  20,000 lines as with 200.
+- **`term_settle` catches up the rest**, 250 ms after the last step. It runs one tab per
+  16 ms tick, the visible tab first. Scrolling back, jumping between prompts, and switching to
+  a tab all force it first. A height-only resize never needs it.
+- **Each scrollback line remembers the width it wrapped at.** Rejoining a line therefore
+  doesn't depend on the order the widths came in.
+
+Checked by `--unit` and `--bench-resize`:
+- **Tail reflow plus settle gives exactly what full reflow at every step gives**: every line,
+  wrap and the cursor, on the same drag.
+- **With full scrollback, every line both still have matches.** The old way also lost about
+  5,400 of the oldest lines when narrowing pushed it past the 20,000-line limit; the new way
+  keeps them.
+- **Sixty resizes and back give exactly the text that was never resized.**
+
+That last check found a bug that predates the port, on Windows too. When a wide character
+(CJK, emoji) doesn't fit at the end of a row, it moves to the next row and leaves a blank.
+Reflow joined that blank back in as a real space, so every resize added a space before such
+characters. That blank is now marked (`W_PAD`) and never becomes text. With the old
+behaviour put back, both tests fail.
+
+## What Claude Code writes
+
+Recorded from a real Claude Code 2.1.296 session in a pty, with no prompt sent:
+
+| | writes | bytes |
+|---|---|---|
+| a keystroke in the input box | 1 | 47–57: cursor moves and the changed cells only |
+| opening the `/` command menu | 4 (1,024 + 1,024 + 1,024 + 131) | 3,203, within ~2 ms |
+| startup | 13–14 | ~2,000 |
+
+- **Claude Code's renderer diffs.** It doesn't send the whole screen, or a character at a
+  time.
+- **It doesn't ask about synchronized output (mode 2026)**, so it never brackets its
+  redraws.
+- **A macOS pty hands out at most 1 KB per read.** Anything bigger than an echo therefore
+  arrives in pieces.
+
+To keep those pieces from being painted half-done, hardcore reads everything the pty has at
+once. When a read comes back full (1 KB), it holds the paint up to 2 ms more for the rest,
+never more than 8 ms in all. Replaying the recorded menu redraw 20 times took 48 frames
+with the hold and 68 without; the 20 extra frames were half-drawn menus. A keystroke's
+echo is never full, so it isn't held.
+
 ## Measuring on macOS: what fooled me
 
 - **Capture a region of the display, not the window.** With `SCContentFilter`'s
@@ -130,6 +194,8 @@ bench/run-esctest-mac.sh hardcore --app hardcore;        bench/run-esctest-mac.s
 $B key --app hardcore cmd+q
 $B launch --app hardcore --n 6 --left 164 --top 4 --row 16 --bg 0C0C0C build/hardcore ~/dev/hardcore
 $B quit --app hardcore --n 6 --keys cmd+q build/hardcore ~/dev/hardcore
+build/hardcore --bench-resize build/resize.txt          # reflow, 1 and 16 full tabs, plus the correctness checks
+$B drag --app hardcore --n 60 -400,-200                 # a live corner drag (16 tabs: cat a 21,000-line file in each first)
 python3 bench/latstats.py LOG                           # the HARDCORE_LAT breakdown
 ```
 

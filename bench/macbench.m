@@ -24,6 +24,10 @@
  *   macbench quit    --app A [--title T] [--keys cmd+q] [--n 5] COMMAND...
  *       Starts COMMAND, waits for its window, then presses the keys and times
  *       until the window is gone and until the process has exited.
+ *   macbench drag    --app A [--title T] [--n STEPS] DX,DY
+ *       Drags the window's bottom-right corner by DX,DY points and back, with
+ *       real mouse events (a live resize, as a person does it), STEPS moves
+ *       each way, one per 16 ms. Moves the pointer.
  *   macbench type    --app A [--title T] TEXT      (\n = Enter)
  *   macbench key     --app A [--title T] cmd+t     (cmd ctrl alt shift + a key)
  *   macbench find    --app A [--title T]
@@ -581,6 +585,29 @@ static void cmd_quit(int n, const char *keys, char **argv) {
     report("close -> process exited", exited, n);
 }
 
+static void mouse(CGEventType type, CGPoint p) {
+    CGEventRef e = CGEventCreateMouseEvent(NULL, type, p, kCGMouseButtonLeft);
+    CGEventPost(kCGHIDEventTap, e);
+    CFRelease(e);
+}
+
+static void cmd_drag(int steps, double dx, double dy) {
+    CGPoint start = CGPointMake(g_bounds.origin.x + g_bounds.size.width - 3, g_bounds.origin.y + g_bounds.size.height - 3);
+    int i;
+    must_be_front();
+    mouse(kCGEventMouseMoved, start);
+    usleep(100000);
+    mouse(kCGEventLeftMouseDown, start);
+    usleep(50000);
+    for (i = 1; i <= 2 * steps; i++) {   /* out to DX,DY and back again */
+        double f = i <= steps ? (double)i / steps : (double)(2 * steps - i) / steps;
+        mouse(kCGEventLeftMouseDragged, CGPointMake(start.x + dx * f, start.y + dy * f));
+        usleep(16000);
+    }
+    usleep(50000);
+    mouse(kCGEventLeftMouseUp, start);
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         const char *cmd = argc > 1 ? argv[1] : "";
@@ -615,6 +642,11 @@ int main(int argc, char **argv) {
             focus();
             press(rest[0]);
             usleep(50000);       /* posted events are dropped if we exit before the window server takes them */
+        } else if (!strcmp(cmd, "drag") && rest) {
+            double dx = 0, dy = 0;
+            sscanf(rest[0], "%lf,%lf", &dx, &dy);
+            focus();
+            cmd_drag(n ? n : 60, dx, dy);
         } else if (!strcmp(cmd, "latency")) {
             focus();
             cmd_latency(n ? n : 300, rest ? rest[0] : NULL);

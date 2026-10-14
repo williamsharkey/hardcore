@@ -178,7 +178,10 @@ static char g_cfg_dir[MAX_PATH]; /* ~/Library/Application Support/hardcore */
 #define C_RGB(r, g, b) (0x02000000u | ((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
 
 enum { A_BOLD = 1, A_DIM = 2, A_ITALIC = 4, A_UNDER = 8, A_BLINK = 16, A_INV = 32, A_HIDDEN = 64, A_STRIKE = 128 };
-enum { W_WIDE = 1, W_CONT = 2 };
+/* W_PAD: the blank left at the end of a row when a wide char didn't fit and
+   went to the next one. It isn't text: reflow mustn't turn it into a space
+   (before it was marked, every resize added one before such characters). */
+enum { W_WIDE = 1, W_CONT = 2, W_PAD = 4 };
 
 typedef struct {
     uint32_t ch, fg, bg;
@@ -190,7 +193,7 @@ typedef struct {
 
 typedef struct {
     Cell *c;
-    int n, wrapped;
+    int n, wrapped;              /* wrapped: the width it wrapped at (its trailing blanks are text), 0 = it didn't */
 } HLine;
 
 static uint32_t PAL[256];
@@ -279,6 +282,8 @@ typedef struct {
     int hcount, hstart;
     long long hpushed;
     int view;                    /* lines scrolled back from live */
+    int hist_cols;               /* the width the scrollback is wrapped at... */
+    int hist_stale;              /* ...or 1: older lines still wrap at an earlier width (term_settle) */
     /* reported by the shell / apps */
     wchar_t title[256];
     char cwd[1024];
@@ -372,6 +377,11 @@ static void plat_invalidate(void);               /* redraw soon */
 static void plat_client_size(int *w, int *h);    /* drawable size, in pixels */
 static void plat_flash(void);                    /* ask for attention: taskbar flash, Dock bounce */
 static void plat_timer(int id, int ms);          /* one-shot (or, for TIMER_THROB, repeating) */
+
+#define TIMER_SYNC 1
+#define TIMER_SPARE 2
+#define TIMER_THROB 3
+#define TIMER_SETTLE 4            /* resizing stopped: rewrap the rest of every tab's scrollback */
 static void plat_kill_timer(int id);
 static void plat_set_title(const wchar_t *title);
 static void plat_close_window(void);
@@ -443,9 +453,17 @@ static void hist_clear(Term *t) {
     t->view = 0;
 }
 
+/* the width a wrapped screen row really used: its end, less any W_PAD */
+static int wrap_width(const Cell *row, int cols) {
+    int w = cols;
+    while (w > 1 && row[w - 1].wflag == W_PAD) w--;
+    return w;
+}
+
 static void hist_push(Term *t, const Cell *row, int wrapped) {
     int n = t->cols, idx;
     HLine *h;
+    if (wrapped) wrapped = wrap_width(row, t->cols);
     while (n > 0 && row_is_blank_default(&row[n - 1])) n--;
     if (t->hcount < HIST_LINES) {
         idx = (t->hstart + t->hcount) % HIST_LINES;
@@ -537,6 +555,7 @@ static int term_init(Term *t, int cols, int rows) {
     memset(t, 0, sizeof(*t));
     t->cols = cols;
     t->rows = rows;
+    t->hist_cols = cols;
     t->hist = (HLine *)calloc(HIST_LINES, sizeof(HLine));
     for (s = 0; s < 2; s++) {
         int y;
@@ -592,13 +611,29 @@ static void ll_add(LineList *l, const Cell *c, int n, int wrapped) {
     if (n) memcpy(h->c, c, sizeof(Cell) * n);
 }
 
+/* Appends a line to the scrollback ring, letting the oldest go when it's
+   full. Returns 1 if one went. */
+static int hist_append(Term *t, HLine h) {
+    if (t->hcount < HIST_LINES) {
+        t->hist[(t->hstart + t->hcount++) % HIST_LINES] = h;
+        return 0;
+    }
+    free(t->hist[t->hstart].c);
+    t->hist[t->hstart] = h;
+    t->hstart = (t->hstart + 1) % HIST_LINES;
+    return 1;
+}
+
 /* Rewraps the main screen and its scrollback to a new width, the way Windows
    Terminal does: wrapped rows are joined into logical lines and split again.
-   The cursor keeps its place in the text. */
-static void reflow_main(Term *t, int cols, int rows) {
+   The cursor keeps its place in the text. Only history from line `from` (the
+   start of a logical line) on is rewrapped; older lines keep the width they
+   wrapped at until term_settle. */
+static void reflow_main(Term *t, int cols, int rows, int from) {
     int oc = t->cols, orows = t->rows, y, L, i;
     int ccx = t->alt ? t->saved[0].cx : t->cx, ccy = t->alt ? t->saved[0].cy : t->cy;
-    int last = ccy, cur_line = -1, cur_off = 0, cur_prow = 0, start, keep;
+    int last = ccy, cur_line = -1, cur_off = 0, cur_prow = 0, start, evicted = 0;
+    long long base = t->hpushed - t->hcount;   /* absolute number of the oldest line: stays put */
     Cell *acc = NULL;
     int acc_n = 0, acc_cap = 0;
     LineList out = {0};
@@ -611,7 +646,7 @@ static void reflow_main(Term *t, int cols, int rows) {
         for (x = 0; x < oc && row_is_blank_default(&t->row[0][y][x]); x++) {}
         if (x < oc) { last = y; break; }
     }
-    for (L = 0; L < t->hcount + last + 1; L++) {
+    for (L = from; L < t->hcount + last + 1; L++) {
         const Cell *c;
         int n, wrapped;
         if (L < t->hcount) {
@@ -619,17 +654,18 @@ static void reflow_main(Term *t, int cols, int rows) {
             c = h->c; n = h->n; wrapped = h->wrapped;
         } else {
             y = L - t->hcount;
-            c = t->row[0][y]; n = oc; wrapped = t->wrapf[0][y];
+            c = t->row[0][y]; n = oc; wrapped = t->wrapf[0][y] ? wrap_width(c, oc) : 0;
             if (y == ccy) { cur_line = 1; cur_off = acc_n + ccx; }
         }
-        if (acc_n + oc > acc_cap) {
-            acc_cap = (acc_n + oc) * 2;
+        if (acc_n + (wrapped > n ? wrapped : n) > acc_cap) {
+            acc_cap = (acc_n + (wrapped > n ? wrapped : n)) * 2;
             acc = (Cell *)realloc(acc, sizeof(Cell) * acc_cap);
         }
+        if (wrapped && n > wrapped) n = wrapped;   /* not the padding */
         memcpy(acc + acc_n, c, sizeof(Cell) * n);
         acc_n += n;
-        if (wrapped) {           /* a wrapped row's trailing blanks are real text */
-            for (; n < oc; n++) acc[acc_n++] = blank;
+        if (wrapped) {           /* a wrapped row's trailing blanks are real text, up to the width it wrapped at */
+            for (; n < wrapped; n++) acc[acc_n++] = blank;
             continue;
         }
         /* end of a logical line: trim and split it at the new width */
@@ -645,7 +681,7 @@ static void reflow_main(Term *t, int cols, int rows) {
                     ccx = (cur_off - pos) % cols;
                     cur_line = 2;
                 }
-                ll_add(&out, acc + pos, take, pos + take < len);
+                ll_add(&out, acc + pos, take, pos + take < len ? take : 0);   /* take < cols: a wide char went on */
                 pos += take;
             } while (pos < len);
             if (cur_line == 2 && cur_prow >= out.n) {  /* cursor beyond the text, on rows of its own */
@@ -660,14 +696,18 @@ static void reflow_main(Term *t, int cols, int rows) {
     start = out.n - rows;
     if (start > cur_prow) start = cur_prow;
     if (start < 0) start = 0;
-    hist_clear(t);
-    keep = start > HIST_LINES ? HIST_LINES : start;
-    for (i = 0; i < start; i++) {
-        if (i < start - keep) { free(out.v[i].c); continue; }
-        t->hist[t->hcount++] = out.v[i];
+    /* history: lines before `from` stay as they are; the rewrapped rest follows */
+    for (L = from; L < t->hcount; L++) free(t->hist[(t->hstart + L) % HIST_LINES].c);
+    t->hcount = from;
+    for (i = 0; i < start; i++) evicted += hist_append(t, out.v[i]);
+    base += evicted;
+    t->hpushed = base + t->hcount;
+    {   /* prompt marks above the rewrapped part keep their lines; the rest are gone */
+        int k, n = 0;
+        for (k = 0; k < t->nmarks; k++)
+            if (t->marks[k] >= base && t->marks[k] < base + from - evicted) t->marks[n++] = t->marks[k];
+        t->nmarks = n;
     }
-    t->hpushed = t->hcount;
-    t->nmarks = 0;               /* line numbers changed under them; reflow doesn't track marks */
     for (y = 0; y < orows; y++) free(t->row[0][y]);
     free(t->row[0]);
     free(t->wrapf[0]);
@@ -679,7 +719,8 @@ static void reflow_main(Term *t, int cols, int rows) {
         for (x = 0; x < cols; x++) t->row[0][y][x] = blank;
         if (idx < out.n) {
             memcpy(t->row[0][y], out.v[idx].c, sizeof(Cell) * out.v[idx].n);
-            t->wrapf[0][y] = (uint8_t)out.v[idx].wrapped;
+            t->wrapf[0][y] = out.v[idx].wrapped != 0;
+            for (x = out.v[idx].wrapped; out.v[idx].wrapped && x < cols; x++) t->row[0][y][x].wflag = W_PAD;
             free(out.v[idx].c);
         }
     }
@@ -717,10 +758,24 @@ static void resize_alt(Term *t, int cols, int rows) {
     }
 }
 
+/* While a window is being resized only the newest REFLOW_TAIL lines of
+   scrollback are rewrapped at each step, so a step costs the same with 20,000
+   lines as with 200 (measured: 2.2 ms a step per full tab before, 14-16 ms
+   for eight tabs). The rest catches up once, in term_settle, after the
+   resizing stops; a height-only resize never needs it. */
+#define REFLOW_TAIL 500
+static int g_reflow_all;         /* tests: rewrap everything at every step, the old way */
+
 static void term_resize(Term *t, int cols, int rows) {
-    int s, x;
+    int s, x, from = 0;
     if (cols == t->cols && rows == t->rows) return;
-    reflow_main(t, cols, rows);
+    if (t->hcount > REFLOW_TAIL && !g_reflow_all) {
+        from = t->hcount - REFLOW_TAIL;
+        while (from > 0 && t->hist[(t->hstart + from - 1) % HIST_LINES].wrapped) from--;   /* a logical line's start */
+    }
+    reflow_main(t, cols, rows, from);
+    if (!from) t->hist_cols = cols;
+    else if (cols != t->hist_cols) t->hist_stale = 1;
     resize_alt(t, cols, rows);
     {
         uint8_t *nt = (uint8_t *)malloc((size_t)cols);
@@ -740,6 +795,17 @@ static void term_resize(Term *t, int cols, int rows) {
     t->wrapnext = 0;
     t->view = 0;
     t->dirty = 1;
+}
+
+/* The rest of the scrollback, rewrapped to the current width. Returns 1 if
+   there was anything to do. */
+static int term_settle(Term *t) {
+    if (!t->hist_stale) return 0;
+    reflow_main(t, t->cols, t->rows, 0);
+    t->hist_cols = t->cols;
+    t->hist_stale = 0;
+    t->dirty = 1;
+    return 1;
 }
 
 /* Writing over half of a wide char leaves the other half orphaned. */
@@ -778,6 +844,7 @@ static void term_put(Term *t, uint32_t cp) {
     if (w == 2 && t->cx == t->cols - 1) {
         if (!t->m_autowrap) return;
         clear_span(t, t->cy, t->cx, t->cols);
+        CELL(t, t->cx, t->cy)->wflag = W_PAD;
         t->wrapf[t->alt][t->cy] = 1;
         t->cx = 0;
         term_lf(t);
@@ -2123,6 +2190,27 @@ static void resize_all(void) {
         term_resize(&tb->t, cols, rows);
         tab_set_size(tb, cols, rows);
     }
+    plat_timer(TIMER_SETTLE, 250);   /* re-armed by every step: fires once the resizing stops */
+}
+
+/* Rewraps the rest of the scrollback once a resize has settled: the tab you
+   see first, then one more tab per tick, so even sixteen full tabs never
+   hold a frame up for long (all at once measured 69 ms; one tab ~4 ms). */
+static void settle_all(void) {
+    Tab *tb = active_tab();
+    int i;
+    if (tb && term_settle(&tb->t)) {
+        g_sel_on = 0;            /* line numbers moved under the selection */
+        plat_timer(TIMER_SETTLE, 16);
+        return;
+    }
+    for (i = 0; i <= g_ntabs; i++) {
+        tb = i < g_ntabs ? g_tabs[i] : g_spare;
+        if (tb && term_settle(&tb->t)) {
+            plat_timer(TIMER_SETTLE, 16);
+            return;
+        }
+    }
 }
 
 static void sel_norm(long long *r0, int *c0, long long *r1, int *c1) {
@@ -3245,9 +3333,6 @@ static void snap_backbuffer(void);
 static char g_snap_path[MAX_PATH];
 #endif
 
-#define TIMER_SYNC 1
-#define TIMER_SPARE 2
-#define TIMER_THROB 3
 
 static void r_present(void);
 
@@ -3328,6 +3413,7 @@ static void update_busy(void) {
 
 static void activate(int i) {
     if (i < 0 || i >= g_ntabs) return;
+    term_settle(&g_tabs[i]->t);  /* a tab not caught up since a resize: before it shows */
     g_active = i;
     g_tabs[i]->activity = 0;
     g_tabs[i]->attention = 0;
@@ -3404,6 +3490,7 @@ static void close_tab(int i) {
 static void scroll_view(int lines) {
     Tab *tb = active_tab();
     if (!tb || tb->t.alt) return;
+    term_settle(&tb->t);         /* scrolling back: the old lines at today's width first */
     tb->t.view += lines;
     if (tb->t.view > tb->t.hcount) tb->t.view = tb->t.hcount;
     if (tb->t.view < 0) tb->t.view = 0;
@@ -3431,6 +3518,7 @@ static void jump_mark(int dir) {
     int i;
     if (!tb) return;
     t = &tb->t;
+    term_settle(t);
     base = term_base(t);
     top = t->hpushed - t->view;
     if (dir < 0) {
@@ -3763,6 +3851,204 @@ static void replay_one(FILE *out, FILE *f, int cols, int rows) {
     free(tb);
 }
 
+/* --bench-resize OUT: what a window drag costs the layout. A terminal with
+   full scrollback (HIST_LINES) of transcript-like text, mixed lengths, color
+   and CJK, many lines long enough to wrap, is reflowed through the sizes a
+   drag passes through, one step at a time, and each step is timed. */
+static double bench_now_ms(void);
+
+static void bench_fill(Term *t, int lines) {
+    static const char *words[] = {"the", "terminal", "Claude", "\x1b[1mbuild\x1b[0m", "\x1b[32mpassed\x1b[0m", "src/hardcore.c:2810",
+                                  "\x1b[38;2;255;166;13mwarning\x1b[0m", "日本語", "→", "✓", "reflow", "scrollback", "a", "of", "and"};
+    char line[2048];
+    unsigned seed = 1;
+    int i;
+    for (i = 0; i < lines; i++) {
+        int n = 0, len, w;
+        seed = seed * 1103515245u + 12345u;
+        len = (int)((seed >> 16) % 7 == 0 ? 200 + (seed >> 8) % 300 : (seed >> 16) % 110);   /* 1 in 7 lines wraps */
+        while (n < len && n < (int)sizeof(line) - 64) {
+            seed = seed * 1103515245u + 12345u;
+            w = (int)((seed >> 16) % (sizeof(words) / sizeof(words[0])));
+            n += snprintf(line + n, sizeof(line) - n, "%s ", words[w]);
+        }
+        n += snprintf(line + n, sizeof(line) - n, "\r\n");
+        vt_feed(t, (const unsigned char *)line, n);
+    }
+}
+
+static void bench_series(FILE *out, const char *name, Term **ts, int nt, const int (*sizes)[2], int n) {
+    double *v = (double *)malloc(sizeof(double) * n), total = 0, tmp;
+    int i, j, k;
+    for (i = 0; i < n; i++) {
+        double t0 = bench_now_ms();
+        for (k = 0; k < nt; k++) term_resize(ts[k], sizes[i][0], sizes[i][1]);   /* resize_all: every tab */
+        v[i] = bench_now_ms() - t0;
+        total += v[i];
+    }
+    for (i = 1; i < n; i++)      /* insertion sort: n is small */
+        for (j = i; j > 0 && v[j] < v[j - 1]; j--) { tmp = v[j]; v[j] = v[j - 1]; v[j - 1] = tmp; }
+    fprintf(out, "%-26s %4d steps  p50 %7.2f  p90 %7.2f  max %7.2f ms  total %8.1f ms\n", name, n, v[n / 2], v[n * 9 / 10], v[n - 1], total);
+    free(v);
+}
+
+#define BENCH_TABS 16             /* the stress case: this many tabs, each with full scrollback */
+
+/* 1 if two terminals hold the same text: every screen row and every
+   scrollback line they both still have (counted from the newest), the wraps
+   and the cursor. *extra = how many more old lines a kept than b. */
+static int term_same(const Term *a, const Term *b, int *extra) {
+    int L, x, d = a->hcount - b->hcount;
+    *extra = d;
+    if (d < 0 || a->cols != b->cols || a->rows != b->rows || a->cx != b->cx || a->cy != b->cy) return 0;
+    for (L = 0; L < b->hcount + b->rows; L++) {
+        const Cell *ca, *cb;
+        int na, nb, wa, wb;
+        term_line(a, L + d, &ca, &na, &wa);
+        term_line(b, L, &cb, &nb, &wb);
+        if (!wa != !wb) return 0;
+        for (x = 0; x < (na > nb ? na : nb); x++) {
+            uint32_t ch_a = x < na ? ca[x].ch : ' ', ch_b = x < nb ? cb[x].ch : ' ';
+            uint32_t fg_a = x < na ? ca[x].fg : 0, fg_b = x < nb ? cb[x].fg : 0;
+            if (ch_a != ch_b || fg_a != fg_b) return 0;
+        }
+    }
+    return 1;
+}
+
+/* The text of every logical line (wrapped rows joined), one per line: what
+   a resize must never change */
+static char *term_text(const Term *t) {
+    size_t cap = 1 << 20, n = 0;
+    char *out = (char *)malloc(cap);
+    int L, x;
+    for (L = 0; L < t->hcount + t->rows; L++) {
+        const Cell *c;
+        int len, wrapped;
+        term_line(t, L, &c, &len, &wrapped);
+        if (wrapped && len > wrapped) len = wrapped;
+        if (!wrapped) while (len > 0 && c[len - 1].ch == ' ') len--;
+        for (x = 0; x < len; x++) {
+            if (c[x].wflag == W_CONT) continue;
+            if (n + 8 >= cap) out = (char *)realloc(out, cap *= 2);
+            n += utf8_encode(c[x].ch ? c[x].ch : ' ', out + n);
+        }
+        if (wrapped && len < wrapped) for (; x < wrapped; x++) out[n++] = ' ';   /* trimmed, but text */
+        if (!wrapped) {
+            if (n + 2 >= cap) out = (char *)realloc(out, cap *= 2);
+            out[n++] = '\n';
+        }
+    }
+    out[n] = 0;
+    return out;
+}
+
+/* Resizing through many widths and back gives back the same text: no space
+   gained or lost at a wrap (wide chars at the edge, trailing blanks). */
+static int reflow_roundtrip(void) {
+    Term *a = (Term *)calloc(1, sizeof(Tab)), *b = (Term *)calloc(1, sizeof(Tab));
+    char *ta, *tb;
+    int i, same;
+    if (!a || !b || !term_init(a, 120, 40) || !term_init(b, 120, 40)) return 0;
+    bench_fill(a, 3000);
+    bench_fill(b, 3000);
+    for (i = 0; i < 60; i++) term_resize(a, 120 - (i * 37) % 70, 40 - i % 9);
+    term_resize(a, 120, 40);
+    term_settle(a);
+    ta = term_text(a);
+    tb = term_text(b);
+    same = !strcmp(ta, tb);
+    free(ta);
+    free(tb);
+    term_free(a);
+    term_free(b);
+    free(a);
+    free(b);
+    return same;
+}
+
+/* Tail-only reflow plus term_settle gives exactly what rewrapping everything
+   at every step gives: the same drag on two full terminals, compared. With
+   full scrollback the old way also lost the oldest lines at every narrowing
+   step (they overflowed HIST_LINES); the tail-only way keeps them, so it may
+   hold more: *extra says how many. */
+static int reflow_check(int lines, int *extra) {
+    Term *a = (Term *)calloc(1, sizeof(Tab)), *b = (Term *)calloc(1, sizeof(Tab));
+    int i, same;
+    if (!a || !b || !term_init(a, 120, 40) || !term_init(b, 120, 40)) return 0;
+    bench_fill(a, lines);
+    bench_fill(b, lines);
+    for (i = 0; i < 60; i++) {   /* narrower, shorter, then back out past where it started */
+        int c = i < 30 ? 120 - i * 2 : 60 + (i - 30) * 3, r = i < 30 ? 40 - i / 3 : 30 + (i - 30) / 2;
+        term_resize(a, c, r);
+        g_reflow_all = 1;
+        term_resize(b, c, r);
+        g_reflow_all = 0;
+    }
+    term_settle(a);
+    same = term_same(a, b, extra) && a->hist_cols == a->cols && !a->hist_stale;
+    term_free(a);
+    term_free(b);
+    free(a);
+    free(b);
+    return same;
+}
+
+static int bench_resize(const char *out_path) {
+    static int drag[240][2], tall[120][2], wide[120][2];
+    Term *ts[BENCH_TABS];
+    FILE *out = fopen(out_path, "wb");
+    int i, k;
+    double t0;
+    if (!out) return 3;
+    for (k = 0; k < BENCH_TABS; k++) {
+        ts[k] = (Term *)calloc(1, sizeof(Tab));   /* a Tab's worth: the parser's replies look for one */
+        if (!ts[k] || !term_init(ts[k], 120, 40)) return 3;
+        t0 = bench_now_ms();
+        bench_fill(ts[k], HIST_LINES + 40);
+        if (!k) fprintf(out, "filled %d lines of scrollback + %dx%d screen in %.1f ms\n", ts[k]->hcount, ts[k]->cols, ts[k]->rows, bench_now_ms() - t0);
+    }
+    for (i = 0; i < 240; i++) {  /* a corner drag: narrower and shorter, then wider and taller */
+        int d = i < 120 ? i : 239 - i;
+        drag[i][0] = 120 - d / 2 - (i & 1);   /* every step a new size, as a drag delivers them */
+        drag[i][1] = 40 - d / 6;
+    }
+    for (i = 0; i < 120; i++) {
+        tall[i][0] = 120;        /* the bottom edge only: the width never changes */
+        tall[i][1] = 40 - (i < 60 ? i / 3 : (119 - i) / 3) - (i & 1);
+        wide[i][0] = 120 - (i < 60 ? i : 119 - i);   /* the side edge only */
+        wide[i][1] = 40;
+    }
+    {
+        int e1, e2, ok1 = reflow_check(5000, &e1), ok2 = reflow_check(HIST_LINES + 40, &e2);
+        fprintf(out, "tail reflow + settle == full reflow: %s (5,000 lines), %s (full scrollback; it kept %d more old lines)\n",
+                ok1 && !e1 ? "yes" : "NO", ok2 ? "yes" : "NO", e2);
+    }
+    fprintf(out, "60 resizes and back == never resized: %s\n", reflow_roundtrip() ? "yes" : "NO");
+    for (k = 1; k <= BENCH_TABS; k *= BENCH_TABS) {
+        char name[64];
+        double t1;
+        fprintf(out, "-- %d tab%s, each with full scrollback\n", k, k > 1 ? "s" : "");
+        snprintf(name, sizeof(name), "corner drag (cols+rows)");
+        bench_series(out, name, ts, k, drag, 240);
+        bench_series(out, "bottom edge (rows only)", ts, k, tall, 120);
+        bench_series(out, "side edge (cols only)", ts, k, wide, 120);
+        bench_series(out, "corner drag (cols+rows)", ts, k, drag, 240);   /* leave it narrower than it started */
+        t1 = bench_now_ms();
+        {
+            int j, did = 0;
+            for (j = 0; j < k; j++) did += term_settle(ts[j]);
+            fprintf(out, "%-26s %4d tabs   once, after the drag: %.2f ms\n", "settle (rest of history)", did, bench_now_ms() - t1);
+        }
+    }
+    fclose(out);
+    for (k = 0; k < BENCH_TABS; k++) {
+        term_free(ts[k]);
+        free(ts[k]);
+    }
+    return 0;
+}
+
 #ifdef _WIN32
 /* ── window procedure ─────────────────────────────────────────────── */
 
@@ -4063,7 +4349,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_THROB) { update_busy(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
-        else InvalidateRect(hwnd, NULL, FALSE);
+        else if (wp == TIMER_SETTLE) settle_all();
+        InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) {
@@ -4470,6 +4757,12 @@ static int unit_tests(const char *out_path) {
         fprintf(f, "%s url   %s @%d -> %s\n", ok ? "ok  " : "FAIL", urls[i].word, urls[i].at, hit ? got : "(none)");
         fails += !ok;
     }
+    {
+        int e, ok = reflow_check(5000, &e) && !e, rt = reflow_roundtrip();
+        fprintf(f, "%s reflow tail-only + settle == full reflow\n", ok ? "ok  " : "FAIL");
+        fprintf(f, "%s reflow 60 resizes and back == never resized\n", rt ? "ok  " : "FAIL");
+        fails += !ok + !rt;
+    }
     fprintf(f, "%d failed\n", fails);
     fclose(f);
     return fails ? 1 : 0;
@@ -4489,6 +4782,13 @@ static int replay(const char *out_path, int cols, int rows, wchar_t **files, int
     }
     fclose(out);
     return 0;
+}
+
+static double bench_now_ms(void) {
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
@@ -4536,6 +4836,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             char out[MAX_PATH * 3];
             WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
             return unit_tests(out);
+        } else if (!strcmp(a, "--bench-resize") && i + 1 < argc) {
+            char out[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
+            return bench_resize(out);
         } else if (!strcmp(a, "--no-activate")) {
             show = SW_SHOWNOACTIVATE;       /* tests: open behind, never take the keyboard */
         } else if (!strcmp(a, "--inbox-conpty")) {
