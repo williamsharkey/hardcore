@@ -250,7 +250,7 @@ static void report(const char *name, double *v, int n) {
     if (!n) { printf("%-14s no samples\n", name); return; }
     qsort(v, n, sizeof(double), cmp_d);
     for (i = 0; i < n; i++) sum += v[i];
-    printf("%-14s n=%-4d min %7.1f  p50 %7.1f  p90 %7.1f  p99 %7.1f  max %7.1f  mean %7.1f ms\n", name, n, v[0],
+    printf("%-14s n=%-4d min %7.2f  p50 %7.2f  p90 %7.2f  p99 %7.2f  max %7.2f  mean %7.2f ms\n", name, n, v[0],
            v[n / 2], v[(int)(n * 0.9)], v[(int)(n * 0.99) < n ? (int)(n * 0.99) : n - 1], v[n - 1], sum / n);
 }
 
@@ -479,6 +479,29 @@ int main(int argc, char **argv) {
         RECT r;
         GetClientRect(g_target, &r);
         printf("%ld %ld\n", r.right, r.bottom);
+        return 0;
+    }
+    if (!strcmp(cmd, "resizes") && arg) {   /* resizes W0,H0,W1,H1: a drag, N steps there and back, each timed */
+        int w0, h0, w1, h1, k, steps = n ? n : 40, m = 0;
+        double *ms;
+        if (sscanf(arg, "%d,%d,%d,%d", &w0, &h0, &w1, &h1) != 4) return 2;
+        ms = (double *)malloc(sizeof(double) * steps * 2);
+        SendMessageA(g_target, WM_ENTERSIZEMOVE, 0, 0);   /* what a mouse drag brackets its steps with */
+        for (k = 0; k < steps * 2; k++) {
+            double f = k < steps ? (double)(k + 1) / steps : (double)(steps * 2 - k - 1) / steps, t0;
+            int w = (int)(w0 + (w1 - w0) * f + 0.5), h = (int)(h0 + (h1 - h0) * f + 0.5);
+            t0 = now_ms();
+            SetWindowPos(g_target, NULL, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            ms[m++] = now_ms() - t0;
+            Sleep(8);
+        }
+        {
+            double t0 = now_ms(), end;
+            SendMessageA(g_target, WM_EXITSIZEMOVE, 0, 0);
+            end = now_ms() - t0;
+            report("resize step", ms, m);
+            printf("%-14s %.2f ms\n", "drag end", end);
+        }
         return 0;
     }
     if (!strcmp(cmd, "resize") && arg) {

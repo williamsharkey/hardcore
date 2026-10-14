@@ -52,6 +52,12 @@ look, one size, one layout.
     in Windows Terminal), because a pre-warmed shell is waiting.
   - Keypress to screen is about 8 ms p50 (WT: 16 ms).
   - A cold launch puts a usable window up in about 60 ms.
+  - Drag-resizing with full scrollback costs about 4 ms a step, with 1 tab or
+    16. Scrollback is kept as whole lines, so a resize rewraps nothing but the
+    screen, and narrowing the window never drops history. Hidden tabs catch up
+    after the drag.
+  - The tab you're looking at keeps its speed with 63 busy Claude sessions in
+    other tabs. Keypress to frame is about 1.3 ms either way.
 
   Full numbers and the method are in [bench/RESULTS.md](bench/RESULTS.md).
 - **One font.** GNU Unifont 18 at an integer scale picked from the monitor's
