@@ -74,7 +74,7 @@ static void plat_flash(void) {
 static void make_spare(void);
 
 static void timer_fired(int id) {
-    if (id == TIMER_THROB) { update_busy(); return; }
+    if (id == TIMER_THROB) { update_busy(1); return; }
     plat_kill_timer(id);
     if (id == TIMER_SPARE) make_spare();
     else if (id == TIMER_SETTLE) settle_all();
@@ -772,23 +772,34 @@ static void tab_proc_cwd(Tab *tb, char *out, int cap) {
 static void paint_view_now(void);
 
 static void on_output(void) {
+    /* Hidden tabs are parsed but only cause a frame when something the tab
+       column shows changes (see WM_APP_OUTPUT in hardcore.c): 63 busy tabs
+       were ~1800 identical frames a second on Windows. */
     int i, changed = 0;
-    if (g_lat && g_lat_key && !g_lat_out) g_lat_out = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         if (tab_drain(tb) <= 0) continue;
-        if (i == g_active) changed = 1;
-        else tb->activity = 1;
+        if (i == g_active) {
+            changed = 1;
+            if (g_lat && g_lat_key && !g_lat_out) g_lat_out = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
+        } else if (!tb->activity) {
+            tb->activity = 1;
+            changed = 1;
+        }
         if (tb->t.bell) {
             tb->t.bell = 0;
             if (!g_focused || i != g_active) {
                 tb->attention = 1;
+                changed = 1;
                 if (!g_focused) plat_flash();
             }
         }
-        changed = 1;
+        if (tb->t.side) {
+            tb->t.side = 0;
+            changed = 1;
+        }
     }
-    update_busy();
+    update_busy(0);
     for (i = 0; g_tracing && i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         if (tb->adopted && tb->t.nmarks && tb->t.cx && !tb->traced) {

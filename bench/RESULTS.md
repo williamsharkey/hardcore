@@ -163,6 +163,82 @@ Why plain `seq` didn't get faster end to end:
   busy. Pausing the reader after large reads made it much worse (4 s), because
   Windows rounds `Sleep(1)` up to its 15.6 ms timer tick.
 
+### Claude Code, resizing, and many tabs (2026-10-14)
+
+**How Claude Code draws.** Recorded with `HARDCORE_VTLOG=1`, which now also writes
+`hardcore-vt.idx` (time, offset, size per read) so a recording can be cut back into
+the chunks it arrived in. Claude Code 2.1, in its full-screen layout, works like a
+game renderer: it diffs the screen and sends only the changed cells, each update as
+one synchronized-output frame. Typing one character in the input box is ~56 bytes:
+
+```
+ESC[?2026h ESC[?25l ESC[H ESC[4C ESC[51B l ESC[55;1H ESC[52;6H ESC[?25h ESC[?2026l
+```
+
+Opening the `/` menu is one 579–1,285-byte frame. So typing costs the parser almost
+nothing, and hardcore redraws the whole screen each frame anyway (~0.3 ms). The heavy
+cases are streaming replies and resizing.
+
+**Resizing with full scrollback.** Merged with the macOS port's fix (see
+[RESULTS-mac.md](RESULTS-mac.md#resizing-with-full-scrollback)):
+- Each drag step rewraps only the newest 500 lines plus the screen.
+- `term_settle` catches up the rest after the drag.
+- Each scrollback line remembers the width it wrapped at.
+
+On top of that, hardcore resizes only the visible tab during a drag (below). This
+side also fixed a bug: a wrapped row's trailing blanks were trimmed on the way into
+scrollback. So a space that fell at the edge was lost until the next reflow, and a
+selection copied across the wrap read "longenough".
+
+| `--reflow-bench`: 20,000 colored lines of 0–400 chars at 178×55 | before | after |
+|---|---|---|
+| Width step (176 → 100 → 178, by 2) | 13.4 ms avg, 21.9 max | **0.15 ms** avg, 0.57 max |
+| Height step (54 → 20 → 55) | 9.6 ms avg | **0.10 ms** |
+| Scrollback after one drag narrower and back | 13,233 of 20,000 rows left | all kept |
+
+`bench/resize-bg.sh EXE TABS` fills each tab with 25,000 mixed-length lines, then
+drags the window 1600×900 → 1000×600 and back in 80 steps, bracketed by
+`WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE` like a mouse drag. It times each
+`SetWindowPos` from outside, which returns once the frame at the new size is drawn:
+
+| Drag step, p50 / p90 | before | after |
+|---|---|---|
+| 1 tab | 19.0 / 24.5 ms | **4.6 / 14–27 ms** |
+| 16 tabs | 177 / 210 ms | **4.8 / 14 ms** |
+
+During a drag, only the visible tab follows each step. Every pty resize makes ConPTY
+repaint that tab, so with 16 tabs doing it at every step, a drag step took 177 ms.
+The hidden tabs and the spare catch up once the drag has settled (`settle_all`, 250
+ms after the last step): one per 16 ms tick, then their scrollback. A tab you switch
+to before then is resized first. What's left of a step:
+- the swap chain's `ResizeBuffers`, ~1 ms;
+- `Present`, which sometimes waits 8–30 ms while DWM syncs the new size with the
+  window frame.
+
+**The gauntlet.** `bench/gauntlet.sh EXE TABS` runs `bench/ccsim.py` in every tab
+but the first. That's a simulated Claude Code session doing ~60 synchronized frames
+a second, streaming text, dumping tool output, spinning a title throbber, cycling
+OSC 7501 working / blocked / done, and running full-screen or inline (scrolling
+into history). The visible first tab measures keystroke latency and full-screen
+redraws:
+
+| Visible tab | 1 tab | 16 tabs | 64 tabs |
+|---|---|---|---|
+| Key → frame presented, p50 / p99 | 1.22 / 1.83 ms | 1.15 / 2.25 ms | 1.26 / 2.69 ms |
+| Full-screen redraw (176×55) | 522 fps | 615 fps | 548 fps |
+| Drag step p50 (16 tabs) | | 3.9 ms | |
+| Frames hardcore drew per second | 9 | 46 (was 175) | **60 (was 1,830)** |
+| UI-thread time in `Present` per second | 4 ms | 15 ms (was 48) | **20 ms (was 668)** |
+
+The gauntlet found two bugs that made every background chunk redraw the whole window:
+- `WM_APP_OUTPUT` set "changed" for any tab.
+- `update_busy()` redrew whenever any tab was busy, not just on its throbber timer.
+
+Hidden tabs are still parsed (their state and scrollback stay current, and memory
+stays bounded). They only cause a frame when something the tab column shows changes:
+the activity dot, the bell, the folder, or OSC 7501 state and message (`Term.side`).
+`HARDCORE_LAT` now counts only the visible tab's output as the echo.
+
 ## Conformance
 
 | Suite | hardcore | Windows Terminal |
@@ -218,6 +294,10 @@ bench/cpu-flood.sh hardcore.exe           # CPU seconds per process during a seq
 bench/plain3.sh hardcore.exe X=0          # seq wall time ×3; ENV=VAL pairs go to that copy
 bench/parse-bench.sh hardcore.exe         # parser alone on build/vt-*.bin (HARDCORE_VTLOG captures)
 bench/snapdiff.sh old.exe hardcore.exe    # same screen in both builds, compared pixel for pixel
+bench/newtab-bg.sh hardcore.exe           # new tab -> shown / prompt drawn, warm and cold
+bench/resize-bg.sh hardcore.exe 16        # drag-resize steps with deep scrollback in 16 tabs
+bench/gauntlet.sh hardcore.exe 64         # visible tab vs 63 simulated busy Claude sessions
+hardcore.exe --reflow-bench out.txt       # reflow alone, 20,000 lines of scrollback
 ```
 
 `--top` is the distance in pixels from the top of the client area to the first text row:

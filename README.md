@@ -7,21 +7,35 @@ settings are a font and a color scheme, picked from a grid under the tabs and
 the same in every window: one size, one layout.
 
 ```
-▌⣿ thing            │ wm@w11:~/github/thing$ claude          ░ ─  □  × ░
-  Running make test │ 
- ? api              │ > ...
-  approve Bash:     │ 
-  git push origin   │ 
- ⍾ notes            │ 
-  s               + │
+⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕ │ wm@w11:~/github/thing$ claude          ░ ─  □  × ░
+▏⣿thing           × │
+  Running make test │ > ...
+ ?api               │
+  approve Bash: git │
+  push origin main  │
+ ⍾notes             │
+ s                + │
 ```
 
-- **Opens where you left off.** A new window starts in the folder the last
-  window closed in (its active tab, or the last tab you exited). The very
-  first time it's `/mnt/c/Users/<you>` (your `%USERPROFILE%`), not `~` inside the distro.
+- **Close it, open it, and your tabs come back.** Closing the window (or
+  Windows shutting down or restarting) saves every tab: its shell (bash,
+  PowerShell or cmd), folder and text, and the Claude Code session running in it. The next start rebuilds
+  them. Each tab's text is replayed under a dim `── restored ──` line, and
+  Claude comes back with `claude --resume`, with the flags you started it with.
+  Exiting the last tab yourself means you're done: the next window starts
+  fresh. See [Sessions](#sessions).
+- **`hardcore` in any shell opens a window right there.** It works in WSL
+  (Claude Code's `!` too), PowerShell and cmd. See [Update](#update).
+- **Otherwise it opens where you left off.** Launched from the Start menu,
+  desktop or taskbar with no saved tabs, a new window starts in the folder the
+  last window closed in. The very first time it's `/mnt/c/Users/<you>` (your
+  `%USERPROFILE%`), not `~` inside the distro.
 - **Tabs run down the left edge**, like Chrome's vertical tabs: tabs, then
-  **s** (settings) and **+**, laid on the same character grid as the
-  terminal. Min/max/close float over the terminal's top-right corner on smoked
+  **s** (settings) and **+**. The tab column is 20 cells wide and sits on the terminal's own text
+  grid, so each of its rows lines up with a terminal row. Row 0 is a grip of
+  dim braille dots: drag the window there. Each tab is a status cell, then the
+  folder's name. The active tab is marked by a one-pixel amber line down its
+  left edge, drawn over the status cell rather than taking a column. Min/max/close float over the terminal's top-right corner on smoked
   glass. Text runs underneath and only the mouse belongs to them, so no row
   is lost to a title bar. The whole top line works as a title bar: point at
   it and it smokes over and the cursor turns into the move arrows. Drag it to
@@ -55,6 +69,12 @@ the same in every window: one size, one layout.
     in Windows Terminal), because a pre-warmed shell is waiting.
   - Keypress to screen is about 8 ms p50 (WT: 16 ms).
   - A cold launch puts a usable window up in about 60 ms.
+  - Drag-resizing with full scrollback costs about 4–5 ms a step, with 1 tab
+    or 16. A step rewraps only the newest scrollback and the tab you see.
+    Everything else catches up once you let go, and narrowing the window never
+    drops history.
+  - The tab you're looking at keeps its speed with 63 busy Claude sessions in
+    other tabs. Keypress to frame is about 1.3 ms either way.
 
   Full numbers and the method are in [bench/RESULTS.md](bench/RESULTS.md).
 - **Bitmap fonts on the pixel grid.** GNU Unifont 18 at an integer scale
@@ -68,14 +88,91 @@ the same in every window: one size, one layout.
 
 ## Install
 
-Download `hardcore.exe` from
-[Releases](https://github.com/williamsharkey/hardcore/releases) and run it.
-It's one file with nothing to install; put it wherever you like and pin it to
-the taskbar. The exe isn't code-signed yet, so the first run shows Windows'
-"Windows protected your PC" screen: **More info → Run anyway**.
+In PowerShell:
 
-Or build it yourself (see [Build](#build)); `make install` adds Start menu
-and desktop shortcuts.
+```powershell
+irm https://raw.githubusercontent.com/williamsharkey/hardcore/main/install.ps1 | iex
+```
+
+Or from a WSL shell:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/williamsharkey/hardcore/main/install.sh | sh
+```
+
+Either one:
+- downloads the latest release's `hardcore.exe` and checks it against the
+  SHA-256 GitHub publishes for it;
+- puts it in `%LOCALAPPDATA%\hardcore`;
+- adds Start menu and desktop shortcuts;
+- starts it.
+
+hardcore is that one exe. Its font, Windows Terminal's ConPTY and everything
+else it needs are built in, and there's nothing else to install. A file
+downloaded this way doesn't get the "downloaded from the internet" mark a
+browser adds, so there's no "Windows protected your PC" screen.
+
+You can also download `hardcore.exe` from
+[Releases](https://github.com/williamsharkey/hardcore/releases) and run it from
+anywhere. It isn't code-signed yet, so the first run of a browser download
+shows that screen: **More info → Run anyway**. Or build it yourself (see
+[Build](#build)); `make install` adds the shortcuts.
+
+### Update
+
+From any shell:
+
+```
+hardcore               # a new hardcore window in this folder
+hardcore DIR           # ...or in DIR
+hardcore update        # install the latest release, like `claude update`
+hardcore --version     # which release and commit this is
+```
+
+`hardcore` works in any WSL shell, Claude Code's `!` included, and in PowerShell
+and cmd:
+- **WSL:** hardcore's first tab adds a symlink, `~/.local/bin/hardcore`,
+  pointing at the installed exe. It isn't made if you already have something
+  by that name.
+- **PowerShell and cmd outside hardcore:** the installer adds hardcore's
+  folder to your user PATH.
+- **hardcore's own PowerShell and cmd tabs** have it on their PATH already.
+
+Started from a shell, hardcore opens in that shell's folder and hands the
+prompt straight back. WSL would otherwise wait for the window to close.
+Started from the Start menu, the desktop or the taskbar, it restores your last
+session.
+
+`hardcore update` asks GitHub for the latest release and compares it with this
+build's version. If it's newer, it downloads `hardcore.exe`, checks it against
+the SHA-256 GitHub publishes for it, and swaps it in. A running exe can be
+renamed, so nothing has to close for that.
+
+**Then every open window reloads in place.** The programs in your tabs keep
+running through it: Claude, builds and servers don't notice. Each window hands
+itself to the new exe:
+- **Each tab's ConPTY** (OpenConsole and its pipes) stays alive. Its handles
+  pass to the new process, which goes on reading the same pipes, so no output
+  is lost.
+- **What's on screen** passes over as the escape sequences that rebuild it:
+  scrollback, both screens, the cursor, the scroll region, colors, links and
+  modes such as mouse reporting and bracketed paste. The new build's internals
+  can differ from the old one's. Programs like Claude Code keep a model of the
+  screen and send only changes, so it has to come back exactly, cell for cell,
+  and `--unit` checks that.
+- **The new window** opens exactly where the old one is, with the same tab
+  active and each tab scrolled where it was. It draws, and only then does the
+  old process end, without closing the pseudoconsoles. So the switch is one
+  frame.
+- **If anything goes wrong** before that, the old window carries on unchanged
+  and `hardcore update` says to close and reopen it.
+
+The first update from a release without this (0.4.x or older) can't reload in
+place, because that window doesn't know how. Close and reopen it once: your
+tabs come back through [sessions](#sessions). Copies left behind by earlier
+updates are deleted on the next update. `--force` reinstalls the latest
+release even if this one isn't older.
+
 
 ## Claude Code
 
@@ -118,6 +215,61 @@ and forth between them.
 
 Claude Code turns on mouse reporting, so a plain drag goes to Claude. Hold
 **Shift** to select text with the terminal instead.
+
+## Sessions
+
+hardcore's `rc.bash` wraps `claude` in a small shell function. When Claude Code
+starts, the function tells hardcore which session it is
+(`OSC 7700 ; claude=ID`), and again when it exits:
+- **A new session:** the wrapper picks the id and passes it as `--session-id`.
+- **`--resume ID`:** that id.
+- **`--continue`:** the newest transcript in that folder.
+- **The picker (`-r` with no id):** unknown, so the tab comes back with
+  `claude --continue`.
+
+Subcommands (`claude mcp …`, `claude doctor`), `-p` and `--version` pass
+straight through. So does a one-word prompt like `claude hello`, which looks
+like a subcommand. Your own `claude` alias or function, if you have one, takes
+precedence, and then sessions aren't tracked.
+
+The wrapper also remembers the flags you started Claude with
+(`--dangerously-skip-permissions`, `--model opus`, …), but not the session flags
+or the first prompt, so that prompt isn't sent again.
+
+On close, hardcore writes `%LOCALAPPDATA%\hardcore\session\`: `session.txt`
+(each tab's shell, folder, Claude session and flags) plus each tab's last 3,000
+rows of text, and the window's position, size and maximized state, the active
+tab and each tab's scroll position. On the next start the window opens where
+it was, and each tab is rebuilt:
+- **Its text is replayed** with colors and wraps, and rewraps to the new width.
+- **The shell starts below it.** ConPTY's inherit-cursor mode makes it start at
+  the cursor, not the top. The `── restored ──` line says what comes next:
+  Claude resuming, or the command waiting behind ↑.
+- **A Claude tab runs `claude <flags> --resume <id>`**, which is also put in the
+  shell's history. A session closed before its first message has no transcript
+  yet, so it gets a fresh `claude` with the same flags instead.
+
+On restore, an id must be letters, digits and dashes, and flags may contain
+only characters plain flags use, because the command goes through `eval`.
+
+Other programs, such as vim or a running build, aren't run again for you.
+A command can be one you shouldn't rerun, like a push, a deploy or an `rm`.
+Instead, the shell reports each command line as you start it (bash's `PS0`,
+`OSC 7700 ; cmd=`), and the restored tab puts the one that was running into its
+history and says so:
+
+```
+── restored · ↑ reruns: vim -O hardcore.c hardcore_mac.m ──
+wm@w11:~/github/wsl-easy$ █
+```
+
+One up-arrow brings it back exactly as you typed it, flags and quotes
+included, and Enter runs it. It's added at the first prompt, so it's the
+newest entry even though bash loads its history file after hardcore's
+startup file. A folder on the command line
+(`hardcore.exe DIR`) opens there instead of restoring. With several windows
+open, the last one closed is the one restored. Sessions are Windows-only for
+now.
 
 ## What it needs
 
