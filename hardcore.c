@@ -141,7 +141,7 @@ static const Font FONTS[] = {
 
 static int g_scale = 1;          /* integer pixel scale, from the monitor DPI */
 static const Font *g_font = FONTS;    /* the font you picked: every window, and the tab column */
-static const Font *g_tfont = FONTS;   /* the terminal's: g_font, or the one you're pointing at in the settings */
+static const Font *g_tfont = FONTS;   /* the same selected font as the chrome */
 static const Font *g_cf = FONTS;      /* the font CW and CH measure: g_tfont, or g_font while the tab column draws */
 
 static int cell_w(const Font *f) { return f->dev ? f->w : f->w * g_scale; }
@@ -2892,18 +2892,17 @@ static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 /* the cell, in pixels: the terminal's, or the tab column's while it draws (see UI_FONT) */
 #define CW cell_w(g_cf)
 #define CH cell_h(g_cf)
-#define PAD (4 * g_scale)
 #define SCROLLBAR_W (6 * g_scale)
 /* Experimental chrome: a right-side underlay on the font's character grid.
    Terminal text gets the full width. A tab comes forward only on hover;
    its last-cell initial stays visible when terminal content covers its name.
-   Font previews leave the chrome's geometry fixed until a font is picked. */
+   Terminal and chrome always share the selected font and grid. */
 #define SB_COLS 20
 #define UI_FONT const Font *ui_was_ = g_cf; g_cf = g_font
 #define UI_DONE g_cf = ui_was_
 static int sidebar_w(void) { return SB_COLS * cell_w(g_font); }
 #ifdef _WIN32
-static int caption_h(void) { return cell_h(g_font) + 8 * g_scale; }   /* the glass buttons' height */
+static int caption_h(void) { return cell_h(g_font); }   /* the glass buttons' height */
 #else
 static int caption_h(void) { return 0; }   /* macOS keeps its own traffic lights, over the tab column */
 #endif
@@ -2911,15 +2910,17 @@ static int caption_h(void) { return 0; }   /* macOS keeps its own traffic lights
 static int sidebar_x(void) {
     int w, h;
     plat_client_size(&w, &h);
-    return PAD + ((w - 2 * PAD - SCROLLBAR_W) / cell_w(g_font) - SB_COLS) * cell_w(g_font);
+    return (w / cell_w(g_font) - SB_COLS) * cell_w(g_font);
 }
 static int in_sidebar(int x) { return x >= sidebar_x() && x < sidebar_x() + sidebar_w(); }
-static int term_ox(void) { return PAD; }
-static int term_oy(void) { return PAD; }
+/* (0,0) is the native drawable surface, inside any system-owned border.
+   Rounded corners may obscure cells; they never shift the grid. */
+static int term_ox(void) { return 0; }
+static int term_oy(void) { return 0; }
 
 static void compute_grid(int w, int h, int *cols, int *rows) {
-    *cols = (w - 2 * PAD - SCROLLBAR_W) / CW;
-    *rows = (h - 2 * PAD) / CH;
+    *cols = w / CW;
+    *rows = h / CH;
     if (*cols < 10) *cols = 10;
     if (*rows < 3) *rows = 3;
     if (*cols > 1000) *cols = 1000;
@@ -3242,6 +3243,7 @@ static uint32_t g_rgba = 0xFFFFFFFF;
 #define VB_INST 65536            /* per draw; a frame that needs more draws in pieces */
 static Inst g_inst[VB_INST];
 static int g_ninst;
+static int g_clip_w = 32767, g_clip_h = 32767;
 static int g_chrome_x; /* translation for the right-side overlay only */
 
 static void r_flush(void);
@@ -3258,6 +3260,19 @@ static int16_t px(float v) { return (int16_t)(v < 0 ? v - 0.5f : v + 0.5f); }
 static void r_quad_uv(float x0, float y0, float x1, float y1, int u0, int v0, int u1, int v1) {
     Inst *q;
     x0 += g_chrome_x; x1 += g_chrome_x;
+    /* The fractional right/bottom cell remainder is background only. */
+    if (x1 <= 0 || y1 <= 0 || x0 >= g_clip_w || y0 >= g_clip_h) return;
+    if (u0 != 0xFFFF) {
+        float du = (float)(u1 - u0) / (x1 - x0), dv = (float)(v1 - v0) / (y1 - y0);
+        if (x0 < 0) u0 += (int)(-x0 * du);
+        if (y0 < 0) v0 += (int)(-y0 * dv);
+        if (x1 > g_clip_w) u1 -= (int)((x1 - g_clip_w) * du);
+        if (y1 > g_clip_h) v1 -= (int)((y1 - g_clip_h) * dv);
+    }
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > g_clip_w) x1 = (float)g_clip_w;
+    if (y1 > g_clip_h) y1 = (float)g_clip_h;
     if (g_ninst == VB_INST) r_flush();
     q = &g_inst[g_ninst++];
     q->x0 = px(x0); q->y0 = px(y0); q->x1 = px(x1); q->y1 = px(y1);
@@ -3819,7 +3834,7 @@ static int plat_lights_bottom(void);   /* where the window's own buttons in the 
 static void plat_settings_shown(void); /* the font or colors on screen changed */
 static void plat_settings_tell(void);  /* the font or scheme you picked changed: tell the other windows */
 #ifdef _WIN32
-static int sb_row_y(int k) { return PAD + k * CH; }
+static int sb_row_y(int k) { return k * CH; }
 #endif
 
 /* the first tab row: under the traffic lights, if they reach into the column */
@@ -3828,7 +3843,7 @@ static int first_row(void) {
 #ifdef _WIN32
     b = caption_h(); /* keep the right-side tabs below the window buttons */
 #endif
-    while (b > 0 && PAD + r * CH < b) r++;
+    while (b > 0 && r * CH < b) r++;
     return r;
 }
 /* the dim second line under a tab's name: what Claude is doing, asking, or did */
@@ -3871,7 +3886,7 @@ static int panel_rows(void) { return 3 + (g_settings_tab ? NFAMILIES : NFONTS) +
 static int info_row(void) { return PANEL_LIST + (g_settings_tab ? NFAMILIES : NFONTS) + 1; }
 
 static float detail_w(void) { return (float)((SB_COLS - 2) * CW); }
-static float row_y(int r) { return (float)(PAD + r * CH); }
+static float row_y(int r) { return (float)(r * CH); }
 
 static int scheme_index(int key) {
     const Scheme *s = scheme_by_key(key);
@@ -3885,7 +3900,7 @@ static void tab_layout(void) {
     plat_client_size(&win_w, &win_h);
     r = first_row();
     if (g_settings_open) panel = panel_rows();
-    avail = (win_h - PAD) / CH - r - 1 - panel;
+    avail = win_h / CH - r - 1 - panel;
     for (i = 0; i < g_ntabs; i++) {
         const wchar_t *d = tab_detail(g_tabs[i], tmp, 220);
         /* what Claude is asking you gets two lines; the rest get one */
@@ -3901,22 +3916,6 @@ static void tab_layout(void) {
     g_row_y[g_ntabs] = (int)row_y(r);                    /* settings and + */
     g_row_y[g_ntabs + 1] = (int)row_y(r + 1);
     g_panel_row = r + 1;
-    if (g_ntabs > 0 && g_ntabs > avail) {
-        /* Keep the upstream compact layout when tabs outgrow the window,
-           reserving room for the settings row and its open panel. */
-        int y = (int)row_y(first_row());
-        int h = (win_h - y - (1 + panel) * CH) / g_ntabs;
-        if (h < CH / 2) h = CH / 2;
-        for (i = 0; i < g_ntabs; i++) {
-            g_row_two[i] = 0;
-            g_row_y[i] = y;
-            y += h;
-        }
-        r = (y - PAD + CH - 1) / CH;
-        g_row_y[g_ntabs] = (int)row_y(r);
-        g_row_y[g_ntabs + 1] = (int)row_y(r + 1);
-        g_panel_row = r + 1;
-    }
     UI_DONE;
 }
 
@@ -3927,7 +3926,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
     if (mx < 0 || mx >= sidebar_w() || my < 0) { UI_DONE; return HIT_NONE; }
     tab_layout();
     col = mx / CW;
-    row = my < PAD ? -1 : (my - PAD) / CH;
+    row = my / CH;
     for (i = 0; i <= g_ntabs; i++) {
         if (my < g_row_y[i] || my >= g_row_y[i + 1]) continue;
         if (i == g_ntabs) hit = col <= 9 ? HIT_SETTINGS : col >= SB_COLS - 3 ? HIT_PLUS : HIT_BAR;   /* the word "settings", the + */
@@ -3970,20 +3969,14 @@ static int tabbar_action(int mx, int my) {
            (hit == HIT_STAB && idx != g_settings_tab);
 }
 
-/* The terminal tries on the font or scheme under the mouse; anything else
-   puts back the ones you picked. Called whenever the mouse moves or leaves. */
+/* Preview colors on hover. Fonts apply on click so every glyph always
+   belongs to the same grid, including while the settings are open. */
 static void resize_all(void);
 static void settings_point(void) {
     int idx = -1, hit = g_mouse_y >= 0 && g_settings_open ? hit_tabbar(g_mouse_x, g_mouse_y, &idx) : HIT_NONE;
-    const Font *f = hit == HIT_FONT ? &FONTS[idx] : g_font;
     const Scheme *s = hit == HIT_SCHEME ? &SCHEMES[idx] : g_scheme;
     if (s != g_shown) {
         look_set(s);
-        plat_settings_shown();
-    }
-    if (f != g_tfont) {
-        g_tfont = g_cf = f;
-        resize_all();
         plat_settings_shown();
     }
 }
@@ -4201,7 +4194,7 @@ static void render_settings(int hover, int hidx) {
 
 /* Does terminal content occupy this screen rectangle? Check the displayed
    scrollback, wide-cell continuations, selection and cursor as well as text.
-   Use the terminal font even while the settings font is being previewed. */
+   Both layers use the selected font and the same origin. */
 static int chrome_obscured(int x0, int y0, int x1, int y1) {
     Tab *tb = active_tab();
     const Font *saved = g_cf;
@@ -4209,8 +4202,8 @@ static int chrome_obscured(int x0, int y0, int x1, int y1) {
     if (!tb) return 0;
     g_cf = g_tfont;
     Term *t = &tb->t;
-    left = (x0 - PAD) / CW; right = (x1 - PAD + CW - 1) / CW;
-    top = (y0 - PAD) / CH; bottom = (y1 - PAD + CH - 1) / CH;
+    left = x0 / CW; right = (x1 + CW - 1) / CW;
+    top = y0 / CH; bottom = (y1 + CH - 1) / CH;
     if (left < 0) left = 0;
     if (top < 0) top = 0;
     if (right > t->cols) right = t->cols;
@@ -4218,10 +4211,10 @@ static int chrome_obscured(int x0, int y0, int x1, int y1) {
     for (y = top; y < bottom && !blocked; y++) {
         const Cell *cells;
         int n, wrapped, line = t->hcount - t->view + y;
-        if (PAD + (y + 1) * CH <= y0 || PAD + y * CH >= y1) continue;
+        if ((y + 1) * CH <= y0 || y * CH >= y1) continue;
         term_line(t, line, &cells, &n, &wrapped);
         for (x = left; x < right; x++) {
-            if (PAD + (x + 1) * CW <= x0 || PAD + x * CW >= x1) continue;
+            if ((x + 1) * CW <= x0 || x * CW >= x1) continue;
             if (x < n && (cells[x].ch > ' ' || cells[x].wflag == W_CONT ||
                           cells[x].attr & (A_UNDER | A_STRIKE) || cells[x].link)) blocked = 1;
             if (!t->view && t->m_cursor_vis && y == t->cy && x == t->cx) blocked = 1;
@@ -4246,18 +4239,29 @@ static int unit_underlay(FILE *f) {
     tb->t.m_cursor_vis = 0;
     /* A label over blank cells survives; actual text and wide continuations
        suppress it, including text in the second line of a detail row. */
-    fails += chrome_obscured(PAD + 20*cw, PAD, PAD + 40*cw, PAD + 2*ch) != 0;
+    fails += chrome_obscured(20*cw, 0, 40*cw, 2*ch) != 0;
     CELL(&tb->t, 25, 1)->ch = 'X';
-    fails += chrome_obscured(PAD + 20*cw, PAD, PAD + 40*cw, PAD + 2*ch) != 1;
-    fails += chrome_obscured(PAD + 20*cw, PAD, PAD + 40*cw, PAD + ch) != 0;
+    fails += chrome_obscured(20*cw, 0, 40*cw, 2*ch) != 1;
+    fails += chrome_obscured(20*cw, 0, 40*cw, ch) != 0;
     CELL(&tb->t, 25, 1)->ch = ' ';
     CELL(&tb->t, 25, 1)->wflag = W_CONT;
-    fails += chrome_obscured(PAD + 25*cw, PAD + ch, PAD + 26*cw, PAD + 2*ch) != 1;
+    fails += chrome_obscured(25*cw, ch, 26*cw, 2*ch) != 1;
     CELL(&tb->t, 25, 1)->wflag = 0;
     tb->t.m_cursor_vis = 1; tb->t.cx = 25; tb->t.cy = 1;
-    fails += chrome_obscured(PAD + 20*cw, PAD, PAD + 40*cw, PAD + 2*ch) != 1;
-    compute_grid(120 * CW + 2 * PAD + SCROLLBAR_W, 24 * CH + 2 * PAD, &cols, &rows);
-    fails += cols != 120 || rows != 24;
+    fails += chrome_obscured(20*cw, 0, 40*cw, 2*ch) != 1;
+    const Font *saved_font = g_cf;
+    int fi;
+    for (fi = 0; fi < NFONTS; fi++) {
+        g_cf = &FONTS[fi];
+        compute_grid(120 * CW, 24 * CH, &cols, &rows);
+        fails += cols != 120 || rows != 24;
+        fails += term_ox() != 0 || term_oy() != 0;
+        compute_grid(120 * CW + CW - 1, 24 * CH + CH - 1, &cols, &rows);
+        fails += cols != 120 || rows != 24;
+        compute_grid(121 * CW, 25 * CH, &cols, &rows);
+        fails += cols != 121 || rows != 25;
+    }
+    g_cf = saved_font;
     term_free(&tb->t); free(tb);
     g_tabs[0] = saved; g_ntabs = ntabs; g_active = active;
     fprintf(f, "%s underlay: whitespace, text, detail rows, wide cells, cursor, full-width grid\n", fails ? "FAIL" : "ok  ");
@@ -4273,7 +4277,7 @@ static void render_tabbar(int win_w, int win_h) {
     g_chrome_x = sx;
     /* Grip rows share the underlay rule; only the hovered row comes forward. */
     for (i = 0; i < first_row(); i++) {
-        int y = PAD + i * CH, c;
+        int y = i * CH, c;
         int hov = hover == HIT_BAR && g_mouse_y >= y && g_mouse_y < y + CH;
         if (hov) fill_rect(0, (float)y, (float)sw, (float)(y + CH), TAB_HOVER, 1);
         if (hov || !chrome_obscured(sx, y, sx + sw, y + CH)) {
@@ -4348,6 +4352,8 @@ static void render(void) {
     int y, x, ox = term_ox(), oy = term_oy();
     long long base;
     plat_client_size(&r.right, &r.bottom);
+    g_clip_w = r.right / CW * CW;
+    g_clip_h = r.bottom / CH * CH;
     r_begin(r.right, r.bottom);
 #ifdef _WIN32
     if (!tb) { render_tabbar(r.right, r.bottom); render_caption_buttons(r.right); return; }
@@ -4450,7 +4456,7 @@ static void render(void) {
     if (t->hcount > 0 && !t->alt) {
         float track_top = (float)caption_h(), track_h = (float)(oy + t->rows * CH - caption_h());   /* starts under the glass */
         float total = (float)(t->hcount + t->rows);
-        float bar_h = track_h * t->rows / total, pos, bx = (float)(r.right - SCROLLBAR_W + g_scale);
+        float bar_h = track_h * t->rows / total, pos, bx = (float)(t->cols * CW - SCROLLBAR_W + g_scale);
         if (bar_h < 12 * g_scale) bar_h = (float)(12 * g_scale);
         pos = 1.0f - (float)t->view / t->hcount;
         fill_rect(bx, track_top, bx + SCROLLBAR_W - 2 * g_scale, track_top + track_h, TAB_HOVER, 0.5f);
@@ -6554,7 +6560,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_SCLOSE || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return 0; }
         if (hit == HIT_BAR) return 0;
         GetClientRect(hwnd, &r);
-        if (tb && mx >= r.right - SCROLLBAR_W - g_scale && tb->t.hcount && !tb->t.alt) {
+        if (tb && mx >= tb->t.cols * CW - SCROLLBAR_W && mx < tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
             g_sb_drag = 1;
             SetCapture(hwnd);
             scrollbar_set(my);
@@ -7251,8 +7257,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     g_scale = auto_scale();
     if (g_win_w < 300 || g_win_h < 160) {
         r.left = r.top = 0;
-        r.right = sidebar_w() + 2 * PAD + SCROLLBAR_W + 120 * CW;
-        r.bottom = 2 * PAD + 36 * CH;
+        r.right = 120 * CW;
+        r.bottom = 36 * CH;
         AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
         g_win_w = r.right - r.left;
         g_win_h = r.bottom - r.top - GetSystemMetrics(SM_CYCAPTION) - frame_thickness(NULL);   /* no caption: see WM_NCCALCSIZE */

@@ -1456,7 +1456,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
         return;
     }
     plat_client_size(&w, &h);
-    if (tb && mx >= w - SCROLLBAR_W - g_scale && tb->t.hcount && !tb->t.alt) {
+    if (tb && mx >= tb->t.cols * CW - SCROLLBAR_W && mx < tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
         g_sb_drag = 1;
         scrollbar_set(my);
         return;
@@ -2096,7 +2096,7 @@ int main(int argc, char **argv) {
             NSArray *v = [saved componentsSeparatedByString:@" "];
             if ([v count] >= 4) { w = [v[2] intValue] * g_scale; h = [v[3] intValue] * g_scale; }
         }
-        if (w < 100 || h < 100) { w = sidebar_w() + 2 * PAD + SCROLLBAR_W + 120 * CW; h = 2 * PAD + 36 * CH; }
+        if (w < 100 || h < 100) { w = 120 * CW; h = 36 * CH; }
         compute_grid(w, h, &g_cols, &g_rows);
         new_tab_here();
         trace("first tab spawned");
@@ -2113,8 +2113,8 @@ int main(int argc, char **argv) {
 
     g_scale = (int)([[NSScreen mainScreen] backingScaleFactor] + 0.5);
     if (g_scale < 1) g_scale = 1;
-    frame = NSMakeRect(0, 0, (sidebar_w() + 2 * PAD + SCROLLBAR_W + 120 * CW) / (CGFloat)g_scale,
-                       (2 * PAD + 36 * CH) / (CGFloat)g_scale);
+    frame = NSMakeRect(0, 0, (120 * CW) / (CGFloat)g_scale,
+                       (36 * CH) / (CGFloat)g_scale);
     g_win = [[NSWindow alloc] initWithContentRect:frame
                                         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
                                                   NSWindowStyleMaskResizable | NSWindowStyleMaskFullSizeContentView

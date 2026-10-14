@@ -6,7 +6,9 @@ content in their area collapses each tab to its last-cell initial. Hover a tab
 to bring its name and details forward. The initial stays visible, with the
 throbber overlaid while busy. The right-edge cells overlay the terminal without
 reserving columns. Settings and **+** sit below the tabs; the open settings panel
-comes forward for interaction.
+comes forward for interaction. All text shares a font-sized grid beginning at
+the drawable canvas origin (0, 0), with no insets or reserved scrollbar strip.
+Only incomplete cells at the right and bottom remain background.
 
 A terminal for WSL on Windows 11, built for running Claude Code. It also runs
 natively on macOS (see [macOS](#macos)). It does one
@@ -444,8 +446,8 @@ under them the name of what you've picked, or of what you're pointing at.
   Mocha/Latte, `k`/`K` Tokyo Night/Day, `r`/`R` Rosé Pine/Dawn. Pointing at
   the row tries the dark one; at the light letter, the light one.
 
-Pointing at one tries it on: a font in the terminal (the tab column keeps
-the font you picked, so the list doesn't move), a scheme on the whole window.
+Pointing at a scheme previews it on the whole window. Fonts apply on click,
+keeping the terminal and tab controls on the same grid at all times.
 Clicking picks it, for every hardcore window at once. Two letters, such as
 `mT`, describe the whole setup.
 
