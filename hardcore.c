@@ -151,6 +151,7 @@ typedef struct {
 typedef struct {
     Cell *c;
     int n, wrapped;
+    int cap;                     /* cells allocated: a recycled line keeps its buffer */
 } HLine;
 
 static uint32_t PAL[256];
@@ -211,6 +212,8 @@ typedef struct {
     int cols, rows;
     Cell **row[2];               /* per-screen row pointers: scrolling moves pointers, not cells */
     uint8_t *wrapf[2];           /* row ended in an autowrap (for copy and reflow) */
+    uint16_t *rlen[2];           /* per row: cells from here on are default blanks. An upper
+                                    bound, so a line feed only touches the part in use */
     int alt;
     int cx, cy, wrapnext;
     Cell pen;
@@ -302,9 +305,30 @@ static void trace(const char *what) {
 /* HARDCORE_LAT=1: per keypress, how long until the shell's echo arrived and
    until the frame showing it was handed to the compositor
    (%TEMP%\hardcore-lat.txt: key→output ms, key→render start, key→SwapBuffers returned) */
+static double lat_ms(LARGE_INTEGER a, LARGE_INTEGER b) { return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpf.QuadPart; }
 static FILE *g_lat;
 static LARGE_INTEGER g_lat_key, g_lat_out, g_lat_render;
-static double lat_ms(LARGE_INTEGER a, LARGE_INTEGER b) { return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpf.QuadPart; }
+
+/* HARDCORE_PERF=1: once a second, to %TEMP%\\hardcore-perf.txt, what the UI
+   thread did: bytes parsed, frames drawn, and where the time went. */
+static FILE *g_perf;
+static struct { LARGE_INTEGER t0; long long bytes; int frames, drains; double parse, build, present; } g_pf;
+static void perf_tick(void) {
+    LARGE_INTEGER now;
+    double dt;
+    if (!g_perf) return;
+    QueryPerformanceCounter(&now);
+    if (!g_pf.t0.QuadPart) { g_pf.t0 = now; return; }
+    dt = lat_ms(g_pf.t0, now);
+    if (dt < 1000) return;
+    if (g_pf.bytes || g_pf.frames)
+        fprintf(g_perf, "%7.0f ms  %9.2f MB/s  %5d reads  %4d fps  parse %6.1f ms  build %6.1f ms (%.2f/f)  present %6.1f ms (%.2f/f)\n",
+                dt, g_pf.bytes / dt / 1000.0, g_pf.drains, (int)(g_pf.frames * 1000 / dt), g_pf.parse,
+                g_pf.build, g_pf.frames ? g_pf.build / g_pf.frames : 0, g_pf.present, g_pf.frames ? g_pf.present / g_pf.frames : 0);
+    fflush(g_perf);
+    memset(&g_pf, 0, sizeof(g_pf));
+    g_pf.t0 = now;
+}
 
 static void tab_write(Tab *tb, const void *s, int n) {
     DWORD w;
@@ -325,10 +349,23 @@ static Cell blank_cell(const Term *t) {
 
 static void clear_span(Term *t, int y, int x0, int x1) {
     Cell b = blank_cell(t);
+    uint16_t *len = &t->rlen[t->alt][y];
     int x;
     if (x0 < 0) x0 = 0;
     if (x1 > t->cols) x1 = t->cols;
+    if (x0 >= x1) return;
+    if (!b.bg) {                 /* default blanks: past rlen there's nothing to clear */
+        if (x1 >= *len) {
+            x1 = *len;
+            if (x0 < *len) *len = (uint16_t)x0;
+        }
+    } else if (x1 > *len) *len = (uint16_t)x1;
     for (x = x0; x < x1; x++) *CELL(t, x, y) = b;
+}
+
+/* a write at [0, x) of row y: rlen has to cover it */
+static void row_used(Term *t, int y, int x) {
+    if (x > t->rlen[t->alt][y]) t->rlen[t->alt][y] = (uint16_t)x;
 }
 
 static void clear_rows(Term *t, int y0, int y1) {
@@ -345,28 +382,37 @@ static int row_is_blank_default(const Cell *c) {
 
 static void hist_clear(Term *t) {
     int i;
-    for (i = 0; i < t->hcount; i++) free(t->hist[(t->hstart + i) % HIST_LINES].c);
+    for (i = 0; i < HIST_LINES; i++) {      /* recycled buffers live past hcount too */
+        free(t->hist[i].c);
+        t->hist[i].c = NULL;
+        t->hist[i].cap = t->hist[i].n = 0;
+    }
     t->hcount = t->hstart = 0;
     t->view = 0;
 }
 
-static void hist_push(Term *t, const Cell *row, int wrapped) {
-    int n = t->cols, idx;
+static void hist_push(Term *t, const Cell *row, int len, int wrapped) {
+    int n = len, idx;
     HLine *h;
     while (n > 0 && row_is_blank_default(&row[n - 1])) n--;
     if (t->hcount < HIST_LINES) {
         idx = (t->hstart + t->hcount) % HIST_LINES;
         t->hcount++;
-    } else {
+    } else {                     /* the oldest line falls off; its buffer is reused */
         idx = t->hstart;
-        free(t->hist[idx].c);
         t->hstart = (t->hstart + 1) % HIST_LINES;
-        if (t->view > 0) t->view--;     /* oldest line fell off */
+        if (t->view > 0) t->view--;
     }
     h = &t->hist[idx];
+    if (n > h->cap) {
+        int cap = n < 16 ? 16 : n;
+        free(h->c);
+        h->c = (Cell *)malloc(sizeof(Cell) * cap);
+        h->cap = h->c ? cap : 0;
+        if (!h->c) n = 0;
+    }
     h->n = n;
     h->wrapped = wrapped;
-    h->c = n ? (Cell *)malloc(sizeof(Cell) * n) : NULL;
     if (n) memcpy(h->c, row, sizeof(Cell) * n);
     t->hpushed++;
     if (t->view > 0 && t->view < t->hcount) t->view++;  /* keep the viewport still */
@@ -379,22 +425,33 @@ static void rotate_rows(Term *t, int top, int bot, int n) {
     uint8_t wstack[64], *wtmp;
     Cell **R = t->row[t->alt];
     uint8_t *W = t->wrapf[t->alt];
+    uint16_t *Ln = t->rlen[t->alt], lstack[64], *ltmp;
     int h = bot - top + 1, k = n > 0 ? n : -n;
     tmp = k <= 64 ? stack : (Cell **)malloc(sizeof(Cell *) * k);
     wtmp = k <= 64 ? wstack : (uint8_t *)malloc((size_t)k);
+    ltmp = k <= 64 ? lstack : (uint16_t *)malloc(sizeof(uint16_t) * k);
+    /* the rows' lengths travel with them: the rows coming back still hold
+       their old cells until clear_rows() clears them */
     if (n > 0) {
         memcpy(tmp, R + top, sizeof(Cell *) * k);
         memmove(R + top, R + top + k, sizeof(Cell *) * (h - k));
         memcpy(R + bot - k + 1, tmp, sizeof(Cell *) * k);
         memmove(W + top, W + top + k, (size_t)(h - k));
+        memcpy(ltmp, Ln + top, sizeof(uint16_t) * k);
+        memmove(Ln + top, Ln + top + k, sizeof(uint16_t) * (h - k));
+        memcpy(Ln + bot - k + 1, ltmp, sizeof(uint16_t) * k);
     } else {
         memcpy(tmp, R + bot - k + 1, sizeof(Cell *) * k);
         memmove(R + top + k, R + top, sizeof(Cell *) * (h - k));
         memcpy(R + top, tmp, sizeof(Cell *) * k);
         memmove(W + top + k, W + top, (size_t)(h - k));
+        memcpy(ltmp, Ln + bot - k + 1, sizeof(uint16_t) * k);
+        memmove(Ln + top + k, Ln + top, sizeof(uint16_t) * (h - k));
+        memcpy(Ln + top, ltmp, sizeof(uint16_t) * k);
     }
     if (tmp != stack) free(tmp);
     if (wtmp != wstack) free(wtmp);
+    if (ltmp != lstack) free(ltmp);
 }
 
 static void scroll_up(Term *t, int top, int bot, int n, int to_hist) {
@@ -402,7 +459,7 @@ static void scroll_up(Term *t, int top, int bot, int n, int to_hist) {
     if (n <= 0) return;
     if (n > h) n = h;
     if (to_hist && !t->alt && top == 0)
-        for (y = 0; y < n; y++) hist_push(t, CELL(t, 0, y), t->wrapf[0][y]);
+        for (y = 0; y < n; y++) hist_push(t, CELL(t, 0, y), t->rlen[0][y], t->wrapf[0][y]);
     rotate_rows(t, top, bot, n);
     clear_rows(t, bot - n + 1, bot + 1);
 }
@@ -449,9 +506,12 @@ static int term_init(Term *t, int cols, int rows) {
         int y;
         t->row[s] = (Cell **)malloc(sizeof(Cell *) * rows);
         t->wrapf[s] = (uint8_t *)calloc((size_t)rows, 1);
-        if (!t->row[s]) return 0;
-        for (y = 0; y < rows; y++)
+        t->rlen[s] = (uint16_t *)malloc(sizeof(uint16_t) * rows);
+        if (!t->row[s] || !t->rlen[s]) return 0;
+        for (y = 0; y < rows; y++) {
             if (!(t->row[s][y] = (Cell *)malloc(sizeof(Cell) * cols))) return 0;
+            t->rlen[s][y] = (uint16_t)cols;     /* garbage until the clear below */
+        }
     }
     t->tabs = (uint8_t *)malloc((size_t)cols);
     if (!t->hist || !t->tabs) return 0;
@@ -476,6 +536,8 @@ static void term_free(Term *t) {
     }
     free(t->wrapf[0]);
     free(t->wrapf[1]);
+    free(t->rlen[0]);
+    free(t->rlen[1]);
     free(t->tabs);
     {
         int i;
@@ -493,7 +555,7 @@ static void ll_add(LineList *l, const Cell *c, int n, int wrapped) {
         l->v = (HLine *)realloc(l->v, sizeof(HLine) * l->cap);
     }
     h = &l->v[l->n++];
-    h->n = n;
+    h->n = h->cap = n;
     h->wrapped = wrapped;
     h->c = n ? (Cell *)malloc(sizeof(Cell) * n) : NULL;
     if (n) memcpy(h->c, c, sizeof(Cell) * n);
@@ -578,8 +640,10 @@ static void reflow_main(Term *t, int cols, int rows) {
     for (y = 0; y < orows; y++) free(t->row[0][y]);
     free(t->row[0]);
     free(t->wrapf[0]);
+    free(t->rlen[0]);
     t->row[0] = (Cell **)malloc(sizeof(Cell *) * rows);
     t->wrapf[0] = (uint8_t *)calloc((size_t)rows, 1);
+    t->rlen[0] = (uint16_t *)calloc((size_t)rows, sizeof(uint16_t));
     for (y = 0; y < rows; y++) {
         int x, idx = start + y;
         t->row[0][y] = (Cell *)malloc(sizeof(Cell) * cols);
@@ -587,6 +651,7 @@ static void reflow_main(Term *t, int cols, int rows) {
         if (idx < out.n) {
             memcpy(t->row[0][y], out.v[idx].c, sizeof(Cell) * out.v[idx].n);
             t->wrapf[0][y] = (uint8_t)out.v[idx].wrapped;
+            t->rlen[0][y] = (uint16_t)out.v[idx].n;
             free(out.v[idx].c);
         }
     }
@@ -616,8 +681,11 @@ static void resize_alt(Term *t, int cols, int rows) {
     for (y = 0; y < t->rows; y++) free(t->row[1][y]);
     free(t->row[1]);
     free(t->wrapf[1]);
+    free(t->rlen[1]);
     t->row[1] = nr;
     t->wrapf[1] = nw;
+    t->rlen[1] = (uint16_t *)malloc(sizeof(uint16_t) * rows);
+    for (y = 0; y < rows; y++) t->rlen[1][y] = (uint16_t)cols;
     if (t->alt) {
         if (t->cy >= rows) t->cy = rows - 1;
         if (t->cx >= cols) t->cx = cols - 1;
@@ -666,6 +734,7 @@ static void insert_blanks(Term *t, int n) {
     if (n > t->cols - t->cx) n = t->cols - t->cx;
     for (x = t->cols - 1; x >= t->cx + n; x--) *CELL(t, x, t->cy) = *CELL(t, x - n, t->cy);
     for (x = t->cx; x < t->cx + n; x++) *CELL(t, x, t->cy) = b;
+    row_used(t, t->cy, t->cols);
 }
 
 static void term_put(Term *t, uint32_t cp) {
@@ -692,6 +761,7 @@ static void term_put(Term *t, uint32_t cp) {
     if (t->m_insert) insert_blanks(t, w);
     fix_wide(t, t->cx, w);
     c = CELL(t, t->cx, t->cy);
+    row_used(t, t->cy, t->cx + w);
     *c = t->pen;
     c->ch = cp;
     c->wflag = (w == 2) ? W_WIDE : 0;
@@ -759,6 +829,7 @@ static void shift_columns(Term *t, int x0, int n) {
     Cell b = blank_cell(t);
     for (y = t->top; y <= t->bot; y++) {
         Cell *row = CELL(t, 0, y);
+        row_used(t, y, t->cols);
         if (n > 0) {
             for (x = t->cols - 1; x >= x0; x--) row[x] = (x - n >= x0) ? row[x - n] : b;
         } else {
@@ -774,6 +845,7 @@ static void decaln(Term *t) {
             Cell *c = CELL(t, x, y);
             memset(c, 0, sizeof(*c));
             c->ch = 'E';
+            row_used(t, y, x + 1);
         }
     t->top = 0;
     t->bot = t->rows - 1;
@@ -1052,6 +1124,7 @@ static void csi_dispatch(Term *t, int f) {
         if (n > t->cols - t->cx) n = t->cols - t->cx;
         for (x = t->cx; x < t->cols - n; x++) *CELL(t, x, t->cy) = *CELL(t, x + n, t->cy);
         for (x = t->cols - n; x < t->cols; x++) *CELL(t, x, t->cy) = b;
+        if (b.bg) row_used(t, t->cy, t->cols);
         break;
     }
     case 'X': clear_span(t, t->cy, t->cx, t->cx + P(t, 0, 1)); break;
@@ -1488,6 +1561,7 @@ static void vt_feed(Term *t, const unsigned char *s, int n) {
                 *c = t->pen;
                 c->ch = b;
                 t->cx++;
+                if (t->cx > t->rlen[t->alt][t->cy]) t->rlen[t->alt][t->cy] = (uint16_t)t->cx;
                 t->last_ch = b;
                 continue;
             }
@@ -1579,7 +1653,16 @@ static int tab_drain(Tab *tb) {
     InterlockedExchange(&tb->posted, 0);
     LeaveCriticalSection(&tb->lock);
     if (n && g_vtlog) { fwrite(data, 1, (size_t)n, g_vtlog); fflush(g_vtlog); }
-    if (n) vt_feed(&tb->t, (unsigned char *)data, n);
+    if (n && g_perf) {
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        vt_feed(&tb->t, (unsigned char *)data, n);
+        QueryPerformanceCounter(&b);
+        g_pf.parse += lat_ms(a, b);
+        g_pf.bytes += n;
+        g_pf.drains++;
+        perf_tick();
+    } else if (n) vt_feed(&tb->t, (unsigned char *)data, n);
     free(data);
     return n;
 }
@@ -1979,7 +2062,7 @@ static int utf8_encode(uint32_t cp, char *o) {
 
 static int g_focused = 1;
 static int g_mouse_x = -1, g_mouse_y = -1;
-static DWORD g_last_paint;
+static LARGE_INTEGER g_last_paint;   /* QPC: GetTickCount only moves every ~15.6 ms */
 
 static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 
@@ -2039,17 +2122,6 @@ static void sel_norm(long long *r0, int *c0, long long *r1, int *c1) {
     } else {
         *r0 = g_sel_b_row; *c0 = g_sel_b_col; *r1 = g_sel_a_row; *c1 = g_sel_a_col;
     }
-}
-
-static int sel_contains(long long row, int col) {
-    long long r0, r1;
-    int c0, c1;
-    if (!g_sel_on) return 0;
-    sel_norm(&r0, &c0, &r1, &c1);
-    if (row < r0 || row > r1) return 0;
-    if (row == r0 && col < c0) return 0;
-    if (row == r1 && col > c1) return 0;
-    return 1;
 }
 
 static void sel_copy(void) {
@@ -2257,6 +2329,7 @@ static void paste(void) {
 /* ── glyph atlas: on-demand 16×16 slots in one texture ─────────────── */
 
 #define ATLAS 2048
+#define ATLAS_S "2048.0"
 #define SLOTS_PER_ROW (ATLAS / 16)
 #define MAX_SLOTS (SLOTS_PER_ROW * SLOTS_PER_ROW)
 #define HASH_SIZE 65536
@@ -2276,11 +2349,18 @@ static void glyph_cache_reset(void);
    allowed Windows can promote the window to an independent flip or a
    hardware overlay plane, skipping composition altogether.
 
-   The drawing code is still immediate mode: r_color() sets the color,
-   r_quad() / r_quad_uv() append two triangles to one CPU-side vertex array,
-   and r_present() uploads it and draws everything with a single Draw. */
+   The drawing code is still immediate mode: r_color() sets the color, and
+   quad() / r_quad_uv() append one 20-byte instance (pixel rectangle, atlas
+   rectangle, color) to a CPU-side array. The vertex shader turns each
+   instance into two triangles, and r_present() uploads the array and draws it
+   all with one DrawInstanced: a full screen of text is a few hundred KB, not
+   the 120 bytes per quad that six float vertices took. */
 
-typedef struct { float x, y, u, v; uint32_t rgba; } Vtx;
+typedef struct {
+    int16_t x0, y0, x1, y1;      /* pixels */
+    uint16_t u0, v0, u1, v1;     /* atlas pixels; u0 == 0xFFFF: a solid quad */
+    uint32_t rgba;
+} Inst;
 
 /* not in every mingw libuuid */
 static const GUID IID_IDXGIFactory5_ = {0x7632e1f5, 0xee65, 0x4dca, {0x87, 0xfd, 0x84, 0xcd, 0x75, 0xf8, 0x83, 0x8d}};
@@ -2301,16 +2381,24 @@ static ID3D11SamplerState *g_samp;
 static ID3D11RasterizerState *g_rs;
 static int g_tearing;            /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
 static int g_gfx_ready;          /* swap chain exists: GDI no longer paints */
-static float g_rw = 1, g_rh = 1; /* current frame size, for pixel → clip space */
+static ID3D11Buffer *g_cb;       /* the frame size, for pixel → clip space */
+static int g_cb_w, g_cb_h;
 static uint32_t g_rgba = 0xFFFFFFFF;
-#define VB_VERTS 65536           /* per Draw; a frame that needs more draws in pieces */
-static Vtx g_vtx[VB_VERTS];
-static int g_nvtx;
+#define VB_INST 65536            /* per draw; a frame that needs more draws in pieces */
+static Inst g_inst[VB_INST];
+static int g_ninst;
 
 static const char HLSL[] =
-    "struct VI { float2 p : POSITION; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
+    "cbuffer F : register(b0) { float2 inv; };\n"     /* 2 / frame size */
+    "struct VI { int4 r : RECT; uint4 t : TEX; float4 c : COLOR; uint id : SV_VertexID; };\n"
     "struct VO { float4 p : SV_Position; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
-    "VO vs(VI i) { VO o; o.p = float4(i.p, 0, 1); o.uv = i.uv; o.c = i.c; return o; }\n"
+    "VO vs(VI i) {\n"
+    "  uint k = i.id < 3 ? i.id : i.id - 2;\n"         /* 0 1 2, 1 3 2: corners of a quad */
+    "  float2 f = float2(k & 1, k >> 1);\n"
+    "  float2 p = lerp(float2(i.r.xy), float2(i.r.zw), f);\n"
+    "  VO o; o.p = float4(p.x * inv.x - 1, 1 - p.y * inv.y, 0, 1);\n"
+    "  o.uv = i.t.x == 65535 ? float2(-1, -1) : lerp(float2(i.t.xy), float2(i.t.zw), f) / " ATLAS_S ";\n"
+    "  o.c = i.c; return o; }\n"
     "Texture2D t : register(t0); SamplerState s : register(s0);\n"
     "float4 ps(VO i) : SV_Target {\n"
     "  float a = i.uv.x < 0 ? 1 : t.SampleLevel(s, i.uv, 0).a;\n"
@@ -2325,32 +2413,29 @@ static void r_color(uint32_t rgb, float a) {
 
 static void r_flush(void) {
     D3D11_MAPPED_SUBRESOURCE m;
-    if (!g_nvtx || !g_ctx) return;
+    if (!g_ninst || !g_ctx) return;
     if (SUCCEEDED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)g_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        memcpy(m.pData, g_vtx, sizeof(Vtx) * g_nvtx);
+        memcpy(m.pData, g_inst, sizeof(Inst) * g_ninst);
         ID3D11DeviceContext_Unmap(g_ctx, (ID3D11Resource *)g_vb, 0);
-        ID3D11DeviceContext_Draw(g_ctx, (UINT)g_nvtx, 0);
+        ID3D11DeviceContext_DrawInstanced(g_ctx, 6, (UINT)g_ninst, 0, 0);
     }
-    g_nvtx = 0;
+    g_ninst = 0;
 }
 
-static void r_vert(float x, float y, float u, float v) {
-    Vtx *p = &g_vtx[g_nvtx++];
-    p->x = x * 2.0f / g_rw - 1.0f;
-    p->y = 1.0f - y * 2.0f / g_rh;
-    p->u = u;
-    p->v = v;
-    p->rgba = g_rgba;
+/* pixel positions round to whole pixels: the font is a bitmap, it should land on the grid */
+static int16_t px(float v) { return (int16_t)(v < 0 ? v - 0.5f : v + 0.5f); }
+
+/* textured quad, atlas rectangle in atlas pixels */
+static void r_quad_uv(float x0, float y0, float x1, float y1, int u0, int v0, int u1, int v1) {
+    Inst *q;
+    if (g_ninst == VB_INST) r_flush();
+    q = &g_inst[g_ninst++];
+    q->x0 = px(x0); q->y0 = px(y0); q->x1 = px(x1); q->y1 = px(y1);
+    q->u0 = (uint16_t)u0; q->v0 = (uint16_t)v0; q->u1 = (uint16_t)u1; q->v1 = (uint16_t)v1;
+    q->rgba = g_rgba;
 }
 
-/* textured quad; u0 < 0 means a solid one */
-static void r_quad_uv(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1) {
-    if (g_nvtx + 6 > VB_VERTS) r_flush();
-    r_vert(x0, y0, u0, v0); r_vert(x1, y0, u1, v0); r_vert(x1, y1, u1, v1);
-    r_vert(x0, y0, u0, v0); r_vert(x1, y1, u1, v1); r_vert(x0, y1, u0, v1);
-}
-
-static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1, y1, -1, -1, -1, -1); }
+static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1, y1, 0xFFFF, 0, 0, 0); }
 
 /* one 16×16 alpha glyph into the atlas */
 static void r_upload(int x, int y, const unsigned char *bmp) {
@@ -2380,10 +2465,14 @@ static void r_resize(void) {
 static void r_begin(int w, int h) {
     static const float bg[4] = {((DEF_BG >> 16) & 255) / 255.0f, ((DEF_BG >> 8) & 255) / 255.0f, (DEF_BG & 255) / 255.0f, 1};
     D3D11_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
-    UINT stride = sizeof(Vtx), off = 0;
-    g_rw = (float)w;
-    g_rh = (float)h;
-    g_nvtx = 0;
+    UINT stride = sizeof(Inst), off = 0;
+    if (w != g_cb_w || h != g_cb_h) {
+        float inv[4] = {2.0f / (float)w, 2.0f / (float)h, 0, 0};
+        ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_cb, 0, NULL, inv, 0, 0);
+        g_cb_w = w;
+        g_cb_h = h;
+    }
+    g_ninst = 0;
     ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 1, &g_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(g_ctx, g_rtv, bg);
     ID3D11DeviceContext_RSSetViewports(g_ctx, 1, &vp);
@@ -2392,6 +2481,7 @@ static void r_begin(int w, int h) {
     ID3D11DeviceContext_IASetInputLayout(g_ctx, g_il);
     ID3D11DeviceContext_IASetVertexBuffers(g_ctx, 0, 1, &g_vb, &stride, &off);
     ID3D11DeviceContext_VSSetShader(g_ctx, g_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(g_ctx, 0, 1, &g_cb);
     ID3D11DeviceContext_PSSetShader(g_ctx, g_ps, NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1, &g_srv);
     ID3D11DeviceContext_PSSetSamplers(g_ctx, 0, 1, &g_samp);
@@ -2429,16 +2519,19 @@ static int gfx_init_device(void) {
     ID3D11Device_CreatePixelShader(g_dev, ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb), NULL, &g_ps);
     {
         D3D11_INPUT_ELEMENT_DESC el[3] = {
-            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+            {"RECT", 0, DXGI_FORMAT_R16G16B16A16_SINT, 0, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+            {"TEX", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, 8, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1}};
         ID3D11Device_CreateInputLayout(g_dev, el, 3, ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb), &g_il);
     }
     ID3D10Blob_Release(vsb);
     ID3D10Blob_Release(psb);
     {
-        D3D11_BUFFER_DESC bd = {sizeof(g_vtx), D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+        D3D11_BUFFER_DESC bd = {sizeof(g_inst), D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+        D3D11_BUFFER_DESC cd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
         ID3D11Device_CreateBuffer(g_dev, &bd, NULL, &g_vb);
+        ID3D11Device_CreateBuffer(g_dev, &cd, NULL, &g_cb);
+        g_cb_w = g_cb_h = 0;
     }
     {
         D3D11_TEXTURE2D_DESC td;
@@ -2544,7 +2637,7 @@ static int gfx_init_swapchain(HWND hwnd) {
 static void gfx_lost(void) {
     g_gfx_ready = 0;
     REL(g_rtv); REL(g_sc); REL(g_rs); REL(g_samp); REL(g_blend); REL(g_srv); REL(g_atlas);
-    REL(g_vb); REL(g_il); REL(g_ps); REL(g_vs); REL(g_ctx); REL(g_dev);
+    REL(g_vb); REL(g_cb); REL(g_il); REL(g_ps); REL(g_vs); REL(g_ctx); REL(g_dev);
     glyph_cache_reset();
     if (gfx_init_device()) gfx_init_swapchain(g_hwnd);
     InvalidateRect(g_hwnd, NULL, FALSE);
@@ -2599,8 +2692,7 @@ static void fill_rect(float x0, float y0, float x1, float y1, uint32_t rgb, floa
 static void draw_glyph(uint32_t cp, float x, float y, int w_cells, int scale) {
     int gw, slot = glyph_slot(cp, &gw);
     float cw = (float)(FONT_W * scale), chh = (float)(FONT_H * scale);
-    float u0 = (float)((slot % SLOTS_PER_ROW) * 16) / ATLAS, v0 = (float)((slot / SLOTS_PER_ROW) * 16) / ATLAS;
-    float u1 = u0 + (float)gw / ATLAS, v1 = v0 + 16.0f / ATLAS;
+    int u0 = (slot % SLOTS_PER_ROW) * 16, v0 = (slot / SLOTS_PER_ROW) * 16, u1 = u0 + gw, v1 = v0 + 16;
     float x0 = x, y0 = y, x1, y1 = y + chh;
     if (gw == 16 && w_cells == 1) {
         float pad = (chh - cw) * 0.5f;
@@ -2970,29 +3062,38 @@ static void render(void) {
     t = &tb->t;
     base = term_base(t);
 
-    /* backgrounds + selection */
+    /* One pass per row: backgrounds, then glyphs, then underlines, so a bold
+       smear or underline is never painted over by the next cell's background.
+       Rows don't overlap, so this draws the same pixels as three full-screen
+       passes. Past a screen row's rlen everything is a default blank. */
     for (y = 0; y < t->rows; y++) {
         const Cell *cells;
-        int n, wrapped, L = t->hcount - t->view + y;
+        int n, wrapped, L = t->hcount - t->view + y, s0 = 1, s1 = 0, end;
+        float y0 = (float)(oy + y * CH);
         term_line(t, L, &cells, &n, &wrapped);
-        for (x = 0; x < t->cols; x++) {
+        if (L >= t->hcount && L - t->hcount < t->rows && t->rlen[t->alt][L - t->hcount] < n)
+            n = t->rlen[t->alt][L - t->hcount];
+        if (g_sel_on) {          /* this row's selected columns, [s0, s1] */
+            long long r0, r1, row = base + L;
+            int c0, c1;
+            sel_norm(&r0, &c0, &r1, &c1);
+            if (row >= r0 && row <= r1) {
+                s0 = row == r0 ? c0 : 0;
+                s1 = row == r1 ? c1 : t->cols - 1;
+            }
+        }
+        if (n > t->cols) n = t->cols;
+        end = s1 >= s0 && s1 + 1 > n ? (s1 + 1 < t->cols ? s1 + 1 : t->cols) : n;
+        for (x = 0; x < end; x++) {
             uint32_t fg, bg;
-            int sel = sel_contains(base + L, x);
             if (x < n) cell_colors(&cells[x], &fg, &bg);
             else bg = DEF_BG;
-            if (sel) bg = SEL_BG;
+            if (x >= s0 && x <= s1) bg = SEL_BG;
             if (bg == DEF_BG) continue;
             r_color(bg, 1);
-            quad((float)(ox + x * CW), (float)(oy + y * CH), (float)(ox + (x + 1) * CW), (float)(oy + (y + 1) * CH));
+            quad((float)(ox + x * CW), y0, (float)(ox + (x + 1) * CW), y0 + CH);
         }
-    }
-
-    /* glyphs */
-    for (y = 0; y < t->rows; y++) {
-        const Cell *cells;
-        int n, wrapped, L = t->hcount - t->view + y;
-        term_line(t, L, &cells, &n, &wrapped);
-        for (x = 0; x < n && x < t->cols; x++) {
+        for (x = 0; x < n; x++) {
             const Cell *c = &cells[x];
             uint32_t fg, bg;
             int w;
@@ -3001,22 +3102,15 @@ static void render(void) {
             if (fg == bg && !(c->attr & A_HIDDEN)) continue;
             w = (c->wflag == W_WIDE) ? 2 : 1;
             r_color(fg, 1);
-            draw_glyph(c->ch, (float)(ox + x * CW), (float)(oy + y * CH), w, g_scale);
+            draw_glyph(c->ch, (float)(ox + x * CW), y0, w, g_scale);
             /* Unifont has no bold; smear one pixel right, except box drawing */
             if ((c->attr & A_BOLD) && !(c->ch >= 0x2500 && c->ch <= 0x259F))
-                draw_glyph(c->ch, (float)(ox + x * CW + g_scale), (float)(oy + y * CH), w, g_scale);
+                draw_glyph(c->ch, (float)(ox + x * CW + g_scale), y0, w, g_scale);
         }
-    }
-
-    /* underline / strike */
-    for (y = 0; y < t->rows; y++) {
-        const Cell *cells;
-        int n, wrapped, L = t->hcount - t->view + y;
-        term_line(t, L, &cells, &n, &wrapped);
-        for (x = 0; x < n && x < t->cols; x++) {
+        for (x = 0; x < n; x++) {
             const Cell *c = &cells[x];
             uint32_t fg, bg;
-            float x0 = (float)(ox + x * CW), y0 = (float)(oy + y * CH);
+            float x0 = (float)(ox + x * CW);
             if (!(c->attr & (A_UNDER | A_STRIKE)) && !c->link) continue;
             cell_colors(c, &fg, &bg);
             if (c->link && !(c->attr & A_UNDER)) {   /* OSC 8 link: dotted underline */
@@ -3155,15 +3249,25 @@ static void paint_now(void) {
         SetTimer(g_hwnd, 1, 20, NULL);
         return;
     }
+    LARGE_INTEGER p0, p1, p2;
     if (g_lat && g_lat_out.QuadPart) QueryPerformanceCounter(&g_lat_render);
+    if (g_perf) QueryPerformanceCounter(&p0);
     render();
     if (g_snap_path[0]) {
         r_flush();
         snap_backbuffer();
         g_snap_path[0] = 0;
     }
+    if (g_perf) QueryPerformanceCounter(&p1);
     r_present();
-    g_last_paint = GetTickCount();
+    if (g_perf) {
+        QueryPerformanceCounter(&p2);
+        g_pf.build += lat_ms(p0, p1);
+        g_pf.present += lat_ms(p1, p2);
+        g_pf.frames++;
+        perf_tick();
+    }
+    QueryPerformanceCounter(&g_last_paint);
     if (g_lat && g_lat_out.QuadPart) {
         LARGE_INTEGER t;
         QueryPerformanceCounter(&t);
@@ -3741,6 +3845,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             help_key(tb, buf[0] == '\n' ? '\r' : (unsigned char)buf[0]);
         } else if (cd->dwData == 0x48430001 && tb) {   /* type: \n becomes Enter */
             size_t i;
+            if (g_lat && !g_lat_key.QuadPart) {        /* time it like a key, without taking focus */
+                lat_finish();
+                QueryPerformanceCounter(&g_lat_key);
+            }
             for (i = 0; i < n; i++) if (buf[i] == '\n') buf[i] = '\r';
             tab_write(tb, buf, (int)n);
         } else if (cd->dwData == 0x48430002) {          /* a hardcore command */
@@ -3754,6 +3862,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_mouse_y = strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1;
             } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);
             else if (!strncmp(buf, "tophover ", 9)) g_top_hover = atoi(buf + 9);
+            else if (!strncmp(buf, "sel ", 4) && tb) {   /* sel Y0 X0 Y1 X1: select, in screen rows */
+                int y0, x0, y1, x1;
+                if (sscanf(buf + 4, "%d %d %d %d", &y0, &x0, &y1, &x1) != 4) return FALSE;
+                g_sel_a_row = term_abs_line(&tb->t, y0); g_sel_a_col = x0;
+                g_sel_b_row = term_abs_line(&tb->t, y1); g_sel_b_col = x1;
+                g_sel_on = 1;
+            }
             else return FALSE;
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (cd->dwData == 0x48430003 && g_gfx_ready) {   /* snapshot the next frame to a .bmp */
@@ -3948,8 +4063,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (first) { first = 0; trace("first child output"); }
             update_title();
             InvalidateRect(hwnd, NULL, FALSE);
-            /* under a flood of output, still show a frame every ~30ms */
-            if (GetTickCount() - g_last_paint > 30) UpdateWindow(hwnd);
+            /* under a flood of output WM_PAINT never comes (the queue is never
+               empty), so draw one here at least every frame of a 60 Hz display */
+            {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                if (lat_ms(g_last_paint, now) > 16.0) UpdateWindow(hwnd);
+            }
         }
         return 0;
     }
@@ -4298,6 +4418,53 @@ static int unit_tests(const char *out_path) {
         fprintf(f, "%s drop  %s\n", strcmp(a, b) ? "FAIL" : "ok  ", a);
         fails += strcmp(a, b) != 0;
     }
+    {   /* scrollback: what each kind of row leaves in history (rlen bookkeeping) */
+        static const struct { const char *in, *want; int n; } sb[] = {
+            {"abc\r\n", "abc", 3},
+            {"\x1b[41m\x1b[K\x1b[0m\r\n", "", 20},          /* colored blanks are kept */
+            {"abcdefghij\r\x1b[K\r\n", "", 0},
+            {"abcdefghij\x1b[5G\x1b[K\r\n", "abcd", 4},
+            {"abc\x1b[1G\x1b[2@\r\n", "  abc", 5},
+            {"abcdef\x1b[1G\x1b[2P\r\n", "cdef", 4},
+            {"\xe6\x97\xa5\xe6\x9c\xac\r\n", "\xe6\x97\xa5\xe6\x9c\xac", 4},
+            {"abcdefghijklmnopqrstuvwxyz\r\n", "abcdefghijklmnopqrst", 20},
+        };
+        int k;
+        for (k = 0; k < (int)(sizeof(sb) / sizeof(sb[0])); k++) {
+            Term t;
+            char got[256];
+            int len = 0, x, ok;
+            const HLine *h;
+            if (!term_init(&t, 20, 4)) return 3;
+            vt_feed(&t, (const unsigned char *)sb[k].in, (int)strlen(sb[k].in));
+            vt_feed(&t, (const unsigned char *)"\x1b[4H\n\n\n\n", 8);   /* push it up into history */
+            h = t.hcount ? &t.hist[t.hstart] : NULL;
+            for (x = 0; h && x < h->n; x++)
+                if (h->c[x].wflag != W_CONT) len += utf8_encode(h->c[x].ch, got + len);
+            while (len && got[len - 1] == ' ') len--;
+            got[len] = 0;
+            ok = h && h->n == sb[k].n && !strcmp(got, sb[k].want);
+            fprintf(f, "%s hist  #%d n=%d \"%s\"\n", ok ? "ok  " : "FAIL", k, h ? h->n : -1, got);
+            fails += !ok;
+            term_free(&t);
+        }
+        {   /* past HIST_LINES: the oldest lines go, their buffers are reused */
+            Term t;
+            char line[32];
+            const HLine *h;
+            int ok;
+            if (!term_init(&t, 20, 4)) return 3;
+            for (k = 0; k < HIST_LINES + 10; k++) {
+                int n = snprintf(line, sizeof(line), "line %d\r\n", k);
+                vt_feed(&t, (const unsigned char *)line, n);
+            }
+            h = &t.hist[(t.hstart + t.hcount - 1) % HIST_LINES];
+            ok = t.hcount == HIST_LINES && h->n == 10 && h->c[5].ch == '2' && h->c[9].ch == '6';   /* "line 20006" */
+            fprintf(f, "%s hist  recycled, count %d\n", ok ? "ok  " : "FAIL", t.hcount);
+            fails += !ok;
+            term_free(&t);
+        }
+    }
     for (i = 0; i < (int)(sizeof(urls) / sizeof(urls[0])); i++) {
         char got[256] = "";
         int hit = url_in_word(urls[i].word, urls[i].at, got, sizeof(got));
@@ -4308,6 +4475,38 @@ static int unit_tests(const char *out_path) {
     fprintf(f, "%d failed\n", fails);
     fclose(f);
     return fails ? 1 : 0;
+}
+
+/* --bench OUT COLS ROWS FILE: parser speed on a captured ConPTY stream (see
+   HARDCORE_VTLOG), fed in 64 KB chunks the way the reader thread does. */
+static int parse_bench(const char *out_path, int cols, int rows, const wchar_t *file) {
+    FILE *out = fopen(out_path, "wb"), *f = _wfopen(file, L"rb");
+    Tab *tb = (Tab *)calloc(1, sizeof(Tab));
+    unsigned char *data;
+    long n, k;
+    int rep, best = 0, chunk = _wgetenv(L"HARDCORE_BENCH_CHUNK") ? _wtoi(_wgetenv(L"HARDCORE_BENCH_CHUNK")) : 65536;
+    double best_ms = 1e9;
+    if (!out || !f || !tb || !term_init(&tb->t, cols, rows)) return 3;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    data = (unsigned char *)malloc((size_t)n);
+    if (!data || fread(data, 1, (size_t)n, f) != (size_t)n) return 3;
+    fclose(f);
+    QueryPerformanceFrequency(&g_qpf);
+    for (rep = 0; rep < 5; rep++) {
+        LARGE_INTEGER a, b;
+        double ms;
+        QueryPerformanceCounter(&a);
+        for (k = 0; k < n; k += chunk) vt_feed(&tb->t, data + k, (int)(n - k < chunk ? n - k : chunk));
+        QueryPerformanceCounter(&b);
+        ms = lat_ms(a, b);
+        fprintf(out, "run %d: %.1f ms\n", rep, ms);
+        if (ms < best_ms) { best_ms = ms; best = rep; }
+    }
+    fprintf(out, "%.1f MB in %.1f ms best of 5 (run %d): %.1f MB/s\n", n / 1e6, best_ms, best, n / 1e3 / best_ms);
+    fclose(out);
+    return 0;
 }
 
 /* Parser-only replay for conformance corpora: each input file goes through a
@@ -4384,6 +4583,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-vt.log", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
         g_vtlog = _wfopen(tp, L"wb");
     }
+    if (_wgetenv(L"HARDCORE_PERF")) {
+        wchar_t tp[MAX_PATH];
+        _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-perf.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
+        g_perf = _wfopen(tp, L"wb");
+    }
     if (_wgetenv(L"HARDCORE_LAT")) {
         wchar_t tp[MAX_PATH];
         _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-lat.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
@@ -4410,6 +4614,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             show = SW_SHOWNOACTIVATE;       /* tests: open behind, never take the keyboard */
         } else if (!strcmp(a, "--inbox-conpty")) {
             g_inbox_conpty = 1;
+        } else if (!strcmp(a, "--bench") && i + 4 < argc) {
+            char out[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
+            return parse_bench(out, _wtoi(argv[i + 2]), _wtoi(argv[i + 3]), argv[i + 4]);
         } else if (!strcmp(a, "--replay") && i + 3 < argc) {
             /* --replay OUT COLS ROWS FILE... */
             char out[MAX_PATH * 3];
