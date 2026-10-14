@@ -1214,9 +1214,7 @@ static int plain_layout(void) {
 
 - (void)resetCursorRects {
     NSRect b = [self bounds];
-    CGFloat side = sidebar_w() / [g_win backingScaleFactor];
-    [self addCursorRect:NSMakeRect(0, 0, side, b.size.height) cursor:[NSCursor arrowCursor]];
-    [self addCursorRect:NSMakeRect(side, 0, b.size.width - side, b.size.height) cursor:[NSCursor IBeamCursor]];
+    [self addCursorRect:b cursor:[NSCursor IBeamCursor]];
 }
 
 - (void)updateTrackingAreas {
@@ -1400,7 +1398,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     CGFloat s = [g_win backingScaleFactor];
     int col, row;
     char url[2048];
-    if (!NSPointInRect(p, [self bounds]) || p.x * s < sidebar_w()) return;
+    if (!NSPointInRect(p, [self bounds]) || over_chrome((int)(p.x * s), (int)(p.y * s))) return;
     mouse_cell((int)(p.x * s), (int)(p.y * s), &col, &row);
     if (([e modifierFlags] & NSEventModifierFlagCommand) && link_at(col, row, url, sizeof(url))) [[NSCursor pointingHandCursor] set];
     else [[NSCursor IBeamCursor] set];
@@ -1499,7 +1497,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
         plat_invalidate();
         return;
     }
-    if (mx >= sidebar_w()) mouse_report(0, 1, 1, mx, my, ev_mods(e));
+    if (!over_chrome(mx, my)) mouse_report(0, 1, 1, mx, my, ev_mods(e));
 }
 
 - (void)mouseUp:(NSEvent *)e {
@@ -1516,7 +1514,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     int mx, my;
     NSMenu *m;
     view_px(e, &mx, &my);
-    if (mx < sidebar_w()) return;
+    if (over_chrome(mx, my)) return;
     if (mouse_report(2, 1, 0, mx, my, ev_mods(e))) return;
     m = [[[NSMenu alloc] init] autorelease];
     [m setAutoenablesItems:NO];
@@ -1536,7 +1534,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (void)rightMouseDragged:(NSEvent *)e {
     int mx, my;
     view_px(e, &mx, &my);
-    if (mx >= sidebar_w()) mouse_report(2, 1, 1, mx, my, ev_mods(e));
+    if (!over_chrome(mx, my)) mouse_report(2, 1, 1, mx, my, ev_mods(e));
 }
 
 - (void)otherMouseDown:(NSEvent *)e {
@@ -1554,10 +1552,10 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 }
 
 - (void)mouseMoved:(NSEvent *)e {
-    int mx, my, was_bar = g_mouse_y >= 0 && g_mouse_x < sidebar_w(), on_bar;
+    int mx, my, was_bar = g_mouse_y >= 0 && in_sidebar(g_mouse_x), on_bar;
     Tab *tb = active_tab();
     view_px(e, &mx, &my);
-    on_bar = mx < sidebar_w();
+    on_bar = over_chrome(mx, my);
     g_mouse_x = mx;
     g_mouse_y = my;
     if (was_bar || on_bar) plat_invalidate();
@@ -1968,6 +1966,7 @@ static int unit_tests(const char *out_path) {
         fails += !ok;
     }
     fails += unit_scrollback(f);
+    fails += unit_underlay(f);
     {
         int e, ok = reflow_check(5000, &e) && !e, rt = reflow_roundtrip();
         fprintf(f, "%s reflow tail-only + settle == full reflow\n", ok ? "ok  " : "FAIL");

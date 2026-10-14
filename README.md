@@ -1,5 +1,13 @@
 # hardcore
 
+Experimental branch `experiment/right-underlay-tabs`: the terminal uses the full
+window width. Tabs and grip rows sit on the right, visible over whitespace;
+content in their area collapses each tab to its last-cell initial. Hover a tab
+to bring its name and details forward. The initial stays visible, with the
+throbber overlaid while busy. The right-edge cells overlay the terminal without
+reserving columns. Settings and **+** sit below the tabs; the open settings panel
+comes forward for interaction.
+
 A terminal for WSL on Windows 11, built for running Claude Code. It also runs
 natively on macOS (see [macOS](#macos)). It does one
 job, running your WSL shell, and it isn't a jack of all trades. The only

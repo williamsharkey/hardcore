@@ -2894,13 +2894,10 @@ static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 #define CH cell_h(g_cf)
 #define PAD (4 * g_scale)
 #define SCROLLBAR_W (6 * g_scale)
-/* The chrome: one column on the left with the tabs and "+". Min/max/close
-   float over the terminal's top-right corner on smoked glass: the text runs
-   underneath, only the mouse is theirs. No row is spent on a title bar.
-   The column is laid on a character grid of the font you picked: SB_COLS
-   cells wide, rows one cell tall from the terminal's own top. While you
-   point at a font in the settings only the terminal tries it on, so the
-   column (and what you're pointing at) stays put. */
+/* Experimental chrome: a right-side underlay on the font's character grid.
+   Terminal text gets the full width. A tab comes forward only on hover;
+   its last-cell initial stays visible when terminal content covers its name.
+   Font previews leave the chrome's geometry fixed until a font is picked. */
 #define SB_COLS 20
 #define UI_FONT const Font *ui_was_ = g_cf; g_cf = g_font
 #define UI_DONE g_cf = ui_was_
@@ -2910,11 +2907,18 @@ static int caption_h(void) { return cell_h(g_font) + 8 * g_scale; }   /* the gla
 #else
 static int caption_h(void) { return 0; }   /* macOS keeps its own traffic lights, over the tab column */
 #endif
-static int term_ox(void) { return sidebar_w() + PAD; }
+/* The chrome overlays the right edge; it never changes the pty grid. */
+static int sidebar_x(void) {
+    int w, h;
+    plat_client_size(&w, &h);
+    return PAD + ((w - 2 * PAD - SCROLLBAR_W) / cell_w(g_font) - SB_COLS) * cell_w(g_font);
+}
+static int in_sidebar(int x) { return x >= sidebar_x() && x < sidebar_x() + sidebar_w(); }
+static int term_ox(void) { return PAD; }
 static int term_oy(void) { return PAD; }
 
 static void compute_grid(int w, int h, int *cols, int *rows) {
-    *cols = (w - sidebar_w() - 2 * PAD - SCROLLBAR_W) / CW;
+    *cols = (w - 2 * PAD - SCROLLBAR_W) / CW;
     *rows = (h - 2 * PAD) / CH;
     if (*cols < 10) *cols = 10;
     if (*rows < 3) *rows = 3;
@@ -3238,6 +3242,7 @@ static uint32_t g_rgba = 0xFFFFFFFF;
 #define VB_INST 65536            /* per draw; a frame that needs more draws in pieces */
 static Inst g_inst[VB_INST];
 static int g_ninst;
+static int g_chrome_x; /* translation for the right-side overlay only */
 
 static void r_flush(void);
 static void r_upload(int x, int y, const unsigned char *bmp);
@@ -3252,6 +3257,7 @@ static int16_t px(float v) { return (int16_t)(v < 0 ? v - 0.5f : v + 0.5f); }
 /* textured quad, atlas rectangle in atlas pixels */
 static void r_quad_uv(float x0, float y0, float x1, float y1, int u0, int v0, int u1, int v1) {
     Inst *q;
+    x0 += g_chrome_x; x1 += g_chrome_x;
     if (g_ninst == VB_INST) r_flush();
     q = &g_inst[g_ninst++];
     q->x0 = px(x0); q->y0 = px(y0); q->x1 = px(x1); q->y1 = px(y1);
@@ -3818,9 +3824,9 @@ static int sb_row_y(int k) { return PAD + k * CH; }
 
 /* the first tab row: under the traffic lights, if they reach into the column */
 static int first_row(void) {
-    int r = 0, b = plat_lights_bottom();
+    int r = 1, b = plat_lights_bottom();
 #ifdef _WIN32
-    r = 1; /* the drag grip above the tabs */
+    b = caption_h(); /* keep the right-side tabs below the window buttons */
 #endif
     while (b > 0 && PAD + r * CH < b) r++;
     return r;
@@ -3917,6 +3923,7 @@ static void tab_layout(void) {
 static int hit_tabbar(int mx, int my, int *idx) {
     int i, col, row, hit = HIT_BAR;
     UI_FONT;
+    mx -= sidebar_x();
     if (mx < 0 || mx >= sidebar_w() || my < 0) { UI_DONE; return HIT_NONE; }
     tab_layout();
     col = mx / CW;
@@ -3926,7 +3933,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
         if (i == g_ntabs) hit = col <= 9 ? HIT_SETTINGS : col >= SB_COLS - 3 ? HIT_PLUS : HIT_BAR;   /* the word "settings", the + */
         else {
             *idx = i;
-            hit = col >= SB_COLS - 3 ? HIT_CLOSE : HIT_TAB;
+            hit = col == SB_COLS - 2 && my < g_row_y[i] + CH ? HIT_CLOSE : HIT_TAB;
         }
         UI_DONE;
         return hit;
@@ -3946,8 +3953,14 @@ static int hit_tabbar(int mx, int my, int *idx) {
             hit = HIT_SCHEME;
         }
     }
+    if (hit == HIT_BAR && row >= first_row()) hit = HIT_NONE;
     UI_DONE;
     return hit;
+}
+
+static int over_chrome(int x, int y) {
+    int idx = -1;
+    return hit_tabbar(x, y, &idx) != HIT_NONE;
 }
 
 /* things in the tab column a click does something to get the pointing hand, as on a web page */
@@ -4021,7 +4034,7 @@ static int g_nc_hover, g_nc_press, g_win_active = 1;
 static int g_top_hover;          /* the mouse is on the top line: it drags the window */
 
 /* the top line, left of the buttons: a title bar that only shows itself on hover */
-static int in_top_line(int mx, int my) { return mx >= sidebar_w() && my >= 0 && my < caption_h(); }
+static int in_top_line(int mx, int my) { return mx >= 0 && !in_sidebar(mx) && my >= 0 && my < caption_h(); }
 
 /* ── low disk ─────────────────────────────────────────────────────────
    WSL's disk is a .vhdx on a Windows drive that grows as Linux writes. When
@@ -4186,80 +4199,144 @@ static void render_settings(int hover, int hidx) {
     grid_text(buf, 0, info_row(), hover == HIT_FONT || hover == HIT_SCHEME ? on : g_look.text_lo);
 }
 
+/* Does terminal content occupy this screen rectangle? Check the displayed
+   scrollback, wide-cell continuations, selection and cursor as well as text.
+   Use the terminal font even while the settings font is being previewed. */
+static int chrome_obscured(int x0, int y0, int x1, int y1) {
+    Tab *tb = active_tab();
+    const Font *saved = g_cf;
+    int x, y, blocked = 0, left, right, top, bottom;
+    if (!tb) return 0;
+    g_cf = g_tfont;
+    Term *t = &tb->t;
+    left = (x0 - PAD) / CW; right = (x1 - PAD + CW - 1) / CW;
+    top = (y0 - PAD) / CH; bottom = (y1 - PAD + CH - 1) / CH;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > t->cols) right = t->cols;
+    if (bottom > t->rows) bottom = t->rows;
+    for (y = top; y < bottom && !blocked; y++) {
+        const Cell *cells;
+        int n, wrapped, line = t->hcount - t->view + y;
+        if (PAD + (y + 1) * CH <= y0 || PAD + y * CH >= y1) continue;
+        term_line(t, line, &cells, &n, &wrapped);
+        for (x = left; x < right; x++) {
+            if (PAD + (x + 1) * CW <= x0 || PAD + x * CW >= x1) continue;
+            if (x < n && (cells[x].ch > ' ' || cells[x].wflag == W_CONT ||
+                          cells[x].attr & (A_UNDER | A_STRIKE) || cells[x].link)) blocked = 1;
+            if (!t->view && t->m_cursor_vis && y == t->cy && x == t->cx) blocked = 1;
+            if (g_sel_on) {
+                long long r0, r1, row = term_base(t) + line;
+                int c0, c1;
+                sel_norm(&r0, &c0, &r1, &c1);
+                if (row >= r0 && row <= r1 && (row != r0 || x >= c0) && (row != r1 || x <= c1)) blocked = 1;
+            }
+            if (blocked) break;
+        }
+    }
+    g_cf = saved;
+    return blocked;
+}
+
+static int unit_underlay(FILE *f) {
+    Tab *tb = (Tab *)calloc(1, sizeof(Tab)), *saved = g_tabs[0];
+    int ntabs = g_ntabs, active = g_active, fails = 0, cols, rows, cw = cell_w(g_tfont), ch = cell_h(g_tfont);
+    if (!tb || !term_init(&tb->t, 40, 4)) { free(tb); return 1; }
+    g_tabs[0] = tb; g_ntabs = 1; g_active = 0;
+    tb->t.m_cursor_vis = 0;
+    /* A label over blank cells survives; actual text and wide continuations
+       suppress it, including text in the second line of a detail row. */
+    fails += chrome_obscured(PAD + 20*cw, PAD, PAD + 40*cw, PAD + 2*ch) != 0;
+    CELL(&tb->t, 25, 1)->ch = 'X';
+    fails += chrome_obscured(PAD + 20*cw, PAD, PAD + 40*cw, PAD + 2*ch) != 1;
+    fails += chrome_obscured(PAD + 20*cw, PAD, PAD + 40*cw, PAD + ch) != 0;
+    CELL(&tb->t, 25, 1)->ch = ' ';
+    CELL(&tb->t, 25, 1)->wflag = W_CONT;
+    fails += chrome_obscured(PAD + 25*cw, PAD + ch, PAD + 26*cw, PAD + 2*ch) != 1;
+    CELL(&tb->t, 25, 1)->wflag = 0;
+    tb->t.m_cursor_vis = 1; tb->t.cx = 25; tb->t.cy = 1;
+    fails += chrome_obscured(PAD + 20*cw, PAD, PAD + 40*cw, PAD + 2*ch) != 1;
+    compute_grid(120 * CW + 2 * PAD + SCROLLBAR_W, 24 * CH + 2 * PAD, &cols, &rows);
+    fails += cols != 120 || rows != 24;
+    term_free(&tb->t); free(tb);
+    g_tabs[0] = saved; g_ntabs = ntabs; g_active = active;
+    fprintf(f, "%s underlay: whitespace, text, detail rows, wide cells, cursor, full-width grid\n", fails ? "FAIL" : "ok  ");
+    return fails;
+}
+
 static void render_tabbar(int win_w, int win_h) {
-    int i, idx = -1, hover = HIT_NONE, sw = sidebar_w();
-    float lx, name_w;
+    int i, idx = -1, hover = HIT_NONE, sw = sidebar_w(), sx = sidebar_x();
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
     UI_FONT;
-    lx = 0;                    /* status in column 0, name in column 1 */
-    name_w = (float)((SB_COLS - 4) * CW);
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
-    fill_rect(0, 0, (float)sw, (float)win_h, BAR_BG, 1);
-#ifdef _WIN32
-    {   /* row 0: a grip of dim braille dots (drag here; one day maybe a menu) */
-        float gy = (float)sb_row_y(0);
-        int c;
-        r_color(g_look.dim, 1);
-        for (c = 0; c < SB_COLS; c++) draw_glyph(c % 2 ? 0x2895 : 0x286A, (float)(c * CW), gy, 1, g_scale);
+    g_chrome_x = sx;
+    /* Grip rows share the underlay rule; only the hovered row comes forward. */
+    for (i = 0; i < first_row(); i++) {
+        int y = PAD + i * CH, c;
+        int hov = hover == HIT_BAR && g_mouse_y >= y && g_mouse_y < y + CH;
+        if (hov) fill_rect(0, (float)y, (float)sw, (float)(y + CH), TAB_HOVER, 1);
+        if (hov || !chrome_obscured(sx, y, sx + sw, y + CH)) {
+            r_color(g_look.dim, 1);
+            for (c = 0; c < SB_COLS; c++) draw_glyph(c % 2 ? 0x2895 : 0x286A, (float)(c * CW), (float)y, 1, g_scale);
+        } else {
+            fill_rect((float)(sw - CW), (float)y, (float)sw, (float)(y + CH), DEF_BG, 1);
+            r_color(g_look.dim, 1);
+            draw_glyph(0x2895, (float)(sw - CW), (float)y, 1, g_scale);
+        }
     }
-#endif
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         wchar_t label[256], detail[220];
-        float y0 = (float)g_row_y[i], y1 = (float)g_row_y[i + 1], ty = y0;
-        int act = (i == g_active), hov = (idx == i && (hover == HIT_TAB || hover == HIT_CLOSE));
+        float y0 = (float)g_row_y[i], y1 = (float)g_row_y[i + 1];
+        int act = i == g_active, hov = idx == i && (hover == HIT_TAB || hover == HIT_CLOSE);
+        int full = hov || !chrome_obscured(sx, (int)y0, sx + sw, (int)y1);
         uint32_t fg = act ? g_look.text : g_look.text_lo;
-        /* the active tab takes the terminal's background, so it reads as attached to it */
-        if (act || hov) fill_rect(0, y0, (float)sw, y1, act ? DEF_BG : TAB_HOVER, 1);
         tab_label(tb, label, 256);
-        /* column 0, the status cell, strongest first:
-           ? Claude needs you   ! it failed   throbber: working   bell: finished or rang   dot: output */
-        if (tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) {
-            uint32_t ch = tb->t.ps_state == PS_BLOCKED ? '?' : '!';
-            r_color(tb->t.ps_state == PS_BLOCKED ? AMBER : g_look.red, 1);
-            draw_glyph(ch, lx, ty, 1, g_scale);
-            draw_glyph(ch, lx + smear(), ty, 1, g_scale);       /* bold, the way cells do it */
-        } else if (tb->busy) {
-            r_color(act ? g_look.text : g_look.busy_lo, 1);
-            draw_glyph(drip, lx, ty, 1, g_scale);
-        } else if (tb->attention) {
-            r_color(AMBER, 1);
-            draw_glyph(BELL_GLYPH, 0, ty, 1, g_scale);
-        } else if (tb->activity && !act) {
-            fill_rect(lx + 3 * g_scale, ty + CH / 2 - g_scale, lx + 5 * g_scale, ty + CH / 2 + g_scale, g_look.dim, 1);
+        if (hov) fill_rect(0, y0, (float)sw, y1, TAB_HOVER, 1);
+        if (full) {
+            draw_label(label, 0, y0, (float)((SB_COLS - 3) * CW), fg);
+            if (g_row_two[i] && tab_detail(tb, detail, 220))
+                layout_text(detail, 0, y0 + CH, (float)((SB_COLS - 1) * CW), g_row_two[i],
+                            tb->t.ps_state == PS_BLOCKED ? g_look.detail_ask : g_look.detail, 1);
+            if (hov) {
+                r_color(hover == HIT_CLOSE ? g_look.red : g_look.dim, 1);
+                draw_glyph(0x00D7, (float)(sw - 2 * CW), y0, 1, g_scale);
+            }
         }
-        draw_label(label, (float)CW, ty, name_w, fg);
-        if (g_row_two[i] && tab_detail(tb, detail, 220))
-            layout_text(detail, (float)CW, ty + CH, detail_w(), g_row_two[i],
-                        tb->t.ps_state == PS_BLOCKED ? g_look.detail_ask : g_look.detail, 1);
-        if (act || hov) {
-            r_color((hov && hover == HIT_CLOSE) ? 0xFF6B5E : g_look.dim, 1);
-            draw_glyph(0x00D7, (float)((SB_COLS - 2) * CW), ty, 1, g_scale);
+        /* The last cell always identifies the tab, even when text occludes
+           its full name. A busy tab's braille animates over that initial. */
+        fill_rect((float)(sw - CW), y0, (float)sw, y0 + CH, hov ? TAB_HOVER : DEF_BG, 1);
+        r_color(act ? AMBER : fg, 1);
+        draw_glyph(label[0] ? (uint32_t)label[0] : '?', (float)(sw - CW), y0, 1, g_scale);
+        if (tb->busy) {
+            r_color(AMBER, 0.85f);
+            draw_glyph(drip, (float)(sw - CW), y0, 1, g_scale);
+        } else if (tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR || tb->attention) {
+            r_color(tb->t.ps_state == PS_ERROR ? g_look.red : AMBER, 1);
+            quad((float)(sw - CW), y0 + CH - g_scale, (float)sw, y0 + CH);
         }
-        if (tb->exited) fill_rect((float)CW, ty + CH / 2, (float)((SB_COLS - 3) * CW), ty + CH / 2 + g_scale, g_look.dim, 1);
-        if (act) fill_rect(0, y0, (float)g_scale, y1, AMBER, 1);
     }
-    {   /* settings on the left, + on the right */
-        lx = (float)CW;
-        float y0 = (float)g_row_y[g_ntabs], y1 = y0 + CH;
-        int hs = hover == HIT_SETTINGS, hp = hover == HIT_PLUS;
-        /* the s grows into the word when you point at it, and stays while the settings are open */
-        if (hs) fill_rect(0, y0, 10.0f * CW, y1, TAB_HOVER, 1);
-        if (hp) fill_rect((float)((SB_COLS - 3) * CW), y0, (float)sw, y1, TAB_HOVER, 1);
-        if (hs || g_settings_open) layout_text(L"settings", lx, y0, 9.0f * CW, 1, hs ? g_look.text : g_look.text_lo, 1);
-        else {
-            r_color(g_look.dim, 1);
-            draw_glyph('s', lx, y0, 1, g_scale);
-        }
-        r_color(hp ? g_look.text : g_look.text_lo, 1);
-        draw_glyph('+', (float)((SB_COLS - 2) * CW), y0, 1, g_scale);   /* the font's own plus */
+    {
+        float y = (float)g_row_y[g_ntabs];
+        int hov = hover == HIT_SETTINGS || hover == HIT_PLUS;
+        if (hov) fill_rect(0, y, (float)sw, y + CH, TAB_HOVER, 1);
+        if (hov || g_settings_open || !chrome_obscured(sx, (int)y, sx + sw, (int)y + CH))
+            layout_text(L"settings", (float)CW, y, 9.0f * CW, 1, g_look.text_lo, 1);
+        fill_rect((float)(sw - CW), y, (float)sw, y + CH, DEF_BG, 1);
+        r_color(g_look.text, 1);
+        draw_glyph('+', (float)(sw - CW), y, 1, g_scale);
     }
-    if (g_settings_open) render_settings(hover, idx);
+    if (g_settings_open) {
+        fill_rect(0, row_y(g_panel_row), (float)sw, row_y(g_panel_row + panel_rows()), BAR_BG, 1);
+        render_settings(hover, idx);
+    }
 #ifdef _WIN32
-    render_disk_warning(win_h);  /* WSL's disk: the Mac has no VM to take down */
+    render_disk_warning(win_h);
 #endif
+    g_chrome_x = 0;
     UI_DONE;
+    (void)win_w;
 }
 
 static void r_begin(int w, int h);
@@ -4272,11 +4349,10 @@ static void render(void) {
     long long base;
     plat_client_size(&r.right, &r.bottom);
     r_begin(r.right, r.bottom);
-    render_tabbar(r.right, r.bottom);
 #ifdef _WIN32
-    if (!tb) { render_caption_buttons(r.right); return; }
+    if (!tb) { render_tabbar(r.right, r.bottom); render_caption_buttons(r.right); return; }
 #else
-    if (!tb) return;
+    if (!tb) { render_tabbar(r.right, r.bottom); return; }
 #endif
     t = &tb->t;
     base = term_base(t);
@@ -4368,6 +4444,8 @@ static void render(void) {
         }
     }
 
+    render_tabbar(r.right, r.bottom);
+
     /* scrollbar, dumbterm-style thin amber thumb */
     if (t->hcount > 0 && !t->alt) {
         float track_top = (float)caption_h(), track_h = (float)(oy + t->rows * CH - caption_h());   /* starts under the glass */
@@ -4381,7 +4459,7 @@ static void render(void) {
     }
 #ifdef _WIN32
     if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
-        fill_rect((float)sidebar_w(), 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
+        fill_rect(0, 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
     render_caption_buttons(r.right);   /* last: glass over whatever is under it */
 #endif
 }
@@ -6252,7 +6330,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetCursorPos(&pt);
             ScreenToClient(hwnd, &pt);
             mouse_cell(pt.x, pt.y, &col, &row);
-            if (pt.x < sidebar_w()) SetCursor(LoadCursorW(NULL, (LPCWSTR)(tabbar_action(pt.x, pt.y) ? IDC_HAND : IDC_ARROW)));
+            if (over_chrome(pt.x, pt.y)) SetCursor(LoadCursorW(NULL, (LPCWSTR)(tabbar_action(pt.x, pt.y) ? IDC_HAND : IDC_ARROW)));
             else if ((GetKeyState(VK_CONTROL) & 0x8000) && link_at(col, row, url, sizeof(url)))
                 SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
             else SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM));
@@ -6271,7 +6349,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HBRUSH bb = CreateSolidBrush(RGB(BAR_BG >> 16, (BAR_BG >> 8) & 255, BAR_BG & 255));
             GetClientRect(hwnd, &r);
             bar = r;
-            bar.right = sidebar_w();
+            bar.left = bar.right; /* no opaque sidebar during startup */
             FillRect(ps.hdc, &r, bg);
             FillRect(ps.hdc, &bar, bb);
             DeleteObject(bg);
@@ -6433,7 +6511,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_MOUSEMOVE: {
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), col, row;
-        int was_bar = g_mouse_y >= 0 && g_mouse_x < sidebar_w(), on_bar = mx < sidebar_w();
+        int was_bar = g_mouse_y >= 0 && in_sidebar(g_mouse_x), on_bar = over_chrome(mx, my);
         Tab *tb = active_tab();
         TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&tme);
@@ -6524,7 +6602,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         mouse_report(1, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_RBUTTONDOWN:
-        if (GET_X_LPARAM(lp) < sidebar_w()) return 0;
+        if (over_chrome(GET_X_LPARAM(lp), GET_Y_LPARAM(lp))) return 0;
         if (mouse_report(2, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp))) return 0;
         /* conhost habit: right-click copies a selection, or pastes */
         if (g_sel_on) {
@@ -6738,6 +6816,7 @@ static int unit_tests(const char *out_path) {
         fails += strcmp(a, b) != 0;
     }
     fails += unit_scrollback(f);
+    fails += unit_underlay(f);
     for (i = 0; i < (int)(sizeof(urls) / sizeof(urls[0])); i++) {
         char got[256] = "";
         int hit = url_in_word(urls[i].word, urls[i].at, got, sizeof(got));
