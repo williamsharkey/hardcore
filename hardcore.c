@@ -3305,7 +3305,7 @@ static int caption_btn_w(void) { return 46 * g_scale; }
       U Unifont      16×32       and under them the name of what's picked
        ...                       or pointed at
        ... drag space (it's the title bar) ...                         */
-enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT, HIT_SCHEME, HIT_STAB };
+enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT, HIT_SCHEME, HIT_STAB, HIT_SCLOSE };
 
 static int plat_lights_bottom(void);   /* where the window's own buttons in the tab column end, in pixels */
 static void plat_settings_shown(void); /* the font or colors on screen changed */
@@ -3407,7 +3407,9 @@ static int hit_tabbar(int mx, int my, int *idx) {
         UI_DONE;
         return hit;
     }
-    if (g_settings_open && row >= g_panel_row && row < g_panel_row + 2 && col >= 1 && col <= 16) {
+    if (g_settings_open && row >= g_panel_row && row < g_panel_row + 2 && col >= SB_COLS - 3) {
+        hit = HIT_SCLOSE;                                /* the × beside the tabs: back to the s */
+    } else if (g_settings_open && row >= g_panel_row && row < g_panel_row + 2 && col >= 1 && col <= 16) {
         *idx = col <= 8 ? 0 : 1;                         /* the tabs: font, theme */
         hit = HIT_STAB;
     } else if (g_settings_open && row >= PANEL_LIST && col >= 1) {
@@ -3427,7 +3429,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
 /* things in the tab column a click does something to get the pointing hand, as on a web page */
 static int tabbar_action(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
-    return hit == HIT_SETTINGS || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_FONT || hit == HIT_SCHEME ||
+    return hit == HIT_SETTINGS || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_FONT || hit == HIT_SCHEME || hit == HIT_SCLOSE ||
            (hit == HIT_STAB && idx != g_settings_tab);
 }
 
@@ -3471,6 +3473,7 @@ static void settings_pick(int hit, int idx) {
 static void settings_click(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
     if (hit == HIT_SETTINGS) g_settings_open = !g_settings_open;
+    else if (hit == HIT_SCLOSE) g_settings_open = 0;
     else if (hit == HIT_STAB) g_settings_tab = idx;
     else if (hit == HIT_FONT || hit == HIT_SCHEME) settings_pick(hit, idx);
     settings_point();
@@ -3609,6 +3612,9 @@ static void render_settings(int hover, int hidx) {
         grid_text(L"│", 16, r + 1, line);
         grid_text(L"────────┘       └───", 0, r + 2, line);
     }
+    /* ×, the tabs' own close mark, folds the settings back into the s */
+    r_color(hover == HIT_SCLOSE ? 0xFF6B5E : g_look.dim, 1);
+    draw_glyph(0x00D7, (float)((SB_COLS - 2) * CW), row_y(g_panel_row + 1), 1, g_scale);
     r = PANEL_LIST;
     if (!g_settings_tab) {
         for (i = 0; i < NFONTS; i++, r++) {
@@ -5277,7 +5283,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit == HIT_TAB) { activate(idx); return 0; }
         if (hit == HIT_CLOSE) { close_tab(idx); return 0; }
         if (hit == HIT_PLUS) { new_tab_here(); return 0; }
-        if (hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return 0; }
+        if (hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_SCLOSE || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return 0; }
         if (hit == HIT_BAR) return 0;
         GetClientRect(hwnd, &r);
         if (tb && mx >= r.right - SCROLLBAR_W - g_scale && tb->t.hcount && !tb->t.alt) {
