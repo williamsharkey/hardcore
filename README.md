@@ -140,10 +140,32 @@ Started from the Start menu, the desktop or the taskbar, it restores your last
 session.
 
 `hardcore update` asks GitHub for the latest release and compares it with this
-build's version. If it's newer, it downloads `hardcore.exe` and checks it
-against the SHA-256 GitHub publishes for it, then swaps it in. A running exe can
-be renamed but not overwritten, so open windows keep running the old copy and
-the next window you open runs the new one. Copies left behind by earlier
+build's version. If it's newer, it downloads `hardcore.exe`, checks it against
+the SHA-256 GitHub publishes for it, and swaps it in. A running exe can be
+renamed, so nothing has to close for that.
+
+**Then every open window reloads in place.** The programs in your tabs keep
+running through it: Claude, builds and servers don't notice. Each window hands
+itself to the new exe:
+- **Each tab's ConPTY** (OpenConsole and its pipes) stays alive. Its handles
+  pass to the new process, which goes on reading the same pipes, so no output
+  is lost.
+- **What's on screen** passes over as the escape sequences that rebuild it:
+  scrollback, both screens, the cursor, the scroll region, colors, links and
+  modes such as mouse reporting and bracketed paste. The new build's internals
+  can differ from the old one's. Programs like Claude Code keep a model of the
+  screen and send only changes, so it has to come back exactly, cell for cell,
+  and `--unit` checks that.
+- **The new window** opens exactly where the old one is, with the same tab
+  active and each tab scrolled where it was. It draws, and only then does the
+  old process end, without closing the pseudoconsoles. So the switch is one
+  frame.
+- **If anything goes wrong** before that, the old window carries on unchanged
+  and `hardcore update` says to close and reopen it.
+
+The first update from a release without this (0.4.x or older) can't reload in
+place, because that window doesn't know how. Close and reopen it once: your
+tabs come back through [sessions](#sessions). Copies left behind by earlier
 updates are deleted on the next update. `--force` reinstalls the latest
 release even if this one isn't older.
 
@@ -212,7 +234,9 @@ or the first prompt, so that prompt isn't sent again.
 
 On close, hardcore writes `%LOCALAPPDATA%\hardcore\session\`: `session.txt`
 (each tab's shell, folder, Claude session and flags) plus each tab's last 3,000
-rows of text. On the next start, each tab is rebuilt:
+rows of text, and the window's position, size and maximized state, the active
+tab and each tab's scroll position. On the next start the window opens where
+it was, and each tab is rebuilt:
 - **Its text is replayed** with colors and wraps, and rewraps to the new width.
 - **The shell starts below it.** ConPTY's inherit-cursor mode makes it start at
   the cursor, not the top. The `── restored ──` line says what comes next:

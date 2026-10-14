@@ -41,7 +41,6 @@
 #include <winhttp.h>
 #include <tlhelp32.h>
 #include <bcrypt.h>
-#include <stdarg.h>
 #define COBJMACROS
 #include <d3d11.h>
 #include <dxgi1_5.h>
@@ -66,6 +65,7 @@ static DWORD GetTickCount(void) { return (DWORD)(clock_gettime_nsec_np(CLOCK_UPT
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -150,7 +150,7 @@ static PFN_ClosePC  pClosePC;
 
 /* the release: `hardcore update` compares it with the latest tag, and the Mac
    build reads it into Info.plist (keep this line exactly as it is) */
-#define HARDCORE_VERSION "0.4.2"
+#define HARDCORE_VERSION "0.5"
 #define AMBER 0xFFA60D           /* dumbterm's phosphor cursor */
 #define DEF_FG 0xCCCCCC
 #define DEF_BG 0x0C0C0C
@@ -353,6 +353,8 @@ typedef struct Tab {
     int traced;
     char run[600];               /* a command for the shell to run first (a restored claude --resume) */
     char hist[400];              /* ...or one only to offer: put in its history, not run */
+    int adopt_marks;             /* reload: prompt marks to set once the snapshot is in */
+    long long mark_off[512];
     int inherit;                 /* restored text above: ConPTY starts at our cursor, not at the top */
     char start_dir[1024];
 } Tab;
@@ -1854,6 +1856,252 @@ static void term_dump(Term *t, FILE *f, int max_rows) {
     t->alt = alt;
 }
 
+/* ── a terminal's whole state as text ──────────────────────────────────
+   For handing a tab to a newer hardcore without stopping what runs in it:
+   the screens, scrollback, cursor, scroll region, colors, links, tab stops
+   and modes, written as the escape sequences that build them. Replayed into
+   a fresh Term of the same size it gives back the same cells, row for row,
+   whatever the new build's structs look like. Programs (Claude Code, ConPTY
+   itself) keep a model of the screen and send only changes against it, so
+   "the same" has to mean exactly. term_snapshot_check() in --unit holds it
+   to that. */
+typedef struct { char *p; size_t n, cap; } SBuf;
+
+static void sb_put(SBuf *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = (b->n + n + 1) * 2;
+        char *q = (char *)realloc(b->p, cap);
+        if (!q) return;
+        b->p = q;
+        b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+
+static void sb_printf(SBuf *b, const char *fmt, ...) {
+    char tmp[1200];
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n > 0) sb_put(b, tmp, (size_t)(n < (int)sizeof(tmp) ? n : (int)sizeof(tmp) - 1));
+}
+
+typedef struct { uint32_t fg, bg; uint8_t attr; uint16_t link; } SnapPen;
+
+static void snap_sgr(SBuf *b, const Term *t, SnapPen *cur, uint32_t fg, uint32_t bg, uint8_t attr, uint16_t link) {
+    static const int abit[8] = {1, 2, 3, 4, 5, 7, 8, 9};
+    if (fg != cur->fg || bg != cur->bg || attr != cur->attr) {
+        char fs[32] = "", bs[32] = "";
+        int k;
+        sb_put(b, "\x1b[0", 3);
+        for (k = 0; k < 8; k++) if (attr & (1 << k)) sb_printf(b, ";%d", abit[k]);
+        sgr_color(fs, sizeof(fs), fg, 0);
+        sgr_color(bs, sizeof(bs), bg, 1);
+        sb_printf(b, "%s%sm", fs, bs);
+        cur->fg = fg; cur->bg = bg; cur->attr = attr;
+    }
+    if (link != cur->link) {
+        const char *u = link && link <= MAX_LINKS && t->links[link - 1] ? t->links[link - 1] : "";
+        sb_printf(b, "\x1b]8;;%s\x1b\\", u);
+        cur->link = link;
+    }
+}
+
+/* one row's cells; trailing default blanks left out unless the row wraps */
+static void snap_cells(SBuf *b, const Term *t, SnapPen *cur, const Cell *c, int n, int wrapped) {
+    int x;
+    char u[8];
+    if (!wrapped) while (n > 0 && row_is_blank_default(&c[n - 1]) && !c[n - 1].link) n--;
+    for (x = 0; c && x < n; x++) {
+        if (c[x].wflag == W_CONT || c[x].wflag == W_PAD) continue;   /* the replay makes these */
+        snap_sgr(b, t, cur, c[x].fg, c[x].bg, c[x].attr, c[x].link);
+        sb_put(b, u, (size_t)utf8_encode(c[x].ch ? c[x].ch : ' ', u));
+    }
+}
+
+/* CUP to (x, y), 0-based, as the current origin mode reads it */
+static void snap_cup(SBuf *b, int x, int y) { sb_printf(b, "\x1b[%d;%dH", y + 1, x + 1); }
+
+static void term_snapshot(Term *t, SBuf *b) {
+    SnapPen cur = {0, 0, 0, 0};
+    int alt = t->alt, L, y, x, total;
+    term_settle(t);                          /* scrollback all wrapped at today's width */
+    sb_put(b, "\x1b[0m", 4);
+    /* scrollback, then every main-screen row, as one flow at this width */
+    t->alt = 0;
+    total = t->hcount + t->rows;
+    for (L = 0; L < total; L++) {
+        const Cell *c;
+        int n, wr;
+        term_line(t, L, &c, &n, &wr);
+        if (L == total - 1) wr = 0;          /* the last row: nothing below to wrap into */
+        snap_cells(b, t, &cur, c, n, wr);
+        if (!wr && L < total - 1) {
+            snap_sgr(b, t, &cur, 0, 0, 0, 0);
+            sb_put(b, "\r\n", 2);
+        }
+    }
+    snap_sgr(b, t, &cur, 0, 0, 0, 0);
+    if (alt) {
+        /* the main screen's cursor as the program left it, saved by ?1049h with its pen */
+        const SavedCursor *s = &t->saved[0];
+        snap_cup(b, s->cx, s->cy);
+        snap_sgr(b, t, &cur, s->pen.fg, s->pen.bg, s->pen.attr, 0);
+        sb_put(b, s->g0dec ? "\x1b(0" : "\x1b(B", 3);
+        sb_put(b, "\x1b[?1049h\x1b(B", 11);
+        snap_sgr(b, t, &cur, 0, 0, 0, 0);
+        sb_put(b, "\x1b[H", 3);
+        t->alt = 1;
+        for (y = 0; y < t->rows; y++) {
+            int wr = t->wrapf[1][y] && y < t->rows - 1;
+            snap_cells(b, t, &cur, t->row[1][y], t->rlen[1][y] < t->cols ? t->rlen[1][y] : t->cols, wr);
+            if (!wr && y < t->rows - 1) { snap_sgr(b, t, &cur, 0, 0, 0, 0); sb_put(b, "\r\n", 2); }
+        }
+        snap_sgr(b, t, &cur, 0, 0, 0, 0);
+    }
+    t->alt = alt;
+    /* this screen's DECSC slot (for the alt screen ?1049h already filled it from the main one) */
+    {
+        const SavedCursor *s = &t->saved[alt];
+        if (!alt || memcmp(&t->saved[1], &t->saved[0], sizeof(SavedCursor))) {
+            /* origin mode homes the cursor when it's set: set it first, then a CUP
+               relative to the scroll region (which isn't set yet: the whole screen) */
+            if (s->origin) sb_put(b, "\x1b[?6h", 5);
+            snap_cup(b, s->cx, s->cy);
+            snap_sgr(b, t, &cur, s->pen.fg, s->pen.bg, s->pen.attr, 0);
+            sb_put(b, s->g0dec ? "\x1b(0" : "\x1b(B", 3);
+            sb_put(b, "\x1b" "7", 2);
+            if (s->origin) sb_put(b, "\x1b[?6l", 5);
+            sb_put(b, "\x1b(B", 3);
+        }
+    }
+    /* tab stops, if they aren't every 8 */
+    for (x = 0; x < t->cols && t->tabs[x] == (x % 8 == 0); x++) {}
+    if (x < t->cols) {
+        sb_put(b, "\x1b[3g", 4);
+        for (x = 0; x < t->cols; x++) if (t->tabs[x]) { snap_cup(b, x, 0); sb_put(b, "\x1bH", 2); }
+    }
+    /* modes; autowrap last (drawing needed it), then the scroll region, origin, pen, cursor */
+    sb_printf(b, "\x1b[?1%c\x1b[?25%c\x1b[?1004%c\x1b[?1006%c\x1b[?2004%c",
+              t->m_appcursor ? 'h' : 'l', t->m_cursor_vis ? 'h' : 'l', t->m_focus ? 'h' : 'l',
+              t->m_mouse_sgr ? 'h' : 'l', t->m_bracketed ? 'h' : 'l');
+    if (t->m_mouse) sb_printf(b, "\x1b[?%dh", t->m_mouse);
+    sb_printf(b, "\x1b[%d q", t->cursor_shape == 1 ? 4 : t->cursor_shape == 2 ? 6 : 2);
+    if (t->top != 0 || t->bot != t->rows - 1) sb_printf(b, "\x1b[%d;%dr", t->top + 1, t->bot + 1);
+    if (!t->m_autowrap) sb_put(b, "\x1b[?7l", 5);
+    if (t->m_origin) sb_put(b, "\x1b[?6h", 5);
+    sb_put(b, t->g0dec ? "\x1b(0" : "\x1b(B", 3);
+    if (t->wrapnext && t->cx == t->cols - 1 && t->m_autowrap) {
+        /* a pending wrap: print the last cell again, which leaves exactly that */
+        const Cell *c = &t->row[alt][t->cy][t->cx];
+        char u[8];
+        snap_cup(b, t->cx, t->m_origin ? t->cy - t->top : t->cy);
+        snap_sgr(b, t, &cur, c->fg, c->bg, c->attr, c->link);
+        if (t->g0dec) sb_put(b, "\x1b(B", 3);
+        sb_put(b, u, (size_t)utf8_encode(c->ch > ' ' ? c->ch : ' ', u));
+        if (t->g0dec) sb_put(b, "\x1b(0", 3);
+    } else snap_cup(b, t->cx, t->m_origin ? t->cy - t->top : t->cy);
+    if (t->m_insert) sb_put(b, "\x1b[4h", 4);      /* after the reprint above: insert mode would shift it */
+    if (t->m_newline) sb_put(b, "\x1b[20h", 5);
+    snap_sgr(b, t, &cur, t->pen.fg, t->pen.bg, t->pen.attr, t->pen.link);
+}
+
+/* --unit: term_snapshot replayed into a fresh Term gives back the same cells
+   and state. Returns 0 if equal, else describes the first difference. */
+static int cell_same(const Term *a, const Cell *x, const Term *b, const Cell *y) {
+    const char *la = x->link && a->links[x->link - 1] ? a->links[x->link - 1] : "";
+    const char *lb = y->link && b->links[y->link - 1] ? b->links[y->link - 1] : "";
+    return x->ch == y->ch && x->fg == y->fg && x->bg == y->bg && x->attr == y->attr && x->wflag == y->wflag && !strcmp(la, lb);
+}
+
+static int snapshot_roundtrip(Term *a, char *why, size_t cap) {
+    SBuf b = {0};
+    Term t;
+    int L, s, y, x, ok = 1;
+    term_snapshot(a, &b);
+    if (!term_init(&t, a->cols, a->rows)) { snprintf(why, cap, "init"); return 1; }
+    vt_feed(&t, (const unsigned char *)b.p, (int)b.n);
+    free(b.p);
+#define DIFF(cond, ...) do { if (ok && (cond)) { snprintf(why, cap, __VA_ARGS__); ok = 0; } } while (0)
+    DIFF(t.hcount != a->hcount, "history %d vs %d rows", t.hcount, a->hcount);
+    for (L = 0; ok && L < a->hcount; L++) {
+        const Cell *c1, *c2;
+        int n1, n2, w1, w2, ia = a->alt, it = t.alt;
+        a->alt = t.alt = 0;
+        term_line(a, L, &c1, &n1, &w1);
+        term_line(&t, L, &c2, &n2, &w2);
+        a->alt = ia; t.alt = it;
+        while (n1 > 0 && row_is_blank_default(&c1[n1 - 1]) && !w1) n1--;
+        while (n2 > 0 && row_is_blank_default(&c2[n2 - 1]) && !w2) n2--;
+        DIFF(n1 != n2 || w1 != w2, "history row %d: %d cells wrapped=%d vs %d cells wrapped=%d", L, n2, w2, n1, w1);
+        for (x = 0; ok && x < n1; x++) DIFF(!cell_same(a, &c1[x], &t, &c2[x]), "history row %d col %d: U+%04X vs U+%04X", L, x, c2[x].ch, c1[x].ch);
+    }
+    for (s = 0; s < 2; s++)
+        for (y = 0; ok && y < a->rows; y++) {
+            for (x = 0; ok && x < a->cols; x++)
+                DIFF(!cell_same(a, &a->row[s][y][x], &t, &t.row[s][y][x]), "%s row %d col %d: U+%04X fg %x attr %x vs U+%04X fg %x attr %x",
+                     s ? "alt" : "main", y, x, t.row[s][y][x].ch, t.row[s][y][x].fg, t.row[s][y][x].attr,
+                     a->row[s][y][x].ch, a->row[s][y][x].fg, a->row[s][y][x].attr);
+            DIFF(!s && y < a->rows - 1 && t.wrapf[0][y] != a->wrapf[0][y], "main row %d wrap flag", y);
+        }
+    DIFF(t.alt != a->alt, "alt screen");
+    DIFF(t.cx != a->cx || t.cy != a->cy || t.wrapnext != a->wrapnext, "cursor %d,%d wrap %d vs %d,%d wrap %d", t.cx, t.cy, t.wrapnext, a->cx, a->cy, a->wrapnext);
+    DIFF(t.pen.fg != a->pen.fg || t.pen.bg != a->pen.bg || t.pen.attr != a->pen.attr, "pen");
+    for (s = 0; s < 2; s++)
+        DIFF(t.saved[s].cx != a->saved[s].cx || t.saved[s].cy != a->saved[s].cy || t.saved[s].g0dec != a->saved[s].g0dec ||
+             t.saved[s].origin != a->saved[s].origin || t.saved[s].pen.fg != a->saved[s].pen.fg || t.saved[s].pen.attr != a->saved[s].pen.attr,
+             "saved cursor %d: %d,%d vs %d,%d", s, t.saved[s].cx, t.saved[s].cy, a->saved[s].cx, a->saved[s].cy);
+    DIFF(t.top != a->top || t.bot != a->bot, "scroll region %d-%d vs %d-%d", t.top, t.bot, a->top, a->bot);
+    DIFF(t.g0dec != a->g0dec, "charset");
+    DIFF(t.m_autowrap != a->m_autowrap || t.m_origin != a->m_origin || t.m_insert != a->m_insert || t.m_cursor_vis != a->m_cursor_vis ||
+         t.m_appcursor != a->m_appcursor || t.m_bracketed != a->m_bracketed || t.m_mouse != a->m_mouse || t.m_mouse_sgr != a->m_mouse_sgr ||
+         t.m_focus != a->m_focus || t.m_newline != a->m_newline, "modes");
+    DIFF(t.cursor_shape != a->cursor_shape, "cursor shape");
+    DIFF(memcmp(t.tabs, a->tabs, (size_t)a->cols), "tab stops");
+#undef DIFF
+    term_free(&t);
+    return !ok;
+}
+
+static int term_snapshot_check(FILE *f) {
+    static const char *names[3] = {"shell", "full-screen program", "odd modes"};
+    int k, fails = 0;
+    for (k = 0; k < 3; k++) {
+        Term t;
+        char why[256] = "", line[512];
+        int i, n;
+        if (!term_init(&t, 40, 12)) return 1;
+        for (i = 0; i < 300; i++) {             /* scrollback: colors, long lines, CJK at the edge */
+            n = snprintf(line, sizeof(line), "\x1b[3%dmline %d\x1b[0m %s%s\r\n", i % 8, i,
+                         i % 7 == 0 ? "a long line that wraps around the forty column edge and then some more" : "",
+                         i % 11 == 0 ? "x\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe6\x97\xa5" : "");
+            vt_feed(&t, (const unsigned char *)line, n);
+        }
+        vt_feed(&t, (const unsigned char *)"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ \x1b[44m\x1b[K\x1b[0m\r\n$ ", 54);
+        if (k == 0) vt_feed(&t, (const unsigned char *)"\x1b[5;9H\x1b[1;32mmid\x1b[0m\x1b[6;40HZ", 30);   /* ends on a pending wrap */
+        if (k == 1) {
+            const char *s = "\x1b[3;5H\x1b" "7\x1b[?1049h\x1b[H\x1b[2J\x1b[1;31mtitle bar\x1b[0m\r\n\x1b[7m inverse \x1b[0m"
+                            "\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1h\x1b[?25l\x1b[2;10r\x1b[4;3H\x1b" "7\x1b[6;1H"
+                            "\x1b[12;30Hend of the last row:0123456789\x1b[1;31m";
+            vt_feed(&t, (const unsigned char *)s, (int)strlen(s));
+        }
+        if (k == 2) {
+            const char *s = "\x1b[3g\x1b[1;5H\x1bH\x1b[1;13H\x1bH\x1b[3;8r\x1b[?6h\x1b[2;4H\x1b(0lqk\x1b[4h\x1b[6 q";
+            vt_feed(&t, (const unsigned char *)s, (int)strlen(s));
+        }
+        if (snapshot_roundtrip(&t, why, sizeof(why))) {
+            fprintf(f, "FAIL snapshot %s: %s\n", names[k], why);
+            fails++;
+        } else fprintf(f, "ok   snapshot %s round trip (history %d, cursor %d,%d)\n", names[k], t.hcount, t.cx, t.cy);
+        term_free(&t);
+    }
+    return fails;
+}
+
 /* ── tabs ──────────────────────────────────────────────────────────── */
 
 static Tab *g_tabs[MAX_TABS];
@@ -1878,6 +2126,7 @@ static void term_message(Term *t, const char *msg) {
 
 #define WM_APP_OUTPUT (WM_APP + 1)
 #define WM_APP_EXITED (WM_APP + 2)
+#define WM_APP_HANDED_OVER (WM_APP + 4)  /* a reload went through: end this process now */
 
 static DWORD WINAPI reader_thread(LPVOID arg) {
     Tab *tb = (Tab *)arg;
@@ -3979,6 +4228,12 @@ static void session_save(void) {
     if (!(f = _wfopen(p, L"wb"))) return;
     fprintf(f, "# hardcore: the tabs open when the window closed, restored on the next start\n");
     fprintf(f, "active=%d\n", g_active);
+    {
+        WINDOWPLACEMENT wp = {sizeof(wp)};
+        if (GetWindowPlacement(g_hwnd, &wp))
+            fprintf(f, "placement=%u %ld %ld %ld %ld\n", wp.showCmd == SW_SHOWMINIMIZED ? SW_SHOWNORMAL : wp.showCmd,
+                    wp.rcNormalPosition.left, wp.rcNormalPosition.top, wp.rcNormalPosition.right, wp.rcNormalPosition.bottom);
+    }
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         wchar_t name[32];
@@ -3995,7 +4250,7 @@ static void session_save(void) {
             int k;
             snprintf(cmd, sizeof(cmd), "%s", tb->t.claude[0] ? "" : tb->t.cmd);   /* Claude comes back on its own */
             for (k = 0; cmd[k]; k++) if (cmd[k] == '\r' || cmd[k] == '\n') cmd[k] = ' ';
-            fprintf(f, "\n[tab]\nkind=%s\ndir=%s\nclaude=%s\nclaude_args=%s\ncmd=%s\ntext=tab%d.txt\n",
+            fprintf(f, "\n[tab]\nview=%d\nkind=%s\ndir=%s\nclaude=%s\nclaude_args=%s\ncmd=%s\ntext=tab%d.txt\n", tb->t.view,
                     tb->kind == TK_PS ? "powershell" : tb->kind == TK_CMD ? "cmd" : "wsl", tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude,
                     tb->t.claude[0] ? tb->t.claude_args : "", cmd, n);
         }
@@ -4038,7 +4293,7 @@ static int session_id_ok(const char *id) {
 }
 
 static void session_add_tab(const char *kind, const char *dir, const char *claude, const char *args, const char *cmd,
-                            const char *text) {
+                            const char *text, int view) {
     wchar_t p[MAX_PATH], wname[64];
     char run[600] = "", *data = NULL;
     size_t n = 0;
@@ -4055,7 +4310,34 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
     tb = tab_create_ex(dir_exists(dir) ? dir : NULL, 0, !strcmp(kind, "powershell") ? TK_PS : !strcmp(kind, "cmd") ? TK_CMD : TK_WSL,
                        run[0] ? run : NULL, !run[0] && cmd[0] && !strcmp(kind, "wsl") ? cmd : NULL, data, n);
     free(data);
-    if (tb) g_tabs[g_ntabs++] = tb;
+    if (tb) {
+        tb->t.view = view > 0 ? (view < tb->t.hcount ? view : tb->t.hcount) : 0;   /* scrolled back as far as it was */
+        g_tabs[g_ntabs++] = tb;
+    }
+}
+
+/* The window's place when it closed (position, size, maximized), to open
+   there again; before it's shown, so it doesn't jump. */
+static int session_placement(WINDOWPLACEMENT *wp) {
+    wchar_t p[MAX_PATH];
+    size_t n;
+    char *d, *pl;
+    unsigned show;
+    long l, t, r, b;
+    int ok = 0;
+    if (g_session_off) return 0;
+    session_path(p, L"session.txt");
+    if (!(d = read_file(p, &n))) return 0;
+    if ((pl = strstr(d, "\nplacement=")) && sscanf(pl + 11, "%u %ld %ld %ld %ld", &show, &l, &t, &r, &b) == 5 && r > l && b > t) {
+        memset(wp, 0, sizeof(*wp));
+        wp->length = sizeof(*wp);
+        wp->showCmd = show;
+        wp->rcNormalPosition.left = l; wp->rcNormalPosition.top = t;
+        wp->rcNormalPosition.right = r; wp->rcNormalPosition.bottom = b;
+        ok = 1;
+    }
+    free(d);
+    return ok;
 }
 
 /* Returns how many tabs came back. */
@@ -4063,7 +4345,7 @@ static int session_restore(void) {
     wchar_t p[MAX_PATH];
     size_t n;
     char *d, *line, *next, kind[16] = "", dir[1024] = "", claude[72] = "", args[400] = "", cmd[400] = "", text[64] = "";
-    int active = 0, intab = 0;
+    int active = 0, intab = 0, view = 0;
     if (g_session_off) return 0;
     session_path(p, L"session.txt");
     if (!(d = read_file(p, &n))) return 0;
@@ -4073,9 +4355,10 @@ static int session_restore(void) {
         if (next) *next++ = 0;
         if ((e = strchr(line, '\r'))) *e = 0;
         if (!strcmp(line, "[tab]")) {
-            if (intab) session_add_tab(kind, dir, claude, args, cmd, text);
+            if (intab) session_add_tab(kind, dir, claude, args, cmd, text, view);
             intab = 1;
             kind[0] = dir[0] = claude[0] = args[0] = cmd[0] = text[0] = 0;
+            view = 0;
             continue;
         }
         if (line[0] == '#' || !(v = strchr(line, '='))) continue;
@@ -4086,13 +4369,315 @@ static int session_restore(void) {
         else if (!strcmp(line, "claude")) snprintf(claude, sizeof(claude), "%s", v);
         else if (!strcmp(line, "claude_args")) snprintf(args, sizeof(args), "%s", v);
         else if (!strcmp(line, "cmd")) snprintf(cmd, sizeof(cmd), "%s", v);
+        else if (!strcmp(line, "view")) view = atoi(v);
         else if (!strcmp(line, "text")) snprintf(text, sizeof(text), "%s", v);
     }
-    if (intab) session_add_tab(kind, dir, claude, args, cmd, text);
+    if (intab) session_add_tab(kind, dir, claude, args, cmd, text, view);
     free(d);
     if (g_ntabs) activate(active >= 0 && active < g_ntabs ? active : 0);
     return g_ntabs;
 }
+
+/* ── reloading in place: a newer hardcore takes over without stopping anything ──
+   `hardcore update` asks each open window to hand itself to the new exe. The
+   programs in its tabs never notice: each tab's ConPTY (OpenConsole and its
+   pipes) is kept alive by handing its handles to the new process, which goes
+   on reading the same pipes. What's on the screen goes over as term_snapshot
+   text, so the new build's structs can differ from this one's. The new window
+   opens where this one is, draws, says "ok", and only then does this process
+   end (without closing the pseudoconsoles: the new process holds them now).
+   If anything goes wrong first, this window carries on as if nothing happened. */
+static wchar_t g_exe_path[MAX_PATH];     /* where this exe was started from: an update puts the new one there */
+static int g_adopting;                   /* this process is taking over from an older one */
+
+/* conpty.dll's HPCON points at {signal pipe, reference handle, OpenConsole
+   process}. Checked before relying on it: three live handles, the last one a
+   process running OpenConsole (or conhost, for the inbox ConPTY). */
+static int hpcon_parts(HPCON_ pc, HANDLE out[3]) {
+    HANDLE *h = (HANDLE *)pc;
+    DWORD flags, pid, n = MAX_PATH;
+    wchar_t img[MAX_PATH], *b;
+    HANDLE ph;
+    int i, ok = 0;
+    if (!pc) return 0;
+    for (i = 0; i < 3; i++) if (!h[i] || !GetHandleInformation(h[i], &flags)) return 0;
+    if (!(pid = GetProcessId(h[2])) || !(ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))) return 0;
+    if (QueryFullProcessImageNameW(ph, 0, img, &n)) {
+        b = wcsrchr(img, L'\\');
+        b = b ? b + 1 : img;
+        ok = !_wcsicmp(b, L"OpenConsole.exe") || !_wcsicmp(b, L"conhost.exe");
+    }
+    CloseHandle(ph);
+    if (ok) for (i = 0; i < 3; i++) out[i] = h[i];
+    return ok;
+}
+
+static void reader_stop(Tab *tb) {
+    int k;
+    if (tb->wait) { UnregisterWaitEx(tb->wait, INVALID_HANDLE_VALUE); tb->wait = NULL; }
+    for (k = 0; tb->reader && k < 400; k++) {     /* only works while it's inside ReadFile: retry */
+        CancelSynchronousIo(tb->reader);
+        if (WaitForSingleObject(tb->reader, 5) == WAIT_OBJECT_0) break;
+    }
+    if (tb->reader) { CloseHandle(tb->reader); tb->reader = NULL; }
+    tab_drain(tb);                               /* what it read before stopping */
+}
+
+static void reader_start(Tab *tb) {
+    tb->reader = CreateThread(NULL, 0, reader_thread, tb, 0, NULL);
+    RegisterWaitForSingleObject(&tb->wait, tb->proc, on_child_exit, tb, INFINITE, WT_EXECUTEONLYONCE);
+}
+
+static void blob_line(SBuf *b, const char *key, const char *v) {
+    char clean[1200];
+    size_t k;
+    snprintf(clean, sizeof(clean), "%s", v ? v : "");
+    for (k = 0; clean[k]; k++) if (clean[k] == '\n' || clean[k] == '\r') clean[k] = ' ';
+    sb_printf(b, "%s %s\n", key, clean);
+}
+
+/* Hands every live tab to EXE. Returns 1 once the new process has them (the
+   caller then ends this one), 0 with *why on failure (nothing changed). */
+static int reload_into(const wchar_t *exe, char *why, size_t cap) {
+    Tab *live[MAX_TABS];
+    HANDLE parts[MAX_TABS][3], blob_r = NULL, blob_w = NULL, ack_r = NULL, ack_w = NULL, list[2];
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    STARTUPINFOEXW si;
+    PROCESS_INFORMATION pi;
+    SIZE_T asz = 0;
+    WINDOWPLACEMENT wp = {sizeof(wp)};
+    SBuf b = {0};
+    char ack[8] = "";
+    DWORD w, got = 0, avail;
+    int i, n = 0, active = 0, k;
+    wchar_t cl[MAX_PATH + 4];
+    for (i = 0; i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        if (tb->help || tb->exited || !tb->hpc) continue;           /* nothing running: not carried over */
+        if (!hpcon_parts(tb->hpc, parts[n])) { snprintf(why, cap, "this ConPTY doesn't allow it"); return 0; }
+        if (i == g_active) active = n;
+        live[n++] = tb;
+    }
+    if (!n) { snprintf(why, cap, "no running tabs"); return 0; }
+    if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) { snprintf(why, cap, "no exe to reload into"); return 0; }
+    if (!CreatePipe(&blob_r, &blob_w, &sa, 1 << 20) || !CreatePipe(&ack_r, &ack_w, &sa, 0)) { snprintf(why, cap, "pipes"); return 0; }
+    SetHandleInformation(blob_w, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(ack_r, HANDLE_FLAG_INHERIT, 0);
+    for (i = 0; i < n; i++) reader_stop(live[i]);     /* from here no output is read here; it waits in the pipes */
+    memset(&si, 0, sizeof(si));
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = blob_r;
+    si.StartupInfo.hStdOutput = si.StartupInfo.hStdError = ack_w;
+    list[0] = blob_r;
+    list[1] = ack_w;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &asz);
+    si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, asz);
+    InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &asz);
+    UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list, sizeof(list), NULL, NULL);
+    _snwprintf(cl, MAX_PATH + 4, L"\"%ls\"", exe);
+    SetEnvironmentVariableW(L"HARDCORE_ADOPT", L"1");
+    if (!CreateProcessW(exe, cl, NULL, NULL, TRUE, CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, NULL, NULL, &si.StartupInfo, &pi)) {
+        SetEnvironmentVariableW(L"HARDCORE_ADOPT", NULL);
+        snprintf(why, cap, "couldn't start the new exe (error %lu)", GetLastError());
+        goto undo;
+    }
+    SetEnvironmentVariableW(L"HARDCORE_ADOPT", NULL);
+    DeleteProcThreadAttributeList(si.lpAttributeList);
+    HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+    si.lpAttributeList = NULL;
+    CloseHandle(blob_r); blob_r = NULL;
+    CloseHandle(ack_w); ack_w = NULL;
+    GetWindowPlacement(g_hwnd, &wp);
+    sb_printf(&b, "HARDCORE-ADOPT 1\nplacement %u %ld %ld %ld %ld\nactive %d\n", wp.showCmd,
+              wp.rcNormalPosition.left, wp.rcNormalPosition.top, wp.rcNormalPosition.right, wp.rcNormalPosition.bottom, active);
+    for (i = 0; i < n; i++) {
+        Tab *tb = live[i];
+        Term *t = &tb->t;
+        HANDLE src[6] = {tb->pin_w, tb->pout_r, tb->proc, parts[i][0], parts[i][1], parts[i][2]}, dst[6];
+        SBuf snap = {0};
+        char tmp[800];
+        for (k = 0; k < 6; k++)
+            if (!DuplicateHandle(GetCurrentProcess(), src[k], pi.hProcess, &dst[k], 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                snprintf(why, cap, "couldn't hand over a tab (error %lu)", GetLastError());
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                free(b.p);
+                goto undo;
+            }
+        term_snapshot(t, &snap);
+        sb_printf(&b, "tab\nkind %d\nsize %d %d\nview %d\n", tb->kind, t->cols, t->rows, t->view);
+        sb_printf(&b, "handles %llx %llx %llx %llx %llx %llx\n", (unsigned long long)(uintptr_t)dst[0], (unsigned long long)(uintptr_t)dst[1],
+                  (unsigned long long)(uintptr_t)dst[2], (unsigned long long)(uintptr_t)dst[3], (unsigned long long)(uintptr_t)dst[4],
+                  (unsigned long long)(uintptr_t)dst[5]);
+        blob_line(&b, "dir", tb->start_dir);
+        blob_line(&b, "cwd", t->cwd);
+        blob_line(&b, "claude", t->claude);
+        blob_line(&b, "claude_args", t->claude_args);
+        blob_line(&b, "cmd", t->cmd);
+        WideCharToMultiByte(CP_UTF8, 0, t->title, -1, tmp, sizeof(tmp), NULL, NULL);
+        blob_line(&b, "title", tmp);
+        sb_printf(&b, "ps %d %d %d %d\n", t->ps_state, t->ps_pct, t->ps_tasks, t->progress);
+        blob_line(&b, "ps_kind", t->ps_kind);
+        WideCharToMultiByte(CP_UTF8, 0, t->ps_msg, -1, tmp, sizeof(tmp), NULL, NULL);
+        blob_line(&b, "ps_msg", tmp);
+        sb_printf(&b, "marks %d", t->nmarks);
+        for (k = 0; k < t->nmarks; k++) sb_printf(&b, " %lld", t->hpushed - t->marks[k]);
+        sb_printf(&b, "\nsnap %zu\n", snap.n);
+        sb_put(&b, snap.p ? snap.p : "", snap.n);
+        sb_put(&b, "\n", 1);
+        free(snap.p);
+    }
+    sb_put(&b, "end\n", 4);
+    WriteFile(blob_w, b.p, (DWORD)b.n, &w, NULL);
+    CloseHandle(blob_w); blob_w = NULL;
+    free(b.p);
+    AllowSetForegroundWindow(pi.dwProcessId);
+    ResumeThread(pi.hThread);
+    for (k = 0; k < 1500; k++) {                  /* up to 15 s for "ok": D3D, the window, a frame */
+        if (PeekNamedPipe(ack_r, NULL, 0, NULL, &avail, NULL) && avail) { ReadFile(ack_r, ack, sizeof(ack) - 1, &got, NULL); break; }
+        if (WaitForSingleObject(pi.hProcess, 10) == WAIT_OBJECT_0) break;
+    }
+    if (got >= 2 && !strncmp(ack, "ok", 2)) {
+        CloseHandle(ack_r);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return 1;
+    }
+    snprintf(why, cap, "the new hardcore didn't take over");
+    TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+undo:
+    if (si.lpAttributeList) { DeleteProcThreadAttributeList(si.lpAttributeList); HeapFree(GetProcessHeap(), 0, si.lpAttributeList); }
+    if (blob_r) CloseHandle(blob_r);
+    if (blob_w) CloseHandle(blob_w);
+    if (ack_r) CloseHandle(ack_r);
+    if (ack_w) CloseHandle(ack_w);
+    for (i = 0; i < n; i++) reader_start(live[i]);   /* carry on as before */
+    return 0;
+}
+
+/* The new side: reads what reload_into sent on stdin. Returns the tabs made. */
+static char *g_adopt_blob;
+static WINDOWPLACEMENT g_adopt_wp;
+static int g_adopt_active;
+
+static void adopt_read(void) {
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    size_t n = 0, cap = 0;
+    DWORD got;
+    char *d = NULL;
+    for (;;) {
+        if (n + 65537 > cap) { char *q = (char *)realloc(d, cap = (n + 65537) * 2); if (!q) break; d = q; }
+        if (!ReadFile(in, d + n, 65536, &got, NULL) || !got) break;
+        n += got;
+    }
+    if (d) d[n] = 0;
+    if (!d || strncmp(d, "HARDCORE-ADOPT 1\n", 17)) { free(d); return; }
+    g_adopt_blob = d;
+    g_adopting = 1;
+    {
+        unsigned show = SW_SHOWNORMAL;
+        long l, t, r, bo;
+        if (sscanf(strstr(d, "placement ") + 10, "%u %ld %ld %ld %ld", &show, &l, &t, &r, &bo) == 5) {
+            g_adopt_wp.length = sizeof(g_adopt_wp);
+            g_adopt_wp.showCmd = show;
+            g_adopt_wp.rcNormalPosition.left = l; g_adopt_wp.rcNormalPosition.top = t;
+            g_adopt_wp.rcNormalPosition.right = r; g_adopt_wp.rcNormalPosition.bottom = bo;
+        }
+        if (strstr(d, "\nactive ")) g_adopt_active = atoi(strstr(d, "\nactive ") + 8);
+    }
+}
+
+static int adopt_tabs(void) {
+    char *p = g_adopt_blob, *line;
+    Tab *tb = NULL;
+    if (!p) return 0;
+    while ((line = p) && *p) {
+        char *nl = strchr(p, '\n'), *v;
+        if (!nl) break;
+        *nl = 0;
+        p = nl + 1;
+        v = strchr(line, ' ');
+        if (v) *v++ = 0; else v = line + strlen(line);
+        if (!strcmp(line, "tab")) {
+            if (g_ntabs >= MAX_TABS) break;
+            tb = (Tab *)calloc(1, sizeof(Tab));
+            if (!tb) break;
+            tb->id = g_next_id++;
+            InitializeCriticalSection(&tb->lock);
+            tb->born = GetTickCount() - 60000;    /* not a new tab: an early exit isn't a setup problem */
+        } else if (!tb) continue;
+        else if (!strcmp(line, "kind")) tb->kind = atoi(v);
+        else if (!strcmp(line, "size")) {
+            int c = 80, r = 24;
+            sscanf(v, "%d %d", &c, &r);
+            if (!term_init(&tb->t, c, r)) { free(tb); tb = NULL; }
+        } else if (!strcmp(line, "view")) tb->t.view = atoi(v);
+        else if (!strcmp(line, "handles")) {
+            unsigned long long h[6] = {0};
+            HANDLE *pc = (HANDLE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(HANDLE) * 3);
+            sscanf(v, "%llx %llx %llx %llx %llx %llx", &h[0], &h[1], &h[2], &h[3], &h[4], &h[5]);
+            tb->pin_w = (HANDLE)(uintptr_t)h[0];
+            tb->pout_r = (HANDLE)(uintptr_t)h[1];
+            tb->proc = (HANDLE)(uintptr_t)h[2];
+            if (pc) { pc[0] = (HANDLE)(uintptr_t)h[3]; pc[1] = (HANDLE)(uintptr_t)h[4]; pc[2] = (HANDLE)(uintptr_t)h[5]; }
+            tb->hpc = pc;                         /* the same shape conpty.dll's own HPCON has (checked by the old side) */
+        } else if (!strcmp(line, "dir")) snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", v);
+        else if (!strcmp(line, "cwd")) snprintf(tb->t.cwd, sizeof(tb->t.cwd), "%s", v);
+        else if (!strcmp(line, "claude")) snprintf(tb->t.claude, sizeof(tb->t.claude), "%s", v);
+        else if (!strcmp(line, "claude_args")) snprintf(tb->t.claude_args, sizeof(tb->t.claude_args), "%s", v);
+        else if (!strcmp(line, "cmd")) snprintf(tb->t.cmd, sizeof(tb->t.cmd), "%s", v);
+        else if (!strcmp(line, "title")) utf8_to_wide(v, tb->t.title, 256);
+        else if (!strcmp(line, "ps")) sscanf(v, "%d %d %d %d", &tb->t.ps_state, &tb->t.ps_pct, &tb->t.ps_tasks, &tb->t.progress);
+        else if (!strcmp(line, "ps_kind")) snprintf(tb->t.ps_kind, sizeof(tb->t.ps_kind), "%s", v);
+        else if (!strcmp(line, "ps_msg")) utf8_to_wide(v, tb->t.ps_msg, 200);
+        else if (!strcmp(line, "marks")) {
+            char *q = v;
+            int m = (int)strtol(q, &q, 10), k;
+            long long off[512];
+            for (k = 0; k < m && k < 512; k++) off[k] = strtoll(q, &q, 10);
+            tb->t.nmarks = 0;
+            tb->adopt_marks = k;            /* applied after the snapshot sets hpushed */
+            memcpy(tb->mark_off, off, sizeof(long long) * (size_t)k);
+        } else if (!strcmp(line, "snap")) {
+            size_t len = (size_t)strtoull(v, NULL, 10);
+            int view = tb->t.view, k;
+            if (strlen(p) < len) break;
+            tb->t.view = 0;
+            vt_feed(&tb->t, (const unsigned char *)p, (int)len);
+            p += len + 1;
+            for (k = 0; k < tb->adopt_marks; k++) tb->t.marks[tb->t.nmarks++] = tb->t.hpushed - tb->mark_off[k];
+            tb->t.view = view < tb->t.hcount ? view : tb->t.hcount;
+            tb->t.side = 1;
+            reader_start(tb);
+            g_tabs[g_ntabs++] = tb;
+            tb = NULL;
+        }
+    }
+    free(g_adopt_blob);
+    g_adopt_blob = NULL;
+    if (g_ntabs) {
+        int i;
+        activate(g_adopt_active >= 0 && g_adopt_active < g_ntabs ? g_adopt_active : 0);
+        for (i = 0; i < g_ntabs; i++) if (i != g_active) g_tabs[i]->activity = 0;
+    }
+    return g_ntabs;
+}
+
+/* told by the new process: it has the tabs and has drawn them */
+static void adopt_done(void) {
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD w;
+    if (!g_adopting || !out || out == INVALID_HANDLE_VALUE) return;
+    WriteFile(out, "ok\n", 3, &w, NULL);
+    CloseHandle(out);
+    SetStdHandle(STD_OUTPUT_HANDLE, NULL);
+    SetStdHandle(STD_ERROR_HANDLE, NULL);
+    g_adopting = 0;
+}
+
 #endif
 
 /* The folder the window is closing in, for the next window to open in. */
@@ -4649,6 +5234,7 @@ static int unit_scrollback(FILE *f) {
         fails += !ok;
         term_free(&t);
     }
+    fails += term_snapshot_check(f);
     return fails;
 }
 
@@ -5082,6 +5668,16 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (!strcmp(buf, "nexttab")) activate((g_active + 1) % g_ntabs);
             else if (!strcmp(buf, "closetab")) close_tab(g_active);
             else if (!strcmp(buf, "close")) PostMessageW(hwnd, WM_CLOSE, 0, 0);   /* as the × does */
+            else if (!strcmp(buf, "reload")) {          /* hand the tabs to the exe at our path (an update put a new one there) */
+                char why[200] = "";
+                wchar_t *alt = _wgetenv(L"HARDCORE_RELOAD_EXE");
+                if (!reload_into(alt ? alt : g_exe_path, why, sizeof(why))) {
+                    if (g_perf) { fprintf(g_perf, "reload failed: %s\n", why); fflush(g_perf); }
+                    return FALSE;
+                }
+                PostMessageW(hwnd, WM_APP_HANDED_OVER, 0, 0);
+                return TRUE;
+            }
             else if (!strcmp(buf, "jump")) jump_to_attention();
             else if (!strncmp(buf, "tab ", 4)) activate(atoi(buf + 4));
             else if (!strncmp(buf, "hover ", 6)) {
@@ -5322,6 +5918,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    case WM_APP_HANDED_OVER:
+        /* the new process has every pseudoconsole; ending here closes only our
+           copies of their handles. No ClosePseudoConsole, no session save. */
+        ExitProcess(0);
+        return 0;
     case WM_APP_EXITED: {
         Tab *tb = tab_by_id((int)wp);
         DWORD code = 0;
@@ -5886,7 +6487,24 @@ static int update_cmd(int force) {
     if (!MoveFileExW(exe, old, MOVEFILE_REPLACE_EXISTING) || !MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING)) {
         cli("hardcore: couldn't swap in the new exe (error %lu)\n", GetLastError()); return 1;
     }
-    cli("hardcore: updated %s -> %s. New windows run it; open ones keep the old one until closed.\n", HARDCORE_VERSION, tag);
+    cli("hardcore: updated %s -> %s\n", HARDCORE_VERSION, tag);
+    {   /* and every open window takes it up in place: tabs, programs and all keep going */
+        HWND w = NULL, all[64];
+        int ok = 0, bad = 0, nw = 0, i;
+        while (nw < 64 && (w = FindWindowExW(NULL, w, L"hardcore", NULL)) != NULL) all[nw++] = w;   /* first, before any of them changes */
+        for (i = 0; i < nw; i++) {
+            COPYDATASTRUCT cd;
+            DWORD_PTR res = 0;
+            w = all[i];
+            cd.dwData = 0x48430002;
+            cd.cbData = 6;
+            cd.lpData = (void *)"reload";
+            if (SendMessageTimeoutW(w, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 20000, &res) && res) ok++;
+            else bad++;
+        }
+        if (ok) cli("hardcore: %d window%s reloaded in place\n", ok, ok == 1 ? "" : "s");
+        if (bad) cli("hardcore: %d window%s couldn't reload in place: close and reopen %s to finish\n", bad, bad == 1 ? "" : "s", bad == 1 ? "it" : "them");
+    }
     return 0;
 }
 
@@ -5939,6 +6557,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_t0);
+    GetModuleFileNameW(NULL, g_exe_path, MAX_PATH);   /* before an update renames this file */
+    if (_wgetenv(L"HARDCORE_ADOPT")) {                /* an older hardcore is handing its tabs over */
+        SetEnvironmentVariableW(L"HARDCORE_ADOPT", NULL);
+        adopt_read();
+    }
     if (_wgetenv(L"HARDCORE_TRACE")) {
         wchar_t tp[MAX_PATH];
         _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-trace.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
@@ -6025,7 +6648,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* `hardcore` or `hardcore DIR` typed in a shell: a window there (the shell's
        folder if none was named), started on its own so the shell gets its
        prompt back (WSL waits for the Windows programs it starts) */
-    if (!selftest_out[0] && show != SW_SHOWNOACTIVATE && !_wgetenv(L"HARDCORE_DETACHED") && from_command_line()) {
+    if (!selftest_out[0] && show != SW_SHOWNOACTIVATE && !g_adopting && !_wgetenv(L"HARDCORE_DETACHED") && from_command_line()) {
         wchar_t self[MAX_PATH], here[MAX_PATH * 2], full[MAX_PATH * 2], cl[4096], wdir[1100];
         char dir[1100];
         STARTUPINFOW si;
@@ -6099,6 +6722,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     compute_grid(r.right, r.bottom, &cols, &rows);
     g_cols = cols;
     g_rows = rows;
+    if (!g_adopting && !dir_given && session_placement(&g_adopt_wp)) {
+        /* the last session's window: where it was, as big as it was */
+        if (show == SW_SHOWNOACTIVATE && g_adopt_wp.showCmd == SW_SHOWNORMAL) g_adopt_wp.showCmd = SW_SHOWNOACTIVATE;
+    }
+    if (g_adopt_wp.length) {                     /* exactly where the old window is (a reload), or was (a session) */
+        SetWindowPlacement(h, &g_adopt_wp);
+        show = (int)g_adopt_wp.showCmd;
+        GetClientRect(h, &r);
+        compute_grid(r.right, r.bottom, &cols, &rows);
+        g_cols = cols;
+        g_rows = rows;
+    }
     ShowWindow(h, show);
     UpdateWindow(h);
     trace("window shown");
@@ -6106,7 +6741,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     SetTimer(h, TIMER_DISK, 60 * 1000, NULL);
     /* wsl.exe boots while the D3D device is created; the tabs from last time
        if there are any (unless a folder was asked for), else one new tab */
-    if (dir_given || !session_restore()) new_tab_here();
+    if (g_adopting && adopt_tabs()) {
+        tab_fit(g_tabs[g_active]);               /* a different size only if the screen's DPI changed */
+        schedule_spare();
+    } else if (dir_given || !session_restore()) new_tab_here();
     else schedule_spare();
     trace("first tab spawned");
     if (gfx_thread) { WaitForSingleObject(gfx_thread, 5000); CloseHandle(gfx_thread); }
@@ -6117,6 +6755,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     }
     trace("swap chain ready");
     InvalidateRect(h, NULL, FALSE);
+    if (g_adopting) {                            /* drawn on top of the old window, then tell it */
+        paint_now();
+        SetForegroundWindow(h);
+        adopt_done();
+    }
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
