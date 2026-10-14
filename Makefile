@@ -51,6 +51,14 @@ build/font.bin: $(FONT) tools/gen_font.py
 	@mkdir -p build
 	python3 tools/gen_font.py $@ $(FONT)
 
+# the other fonts for the settings (each one's own glyphs) and their list
+FONTS_SRC = font/terminus/ter-u24n.bdf.gz font/terminus/ter-u28n.bdf.gz font/terminus/ter-u32n.bdf.gz \
+            font/tamzen/Tamzen8x15r.bdf.gz font/misc-fixed/7x13.bdf.gz font/sony/12x24.bdf.gz font/etl/lt1-24-etl.bdf.gz
+
+build/fonts.bin build/fonts.inc &: $(FONTS_SRC) tools/gen_fonts.py
+	@mkdir -p build
+	python3 tools/gen_fonts.py build/fonts.bin build/fonts.inc
+
 build/width.inc: font/ucd/EastAsianWidth.txt font/ucd/DerivedGeneralCategory.txt tools/gen_width.py
 	@mkdir -p build
 	python3 tools/gen_width.py font/ucd > $@
@@ -67,8 +75,8 @@ build/res.o: hardcore.rc build/hardcore.ico
 
 CONPTY_VER = 1.25.260930003
 
-hardcore.exe: hardcore.c build/font.bin build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
-	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
+hardcore.exe: hardcore.c build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
+	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-o $@ hardcore.c build/res.o $(LIBS)
 
 win-test: hardcore.exe
@@ -100,8 +108,8 @@ build/hardcore.metallib: hardcore.metal
 	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
 	xcrun metallib build/hardcore.air -o $@
 
-build/hardcore: hardcore.c hardcore_mac.m hardcore.metal build/font.bin build/width.inc $(METALLIB)
-	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -o $@ hardcore.c $(MAC_LIBS)
+build/hardcore: hardcore.c hardcore_mac.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
+	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
 	@mkdir -p build

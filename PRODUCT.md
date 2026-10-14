@@ -7,7 +7,7 @@ still take. Written 2026-10-13.
 
 People on Windows who live in a Linux shell, and these days mostly in
 Claude Code, and want the terminal to get out of the way:
-- one look and one layout, no settings;
+- one layout, and no settings beyond a font and a color scheme;
 - tabs that know where you are;
 - a tab column that tells you which Claude needs you.
 
@@ -26,8 +26,9 @@ opinionated terminals (Ghostty, kitty, foot) are Linux and macOS first.
 | WSL at all | required | `shell=powershell` gives the same terminal over PowerShell |
 
 Still assumed, deliberately:
-- **Dark only, Unifont only, integer scale only.** At 125% DPI the text is
-  1×, small but sharp. That's the product, not a gap.
+- **Bitmap fonts only, integer scale only.** At 125% DPI the text is 1×,
+  small but sharp. That's the product, not a gap. (A font and a color
+  scheme, light ones included, are the only settings.)
 - **bash for folder tracking** (and Ctrl+Shift+↑/↓ prompt marks). zsh and fish
   users get bash in hardcore's tabs.
 

@@ -234,7 +234,7 @@ static void r_flush(void) {      /* the whole frame goes in one draw, so this on
    handed over, so the shared texture needs no fence. (After a full-atlas
    reset, the frame being built at that moment can show stale glyphs once.) */
 static void r_upload(int x, int y, const unsigned char *bmp) {
-    [g_atlas replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, 16, 16) mipmapLevel:0 withBytes:bmp bytesPerRow:16];
+    [g_atlas replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, SLOT, SLOT) mipmapLevel:0 withBytes:bmp bytesPerRow:SLOT];
 }
 
 static void r_begin(int w, int h) {
@@ -874,6 +874,7 @@ static void config_load(void) {
         while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
         if (!strcmp(line, "dir") && *v) expand_home(v, g_start_dir, sizeof(g_start_dir));
         else if (!strcmp(line, "last")) snprintf(g_last_dir, sizeof(g_last_dir), "%s", v);
+        else config_look(line, v);
     }
     fclose(f);
 }
@@ -888,7 +889,37 @@ static void config_save(void) {
     fprintf(f, "dir=%s\n", g_cfg_dir_line);
     fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
     fprintf(f, "last=%s\n", g_last_dir);
+    config_look_save(f);
     fclose(f);
+}
+
+/* ── settings: every window is its own process, so a pick goes to config.ini
+   and a note to the others, which read it back ───────────────────────── */
+
+#define SETTINGS_NOTE @"com.williamsharkey.hardcore.settings"
+
+static void plat_settings_tell(void) {
+    [[NSDistributedNotificationCenter defaultCenter] postNotificationName:SETTINGS_NOTE object:nil userInfo:nil deliverImmediately:YES];
+}
+
+/* the window's background shows while resizing, and the title bar's buttons follow light or dark */
+static void plat_settings_shown(void) {
+    if (!g_win) return;
+    [g_win setBackgroundColor:[NSColor colorWithSRGBRed:((DEF_BG >> 16) & 255) / 255.0 green:((DEF_BG >> 8) & 255) / 255.0
+                                                   blue:(DEF_BG & 255) / 255.0 alpha:1]];
+    [g_win setAppearance:[NSAppearance appearanceNamed:g_shown->dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua]];
+    [g_win invalidateCursorRectsForView:[g_win contentView]];
+    plat_invalidate();
+}
+
+/* the traffic lights' bottom edge, in the view's pixels from the top: the
+   circle's, which is a little smaller than its button (12 of 14 points) */
+static int plat_lights_bottom(void) {
+    NSButton *b = g_win ? [g_win standardWindowButton:NSWindowCloseButton] : nil;
+    NSRect r;
+    if (!b || ([g_win styleMask] & NSWindowStyleMaskFullScreen)) return 0;
+    r = [b convertRect:[b bounds] toView:nil];   /* window coordinates, origin bottom left */
+    return (int)(([[g_win contentView] bounds].size.height - NSMidY(r) + NSWidth(r) / 2 - 1) * g_scale + 0.5);
 }
 
 /* ── clipboard, drops, links ───────────────────────────────────────── */
@@ -1163,6 +1194,7 @@ static int plain_layout(void) {
 - (void)viewDidChangeBackingProperties {
     int s = (int)([g_win backingScaleFactor] + 0.5);
     [super viewDidChangeBackingProperties];
+    if ((s < 1 ? 1 : s) != g_scale) glyph_cache_reset();   /* thin box lines are drawn for the scale */
     g_scale = s < 1 ? 1 : s;
     if (g_layer) layer_fit();
     resize_all();
@@ -1408,6 +1440,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (hit == HIT_TAB) { activate(idx); return; }
     if (hit == HIT_CLOSE) { user_close_tab(idx); return; }
     if (hit == HIT_PLUS) { new_tab_mac(); return; }
+    if (hit == HIT_SETTINGS || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return; }
     if (hit == HIT_BAR) {        /* the tab column's empty part is the title bar */
         if ([e clickCount] == 2) [g_win performZoom:nil];
         else [g_win performWindowDragWithEvent:e];
@@ -1517,6 +1550,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     g_mouse_x = mx;
     g_mouse_y = my;
     if (was_bar || on_bar) plat_invalidate();
+    if (was_bar || on_bar) settings_point();
     if (!on_bar && tb && tb->t.m_mouse == 1003) mouse_report(3, 1, 1, mx, my, ev_mods(e));
     if (!on_bar) [self flagsChanged:e];
 }
@@ -1524,6 +1558,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (void)mouseExited:(NSEvent *)e {
     (void)e;
     g_mouse_x = g_mouse_y = -1;
+    settings_point();
     plat_invalidate();
 }
 
@@ -1712,7 +1747,8 @@ static void build_menus(void) {
 
 /* ── test channel ───────────────────────────────────────────────────
    HARDCORE_CTL=/path/fifo: lines of "type TEXT" (\n is Enter, \e is ESC),
-   "cmd newtab|nexttab|closetab|jump|tab N|hover X,Y|resize W,H|sel Y0 X0 Y1 X1", "snap OUT.bmp", and
+   "cmd newtab|nexttab|closetab|jump|tab N|hover X,Y|click X,Y|resize W,H|sel Y0 X0 Y1 X1" (click: the
+   tab column's settings only), "snap OUT.bmp", and
    "winid OUT" (the window number, for screencapture -l, which also gets the
    traffic lights), and "key KEYCODE FLAGS CHARS [UNMODIFIED]": a synthetic
    key event through the same keyDown: path as the keyboard (FLAGS in hex,
@@ -1770,6 +1806,9 @@ static void ctl_line(char *s) {
         } else if (!strncmp(c, "hover ", 6)) {
             g_mouse_x = atoi(c + 6);
             g_mouse_y = strchr(c + 6, ',') ? atoi(strchr(c + 6, ',') + 1) : -1;
+            settings_point();
+        } else if (!strncmp(c, "click ", 6)) {
+            settings_click(atoi(c + 6), strchr(c + 6, ',') ? atoi(strchr(c + 6, ',') + 1) : -1);
         }
         plat_invalidate();
     } else if (!strncmp(s, "key ", 4)) {
@@ -2075,7 +2114,7 @@ int main(int argc, char **argv) {
     [g_win setTitleVisibility:NSWindowTitleHidden];
     [g_win setBackgroundColor:[NSColor colorWithSRGBRed:((DEF_BG >> 16) & 255) / 255.0 green:((DEF_BG >> 8) & 255) / 255.0
                                                    blue:(DEF_BG & 255) / 255.0 alpha:1]];
-    [g_win setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    [g_win setAppearance:[NSAppearance appearanceNamed:g_shown->dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua]];
     [g_win setContentMinSize:NSMakeSize(300, 160)];
     [g_win setAnimationBehavior:NSWindowAnimationBehaviorNone];
     [g_win setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
@@ -2097,6 +2136,8 @@ int main(int argc, char **argv) {
     [[NSNotificationCenter defaultCenter] addObserverForName:NSTextInputContextKeyboardSelectionDidChangeNotification
                                                       object:nil queue:nil
                                                   usingBlock:^(NSNotification *n) { (void)n; g_plain_layout = -1; }];
+    [[NSDistributedNotificationCenter defaultCenter] addObserverForName:SETTINGS_NOTE object:nil queue:nil
+                                                             usingBlock:^(NSNotification *n) { (void)n; config_load(); settings_apply(); }];
     if (getenv("HARDCORE_CTL")) ctl_start(getenv("HARDCORE_CTL"));
     trace("window built");
     dispatch_group_wait(gfx, DISPATCH_TIME_FOREVER);

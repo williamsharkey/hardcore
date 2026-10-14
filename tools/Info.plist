@@ -25,7 +25,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>MIT license. GNU Unifont: GPLv2+ with the font embedding exception, or OFL 1.1.</string>
+	<string>MIT license. GNU Unifont: GPLv2+ with the font embedding exception, or OFL 1.1. Terminus: OFL 1.1. Tamzen, misc-fixed, Sony and ETL fonts: their own free licenses (see the README).</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>

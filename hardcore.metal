@@ -16,7 +16,7 @@ vertex VO vs(const device Inst *q [[buffer(0)]], constant float2 &inv [[buffer(1
     float2 p = mix(float2(short2(i.r.xy)), float2(short2(i.r.zw)), f);
     VO o;
     o.p = float4(p.x * inv.x - 1, 1 - p.y * inv.y, 0, 1);
-    o.uv = i.t.x == 65535 ? float2(-1, -1) : mix(float2(ushort2(i.t.xy)), float2(ushort2(i.t.zw)), f) / 2048.0;
+    o.uv = i.t.x == 65535 ? float2(-1, -1) : mix(float2(ushort2(i.t.xy)), float2(ushort2(i.t.zw)), f) / 4096.0;
     o.c = float4(i.c) / 255.0;
     return o;
 }

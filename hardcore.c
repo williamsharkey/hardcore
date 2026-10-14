@@ -84,8 +84,13 @@ __asm__(
     ".global " BLOB_SYM(font_blob_end) "\n"
     BLOB_SYM(font_blob_end) ":\n"
     ".byte 0\n"
+    ".balign 16\n"
+    ".global " BLOB_SYM(fonts_blob) "\n"
+    BLOB_SYM(fonts_blob) ":\n"
+    ".incbin \"" FONTS_BIN "\"\n"
+    ".byte 0\n"
     ".text\n");
-extern const unsigned char font_blob[], font_blob_end[];
+extern const unsigned char font_blob[], font_blob_end[], fonts_blob[];
 
 #ifdef _WIN32
 /* Windows Terminal's own ConPTY (vendor/conpty), extracted on first run. */
@@ -108,18 +113,53 @@ __asm__(
 extern const unsigned char conpty_dll[], conpty_dll_end[], openconsole_exe[], openconsole_exe_end[];
 #endif
 
-#define FONT_W 8
-#define FONT_H 16
+/* ── fonts: the settings panel's upper grid ────────────────────────────
+   Unifont is the font; the others (tools/gen_fonts.py → build/fonts.bin)
+   carry only their own glyphs, and whatever one lacks comes from its
+   fallback, then from Unifont squeezed into its cell. A font's cell is in
+   its own pixels. Unifont's and the other small ones' are multiplied by the
+   display scale, so on a Retina screen each of their pixels is 2×2; the
+   big ones (dev) were drawn for the display's own pixels and go on 1:1. */
+typedef struct {
+    char key;                    /* its letter in the settings, and in config.ini */
+    const char *name;
+    int w, h;                    /* the cell, in the font's pixels */
+    int dev;                     /* those pixels are the display's: drawn 1:1, whatever the scale */
+    int thin;                    /* at scale 2, box drawing gets 1-pixel lines instead of doubled ones */
+    char fallback;               /* the font a missing glyph comes from before Unifont, or 0 */
+    long off;                    /* its glyph table in fonts.bin; -1: Unifont, font.bin */
+} Font;
 
-/* Returns the glyph record (width byte + rows) or NULL. */
-static const unsigned char *font_glyph(uint32_t cp) {
+static const Font FONTS[] = {
+#include "build/fonts.inc"
+};
+#define NFONTS ((int)(sizeof(FONTS) / sizeof(FONTS[0])))
+
+static int g_scale = 1;          /* integer pixel scale, from the monitor DPI */
+static const Font *g_font = FONTS;    /* the font you picked: every window, and the tab column */
+static const Font *g_tfont = FONTS;   /* the terminal's: g_font, or the one you're pointing at in the settings */
+static const Font *g_cf = FONTS;      /* the font CW and CH measure: g_tfont, or g_font while the tab column draws */
+
+static int cell_w(const Font *f) { return f->dev ? f->w : f->w * g_scale; }
+static int cell_h(const Font *f) { return f->dev ? f->h : f->h * g_scale; }
+
+/* A font's glyph record (width byte + rows, (width + 7) / 8 bytes each) or NULL. */
+static const unsigned char *font_record(const Font *f, uint32_t cp) {
+    const unsigned char *base = f->off < 0 ? font_blob : fonts_blob + f->off;
     uint32_t page, off;
     if (cp > 0x10FFFF) return NULL;
-    memcpy(&page, font_blob + 4 + (cp >> 8) * 4, 4);
+    memcpy(&page, base + 4 + (cp >> 8) * 4, 4);
     if (!page) return NULL;
-    memcpy(&off, font_blob + page + (cp & 255) * 4, 4);
-    if (!off || font_blob + off >= font_blob_end) return NULL;
-    return font_blob + off;
+    memcpy(&off, base + page + (cp & 255) * 4, 4);
+    if (!off || (f->off < 0 && font_blob + off >= font_blob_end)) return NULL;
+    return base + off;
+}
+
+static const Font *font_by_key(int key) {
+    int i;
+    for (i = 0; i < NFONTS; i++)
+        if (FONTS[i].key == key) return &FONTS[i];
+    return NULL;
 }
 
 #ifdef _WIN32
@@ -145,15 +185,76 @@ static PFN_ClosePC  pClosePC;
 #define OSC_MAX      8192
 
 #define HARDCORE_VERSION "0.3"
-#define AMBER 0xFFA60D           /* dumbterm's phosphor cursor */
-#define DEF_FG 0xCCCCCC
-#define DEF_BG 0x0C0C0C
-#define BAR_BG 0x1B1B1B
-#define TAB_BG 0x262626
-#define TAB_HOVER 0x303030
-#define SEL_BG 0x264F78
 
-static int g_scale = 1;          /* integer pixel scale, from the monitor DPI; one size, no zoom */
+/* ── color schemes: the settings panel's lower grid ────────────────────
+   One is in effect for every window. Lowercase letters are dark schemes,
+   uppercase the light twin of the same family. hardcore's own is Windows
+   Terminal's Campbell with dumbterm's amber cursor; the others are as
+   iTerm2-Color-Schemes (MIT, Mark Badolato) has them, except four
+   selection colors that were the text color or nearly white, so selected
+   text vanished: those are each scheme's own surface/bg2 shade. */
+typedef struct {
+    char key;
+    const char *name;
+    int dark;
+    uint32_t bg, fg, cursor, sel, pal[16];
+} Scheme;
+
+static const Scheme SCHEMES[] = {
+    {'h', "hardcore", 1, 0x0C0C0C, 0xCCCCCC, 0xFFA60D, 0x264F78, {0x0C0C0C, 0xC50F1F, 0x13A10E, 0xC19C00, 0x0037DA, 0x881798, 0x3A96DD, 0xCCCCCC, 0x767676, 0xE74856, 0x16C60C, 0xF9F1A5, 0x3B78FF, 0xB4009E, 0x61D6D6, 0xF2F2F2}},
+    {'d', "Dracula", 1, 0x282A36, 0xF8F8F2, 0xF8F8F2, 0x44475A, {0x21222C, 0xFF5555, 0x50FA7B, 0xF1FA8C, 0xBD93F9, 0xFF79C6, 0x8BE9FD, 0xF8F8F2, 0x6272A4, 0xFF6E6E, 0x69FF94, 0xFFFFA5, 0xD6ACFF, 0xFF92DF, 0xA4FFFF, 0xFFFFFF}},
+    {'m', "Monokai", 1, 0x272822, 0xFDFFF1, 0xC0C1B5, 0x57584F, {0x272822, 0xF92672, 0xA6E22E, 0xE6DB74, 0xFD971F, 0xAE81FF, 0x66D9EF, 0xFDFFF1, 0x6E7066, 0xF92672, 0xA6E22E, 0xE6DB74, 0xFD971F, 0xAE81FF, 0x66D9EF, 0xFDFFF1}},
+    {'n', "Nord", 1, 0x2E3440, 0xD8DEE9, 0xECEFF4, 0x434C5E, {0x3B4252, 0xBF616A, 0xA3BE8C, 0xEBCB8B, 0x81A1C1, 0xB48EAD, 0x88C0D0, 0xE5E9F0, 0x596377, 0xBF616A, 0xA3BE8C, 0xEBCB8B, 0x81A1C1, 0xB48EAD, 0x8FBCBB, 0xECEFF4}},
+    {'g', "Gruvbox Dark", 1, 0x282828, 0xEBDBB2, 0xEBDBB2, 0x665C54, {0x282828, 0xCC241D, 0x98971A, 0xD79921, 0x458588, 0xB16286, 0x689D6A, 0xA89984, 0x928374, 0xFB4934, 0xB8BB26, 0xFABD2F, 0x83A598, 0xD3869B, 0x8EC07C, 0xEBDBB2}},
+    {'s', "Solarized Dark", 1, 0x002B36, 0x839496, 0x839496, 0x073642, {0x073642, 0xDC322F, 0x859900, 0xB58900, 0x268BD2, 0xD33682, 0x2AA198, 0xEEE8D5, 0x335E69, 0xCB4B16, 0x586E75, 0x657B83, 0x839496, 0x6C71C4, 0x93A1A1, 0xFDF6E3}},
+    {'o', "One Dark", 1, 0x282C34, 0xDCDFE4, 0xA3B3CC, 0x474E5D, {0x282C34, 0xE06C75, 0x98C379, 0xE5C07B, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xDCDFE4, 0x5D677A, 0xE06C75, 0x98C379, 0xE5C07B, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xDCDFE4}},
+    {'c', "Catppuccin Mocha", 1, 0x1E1E2E, 0xCDD6F4, 0xF5E0DC, 0x585B70, {0x45475A, 0xF38BA8, 0xA6E3A1, 0xF9E2AF, 0x89B4FA, 0xF5C2E7, 0x94E2D5, 0xBAC2DE, 0x585B70, 0xF7AEC2, 0xC2ECBF, 0xFCD682, 0xAECCFC, 0xF398DA, 0xB1EAE1, 0xA6ADC8}},
+    {'k', "Tokyo Night", 1, 0x1A1B26, 0xC0CAF5, 0xC0CAF5, 0x33467C, {0x15161E, 0xF7768E, 0x9ECE6A, 0xE0AF68, 0x7AA2F7, 0xBB9AF7, 0x7DCFFF, 0xA9B1D6, 0x414868, 0xF7768E, 0x9ECE6A, 0xE0AF68, 0x7AA2F7, 0xBB9AF7, 0x7DCFFF, 0xC0CAF5}},
+    {'r', "Rose Pine", 1, 0x191724, 0xE0DEF4, 0xE0DEF4, 0x403D52, {0x26233A, 0xEB6F92, 0x31748F, 0xF6C177, 0x9CCFD8, 0xC4A7E7, 0xEBBCBA, 0xE0DEF4, 0x6E6A86, 0xEB6F92, 0x31748F, 0xF6C177, 0x9CCFD8, 0xC4A7E7, 0xEBBCBA, 0xE0DEF4}},
+    {'G', "Gruvbox Light", 0, 0xFBF1C7, 0x3C3836, 0x3C3836, 0xD5C4A1, {0xFBF1C7, 0xCC241D, 0x98971A, 0xD79921, 0x458588, 0xB16286, 0x689D6A, 0x7C6F64, 0x928374, 0x9D0006, 0x79740E, 0xB57614, 0x076678, 0x8F3F71, 0x427B58, 0x3C3836}},
+    {'S', "Solarized Light", 0, 0xFDF6E3, 0x657B83, 0x657B83, 0xEEE8D5, {0x073642, 0xDC322F, 0x859900, 0xB58900, 0x268BD2, 0xD33682, 0x2AA198, 0xBBB5A2, 0x002B36, 0xCB4B16, 0x586E75, 0x657B83, 0x839496, 0x6C71C4, 0x93A1A1, 0xFDF6E3}},
+    {'O', "One Light", 0, 0xFAFAFA, 0x383A42, 0xA5B4E5, 0xBFCEFF, {0x383A42, 0xE45649, 0x50A14F, 0xC18401, 0x0184BC, 0xA626A4, 0x0997B3, 0xBABABA, 0x4F525E, 0xE06C75, 0x98C379, 0xD8B36E, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xFFFFFF}},
+    {'C', "Catppuccin Latte", 0, 0xEFF1F5, 0x4C4F69, 0xDC8A78, 0xACB0BE, {0xBCC0CC, 0xD20F39, 0x40A02B, 0xDF8E1D, 0x1E66F5, 0xEA76CB, 0x179299, 0x5C5F77, 0xACB0BE, 0xE7103F, 0x46B02F, 0xE49931, 0x3878F6, 0xEF95D7, 0x19A1A8, 0x6C6F85}},
+    {'K', "Tokyo Night Day", 0, 0xE1E2E7, 0x3760BF, 0x3760BF, 0x99A7DF, {0xE9E9ED, 0xF52A65, 0x587539, 0x8C6C3E, 0x2E7DE9, 0x9854F1, 0x007197, 0x6172B0, 0xA1A6C5, 0xF52A65, 0x587539, 0x8C6C3E, 0x2E7DE9, 0x9854F1, 0x007197, 0x3760BF}},
+    {'R', "Rose Pine Dawn", 0, 0xFAF4ED, 0x575279, 0x575279, 0xDFDAD9, {0xF2E9E1, 0xB4637A, 0x286983, 0xEA9D34, 0x56949F, 0x907AA9, 0xD7827E, 0x575279, 0x9893A5, 0xB4637A, 0x286983, 0xEA9D34, 0x56949F, 0x907AA9, 0xD7827E, 0x575279}},
+};
+#define NSCHEMES ((int)(sizeof(SCHEMES) / sizeof(SCHEMES[0])))
+
+/* What the drawing uses, worked out from the scheme in effect. The tab
+   column's shades sit between the scheme's background and text; hardcore's
+   own keeps the exact greys it always had. */
+typedef struct {
+    uint32_t bg, fg, bold, accent, sel, bar, hover;
+    uint32_t text, text_lo, busy_lo, dim, detail, detail_ask, red;
+} Look;
+static Look g_look;
+static const Scheme *g_scheme = SCHEMES;     /* the scheme you picked, for every window */
+static const Scheme *g_shown = SCHEMES;      /* the one on screen: g_scheme, or one you're pointing at */
+
+#define AMBER (g_look.accent)    /* the cursor and the marks: dumbterm's phosphor amber in hardcore's scheme */
+#define DEF_FG (g_look.fg)
+#define DEF_BG (g_look.bg)
+#define BAR_BG (g_look.bar)
+#define TAB_HOVER (g_look.hover)
+#define SEL_BG (g_look.sel)
+
+static const Scheme *scheme_by_key(int key) {
+    int i;
+    for (i = 0; i < NSCHEMES; i++)
+        if (SCHEMES[i].key == key) return &SCHEMES[i];
+    return NULL;
+}
+
+static uint32_t mix(uint32_t a, uint32_t b, float t) {
+    uint32_t o = 0;
+    int s;
+    for (s = 0; s < 24; s += 8) {
+        float ca = (float)((a >> s) & 255), cb = (float)((b >> s) & 255);
+        o |= (uint32_t)(ca + (cb - ca) * t + 0.5f) << s;
+    }
+    return o;
+}
+
 static char g_start_dir[1024];   /* Windows or Linux path */
 static char g_last_dir[1024];    /* where the last window closed: the next one opens there */
 static int g_shell_ps;           /* shell=powershell in config.ini: tabs run PowerShell, not WSL */
@@ -201,20 +302,65 @@ typedef struct {
 
 static uint32_t PAL[256];
 
+/* the scheme on screen → the 16 colors and the look; the cube and greys stay */
+static void look_set(const Scheme *s) {
+    Look *l = &g_look;
+    int i;
+    g_shown = s;
+    for (i = 0; i < 16; i++) PAL[i] = s->pal[i];
+    l->bg = s->bg;
+    l->fg = s->fg;
+    l->accent = s->cursor;
+    l->sel = s->sel;
+    l->red = s->pal[9];
+    if (s == SCHEMES) {          /* hardcore's own, as it always was */
+        l->bold = 0xF2F2F2;
+        l->bar = 0x1B1B1B;
+        l->hover = 0x303030;
+        l->text = 0xF2F2F2;
+        l->text_lo = 0x9A9A9A;
+        l->busy_lo = 0xBDBDBD;
+        l->dim = 0x8A8A8A;
+        l->detail = 0x767676;
+        l->detail_ask = 0xC9A15A;
+        return;
+    }
+    l->bold = s->dark ? s->pal[15] : s->fg;   /* a light scheme's bright white would vanish */
+    l->bar = mix(s->bg, s->fg, s->dark ? 0.06f : 0.05f);
+    l->hover = mix(s->bg, s->fg, 0.16f);
+    l->text = s->fg;
+    l->text_lo = mix(s->bg, s->fg, 0.72f);
+    l->busy_lo = mix(s->bg, s->fg, 0.85f);
+    l->dim = mix(s->bg, s->fg, 0.6f);
+    l->detail = mix(s->bg, s->fg, 0.5f);
+    l->detail_ask = mix(s->bg, s->cursor, 0.75f);
+}
+
 static void palette_init(void) {
-    /* Campbell, the Windows Terminal default, so colors look familiar */
-    static const uint32_t base[16] = {
-        0x0C0C0C, 0xC50F1F, 0x13A10E, 0xC19C00, 0x0037DA, 0x881798, 0x3A96DD, 0xCCCCCC,
-        0x767676, 0xE74856, 0x16C60C, 0xF9F1A5, 0x3B78FF, 0xB4009E, 0x61D6D6, 0xF2F2F2};
     static const int cube[6] = {0, 95, 135, 175, 215, 255};
     int i;
-    for (i = 0; i < 16; i++) PAL[i] = base[i];
+    look_set(g_scheme);
     for (i = 0; i < 216; i++)
         PAL[16 + i] = ((uint32_t)cube[i / 36] << 16) | ((uint32_t)cube[(i / 6) % 6] << 8) | (uint32_t)cube[i % 6];
     for (i = 0; i < 24; i++) {
         uint32_t g = 8 + i * 10;
         PAL[232 + i] = (g << 16) | (g << 8) | g;
     }
+}
+
+/* config.ini's font= and theme=: a letter each */
+static void config_look(const char *key, const char *v) {
+    if (!strcmp(key, "font") && font_by_key(v[0])) g_font = g_tfont = g_cf = font_by_key(v[0]);
+    else if (!strcmp(key, "theme") && scheme_by_key(v[0])) look_set(g_scheme = scheme_by_key(v[0]));
+}
+
+static void config_look_save(FILE *f) {
+    int i;
+    fprintf(f, "# the font and color scheme, a letter each (the settings, under the tabs, pick them):\n#");
+    for (i = 0; i < NFONTS; i++) fprintf(f, " %c=%s %dx%d", FONTS[i].key, FONTS[i].name, cell_w(&FONTS[i]), cell_h(&FONTS[i]));
+    fprintf(f, "\nfont=%c\n#", g_font->key);
+    for (i = 0; i < NSCHEMES; i++) fprintf(f, " %c=%s", SCHEMES[i].key, SCHEMES[i].name);
+    fprintf(f, "\ntheme=%c\n", g_scheme->key);
 }
 
 /* wcwidth from Unicode 17 (tools/gen_width.py → build/width.inc): the same
@@ -1341,10 +1487,10 @@ static void csi_dispatch(Term *t, int f) {
             snprintf(buf, sizeof(buf), "\x1b[8;%d;%dt", t->rows, t->cols);
             term_reply(t, buf);
         } else if (P(t, 0, 0) == 16) {   /* cell size in pixels (Claude Code asks, for images) */
-            snprintf(buf, sizeof(buf), "\x1b[6;%d;%dt", FONT_H * g_scale, FONT_W * g_scale);
+            snprintf(buf, sizeof(buf), "\x1b[6;%d;%dt", cell_h(g_tfont), cell_w(g_tfont));
             term_reply(t, buf);
         } else if (P(t, 0, 0) == 14) {   /* text area in pixels */
-            snprintf(buf, sizeof(buf), "\x1b[4;%d;%dt", t->rows * FONT_H * g_scale, t->cols * FONT_W * g_scale);
+            snprintf(buf, sizeof(buf), "\x1b[4;%d;%dt", t->rows * cell_h(g_tfont), t->cols * cell_w(g_tfont));
             term_reply(t, buf);
         }
         break;
@@ -1793,6 +1939,7 @@ static void term_message(Term *t, const char *msg) {
 
 #define WM_APP_OUTPUT (WM_APP + 1)
 #define WM_APP_EXITED (WM_APP + 2)
+#define WM_APP_SETTINGS (WM_APP + 3)     /* another window changed the font or scheme */
 
 static DWORD WINAPI reader_thread(LPVOID arg) {
     Tab *tb = (Tab *)arg;
@@ -2187,6 +2334,7 @@ static void config_load(void) {
         else if (!strcmp(line, "shell")) g_shell_ps = !_stricmp(v, "powershell");
         else if (!strcmp(line, "width")) g_win_w = atoi(v);
         else if (!strcmp(line, "height")) g_win_h = atoi(v);
+        else config_look(line, v);
     }
     fclose(f);
 }
@@ -2207,6 +2355,7 @@ static void config_save(void) {
     fprintf(f, "width=%d\nheight=%d\n", g_win_w, g_win_h);
     fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
     fprintf(f, "last=%s\n", g_last_dir);
+    config_look_save(f);
     fclose(f);
 }
 
@@ -2250,16 +2399,24 @@ static DWORD g_last_paint;
 
 static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 
-#define CW (FONT_W * g_scale)
-#define CH (FONT_H * g_scale)
+/* the cell, in pixels: the terminal's, or the tab column's while it draws (see UI_FONT) */
+#define CW cell_w(g_cf)
+#define CH cell_h(g_cf)
 #define PAD (4 * g_scale)
 #define SCROLLBAR_W (6 * g_scale)
 /* The chrome: one column on the left with the tabs and "+". Min/max/close
    float over the terminal's top-right corner on smoked glass: the text runs
-   underneath, only the mouse is theirs. No row is spent on a title bar. */
-static int sidebar_w(void) { return 20 * CW; }
+   underneath, only the mouse is theirs. No row is spent on a title bar.
+   The column is laid on a character grid of the font you picked: SB_COLS
+   cells wide, rows one cell tall from the terminal's own top. While you
+   point at a font in the settings only the terminal tries it on, so the
+   column (and what you're pointing at) stays put. */
+#define SB_COLS 20
+#define UI_FONT const Font *ui_was_ = g_cf; g_cf = g_font
+#define UI_DONE g_cf = ui_was_
+static int sidebar_w(void) { return SB_COLS * cell_w(g_font); }
 #ifdef _WIN32
-static int caption_h(void) { return CH + 8 * g_scale; }   /* the glass buttons' height */
+static int caption_h(void) { return cell_h(g_font) + 8 * g_scale; }   /* the glass buttons' height */
 #else
 static int caption_h(void) { return 0; }   /* macOS keeps its own traffic lights, over the tab column */
 #endif
@@ -2544,16 +2701,19 @@ static void paste(void) {
 
 #endif /* _WIN32: drops, clipboard formats */
 
-/* ── glyph atlas: on-demand 16×16 slots in one texture ─────────────── */
+/* ── glyph atlas: on-demand 32×32 slots in one texture ─────────────── */
 
-#define ATLAS 2048
-#define ATLAS_S "2048.0"
-#define SLOTS_PER_ROW (ATLAS / 16)
+/* A slot holds one glyph in its font's pixels (the GPU scales those up to
+   the cell), or, for box drawing redrawn with thin lines, in the display's. */
+#define SLOT 32
+#define ATLAS 4096
+#define ATLAS_S "4096.0"
+#define SLOTS_PER_ROW (ATLAS / SLOT)
 #define MAX_SLOTS (SLOTS_PER_ROW * SLOTS_PER_ROW)
 #define HASH_SIZE 65536
-static uint32_t g_hkey[HASH_SIZE];   /* cp + 1, 0 = empty */
+static uint32_t g_hkey[HASH_SIZE];   /* cp + 1 + font index << 21, 0 = empty */
 static uint16_t g_hslot[HASH_SIZE];
-static uint8_t g_hwidth[HASH_SIZE];
+static uint8_t g_hwidth[HASH_SIZE], g_hheight[HASH_SIZE], g_hwide[HASH_SIZE];   /* in the slot's pixels */
 static int g_nslots;
 
 static void glyph_cache_reset(void);
@@ -2666,10 +2826,10 @@ static void r_flush(void) {
 }
 
 
-/* one 16×16 alpha glyph into the atlas */
+/* one SLOT×SLOT alpha glyph into the atlas */
 static void r_upload(int x, int y, const unsigned char *bmp) {
-    D3D11_BOX b = {(UINT)x, (UINT)y, 0, (UINT)x + 16, (UINT)y + 16, 1};
-    ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_atlas, 0, &b, bmp, 16, 0);
+    D3D11_BOX b = {(UINT)x, (UINT)y, 0, (UINT)x + SLOT, (UINT)y + SLOT, 1};
+    ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_atlas, 0, &b, bmp, SLOT, 0);
 }
 
 static void r_make_rtv(void) {
@@ -2692,7 +2852,7 @@ static void r_resize(void) {
 }
 
 static void r_begin(int w, int h) {
-    static const float bg[4] = {((DEF_BG >> 16) & 255) / 255.0f, ((DEF_BG >> 8) & 255) / 255.0f, (DEF_BG & 255) / 255.0f, 1};
+    const float bg[4] = {((DEF_BG >> 16) & 255) / 255.0f, ((DEF_BG >> 8) & 255) / 255.0f, (DEF_BG & 255) / 255.0f, 1};
     D3D11_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
     UINT stride = sizeof(Inst), off = 0;
     if (w != g_cb_w || h != g_cb_h) {
@@ -2880,36 +3040,106 @@ static void glyph_cache_reset(void) {
     g_nslots = 0;
 }
 
-static int glyph_slot(uint32_t cp, int *gw) {
-    uint32_t h = (cp * 2654435761u) & (HASH_SIZE - 1);
-    const unsigned char *g;
-    unsigned char bmp[16 * 16];
-    int slot, y, x, w;
+/* A glyph in font f's pixels, one byte a pixel, rows SLOT apart: its own,
+   its fallback font's, or Unifont's squeezed into f's cell (nearest pixel).
+   Returns its width: f->w, or 2 f->w for a wide one. */
+static int glyph_bits(const Font *f, uint32_t cp, unsigned char *bmp) {
+    const Font *fb;
+    const unsigned char *g = font_record(f, cp);
+    int w, x, y, bpr;
+    if (!g && f->fallback && (fb = font_by_key(f->fallback)) && fb->w == f->w && fb->h == f->h) g = font_record(fb, cp);
+    if (!g) {
+        const unsigned char *u = font_record(FONTS, cp);
+        int uw, tw;
+        if (!u) u = font_record(FONTS, 0xFFFD);
+        if (!u) return f->w;
+        uw = u[0];
+        tw = uw == 8 ? f->w : 2 * f->w;
+        bpr = (uw + 7) / 8;
+        for (y = 0; y < f->h; y++) {
+            const unsigned char *row = u + 1 + (y * 16 / f->h) * bpr;
+            for (x = 0; x < tw; x++) {
+                int sx = x * uw / tw;
+                if (row[sx >> 3] & (0x80 >> (sx & 7))) bmp[y * SLOT + x] = 255;
+            }
+        }
+        return tw;
+    }
+    w = g[0];
+    bpr = (w + 7) / 8;
+    for (y = 0; y < f->h; y++)
+        for (x = 0; x < w; x++)
+            if (g[1 + y * bpr + (x >> 3)] & (0x80 >> (x & 7))) bmp[y * SLOT + x] = 255;
+    return w;
+}
+
+/* Box drawing at scale 2 with 1-pixel lines instead of doubled ones. Each
+   lit pixel of the glyph becomes a point at twice its position, joined to
+   its lit neighbours by 1-pixel lines (a diagonal only where no straight
+   path joins them). A solid 2×2 block, a heavy line, stays solid, and a
+   stroke that reaches the right or bottom edge runs on to meet the next
+   cell's. The glyph's own shape stays: corners, arcs, double lines. */
+static int thin_on(const unsigned char *s, int w, int h, int x, int y) {
+    if (x == w && y >= 0 && y < h) return w > 1 && s[y * SLOT + w - 1] && s[y * SLOT + w - 2];
+    if (y == h && x >= 0 && x < w) return h > 1 && s[(h - 1) * SLOT + x] && s[(h - 2) * SLOT + x];
+    return x >= 0 && x < w && y >= 0 && y < h && s[y * SLOT + x];
+}
+
+static void thin_box(const unsigned char *s, int w, int h, unsigned char *d) {
+    int x, y, k, dd;
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            int ax = 2 * x, ay = 2 * y;
+            if (!s[y * SLOT + x]) continue;
+            d[ay * SLOT + ax] = 255;
+            if (thin_on(s, w, h, x + 1, y))
+                for (k = 1; k <= 2 && ax + k < 2 * w; k++) d[ay * SLOT + ax + k] = 255;
+            if (thin_on(s, w, h, x, y + 1))
+                for (k = 1; k <= 2 && ay + k < 2 * h; k++) d[(ay + k) * SLOT + ax] = 255;
+            for (dd = -1; dd <= 1; dd += 2)
+                if (thin_on(s, w, h, x + dd, y + 1) && !thin_on(s, w, h, x + dd, y) && !thin_on(s, w, h, x, y + 1))
+                    for (k = 1; k <= 2; k++)
+                        if (ax + dd * k >= 0 && ax + dd * k < 2 * w && ay + k < 2 * h) d[(ay + k) * SLOT + ax + dd * k] = 255;
+            if (thin_on(s, w, h, x + 1, y) && thin_on(s, w, h, x, y + 1) && thin_on(s, w, h, x + 1, y + 1) &&
+                ax + 1 < 2 * w && ay + 1 < 2 * h)
+                d[(ay + 1) * SLOT + ax + 1] = 255;
+        }
+}
+
+/* The slot holding cp in the font CW/CH measure, uploaded the first time;
+   *aw × *ah: the glyph's size in the slot, *wide: it takes two cells. */
+static int glyph_slot(uint32_t cp, int *aw, int *ah, int *wide) {
+    const Font *f = g_cf;
+    uint32_t key = cp + 1 + ((uint32_t)(f - FONTS) << 21), h = (key * 2654435761u) & (HASH_SIZE - 1);
+    unsigned char bits[SLOT * SLOT], thin[SLOT * SLOT];
+    int slot, w, gh = f->h;
     while (g_hkey[h]) {
-        if (g_hkey[h] == cp + 1) { *gw = g_hwidth[h]; return g_hslot[h]; }
+        if (g_hkey[h] == key) { *aw = g_hwidth[h]; *ah = g_hheight[h]; *wide = g_hwide[h]; return g_hslot[h]; }
         h = (h + 1) & (HASH_SIZE - 1);
     }
     if (g_nslots >= MAX_SLOTS || g_nslots >= HASH_SIZE / 2) {
         glyph_cache_reset();
-        return glyph_slot(cp, gw);
+        return glyph_slot(cp, aw, ah, wide);
     }
-    g = font_glyph(cp);
-    if (!g) g = font_glyph(0xFFFD);
-    memset(bmp, 0, sizeof(bmp));
-    w = g ? g[0] : 8;
-    if (g) {
-        for (y = 0; y < 16; y++) {
-            unsigned bits = (w == 8) ? (unsigned)g[1 + y] << 8 : ((unsigned)g[1 + y * 2] << 8) | g[2 + y * 2];
-            for (x = 0; x < 16; x++)
-                if (bits & (0x8000u >> x)) bmp[y * 16 + x] = 255;
-        }
+    memset(bits, 0, sizeof(bits));
+    w = glyph_bits(f, cp, bits);
+    *wide = w > f->w;
+    if (f->thin && !f->dev && g_scale == 2 && cp >= 0x2500 && cp <= 0x257F && 2 * w <= SLOT && 2 * f->h <= SLOT) {
+        memset(thin, 0, sizeof(thin));
+        thin_box(bits, w, f->h, thin);
+        memcpy(bits, thin, sizeof(bits));
+        w *= 2;
+        gh *= 2;
     }
     slot = g_nslots++;
-    r_upload((slot % SLOTS_PER_ROW) * 16, (slot / SLOTS_PER_ROW) * 16, bmp);
-    g_hkey[h] = cp + 1;
+    r_upload((slot % SLOTS_PER_ROW) * SLOT, (slot / SLOTS_PER_ROW) * SLOT, bits);
+    g_hkey[h] = key;
     g_hslot[h] = (uint16_t)slot;
     g_hwidth[h] = (uint8_t)w;
-    *gw = w;
+    g_hheight[h] = (uint8_t)gh;
+    g_hwide[h] = (uint8_t)*wide;
+    *aw = w;
+    *ah = gh;
     return slot;
 }
 
@@ -2918,19 +3148,21 @@ static void fill_rect(float x0, float y0, float x1, float y1, uint32_t rgb, floa
     quad(x0, y0, x1, y1);
 }
 
-/* Draws one glyph into a w_cells-wide box at (x, y). A 16px-wide Unifont glyph
-   in a 1-cell slot is shrunk to fit, the way dumbterm did it. */
+/* Draws one glyph into a w_cells-wide box at (x, y), in the font CW/CH
+   measure. A wide glyph in a 1-cell slot is shrunk to fit, square and
+   centred, the way dumbterm did it; a narrow one in two cells is centred. */
 static void draw_glyph(uint32_t cp, float x, float y, int w_cells, int scale) {
-    int gw, slot = glyph_slot(cp, &gw);
-    float cw = (float)(FONT_W * scale), chh = (float)(FONT_H * scale);
-    int u0 = (slot % SLOTS_PER_ROW) * 16, v0 = (slot / SLOTS_PER_ROW) * 16, u1 = u0 + gw, v1 = v0 + 16;
+    int aw, ah, wide, slot = glyph_slot(cp, &aw, &ah, &wide);
+    float cw = (float)CW, chh = (float)CH;
+    int u0 = (slot % SLOTS_PER_ROW) * SLOT, v0 = (slot / SLOTS_PER_ROW) * SLOT, u1 = u0 + aw, v1 = v0 + ah;
     float x0 = x, y0 = y, x1, y1 = y + chh;
-    if (gw == 16 && w_cells == 1) {
-        float pad = (chh - cw) * 0.5f;
-        y0 = y + pad;
-        y1 = y0 + cw;
+    (void)scale;
+    if (wide && w_cells == 1) {
+        float hh = cw * (float)ah / (float)aw;
+        y0 = y + (chh - hh) * 0.5f;
+        y1 = y0 + hh;
         x1 = x + cw;
-    } else if (gw == 8 && w_cells == 2) {
+    } else if (!wide && w_cells == 2) {
         x0 = x + cw * 0.5f;
         x1 = x0 + cw;
     } else {
@@ -2939,8 +3171,11 @@ static void draw_glyph(uint32_t cp, float x, float y, int w_cells, int scale) {
     r_quad_uv(x0, y0, x1, y1, u0, v0, u1, v1);
 }
 
+/* how far a bold glyph is smeared right: one of the font's pixels */
+static int smear(void) { return g_cf->dev ? 1 : g_scale; }
+
 static uint32_t resolve(uint32_t spec, int is_fg, int bold) {
-    if (!spec) return is_fg ? (bold ? 0xF2F2F2 : DEF_FG) : DEF_BG;
+    if (!spec) return is_fg ? (bold ? g_look.bold : DEF_FG) : DEF_BG;
     if (spec & 0x01000000u) {
         int i = spec & 255;
         if (is_fg && bold && i < 8) i += 8;
@@ -3059,19 +3294,26 @@ static void drip_init(void) {
 static int caption_btn_w(void) { return 46 * g_scale; }
 #endif
 
-/* sidebar geometry, top to bottom:
-     [ drag ][ – ][ □ ][ × ]     caption_h()
-     ▌⣿ folder-name        ×     one row per tab
-       +                         new tab
+/* sidebar geometry, top to bottom, on the character grid (SB_COLS cells):
+     [ drag ][ – ][ □ ][ × ]     caption_h(), over the terminal (Windows)
+     ●●●                         the traffic lights' rows (macOS)
+     ▌⣿ folder-name        ×     a row per tab, and its detail lines
+      s                    +     settings, new tab
+      12×24  t Y E               the settings, when open: fonts by cell size,
+       ...                       then the color schemes
        ... drag space (it's the title bar) ...                         */
-enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR };
+enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT, HIT_SCHEME };
 
-#ifdef _WIN32
-static int tabs_top(void) { return 8 * g_scale; }   /* the gap above the tabs drags the window */
-#else
-static int tabs_top(void) { return 30 * g_scale; }  /* under the traffic lights; the gap drags the window */
-#endif
+static int plat_lights_bottom(void);   /* where the window's own buttons in the tab column end, in pixels */
+static void plat_settings_shown(void); /* the font or colors on screen changed */
+static void plat_settings_tell(void);  /* the font or scheme you picked changed: tell the other windows */
 
+/* the first tab row: under the traffic lights, if they reach into the column */
+static int first_row(void) {
+    int r = 0, b = plat_lights_bottom();
+    while (b > 0 && PAD + r * CH < b) r++;
+    return r;
+}
 /* the dim second line under a tab's name: what Claude is doing, asking, or did */
 static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
     const Term *t = &tb->t;
@@ -3088,47 +3330,160 @@ static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
     return buf;
 }
 
-/* Row layout, recomputed per use (64 tabs at most). A tab with a detail line
-   is two text lines tall. When they don't all fit, details go first, then
-   rows squeeze. */
+/* Row layout, recomputed per use (64 tabs at most), in cells of the font
+   you picked. A tab is a row, plus its detail lines; when they don't all
+   fit, the details go. Then the settings row, then the panel. */
 static int g_row_y[MAX_TABS + 2], g_row_two[MAX_TABS + 1];   /* g_row_two: detail lines, 0..2 */
-static float detail_w(void) { return (float)(sidebar_w() - 10 * g_scale - 2 * CW - 8 * g_scale); }
+static int g_settings_open;      /* this window's settings panel is showing */
+
+/* the panel: options in cells (col, row), labels, and two lines naming what's picked */
+typedef struct { int col, row, kind, idx; } Opt;   /* kind: HIT_FONT or HIT_SCHEME */
+static Opt g_opts[NFONTS + NSCHEMES];
+static int g_nopts;
+static struct { int row, w, h; } g_sizes[NFONTS];  /* the font rows' labels: cell size in pixels */
+static int g_nsizes, g_info_row;
+
+static float detail_w(void) { return (float)((SB_COLS - 4) * CW); }
+static float row_y(int r) { return (float)(PAD + r * CH); }
+
+/* lays out the settings from row r; returns the rows used */
+static int settings_layout(int r) {
+    int r0 = r, i, k, g, dark, n;
+    g_nopts = g_nsizes = 0;
+    r++;                                                 /* a blank row */
+    for (i = 0; i < NFONTS; i++) {                       /* a row per cell size, smallest first */
+        int w = cell_w(&FONTS[i]), h = cell_h(&FONTS[i]), seen = 0, j, at = g_nsizes;
+        for (j = 0; j < g_nsizes; j++) if (g_sizes[j].w == w && g_sizes[j].h == h) seen = 1;
+        if (seen) continue;
+        while (at > 0 && (g_sizes[at - 1].h > h || (g_sizes[at - 1].h == h && g_sizes[at - 1].w > w))) {
+            g_sizes[at] = g_sizes[at - 1];
+            at--;
+        }
+        g_sizes[at].w = w;
+        g_sizes[at].h = h;
+        g_nsizes++;
+    }
+    for (g = 0; g < g_nsizes; g++, r += 2) {             /* a blank row between rows: a space around each */
+        g_sizes[g].row = r;
+        for (k = 0, i = 0; i < NFONTS; i++) {
+            if (cell_w(&FONTS[i]) != g_sizes[g].w || cell_h(&FONTS[i]) != g_sizes[g].h) continue;
+            g_opts[g_nopts].col = 7 + 2 * k++;
+            g_opts[g_nopts].row = r;
+            g_opts[g_nopts].kind = HIT_FONT;
+            g_opts[g_nopts++].idx = i;
+        }
+    }
+    for (dark = 1; dark >= 0; dark--) {                  /* schemes: two cells square, dark ones first */
+        for (n = 0, i = 0; i < NSCHEMES; i++) {
+            if (SCHEMES[i].dark != dark) continue;
+            g_opts[g_nopts].col = 1 + 3 * (n % 6);
+            g_opts[g_nopts].row = r + 2 * (n / 6);
+            g_opts[g_nopts].kind = HIT_SCHEME;
+            g_opts[g_nopts++].idx = i;
+            n++;
+        }
+        r += 2 * ((n + 5) / 6);
+    }
+    g_info_row = r;
+    return r + 2 - r0;
+}
+
 static void tab_layout(void) {
-    int base = CH + 10 * g_scale, i, need = 0, two = 1, h, y, avail, win_w, win_h;
+    int i, r, need = 0, two = 1, avail, win_w, win_h, panel = 0;
     wchar_t tmp[220];
+    UI_FONT;
     plat_client_size(&win_w, &win_h);
-    avail = win_h - tabs_top() - 4 * g_scale;
+    r = first_row();
+    if (g_settings_open) panel = settings_layout(0);     /* how tall, for now */
+    avail = (win_h - PAD) / CH - r - 1 - panel;
     for (i = 0; i < g_ntabs; i++) {
         const wchar_t *d = tab_detail(g_tabs[i], tmp, 220);
         /* what Claude is asking you gets two lines; the rest get one */
         g_row_two[i] = !d ? 0 : g_tabs[i]->t.ps_state == PS_BLOCKED ? layout_text(d, 0, 0, detail_w(), 2, 0, 0) : 1;
-        need += base + g_row_two[i] * CH;
+        need += 1 + g_row_two[i];
     }
-    need += base;                                        /* the + row */
     if (need > avail) two = 0;
-    h = base;
-    if (!two && (g_ntabs + 1) * base > avail) h = avail / (g_ntabs + 1);
-    if (h < CH) h = CH;
-    for (y = tabs_top(), i = 0; i <= g_ntabs; i++) {
-        if (i < g_ntabs && !two) g_row_two[i] = 0;
-        g_row_y[i] = y;
-        y += h + (i < g_ntabs ? g_row_two[i] * CH : 0);
+    for (i = 0; i < g_ntabs; i++) {
+        if (!two) g_row_two[i] = 0;
+        g_row_y[i] = (int)row_y(r);
+        r += 1 + g_row_two[i];
     }
-    g_row_y[g_ntabs + 1] = y;
+    g_row_y[g_ntabs] = (int)row_y(r);                    /* settings and + */
+    g_row_y[g_ntabs + 1] = (int)row_y(r + 1);
+    if (g_settings_open) settings_layout(r + 1);
+    UI_DONE;
 }
 
 static int hit_tabbar(int mx, int my, int *idx) {
-    int i;
-    if (mx < 0 || mx >= sidebar_w() || my < 0) return HIT_NONE;
+    int i, col, row, hit = HIT_BAR;
+    UI_FONT;
+    if (mx < 0 || mx >= sidebar_w() || my < 0) { UI_DONE; return HIT_NONE; }
     tab_layout();
+    col = mx / CW;
+    row = my < PAD ? -1 : (my - PAD) / CH;
     for (i = 0; i <= g_ntabs; i++) {
         if (my < g_row_y[i] || my >= g_row_y[i + 1]) continue;
-        if (i == g_ntabs) return HIT_PLUS;
-        *idx = i;
-        if (mx >= sidebar_w() - CW - 10 * g_scale) return HIT_CLOSE;
-        return HIT_TAB;
+        if (i == g_ntabs) hit = col <= 2 ? HIT_SETTINGS : col >= SB_COLS - 3 ? HIT_PLUS : HIT_BAR;
+        else {
+            *idx = i;
+            hit = col >= SB_COLS - 3 ? HIT_CLOSE : HIT_TAB;
+        }
+        UI_DONE;
+        return hit;
     }
-    return HIT_BAR;
+    if (g_settings_open)
+        for (i = 0; i < g_nopts; i++)
+            if (row == g_opts[i].row && col >= g_opts[i].col && col < g_opts[i].col + (g_opts[i].kind == HIT_SCHEME ? 2 : 1)) {
+                *idx = g_opts[i].idx;
+                hit = g_opts[i].kind;
+            }
+    UI_DONE;
+    return hit;
+}
+
+/* The terminal tries on the font or scheme under the mouse; anything else
+   puts back the ones you picked. Called whenever the mouse moves or leaves. */
+static void resize_all(void);
+static void settings_point(void) {
+    int idx = -1, hit = g_mouse_y >= 0 && g_settings_open ? hit_tabbar(g_mouse_x, g_mouse_y, &idx) : HIT_NONE;
+    const Font *f = hit == HIT_FONT ? &FONTS[idx] : g_font;
+    const Scheme *s = hit == HIT_SCHEME ? &SCHEMES[idx] : g_scheme;
+    if (s != g_shown) {
+        look_set(s);
+        plat_settings_shown();
+    }
+    if (f != g_tfont) {
+        g_tfont = g_cf = f;
+        resize_all();
+        plat_settings_shown();
+    }
+}
+
+/* the font and scheme you picked, on screen (after a pick, or another window's) */
+static void settings_apply(void) {
+    look_set(g_scheme);
+    g_tfont = g_cf = g_font;
+    resize_all();
+    plat_settings_shown();
+    settings_point();
+}
+
+static void settings_pick(int hit, int idx) {
+    if (hit == HIT_FONT) g_font = &FONTS[idx];
+    else if (hit == HIT_SCHEME) g_scheme = &SCHEMES[idx];
+    else return;
+    config_save();
+    plat_settings_tell();
+    settings_apply();
+}
+
+/* a click on the settings row's s (open, close) or on an option (pick it) */
+static void settings_click(int mx, int my) {
+    int idx = -1, hit = hit_tabbar(mx, my, &idx);
+    if (hit == HIT_SETTINGS) g_settings_open = !g_settings_open;
+    else if (hit == HIT_FONT || hit == HIT_SCHEME) settings_pick(hit, idx);
+    settings_point();
+    plat_invalidate();
 }
 
 #ifdef _WIN32
@@ -3179,13 +3534,13 @@ static void render_disk_warning(int win_h) {
     float x = (float)(10 * g_scale), w = (float)(sidebar_w() - 14 * g_scale), y = (float)(win_h - 3 * CH - 6 * g_scale);
     uint32_t col;
     if (g_disk_free_gb < 0 || g_disk_free_gb >= DISK_WARN_GB) return;
-    col = g_disk_free_gb < DISK_BAD_GB ? 0xE74856 : AMBER;
+    col = g_disk_free_gb < DISK_BAD_GB ? g_look.red : AMBER;
     _snwprintf(l1, 64, L"%ls %.1f GB free", g_disk_name, g_disk_free_gb);
     _snwprintf(l2, 64, L"WSL crashes when %ls fills", g_disk_name);
     fill_rect(0, y - 4 * g_scale, (float)sidebar_w(), (float)win_h, BAR_BG, 1);
     fill_rect(0, y - 4 * g_scale, (float)(2 * g_scale), y + 2 * CH + 4 * g_scale, col, 1);
     layout_text(l1, x, y, w, 1, col, 1);
-    layout_text(l2, x, y + CH, w, 2, 0x8A8A8A, 1);
+    layout_text(l2, x, y + CH, w, 2, g_look.dim, 1);
 }
 
 /* one-pixel-wide strokes, scaled: the caption glyphs stay as sharp as the font */
@@ -3202,13 +3557,13 @@ static void render_caption_buttons(int win_w) {
         int code = k == 0 ? HTMINBUTTON : k == 1 ? HTMAXBUTTON : HTCLOSE;
         float x = (float)(win_w - (3 - k) * bw), cx = x + bw / 2 - 5 * s, cy = (float)(bh / 2 - 5 * s);
         int hov = g_nc_hover == code, prs = g_nc_press == code && hov;
-        uint32_t fg = g_win_active ? 0xCCCCCC : 0x7A7A7A;
+        uint32_t fg = g_win_active ? DEF_FG : g_shown == SCHEMES ? 0x7A7A7A : g_look.detail;
         fill_rect(x, 0, x + bw, (float)bh, BAR_BG, 0.62f);       /* smoked glass: text shows through */
         if (hov && code == HTCLOSE) {
             fill_rect(x, 0, x + bw, (float)bh, prs ? 0x94241A : 0xC42B1C, 1);
             fg = 0xFFFFFF;
         } else if (hov) {
-            fill_rect(x, 0, x + bw, (float)bh, prs ? 0x262626 : 0x2D2D2D, 1);
+            fill_rect(x, 0, x + bw, (float)bh, g_shown == SCHEMES ? (prs ? 0x262626 : 0x2D2D2D) : prs ? g_look.bar : TAB_HOVER, 1);
         }
         if (code == HTMINBUTTON) {
             px_line(cx, cy + 5 * s, 10, 1, 0, fg);
@@ -3233,20 +3588,84 @@ static void render_caption_buttons(int win_w) {
 
 #endif /* _WIN32: caption buttons */
 
+/* "+": a plain plus, drawn rather than taken from the font */
+static void draw_plus(float cx, float cy, uint32_t col) {
+    float arm = 4.0f * g_scale, th = (float)g_scale;
+    fill_rect(cx - arm, cy - th, cx + arm + th, cy + th, col, 1);
+    fill_rect(cx - th, cy - arm, cx + th, cy + arm + th, col, 1);
+}
+
+/* a frame one pixel of the scale thick, inside the rectangle */
+static void frame_rect(float x0, float y0, float x1, float y1, uint32_t col) {
+    float t = (float)g_scale;
+    fill_rect(x0, y0, x1, y0 + t, col, 1);
+    fill_rect(x0, y1 - t, x1, y1, col, 1);
+    fill_rect(x0, y0, x0 + t, y1, col, 1);
+    fill_rect(x1 - t, y0, x1, y1, col, 1);
+}
+
+static void render_settings(int hover, int hidx) {
+    int i;
+    wchar_t buf[96];
+    const Font *nf = hover == HIT_FONT ? &FONTS[hidx] : g_font;
+    const Scheme *ns = hover == HIT_SCHEME ? &SCHEMES[hidx] : g_scheme;
+    for (i = 0; i < g_nsizes; i++) {
+        _snwprintf(buf, 96, L"%d×%d", g_sizes[i].w, g_sizes[i].h);
+        buf[95] = 0;
+        layout_text(buf, (float)CW, row_y(g_sizes[i].row), 6.0f * CW, 1, g_look.detail, 1);
+    }
+    for (i = 0; i < g_nopts; i++) {
+        const Opt *o = &g_opts[i];
+        float x = (float)(o->col * CW), y = row_y(o->row);
+        int hov = hover == o->kind && hidx == o->idx;
+        if (o->kind == HIT_FONT) {
+            /* a box with the font's letter in it: amber is the one you picked */
+            int cur = &FONTS[o->idx] == g_font;
+            fill_rect(x, y, x + CW, y + CH, cur ? AMBER : hov ? g_look.text_lo : TAB_HOVER, 1);
+            r_color(cur || hov ? DEF_BG : g_look.text_lo, 1);
+            draw_glyph((uint32_t)(unsigned char)FONTS[o->idx].key, x, y, 1, g_scale);
+        } else {
+            /* the scheme in a square of its own background: its letter in its text color,
+               and its red, green, yellow and blue as the four quarters of a block */
+            const Scheme *sc = &SCHEMES[o->idx];
+            static const uint32_t quarter[4] = {0x2598, 0x259D, 0x2596, 0x2597};
+            int q;
+            fill_rect(x, y, x + 2 * CW, y + CH, sc->bg, 1);
+            r_color(sc->fg, 1);
+            draw_glyph((uint32_t)(unsigned char)sc->key, x, y, 1, g_scale);
+            for (q = 0; q < 4; q++) {
+                r_color(sc->pal[1 + q], 1);
+                draw_glyph(quarter[q], x + CW, y, 1, g_scale);
+            }
+            if (sc == g_scheme) frame_rect(x - g_scale, y - g_scale, x + 2 * CW + g_scale, y + CH + g_scale, AMBER);
+            else if (hov) frame_rect(x - g_scale, y - g_scale, x + 2 * CW + g_scale, y + CH + g_scale, g_look.text_lo);
+        }
+    }
+    /* what's picked, or what you're pointing at, by name and letter */
+    _snwprintf(buf, 96, L"%c %hs %d×%d", nf->key, nf->name, cell_w(nf), cell_h(nf));
+    buf[95] = 0;
+    layout_text(buf, (float)CW, row_y(g_info_row), (float)((SB_COLS - 2) * CW), 1, hover == HIT_FONT ? g_look.text : g_look.detail, 1);
+    _snwprintf(buf, 96, L"%c %hs", ns->key, ns->name);
+    buf[95] = 0;
+    layout_text(buf, (float)CW, row_y(g_info_row + 1), (float)((SB_COLS - 2) * CW), 1, hover == HIT_SCHEME ? g_look.text : g_look.detail, 1);
+}
+
 static void render_tabbar(int win_w, int win_h) {
     int i, idx = -1, hover = HIT_NONE, sw = sidebar_w();
-    float lx = (float)(10 * g_scale), textw = (float)(sw - 10 * g_scale - 3 * CW - 12 * g_scale);
+    float lx, textw;
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
+    UI_FONT;
+    lx = (float)CW;              /* the status cell; the name starts two cells on */
+    textw = (float)((SB_COLS - 7) * CW);
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
     fill_rect(0, 0, (float)sw, (float)win_h, BAR_BG, 1);
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         wchar_t label[256], detail[220];
-        float y0 = (float)g_row_y[i], y1 = (float)g_row_y[i + 1];
-        float ty = y0 + (y1 - y0 - (1 + g_row_two[i]) * CH) / 2;
+        float y0 = (float)g_row_y[i], y1 = (float)g_row_y[i + 1], ty = y0;
         int act = (i == g_active), hov = (idx == i && (hover == HIT_TAB || hover == HIT_CLOSE));
-        uint32_t fg = act ? 0xF2F2F2 : 0x9A9A9A;
+        uint32_t fg = act ? g_look.text : g_look.text_lo;
         /* the active tab takes the terminal's background, so it reads as attached to it */
         if (act || hov) fill_rect(0, y0, (float)sw, y1, act ? DEF_BG : TAB_HOVER, 1);
         if (act) fill_rect(0, y0, (float)(2 * g_scale), y1, AMBER, 1);
@@ -3255,40 +3674,43 @@ static void render_tabbar(int win_w, int win_h) {
            ? Claude needs you   ! it failed   throbber: working   bell: finished or rang   dot: output */
         if (tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) {
             uint32_t ch = tb->t.ps_state == PS_BLOCKED ? '?' : '!';
-            r_color(tb->t.ps_state == PS_BLOCKED ? AMBER : 0xE74856, 1);
+            r_color(tb->t.ps_state == PS_BLOCKED ? AMBER : g_look.red, 1);
             draw_glyph(ch, lx, ty, 1, g_scale);
-            draw_glyph(ch, lx + g_scale, ty, 1, g_scale);       /* bold, the way cells do it */
+            draw_glyph(ch, lx + smear(), ty, 1, g_scale);       /* bold, the way cells do it */
         } else if (tb->busy) {
-            r_color(act ? 0xF2F2F2 : 0xBDBDBD, 1);
+            r_color(act ? g_look.text : g_look.busy_lo, 1);
             draw_glyph(drip, lx, ty, 1, g_scale);
         } else if (tb->attention) {
             r_color(AMBER, 1);
             draw_glyph(BELL_GLYPH, lx, ty, 1, g_scale);
         } else if (tb->activity && !act) {
-            fill_rect(lx + 3 * g_scale, ty + CH / 2 - g_scale, lx + 5 * g_scale, ty + CH / 2 + g_scale, 0x8A8A8A, 1);
+            fill_rect(lx + 3 * g_scale, ty + CH / 2 - g_scale, lx + 5 * g_scale, ty + CH / 2 + g_scale, g_look.dim, 1);
         }
         draw_label(label, lx + 2 * CW, ty, textw, fg);
         if (g_row_two[i] && tab_detail(tb, detail, 220))
             layout_text(detail, lx + 2 * CW, ty + CH, detail_w(), g_row_two[i],
-                        tb->t.ps_state == PS_BLOCKED ? 0xC9A15A : 0x767676, 1);
+                        tb->t.ps_state == PS_BLOCKED ? g_look.detail_ask : g_look.detail, 1);
         if (act || hov) {
-            r_color((hov && hover == HIT_CLOSE) ? 0xFF6B5E : 0x8A8A8A, 1);
-            draw_glyph(0x00D7, (float)(sw - CW - 8 * g_scale), ty, 1, g_scale);
+            r_color((hov && hover == HIT_CLOSE) ? 0xFF6B5E : g_look.dim, 1);
+            draw_glyph(0x00D7, (float)((SB_COLS - 2) * CW), ty, 1, g_scale);
         }
-        if (tb->exited) fill_rect(lx + 2 * CW, ty + CH / 2, (float)(sw - CW - 12 * g_scale), ty + CH / 2 + g_scale, 0x8A8A8A, 1);
+        if (tb->exited) fill_rect(lx + 2 * CW, ty + CH / 2, (float)((SB_COLS - 3) * CW), ty + CH / 2 + g_scale, g_look.dim, 1);
     }
-    {   /* "+": a plain plus in the status column, drawn rather than taken from the font */
-        float y0 = (float)g_row_y[g_ntabs], rh = (float)(g_row_y[g_ntabs + 1] - g_row_y[g_ntabs]);
-        float cx = lx + CW / 2, cy = y0 + rh / 2.0f, arm = 4.0f * g_scale, th = (float)g_scale;
-        int hov = hover == HIT_PLUS;
-        uint32_t col = hov ? 0xF2F2F2 : 0x9A9A9A;
-        if (hov) fill_rect(0, y0, (float)sw, y0 + rh, TAB_HOVER, 1);
-        fill_rect(cx - arm, cy - th, cx + arm + th, cy + th, col, 1);
-        fill_rect(cx - th, cy - arm, cx + th, cy + arm + th, col, 1);
+    {   /* settings on the left, + on the right */
+        float y0 = (float)g_row_y[g_ntabs], y1 = y0 + CH;
+        int hs = hover == HIT_SETTINGS, hp = hover == HIT_PLUS;
+        if (hs) fill_rect(0, y0, 3.0f * CW, y1, TAB_HOVER, 1);
+        if (hp) fill_rect((float)((SB_COLS - 3) * CW), y0, (float)sw, y1, TAB_HOVER, 1);
+        r_color(hs || g_settings_open ? g_look.text : g_look.dim, 1);
+        draw_glyph('s', lx, y0, 1, g_scale);
+        if (hs) layout_text(L"settings", lx + 2 * CW, y0, 9.0f * CW, 1, g_look.text_lo, 1);
+        draw_plus((float)((SB_COLS - 2) * CW) + CW / 2.0f, y0 + CH / 2.0f, hp ? g_look.text : g_look.text_lo);
     }
+    if (g_settings_open) render_settings(hover, idx);
 #ifdef _WIN32
     render_disk_warning(win_h);  /* WSL's disk: the Mac has no VM to take down */
 #endif
+    UI_DONE;
 }
 
 static void r_begin(int w, int h);
@@ -3351,9 +3773,9 @@ static void render(void) {
             w = (c->wflag == W_WIDE) ? 2 : 1;
             r_color(fg, 1);
             draw_glyph(c->ch, (float)(ox + x * CW), y0, w, g_scale);
-            /* Unifont has no bold; smear one pixel right, except box drawing */
+            /* the fonts have no bold; smear one of their pixels right, except box drawing */
             if ((c->attr & A_BOLD) && !(c->ch >= 0x2500 && c->ch <= 0x259F))
-                draw_glyph(c->ch, (float)(ox + x * CW + g_scale), y0, w, g_scale);
+                draw_glyph(c->ch, (float)(ox + x * CW + smear()), y0, w, g_scale);
         }
         for (x = 0; x < n; x++) {
             const Cell *c = &cells[x];
@@ -3404,7 +3826,7 @@ static void render(void) {
         float bar_h = track_h * t->rows / total, pos, bx = (float)(r.right - SCROLLBAR_W + g_scale);
         if (bar_h < 12 * g_scale) bar_h = (float)(12 * g_scale);
         pos = 1.0f - (float)t->view / t->hcount;
-        fill_rect(bx, track_top, bx + SCROLLBAR_W - 2 * g_scale, track_top + track_h, 0x303030, 0.5f);
+        fill_rect(bx, track_top, bx + SCROLLBAR_W - 2 * g_scale, track_top + track_h, TAB_HOVER, 0.5f);
         fill_rect(bx, track_top + pos * (track_h - bar_h), bx + SCROLLBAR_W - 2 * g_scale,
                   track_top + pos * (track_h - bar_h) + bar_h, AMBER, t->view ? 0.8f : 0.3f);
     }
@@ -4363,6 +4785,18 @@ static void plat_flash(void) {
     FlashWindowEx(&fi);
 }
 
+static int plat_lights_bottom(void) { return 0; }   /* the caption buttons float over the terminal instead */
+static void plat_settings_shown(void) { InvalidateRect(g_hwnd, NULL, FALSE); }
+
+/* every hardcore window is its own process: each rereads config.ini */
+static BOOL CALLBACK tell_window(HWND h, LPARAM unused) {
+    wchar_t cls[32];
+    (void)unused;
+    if (h != g_hwnd && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"hardcore")) PostMessageW(h, WM_APP_SETTINGS, 0, 0);
+    return TRUE;
+}
+static void plat_settings_tell(void) { EnumWindows(tell_window, 0); }
+
 static void tab_set_size(Tab *tb, int cols, int rows) {
     COORD sz;
     sz.X = (SHORT)cols;
@@ -4528,6 +4962,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (!strncmp(buf, "hover ", 6)) {
                 g_mouse_x = atoi(buf + 6);
                 g_mouse_y = strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1;
+                settings_point();
+            } else if (!strncmp(buf, "click ", 6)) {
+                settings_click(atoi(buf + 6), strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1);
             } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);
             else if (!strncmp(buf, "tophover ", 9)) g_top_hover = atoi(buf + 9);
             else if (!strncmp(buf, "sel ", 4) && tb) {   /* sel Y0 X0 Y1 X1: select, in screen rows */
@@ -4582,7 +5019,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ScreenToClient(hwnd, &pt);
         top = (wp == HTCAPTION || h) && in_top_line(pt.x, pt.y);
         if (top != g_top_hover) { g_top_hover = top; InvalidateRect(hwnd, NULL, FALSE); }
-        if (g_mouse_y >= 0) { g_mouse_x = g_mouse_y = -1; InvalidateRect(hwnd, NULL, FALSE); }
+        if (g_mouse_y >= 0) { g_mouse_x = g_mouse_y = -1; settings_point(); InvalidateRect(hwnd, NULL, FALSE); }
         if (h != g_nc_hover) { g_nc_hover = h; InvalidateRect(hwnd, NULL, FALSE); }
         break;                   /* DefWindowProc still runs: Win11 snap layouts hang off HTMAXBUTTON */
     }
@@ -4695,6 +5132,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT *nr = (RECT *)lp;
         g_dpi = HIWORD(wp);
         g_scale = auto_scale();
+        glyph_cache_reset();     /* thin box lines are drawn for the scale */
         SetWindowPos(hwnd, NULL, nr->left, nr->top, nr->right - nr->left, nr->bottom - nr->top, SWP_NOZORDER | SWP_NOACTIVATE);
         resize_all();
         return 0;
@@ -4742,6 +5180,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    case WM_APP_SETTINGS:
+        config_load();
+        settings_apply();
+        return 0;
     case WM_APP_EXITED: {
         Tab *tb = tab_by_id((int)wp);
         DWORD code = 0;
@@ -4794,6 +5236,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_mouse_y = my;
         if (g_nc_hover) { g_nc_hover = 0; InvalidateRect(hwnd, NULL, FALSE); }
         if (was_bar || on_bar) InvalidateRect(hwnd, NULL, FALSE);
+        if (was_bar || on_bar) settings_point();
         if (g_sb_drag) { scrollbar_set(my); return 0; }
         if (g_sel_drag && tb) {
             mouse_cell(mx, my, &col, &row);
@@ -4813,6 +5256,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSELEAVE:
         g_mouse_x = g_mouse_y = -1;
+        settings_point();
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
@@ -4824,6 +5268,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit == HIT_TAB) { activate(idx); return 0; }
         if (hit == HIT_CLOSE) { close_tab(idx); return 0; }
         if (hit == HIT_PLUS) { new_tab_here(); return 0; }
+        if (hit == HIT_SETTINGS || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return 0; }
         if (hit == HIT_BAR) return 0;
         GetClientRect(hwnd, &r);
         if (tb && mx >= r.right - SCROLLBAR_W - g_scale && tb->t.hcount && !tb->t.alt) {

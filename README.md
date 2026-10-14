@@ -2,8 +2,9 @@
 
 A terminal for WSL on Windows 11, built for running Claude Code. It also runs
 natively on macOS (see [macOS](#macos)). It does one
-job, running your WSL shell, and it isn't a jack of all trades. There are no options, themes or settings UI: one font, one
-look, one size, one layout.
+job, running your WSL shell, and it isn't a jack of all trades. The only
+settings are a font and a color scheme, picked from a grid under the tabs and
+the same in every window: one size, one layout.
 
 ```
 ▌⣿ thing            │ wm@w11:~/github/thing$ claude          ░ ─  □  × ░
@@ -12,14 +13,15 @@ look, one size, one layout.
   approve Bash:     │ 
   git push origin   │ 
  ⍾ notes            │ 
-  +                 │
+  s               + │
 ```
 
 - **Opens where you left off.** A new window starts in the folder the last
   window closed in (its active tab, or the last tab you exited). The very
   first time it's `/mnt/c/Users/<you>` (your `%USERPROFILE%`), not `~` inside the distro.
 - **Tabs run down the left edge**, like Chrome's vertical tabs: tabs, then
-  **+**. Min/max/close float over the terminal's top-right corner on smoked
+  **s** (settings) and **+**, laid on the same character grid as the
+  terminal. Min/max/close float over the terminal's top-right corner on smoked
   glass. Text runs underneath and only the mouse belongs to them, so no row
   is lost to a title bar. The whole top line works as a title bar: point at
   it and it smokes over and the cursor turns into the move arrows. Drag it to
@@ -55,8 +57,11 @@ look, one size, one layout.
   - A cold launch puts a usable window up in about 60 ms.
 
   Full numbers and the method are in [bench/RESULTS.md](bench/RESULTS.md).
-- **One font.** GNU Unifont 18 at an integer scale picked from the monitor's
-  DPI: 115k glyphs, every emoji, and hand-drawn Powerline symbols.
+- **Bitmap fonts on the pixel grid.** GNU Unifont 18 at an integer scale
+  picked from the monitor's DPI: 115k glyphs, every emoji, and hand-drawn
+  Powerline symbols. Or one of seven hand-drawn bitmap fonts (see
+  [Settings](#settings)), with Unifont filling in whatever they lack. On a
+  Retina or 200% screen, box-drawing lines are 1 device pixel thin.
 - **One static `.exe`** (about 6 MB) with the font and Windows Terminal's own
   ConPTY built in. Nothing to install, no runtime dependencies. It draws with
   Direct3D 11 on a flip-model swap chain.
@@ -250,7 +255,41 @@ If your login shell is zsh or fish, the tab still opens bash.
 
 ## Settings
 
-`%LOCALAPPDATA%\hardcore\config.ini` is written when the window closes:
+Click the gray **s** under the tabs. The tab column then shows two grids:
+
+- **Fonts**, a row per cell size in device pixels (the 2×-scaled ones are
+  listed at their doubled size). Each box holds the font's letter:
+
+  | Letter | Font | Cell |
+  |---|---|---|
+  | `U` | GNU Unifont 18 (the default) | 8×16, scaled |
+  | `Z` | Tamzen 8×15 | 8×15, scaled |
+  | `F` | misc-fixed 7×13 (X11's "fixed") | 7×13, scaled |
+  | `t` | Terminus 24 | 12×24, 1:1 |
+  | `Y` | Sony 12×24 (X11) | 12×24, 1:1 |
+  | `E` | ETL 24 (GNU intlfonts) | 12×24, 1:1 |
+  | `M` | Terminus 28 | 14×28, 1:1 |
+  | `T` | Terminus 32 | 16×32, 1:1 |
+
+  "Scaled" fonts are multiplied by the display scale like Unifont is: each
+  pixel is 2×2 on a Retina screen. The 1:1 ones were drawn for the screen's
+  own pixels. Sony and ETL only cover Latin-1, so the rest comes from
+  Terminus 24, then Unifont.
+- **Color schemes**: a square each, in the scheme's own background with its
+  letter and four of its colors. Lowercase letters are dark, uppercase the
+  light twin of the same family: `h` hardcore (Campbell with an amber
+  cursor, the default), `d` Dracula, `m` Monokai, `n` Nord, `g`/`G` Gruvbox,
+  `s`/`S` Solarized, `o`/`O` One Dark/Light, `c`/`C` Catppuccin Mocha/Latte,
+  `k`/`K` Tokyo Night/Day, `r`/`R` Rosé Pine/Dawn.
+
+Pointing at one tries it on: a font in the terminal (the tab column keeps
+the font you picked, so the grid doesn't move), a scheme on the whole window.
+Clicking picks it, for every hardcore window at once. Two letters, such as
+`mT`, describe the whole setup.
+
+`%LOCALAPPDATA%\hardcore\config.ini` (on a Mac,
+`~/Library/Application Support/hardcore/config.ini`) holds them, along with
+what's written when the window closes:
 
 ```ini
 dir=             # folder for new windows; empty = %USERPROFILE%
@@ -258,6 +297,8 @@ last=            # the folder the last window closed in; wins over dir= (empty i
 distro=          # WSL distro; empty = default
 shell=           # powershell = PowerShell tabs instead of WSL
 width=… height=… # last window size
+font=U           # a font's letter
+theme=h          # a color scheme's letter
 ```
 
 The command line overrides it: `hardcore.exe [--cd DIR] [--distro NAME] [DIR]`.
@@ -319,6 +360,28 @@ you can edit:
 Unifont's private-use area is CSUR (Klingon and others), so it's left out, and
 these fill the slots that prompts actually use.
 
+The other fonts are BDFs in `font/`, packed by `tools/gen_fonts.py` into
+`build/fonts.bin` with only their own glyphs:
+- Terminus 4.49.1 by Dimitar Toshkov Zhekov (`font/terminus/`, SIL OFL 1.1).
+  Its 28 and 32 sizes draw box lines 2 pixels wide, so their box drawing is
+  redrawn from the Unicode names with 1-pixel lines on Terminus's own center
+  lines.
+- Tamzen 8×15 by Suraj N. Kurapati, from Tamsyn by Scott Fial (`font/tamzen/`,
+  free to use, copy, modify and distribute).
+- misc-fixed 7×13 from X.Org (`font/misc-fixed/`, public domain).
+- Sony 12×24 from X.Org's font-sony-misc (`font/sony/`, Sony's permission
+  notice).
+- ETL 24 Latin-1 from GNU intlfonts 1.4.2 (`font/etl/`, Electrotechnical
+  Laboratory, freely usable).
+
+At scale 2, the scaled fonts' box drawing (U+2500–257F) is redrawn with
+1-pixel lines as it's drawn: each lit pixel of the glyph becomes a point,
+joined to its neighbors, so the font's own corners and double lines stay.
+
+The color schemes come from
+[iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes)
+(MIT).
+
 Character widths come from Unicode 17 (`font/ucd`, generated by
 `tools/gen_width.py`). They use the classic wcwidth rule, which ConPTY also
 measures with.
@@ -326,4 +389,5 @@ measures with.
 ## License
 
 MIT, see [LICENSE](LICENSE). The embedded Unifont (GPLv2+ with the font
-embedding exception, or OFL 1.1) and ConPTY (MIT) keep their own licenses.
+embedding exception, or OFL 1.1), the other fonts (see [Font](#font)) and
+ConPTY (MIT) keep their own licenses.
