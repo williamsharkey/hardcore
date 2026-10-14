@@ -5,20 +5,25 @@ job, running your WSL shell, and it isn't a jack of all trades. There are no opt
 look, one size, one layout.
 
 ```
-▌⣿ thing            │ wm@w11:~/github/thing$ claude          ░ ─  □  × ░
-  Running make test │ 
- ? api              │ > ...
-  approve Bash:     │ 
-  git push origin   │ 
- ⍾ notes            │ 
-  +                 │
+⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕ │ wm@w11:~/github/thing$ claude          ░ ─  □  × ░
+▏⣿thing           × │
+  Running make test │ > ...
+ ?api               │
+  approve Bash: git │
+  push origin main  │
+ ⍾notes             │
+                  + │
 ```
 
 - **Opens where you left off.** A new window starts in the folder the last
   window closed in (its active tab, or the last tab you exited). The very
   first time it's `/mnt/c/Users/<you>` (your `%USERPROFILE%`), not `~` inside the distro.
 - **Tabs run down the left edge**, like Chrome's vertical tabs: tabs, then
-  **+**. Min/max/close float over the terminal's top-right corner on smoked
+  **+**. The tab column is 20 cells wide and sits on the terminal's own text
+  grid, so each of its rows lines up with a terminal row. Row 0 is a grip of
+  dim braille dots: drag the window there. Each tab is a status cell, then the
+  folder's name. The active tab is marked by a one-pixel amber line down its
+  left edge, drawn over the status cell rather than taking a column. Min/max/close float over the terminal's top-right corner on smoked
   glass. Text runs underneath and only the mouse belongs to them, so no row
   is lost to a title bar. The whole top line works as a title bar: point at
   it and it smokes over and the cursor turns into the move arrows. Drag it to

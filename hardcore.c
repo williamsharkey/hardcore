@@ -3015,7 +3015,11 @@ static int caption_btn_w(void) { return 46 * g_scale; }
        ... drag space (it's the title bar) ...                         */
 enum { HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR };
 
-static int tabs_top(void) { return 8 * g_scale; }   /* the gap above the tabs drags the window */
+/* The tab column sits on the terminal's character grid: row k of it is at
+   the same height as terminal row k, and it's SB_COLS cells wide. Row 0 is
+   a grip (drag the window there); the tabs start on row 1. */
+#define SB_COLS 20
+static int sb_row_y(int k) { return term_oy() + k * CH; }
 
 /* the dim second line under a tab's name: what Claude is doing, asking, or did */
 static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
@@ -3037,28 +3041,36 @@ static const wchar_t *tab_detail(const Tab *tb, wchar_t *buf, int cap) {
    is two text lines tall. When they don't all fit, details go first, then
    rows squeeze. */
 static int g_row_y[MAX_TABS + 2], g_row_two[MAX_TABS + 1];   /* g_row_two: detail lines, 0..2 */
-static float detail_w(void) { return (float)(sidebar_w() - 10 * g_scale - 2 * CW - 8 * g_scale); }
+static float detail_w(void) { return (float)((SB_COLS - 2) * CW); }   /* cols 1..18 */
 static void tab_layout(void) {
     RECT r;
-    int base = CH + 10 * g_scale, i, need = 0, two = 1, h, y, avail;
+    int i, need = 0, two = 1, y, total, avail;
     wchar_t tmp[220];
     GetClientRect(g_hwnd, &r);
-    avail = r.bottom - tabs_top() - 4 * g_scale;
+    total = (r.bottom - term_oy()) / CH;           /* whole grid rows in the window */
+    avail = total - 2;                             /* minus the grip row and the + row */
     for (i = 0; i < g_ntabs; i++) {
         const wchar_t *d = tab_detail(g_tabs[i], tmp, 220);
         /* what Claude is asking you gets two lines; the rest get one */
         g_row_two[i] = !d ? 0 : g_tabs[i]->t.ps_state == PS_BLOCKED ? layout_text(d, 0, 0, detail_w(), 2, 0, 0) : 1;
-        need += base + g_row_two[i] * CH;
+        need += 1 + g_row_two[i];
     }
-    need += base;                                        /* the + row */
-    if (need > avail) two = 0;
-    h = base;
-    if (!two && (g_ntabs + 1) * base > avail) h = avail / (g_ntabs + 1);
-    if (h < CH) h = CH;
-    for (y = tabs_top(), i = 0; i <= g_ntabs; i++) {
-        if (i < g_ntabs && !two) g_row_two[i] = 0;
-        g_row_y[i] = y;
-        y += h + (i < g_ntabs ? g_row_two[i] * CH : 0);
+    if (need > avail) two = 0;                     /* details go first */
+    y = sb_row_y(1);
+    if (g_ntabs + 1 <= avail + 1 || !g_ntabs) {
+        for (i = 0; i <= g_ntabs; i++) {
+            if (i < g_ntabs && !two) g_row_two[i] = 0;
+            g_row_y[i] = y;
+            y += (1 + (i < g_ntabs ? g_row_two[i] : 0)) * CH;
+        }
+    } else {                     /* more tabs than rows: squeeze them, off the grid */
+        int h = (r.bottom - y) / (g_ntabs + 1);
+        if (h < CH / 2) h = CH / 2;
+        for (i = 0; i <= g_ntabs; i++) {
+            if (i < g_ntabs) g_row_two[i] = 0;
+            g_row_y[i] = y;
+            y += h;
+        }
     }
     g_row_y[g_ntabs + 1] = y;
 }
@@ -3071,10 +3083,10 @@ static int hit_tabbar(int mx, int my, int *idx) {
         if (my < g_row_y[i] || my >= g_row_y[i + 1]) continue;
         if (i == g_ntabs) return HIT_PLUS;
         *idx = i;
-        if (mx >= sidebar_w() - CW - 10 * g_scale) return HIT_CLOSE;
+        if (mx >= (SB_COLS - 2) * CW && mx < (SB_COLS - 1) * CW && my < g_row_y[i] + CH) return HIT_CLOSE;
         return HIT_TAB;
     }
-    return HIT_BAR;
+    return HIT_BAR;              /* the grip row and the empty column below move the window */
 }
 
 /* caption buttons: HTMINBUTTON / HTMAXBUTTON / HTCLOSE, or 0 */
@@ -3122,16 +3134,17 @@ static void check_disk(void) {
 
 static void render_disk_warning(int win_h) {
     wchar_t l1[64], l2[64];
-    float x = (float)(10 * g_scale), w = (float)(sidebar_w() - 14 * g_scale), y = (float)(win_h - 3 * CH - 6 * g_scale);
+    int total = (win_h - term_oy()) / CH;
+    float y = (float)sb_row_y(total - 3), w = (float)((SB_COLS - 2) * CW);
     uint32_t col;
     if (g_disk_free_gb < 0 || g_disk_free_gb >= DISK_WARN_GB) return;
     col = g_disk_free_gb < DISK_BAD_GB ? 0xE74856 : AMBER;
     _snwprintf(l1, 64, L"%ls %.1f GB free", g_disk_name, g_disk_free_gb);
     _snwprintf(l2, 64, L"WSL crashes when %ls fills", g_disk_name);
-    fill_rect(0, y - 4 * g_scale, (float)sidebar_w(), (float)win_h, BAR_BG, 1);
-    fill_rect(0, y - 4 * g_scale, (float)(2 * g_scale), y + 2 * CH + 4 * g_scale, col, 1);
-    layout_text(l1, x, y, w, 1, col, 1);
-    layout_text(l2, x, y + CH, w, 2, 0x8A8A8A, 1);
+    fill_rect(0, y, (float)sidebar_w(), (float)win_h, BAR_BG, 1);
+    layout_text(l1, (float)CW, y, w, 1, col, 1);
+    layout_text(l2, (float)CW, y + CH, w, 2, 0x8A8A8A, 1);
+    fill_rect(0, y, (float)g_scale, y + 3 * CH, col, 1);
 }
 
 /* one-pixel-wide strokes, scaled: the caption glyphs stay as sharp as the font */
@@ -3179,58 +3192,64 @@ static void render_caption_buttons(int win_w) {
 
 static void render_tabbar(int win_w, int win_h) {
     int i, idx = -1, hover = HIT_NONE, sw = sidebar_w();
-    float lx = (float)(10 * g_scale), textw = (float)(sw - 10 * g_scale - 3 * CW - 12 * g_scale);
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
+    float name_w = (float)((SB_COLS - 4) * CW);   /* cols 1..16; 17 is a gap, 18 the ×, 19 a margin */
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
     fill_rect(0, 0, (float)sw, (float)win_h, BAR_BG, 1);
+    {   /* row 0: a grip of dim braille dots (drag here; one day maybe a menu) */
+        float gy = (float)sb_row_y(0);
+        int c;
+        r_color(0x4A4A4A, 1);
+        for (c = 0; c < SB_COLS; c++) draw_glyph(c % 2 ? 0x2895 : 0x286A, (float)(c * CW), gy, 1, g_scale);
+    }
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         wchar_t label[256], detail[220];
-        float y0 = (float)g_row_y[i], y1 = (float)g_row_y[i + 1];
-        float ty = y0 + (y1 - y0 - (1 + g_row_two[i]) * CH) / 2;
+        float y0 = (float)g_row_y[i], y1 = (float)g_row_y[i + 1], ty = y0;
         int act = (i == g_active), hov = (idx == i && (hover == HIT_TAB || hover == HIT_CLOSE));
         uint32_t fg = act ? 0xF2F2F2 : 0x9A9A9A;
         /* the active tab takes the terminal's background, so it reads as attached to it */
         if (act || hov) fill_rect(0, y0, (float)sw, y1, act ? DEF_BG : TAB_HOVER, 1);
-        if (act) fill_rect(0, y0, (float)(2 * g_scale), y1, AMBER, 1);
         tab_label(tb, label, 256);
-        /* one status cell before the name, strongest first:
+        /* column 0, the status cell, strongest first:
            ? Claude needs you   ! it failed   throbber: working   bell: finished or rang   dot: output */
         if (tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) {
             uint32_t ch = tb->t.ps_state == PS_BLOCKED ? '?' : '!';
             r_color(tb->t.ps_state == PS_BLOCKED ? AMBER : 0xE74856, 1);
-            draw_glyph(ch, lx, ty, 1, g_scale);
-            draw_glyph(ch, lx + g_scale, ty, 1, g_scale);       /* bold, the way cells do it */
+            draw_glyph(ch, 0, ty, 1, g_scale);
+            draw_glyph(ch, (float)g_scale, ty, 1, g_scale);   /* bold, the way cells do it */
         } else if (tb->busy) {
             r_color(act ? 0xF2F2F2 : 0xBDBDBD, 1);
-            draw_glyph(drip, lx, ty, 1, g_scale);
+            draw_glyph(drip, 0, ty, 1, g_scale);
         } else if (tb->attention) {
             r_color(AMBER, 1);
-            draw_glyph(BELL_GLYPH, lx, ty, 1, g_scale);
+            draw_glyph(BELL_GLYPH, 0, ty, 1, g_scale);
         } else if (tb->activity && !act) {
-            fill_rect(lx + 3 * g_scale, ty + CH / 2 - g_scale, lx + 5 * g_scale, ty + CH / 2 + g_scale, 0x8A8A8A, 1);
+            fill_rect((float)(3 * g_scale), ty + CH / 2 - g_scale, (float)(5 * g_scale), ty + CH / 2 + g_scale, 0x8A8A8A, 1);
         }
-        draw_label(label, lx + 2 * CW, ty, textw, fg);
+        draw_label(label, (float)CW, ty, name_w, fg);
         if (g_row_two[i] && tab_detail(tb, detail, 220))
-            layout_text(detail, lx + 2 * CW, ty + CH, detail_w(), g_row_two[i],
+            layout_text(detail, (float)CW, ty + CH, detail_w(), g_row_two[i],
                         tb->t.ps_state == PS_BLOCKED ? 0xC9A15A : 0x767676, 1);
         if (act || hov) {
             r_color((hov && hover == HIT_CLOSE) ? 0xFF6B5E : 0x8A8A8A, 1);
-            draw_glyph(0x00D7, (float)(sw - CW - 8 * g_scale), ty, 1, g_scale);
+            draw_glyph(0x00D7, (float)((SB_COLS - 2) * CW), ty, 1, g_scale);
         }
-        if (tb->exited) fill_rect(lx + 2 * CW, ty + CH / 2, (float)(sw - CW - 12 * g_scale), ty + CH / 2 + g_scale, 0x8A8A8A, 1);
+        if (tb->exited) fill_rect((float)CW, ty + CH / 2, (float)((SB_COLS - 3) * CW), ty + CH / 2 + g_scale, 0x8A8A8A, 1);
+        /* the active tab's mark: one pixel of amber down the very left edge,
+           drawn over the status cell rather than taking a column of its own */
+        if (act) fill_rect(0, y0, (float)g_scale, y1, AMBER, 1);
     }
-    {   /* "+": a plain plus in the status column, drawn rather than taken from the font */
-        float y0 = (float)g_row_y[g_ntabs], rh = (float)(g_row_y[g_ntabs + 1] - g_row_y[g_ntabs]);
-        float cx = lx + CW / 2, cy = y0 + rh / 2.0f, arm = 4.0f * g_scale, th = (float)g_scale;
+    {   /* "+": a font glyph on the grid, at the right with one cell after it */
+        float y0 = (float)g_row_y[g_ntabs], y1 = (float)g_row_y[g_ntabs + 1];
         int hov = hover == HIT_PLUS;
-        uint32_t col = hov ? 0xF2F2F2 : 0x9A9A9A;
-        if (hov) fill_rect(0, y0, (float)sw, y0 + rh, TAB_HOVER, 1);
-        fill_rect(cx - arm, cy - th, cx + arm + th, cy + th, col, 1);
-        fill_rect(cx - th, cy - arm, cx + th, cy + arm + th, col, 1);
+        if (hov) fill_rect(0, y0, (float)sw, y1, TAB_HOVER, 1);
+        r_color(hov ? 0xF2F2F2 : 0x9A9A9A, 1);
+        draw_glyph('+', (float)((SB_COLS - 2) * CW), y0, 1, g_scale);
     }
     render_disk_warning(win_h);
+    (void)win_w;
 }
 
 static void render(void) {
