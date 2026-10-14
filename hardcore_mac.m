@@ -199,7 +199,7 @@ static int mtl_init(void) {
    newest frame wins: one the render thread hasn't started yet is replaced. */
 
 typedef struct Frame {
-    Vtx *v;
+    Inst *v;                     /* the frame's quads */
     int n, cap, w, h;
     int snap;                    /* test channel: write this frame to snap_path */
     char snap_path[MAX_PATH];
@@ -220,14 +220,14 @@ static void frame_free(Frame *f) {
 
 static void r_flush(void) {      /* the whole frame goes in one draw, so this only collects */
     Frame *f = g_build;
-    if (!f || !g_nvtx) { g_nvtx = 0; return; }
-    if (f->n + g_nvtx > f->cap) {
-        f->cap = (f->n + g_nvtx) * 2;
-        f->v = (Vtx *)realloc(f->v, sizeof(Vtx) * (size_t)f->cap);
+    if (!f || !g_ninst) { g_ninst = 0; return; }
+    if (f->n + g_ninst > f->cap) {
+        f->cap = (f->n + g_ninst) * 2;
+        f->v = (Inst *)realloc(f->v, sizeof(Inst) * (size_t)f->cap);
     }
-    memcpy(f->v + f->n, g_vtx, sizeof(Vtx) * (size_t)g_nvtx);
-    f->n += g_nvtx;
-    g_nvtx = 0;
+    memcpy(f->v + f->n, g_inst, sizeof(Inst) * (size_t)g_ninst);
+    f->n += g_ninst;
+    g_ninst = 0;
 }
 
 /* Glyph slots are written once, before the first frame that uses them is
@@ -238,9 +238,7 @@ static void r_upload(int x, int y, const unsigned char *bmp) {
 }
 
 static void r_begin(int w, int h) {
-    g_rw = (float)w;
-    g_rh = (float)h;
-    g_nvtx = 0;
+    g_ninst = 0;
     frame_free(g_build);
     g_build = (Frame *)calloc(1, sizeof(Frame));
     g_build->w = w;
@@ -283,14 +281,16 @@ static void draw_frame(Frame *f) {
     [enc setRenderPipelineState:g_pipe];
     [enc setFragmentTexture:g_atlas atIndex:0];
     if (f->n) {
-        size_t bytes = sizeof(Vtx) * (size_t)f->n;
+        size_t bytes = sizeof(Inst) * (size_t)f->n;
+        float inv[2] = {2.0f / (float)f->w, 2.0f / (float)f->h};
         if (bytes <= 4096) [enc setVertexBytes:f->v length:bytes atIndex:0];
         else {
             id<MTLBuffer> vb = [g_mtl newBufferWithBytes:f->v length:bytes options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
             [enc setVertexBuffer:vb offset:0 atIndex:0];
             [vb release];        /* the command buffer keeps it until it's done */
         }
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)f->n];
+        [enc setVertexBytes:inv length:sizeof(inv) atIndex:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:(NSUInteger)f->n];
     }
     [enc endEncoding];
     if (f->snap && w == f->w && h == f->h) {   /* test channel: copy this frame out before it's shown */
@@ -873,6 +873,7 @@ static void config_load(void) {
         n = strlen(v);
         while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
         if (!strcmp(line, "dir") && *v) expand_home(v, g_start_dir, sizeof(g_start_dir));
+        else if (!strcmp(line, "last")) snprintf(g_last_dir, sizeof(g_last_dir), "%s", v);
     }
     fclose(f);
 }
@@ -885,6 +886,8 @@ static void config_save(void) {
     fprintf(f, "# hardcore settings\n");
     fprintf(f, "# starting folder for new windows; empty = your home folder\n");
     fprintf(f, "dir=%s\n", g_cfg_dir_line);
+    fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
+    fprintf(f, "last=%s\n", g_last_dir);
     fclose(f);
 }
 
@@ -1628,6 +1631,7 @@ static void focus_changed(int focused) {
        terminal needs, and the window server drops a dead process's windows
        faster than an orderOut round trip. The window's frame is saved
        whenever it changes. */
+    remember_dir(active_tab());  /* the next window opens where this one closed */
     config_save();
     for (i = 0; i < g_ntabs; i++)   /* the ptys close as we exit, which hangs them up too */
         if (g_tabs[i]->pid > 0 && !g_tabs[i]->exited) kill(g_tabs[i]->pid, SIGHUP);
@@ -1708,7 +1712,7 @@ static void build_menus(void) {
 
 /* ── test channel ───────────────────────────────────────────────────
    HARDCORE_CTL=/path/fifo: lines of "type TEXT" (\n is Enter, \e is ESC),
-   "cmd newtab|nexttab|closetab|jump|tab N|hover X,Y|resize W,H", "snap OUT.bmp", and
+   "cmd newtab|nexttab|closetab|jump|tab N|hover X,Y|resize W,H|sel Y0 X0 Y1 X1", "snap OUT.bmp", and
    "winid OUT" (the window number, for screencapture -l, which also gets the
    traffic lights), and "key KEYCODE FLAGS CHARS [UNMODIFIED]": a synthetic
    key event through the same keyDown: path as the keyboard (FLAGS in hex,
@@ -1752,7 +1756,14 @@ static void ctl_line(char *s) {
         else if (!strcmp(c, "closetab")) close_tab(g_active);
         else if (!strcmp(c, "jump")) jump_to_attention();
         else if (!strncmp(c, "tab ", 4)) activate(atoi(c + 4));
-        else if (!strncmp(c, "resize ", 7)) {   /* content size in points, as a drag would leave it */
+        else if (!strncmp(c, "sel ", 4) && tb) {   /* sel Y0 X0 Y1 X1: select, in screen rows */
+            int y0, x0, y1, x1;
+            if (sscanf(c + 4, "%d %d %d %d", &y0, &x0, &y1, &x1) == 4) {
+                g_sel_a_row = term_abs_line(&tb->t, y0); g_sel_a_col = x0;
+                g_sel_b_row = term_abs_line(&tb->t, y1); g_sel_b_col = x1;
+                g_sel_on = 1;
+            }
+        } else if (!strncmp(c, "resize ", 7)) {   /* content size in points, as a drag would leave it */
             NSRect fr = [g_win frameRectForContentRect:NSMakeRect(0, 0, atoi(c + 7), strchr(c + 7, ',') ? atoi(strchr(c + 7, ',') + 1) : 400)];
             fr.origin = [g_win frame].origin;
             [g_win setFrame:fr display:YES];
@@ -1902,6 +1913,7 @@ static int unit_tests(const char *out_path) {
         fprintf(f, "%s utf8  #%d\n", ok ? "ok  " : "FAIL", i);
         fails += !ok;
     }
+    fails += unit_scrollback(f);
     {
         int e, ok = reflow_check(5000, &e) && !e, rt = reflow_roundtrip();
         fprintf(f, "%s reflow tail-only + settle == full reflow\n", ok ? "ok  " : "FAIL");
@@ -1984,6 +1996,10 @@ int main(int argc, char **argv) {
     drip_init();
     config_load();
     snprintf(g_cfg_dir_line, sizeof(g_cfg_dir_line), "%s", g_start_dir);
+    {   /* reopen where the last window closed, if that folder is still there (a folder argument wins) */
+        struct stat st;
+        if (g_last_dir[0] && stat(g_last_dir, &st) == 0 && S_ISDIR(st.st_mode)) snprintf(g_start_dir, sizeof(g_start_dir), "%s", g_last_dir);
+    }
     for (i = 1; i < argc; i++) {
         if ((!strcmp(argv[i], "--cd") || !strcmp(argv[i], "-d")) && i + 1 < argc) {
             snprintf(g_start_dir, sizeof(g_start_dir), "%s", argv[++i]);
@@ -1992,6 +2008,9 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--replay") && i + 3 < argc) {
             /* --replay OUT COLS ROWS FILE... */
             return replay(argv[i + 1], atoi(argv[i + 2]), atoi(argv[i + 3]), argv + i + 4, argc - i - 4);
+        } else if (!strcmp(argv[i], "--bench") && i + 4 < argc) {
+            /* --bench OUT COLS ROWS FILE: the parser alone, on a captured stream */
+            return parse_bench(argv[i + 1], atoi(argv[i + 2]), atoi(argv[i + 3]), argv[i + 4]);
         } else if (!strcmp(argv[i], "--bench-resize") && i + 1 < argc) {
             return bench_resize(argv[i + 1]);
         } else if (!strcmp(argv[i], "--selftest") && i + 1 < argc) {

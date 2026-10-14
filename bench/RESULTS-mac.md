@@ -15,6 +15,34 @@ Everything is measured from outside with `bench/macbench`, the Mac counterpart o
 
 The internal breakdowns come from hardcore's own logs (`HARDCORE_LAT=1`, `HARDCORE_TRACE=1`).
 
+## After merging main (2026-10-14)
+
+`main` brought:
+- per-row extents (`rlen`) in the screen model;
+- instanced quads in the renderer (ported to Metal: `hardcore.metal`);
+- `--bench`, the parser on its own;
+- unit tests for scrollback rows.
+
+Measured against the build just before the merge, side by side:
+
+| | before the merge | after |
+|---|---|---|
+| `cat` 18.8 MB `seq` / 31.7 MB color / 18.7 MB CJK (best of 3) | 0.52 / 0.36 / 0.29 s | **0.26** / 0.38 / 0.30 s |
+| keypress → frame p50 / p90 (n=300) | 22.3 / 34.1 ms | 22.4 / 34.4 ms |
+| new tab → prompt p50 | 18 ms | 17.1 ms |
+| launch → prompt p50 (same app identity) | 150 ms | 145–151 ms |
+| Cmd+Q → gone p50 | 31 ms | 32.7 ms |
+| reflow per drag step, 16 full tabs | 0.83–0.86 ms | 0.84–0.88 ms |
+| frame, pixel for pixel (a test screen with colours, wide chars, links, a selection) | — | **identical**: 0 of 2.2 million pixels differ |
+| esctest2 | 273 passed / 251 failed / 43 known | 273 / 251 / 43 (the same) |
+
+Plain output now goes twice as fast, from the per-row extents. Nothing else
+moved. `--unit`, the xterm.js fixtures and the shell selftest all pass, and
+the unit tests, replay and resize bench are clean under AddressSanitizer and
+UBSan.
+
+The numbers in the rest of this file are from before the merge.
+
 ## Speed
 
 | | hardcore (Metal) | hardcore (GL, first port) | Terminal.app |

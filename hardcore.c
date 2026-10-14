@@ -17,7 +17,8 @@
  *   - Tabs. The "+" button (and Ctrl+Shift+T) opens a new WSL shell in the
  *     directory the current tab is sitting in. The shell reports $PWD on every
  *     prompt through OSC 9;9 from a small rc file hardcore writes for itself.
- *   - New windows start in %USERPROFILE% (/mnt/c/Users/<you>), not ~.
+ *   - New windows start in the folder the last window closed in, or the
+ *     first time in %USERPROFILE% (/mnt/c/Users/<you>), not ~.
  *
  * Build (from WSL or MSYS2):
  *   make            → hardcore.exe
@@ -154,6 +155,7 @@ static PFN_ClosePC  pClosePC;
 
 static int g_scale = 1;          /* integer pixel scale, from the monitor DPI; one size, no zoom */
 static char g_start_dir[1024];   /* Windows or Linux path */
+static char g_last_dir[1024];    /* where the last window closed: the next one opens there */
 static int g_shell_ps;           /* shell=powershell in config.ini: tabs run PowerShell, not WSL */
 static int g_no_bash;            /* the distro has no bash: run its default shell, without rc.bash */
 static int g_have_distro = 1;    /* any WSL distro registered for this user (HKCU\...\Lxss) */
@@ -194,6 +196,7 @@ typedef struct {
 typedef struct {
     Cell *c;
     int n, wrapped;              /* wrapped: the width it wrapped at (its trailing blanks are text), 0 = it didn't */
+    int cap;                     /* cells allocated: a recycled line keeps its buffer */
 } HLine;
 
 static uint32_t PAL[256];
@@ -254,6 +257,8 @@ typedef struct {
     int cols, rows;
     Cell **row[2];               /* per-screen row pointers: scrolling moves pointers, not cells */
     uint8_t *wrapf[2];           /* row ended in an autowrap (for copy and reflow) */
+    uint16_t *rlen[2];           /* per row: cells from here on are default blanks. An upper
+                                    bound, so a line feed only touches the part in use */
     int alt;
     int cx, cy, wrapnext;
     Cell pen;
@@ -359,9 +364,35 @@ static void trace(const char *what) {
 /* HARDCORE_LAT=1: per keypress, how long until the shell's echo arrived and
    until the frame showing it was handed to the compositor
    (%TEMP%\hardcore-lat.txt: key→output ms, key→render start, key→SwapBuffers returned) */
+static double lat_ms(LARGE_INTEGER a, LARGE_INTEGER b) { return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpf.QuadPart; }
 static FILE *g_lat;
 static LARGE_INTEGER g_lat_key, g_lat_out, g_lat_render;
-static double lat_ms(LARGE_INTEGER a, LARGE_INTEGER b) { return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)g_qpf.QuadPart; }
+/* HARDCORE_LAT, new tabs: from the "newtab" command to the first frame that
+   shows the tab, and to the first frame with its prompt on it */
+static LARGE_INTEGER g_nt_t0;
+static double g_nt_shown;
+static int g_nt_id;
+
+/* HARDCORE_PERF=1: once a second, to %TEMP%\\hardcore-perf.txt, what the UI
+   thread did: bytes parsed, frames drawn, and where the time went. */
+static FILE *g_perf;
+static struct { LARGE_INTEGER t0; long long bytes; int frames, drains; double parse, build, present; } g_pf;
+static void perf_tick(void) {
+    LARGE_INTEGER now;
+    double dt;
+    if (!g_perf) return;
+    QueryPerformanceCounter(&now);
+    if (!g_pf.t0.QuadPart) { g_pf.t0 = now; return; }
+    dt = lat_ms(g_pf.t0, now);
+    if (dt < 1000) return;
+    if (g_pf.bytes || g_pf.frames)
+        fprintf(g_perf, "%7.0f ms  %9.2f MB/s  %5d reads  %4d fps  parse %6.1f ms  build %6.1f ms (%.2f/f)  present %6.1f ms (%.2f/f)\n",
+                dt, g_pf.bytes / dt / 1000.0, g_pf.drains, (int)(g_pf.frames * 1000 / dt), g_pf.parse,
+                g_pf.build, g_pf.frames ? g_pf.build / g_pf.frames : 0, g_pf.present, g_pf.frames ? g_pf.present / g_pf.frames : 0);
+    fflush(g_perf);
+    memset(&g_pf, 0, sizeof(g_pf));
+    g_pf.t0 = now;
+}
 
 static void tab_write(Tab *tb, const void *s, int n) {
     DWORD w;
@@ -381,11 +412,13 @@ static void plat_timer(int id, int ms);          /* one-shot (or, for TIMER_THRO
 #define TIMER_SYNC 1
 #define TIMER_SPARE 2
 #define TIMER_THROB 3
-#define TIMER_SETTLE 4            /* resizing stopped: rewrap the rest of every tab's scrollback */
+#define TIMER_DISK 4              /* Win32: the low-disk check, every minute */
+#define TIMER_SETTLE 5            /* resizing stopped: rewrap the rest of every tab's scrollback */
 static void plat_kill_timer(int id);
 static void plat_set_title(const wchar_t *title);
 static void plat_close_window(void);
 static void set_clipboard_utf8(const char *s, int n);
+static void config_save(void);
 static Tab *tab_create(const char *dir, int spare);
 static void tab_destroy_async(Tab *tb);
 static int tab_drain(Tab *tb);
@@ -428,10 +461,23 @@ static Cell blank_cell(const Term *t) {
 
 static void clear_span(Term *t, int y, int x0, int x1) {
     Cell b = blank_cell(t);
+    uint16_t *len = &t->rlen[t->alt][y];
     int x;
     if (x0 < 0) x0 = 0;
     if (x1 > t->cols) x1 = t->cols;
+    if (x0 >= x1) return;
+    if (!b.bg) {                 /* default blanks: past rlen there's nothing to clear */
+        if (x1 >= *len) {
+            x1 = *len;
+            if (x0 < *len) *len = (uint16_t)x0;
+        }
+    } else if (x1 > *len) *len = (uint16_t)x1;
     for (x = x0; x < x1; x++) *CELL(t, x, y) = b;
+}
+
+/* a write at [0, x) of row y: rlen has to cover it */
+static void row_used(Term *t, int y, int x) {
+    if (x > t->rlen[t->alt][y]) t->rlen[t->alt][y] = (uint16_t)x;
 }
 
 static void clear_rows(Term *t, int y0, int y1) {
@@ -448,7 +494,11 @@ static int row_is_blank_default(const Cell *c) {
 
 static void hist_clear(Term *t) {
     int i;
-    for (i = 0; i < t->hcount; i++) free(t->hist[(t->hstart + i) % HIST_LINES].c);
+    for (i = 0; i < HIST_LINES; i++) {      /* recycled buffers live past hcount too */
+        free(t->hist[i].c);
+        t->hist[i].c = NULL;
+        t->hist[i].cap = t->hist[i].n = 0;
+    }
     t->hcount = t->hstart = 0;
     t->view = 0;
 }
@@ -460,24 +510,29 @@ static int wrap_width(const Cell *row, int cols) {
     return w;
 }
 
-static void hist_push(Term *t, const Cell *row, int wrapped) {
-    int n = t->cols, idx;
+static void hist_push(Term *t, const Cell *row, int len, int wrapped) {
+    int n = len, idx;
     HLine *h;
     if (wrapped) wrapped = wrap_width(row, t->cols);
     while (n > 0 && row_is_blank_default(&row[n - 1])) n--;
     if (t->hcount < HIST_LINES) {
         idx = (t->hstart + t->hcount) % HIST_LINES;
         t->hcount++;
-    } else {
+    } else {                     /* the oldest line falls off; its buffer is reused */
         idx = t->hstart;
-        free(t->hist[idx].c);
         t->hstart = (t->hstart + 1) % HIST_LINES;
-        if (t->view > 0) t->view--;     /* oldest line fell off */
+        if (t->view > 0) t->view--;
     }
     h = &t->hist[idx];
+    if (n > h->cap) {
+        int cap = n < 16 ? 16 : n;
+        free(h->c);
+        h->c = (Cell *)malloc(sizeof(Cell) * cap);
+        h->cap = h->c ? cap : 0;
+        if (!h->c) n = 0;
+    }
     h->n = n;
     h->wrapped = wrapped;
-    h->c = n ? (Cell *)malloc(sizeof(Cell) * n) : NULL;
     if (n) memcpy(h->c, row, sizeof(Cell) * n);
     t->hpushed++;
     if (t->view > 0 && t->view < t->hcount) t->view++;  /* keep the viewport still */
@@ -490,22 +545,33 @@ static void rotate_rows(Term *t, int top, int bot, int n) {
     uint8_t wstack[64], *wtmp;
     Cell **R = t->row[t->alt];
     uint8_t *W = t->wrapf[t->alt];
+    uint16_t *Ln = t->rlen[t->alt], lstack[64], *ltmp;
     int h = bot - top + 1, k = n > 0 ? n : -n;
     tmp = k <= 64 ? stack : (Cell **)malloc(sizeof(Cell *) * k);
     wtmp = k <= 64 ? wstack : (uint8_t *)malloc((size_t)k);
+    ltmp = k <= 64 ? lstack : (uint16_t *)malloc(sizeof(uint16_t) * k);
+    /* the rows' lengths travel with them: the rows coming back still hold
+       their old cells until clear_rows() clears them */
     if (n > 0) {
         memcpy(tmp, R + top, sizeof(Cell *) * k);
         memmove(R + top, R + top + k, sizeof(Cell *) * (h - k));
         memcpy(R + bot - k + 1, tmp, sizeof(Cell *) * k);
         memmove(W + top, W + top + k, (size_t)(h - k));
+        memcpy(ltmp, Ln + top, sizeof(uint16_t) * k);
+        memmove(Ln + top, Ln + top + k, sizeof(uint16_t) * (h - k));
+        memcpy(Ln + bot - k + 1, ltmp, sizeof(uint16_t) * k);
     } else {
         memcpy(tmp, R + bot - k + 1, sizeof(Cell *) * k);
         memmove(R + top + k, R + top, sizeof(Cell *) * (h - k));
         memcpy(R + top, tmp, sizeof(Cell *) * k);
         memmove(W + top + k, W + top, (size_t)(h - k));
+        memcpy(ltmp, Ln + bot - k + 1, sizeof(uint16_t) * k);
+        memmove(Ln + top + k, Ln + top, sizeof(uint16_t) * (h - k));
+        memcpy(Ln + top, ltmp, sizeof(uint16_t) * k);
     }
     if (tmp != stack) free(tmp);
     if (wtmp != wstack) free(wtmp);
+    if (ltmp != lstack) free(ltmp);
 }
 
 static void scroll_up(Term *t, int top, int bot, int n, int to_hist) {
@@ -513,7 +579,7 @@ static void scroll_up(Term *t, int top, int bot, int n, int to_hist) {
     if (n <= 0) return;
     if (n > h) n = h;
     if (to_hist && !t->alt && top == 0)
-        for (y = 0; y < n; y++) hist_push(t, CELL(t, 0, y), t->wrapf[0][y]);
+        for (y = 0; y < n; y++) hist_push(t, CELL(t, 0, y), t->rlen[0][y], t->wrapf[0][y]);
     rotate_rows(t, top, bot, n);
     clear_rows(t, bot - n + 1, bot + 1);
 }
@@ -561,9 +627,12 @@ static int term_init(Term *t, int cols, int rows) {
         int y;
         t->row[s] = (Cell **)malloc(sizeof(Cell *) * rows);
         t->wrapf[s] = (uint8_t *)calloc((size_t)rows, 1);
-        if (!t->row[s]) return 0;
-        for (y = 0; y < rows; y++)
+        t->rlen[s] = (uint16_t *)malloc(sizeof(uint16_t) * rows);
+        if (!t->row[s] || !t->rlen[s]) return 0;
+        for (y = 0; y < rows; y++) {
             if (!(t->row[s][y] = (Cell *)malloc(sizeof(Cell) * cols))) return 0;
+            t->rlen[s][y] = (uint16_t)cols;     /* garbage until the clear below */
+        }
     }
     t->tabs = (uint8_t *)malloc((size_t)cols);
     if (!t->hist || !t->tabs) return 0;
@@ -588,6 +657,8 @@ static void term_free(Term *t) {
     }
     free(t->wrapf[0]);
     free(t->wrapf[1]);
+    free(t->rlen[0]);
+    free(t->rlen[1]);
     free(t->tabs);
     {
         int i;
@@ -605,7 +676,7 @@ static void ll_add(LineList *l, const Cell *c, int n, int wrapped) {
         l->v = (HLine *)realloc(l->v, sizeof(HLine) * l->cap);
     }
     h = &l->v[l->n++];
-    h->n = n;
+    h->n = h->cap = n;
     h->wrapped = wrapped;
     h->c = n ? (Cell *)malloc(sizeof(Cell) * n) : NULL;
     if (n) memcpy(h->c, c, sizeof(Cell) * n);
@@ -615,7 +686,9 @@ static void ll_add(LineList *l, const Cell *c, int n, int wrapped) {
    full. Returns 1 if one went. */
 static int hist_append(Term *t, HLine h) {
     if (t->hcount < HIST_LINES) {
-        t->hist[(t->hstart + t->hcount++) % HIST_LINES] = h;
+        HLine *slot = &t->hist[(t->hstart + t->hcount++) % HIST_LINES];
+        free(slot->c);           /* a recycled buffer may still sit past hcount */
+        *slot = h;
         return 0;
     }
     free(t->hist[t->hstart].c);
@@ -662,7 +735,7 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
             acc = (Cell *)realloc(acc, sizeof(Cell) * acc_cap);
         }
         if (wrapped && n > wrapped) n = wrapped;   /* not the padding */
-        memcpy(acc + acc_n, c, sizeof(Cell) * n);
+        if (n) memcpy(acc + acc_n, c, sizeof(Cell) * n);   /* (an empty line has no cells, and acc may be none yet) */
         acc_n += n;
         if (wrapped) {           /* a wrapped row's trailing blanks are real text, up to the width it wrapped at */
             for (; n < wrapped; n++) acc[acc_n++] = blank;
@@ -681,7 +754,7 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
                     ccx = (cur_off - pos) % cols;
                     cur_line = 2;
                 }
-                ll_add(&out, acc + pos, take, pos + take < len ? take : 0);   /* take < cols: a wide char went on */
+                ll_add(&out, take ? acc + pos : NULL, take, pos + take < len ? take : 0);   /* take < cols: a wide char went on */
                 pos += take;
             } while (pos < len);
             if (cur_line == 2 && cur_prow >= out.n) {  /* cursor beyond the text, on rows of its own */
@@ -697,7 +770,12 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
     if (start > cur_prow) start = cur_prow;
     if (start < 0) start = 0;
     /* history: lines before `from` stay as they are; the rewrapped rest follows */
-    for (L = from; L < t->hcount; L++) free(t->hist[(t->hstart + L) % HIST_LINES].c);
+    for (L = from; L < t->hcount; L++) {   /* hist_clear frees every slot, used or not: leave none dangling */
+        HLine *h = &t->hist[(t->hstart + L) % HIST_LINES];
+        free(h->c);
+        h->c = NULL;
+        h->n = h->cap = 0;
+    }
     t->hcount = from;
     for (i = 0; i < start; i++) evicted += hist_append(t, out.v[i]);
     base += evicted;
@@ -711,8 +789,10 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
     for (y = 0; y < orows; y++) free(t->row[0][y]);
     free(t->row[0]);
     free(t->wrapf[0]);
+    free(t->rlen[0]);
     t->row[0] = (Cell **)malloc(sizeof(Cell *) * rows);
     t->wrapf[0] = (uint8_t *)calloc((size_t)rows, 1);
+    t->rlen[0] = (uint16_t *)calloc((size_t)rows, sizeof(uint16_t));
     for (y = 0; y < rows; y++) {
         int x, idx = start + y;
         t->row[0][y] = (Cell *)malloc(sizeof(Cell) * cols);
@@ -720,7 +800,11 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
         if (idx < out.n) {
             memcpy(t->row[0][y], out.v[idx].c, sizeof(Cell) * out.v[idx].n);
             t->wrapf[0][y] = out.v[idx].wrapped != 0;
-            for (x = out.v[idx].wrapped; out.v[idx].wrapped && x < cols; x++) t->row[0][y][x].wflag = W_PAD;
+            t->rlen[0][y] = (uint16_t)out.v[idx].n;
+            if (out.v[idx].wrapped) {    /* a wide char went on: the rest of the row is padding, and counts as used */
+                for (x = out.v[idx].wrapped; x < cols; x++) t->row[0][y][x].wflag = W_PAD;
+                t->rlen[0][y] = (uint16_t)cols;
+            }
             free(out.v[idx].c);
         }
     }
@@ -750,8 +834,11 @@ static void resize_alt(Term *t, int cols, int rows) {
     for (y = 0; y < t->rows; y++) free(t->row[1][y]);
     free(t->row[1]);
     free(t->wrapf[1]);
+    free(t->rlen[1]);
     t->row[1] = nr;
     t->wrapf[1] = nw;
+    t->rlen[1] = (uint16_t *)malloc(sizeof(uint16_t) * rows);
+    for (y = 0; y < rows; y++) t->rlen[1][y] = (uint16_t)cols;
     if (t->alt) {
         if (t->cy >= rows) t->cy = rows - 1;
         if (t->cx >= cols) t->cx = cols - 1;
@@ -825,6 +912,7 @@ static void insert_blanks(Term *t, int n) {
     if (n > t->cols - t->cx) n = t->cols - t->cx;
     for (x = t->cols - 1; x >= t->cx + n; x--) *CELL(t, x, t->cy) = *CELL(t, x - n, t->cy);
     for (x = t->cx; x < t->cx + n; x++) *CELL(t, x, t->cy) = b;
+    row_used(t, t->cy, t->cols);
 }
 
 static void term_put(Term *t, uint32_t cp) {
@@ -852,6 +940,7 @@ static void term_put(Term *t, uint32_t cp) {
     if (t->m_insert) insert_blanks(t, w);
     fix_wide(t, t->cx, w);
     c = CELL(t, t->cx, t->cy);
+    row_used(t, t->cy, t->cx + w);
     *c = t->pen;
     c->ch = cp;
     c->wflag = (w == 2) ? W_WIDE : 0;
@@ -919,6 +1008,7 @@ static void shift_columns(Term *t, int x0, int n) {
     Cell b = blank_cell(t);
     for (y = t->top; y <= t->bot; y++) {
         Cell *row = CELL(t, 0, y);
+        row_used(t, y, t->cols);
         if (n > 0) {
             for (x = t->cols - 1; x >= x0; x--) row[x] = (x - n >= x0) ? row[x - n] : b;
         } else {
@@ -934,6 +1024,7 @@ static void decaln(Term *t) {
             Cell *c = CELL(t, x, y);
             memset(c, 0, sizeof(*c));
             c->ch = 'E';
+            row_used(t, y, x + 1);
         }
     t->top = 0;
     t->bot = t->rows - 1;
@@ -1212,6 +1303,7 @@ static void csi_dispatch(Term *t, int f) {
         if (n > t->cols - t->cx) n = t->cols - t->cx;
         for (x = t->cx; x < t->cols - n; x++) *CELL(t, x, t->cy) = *CELL(t, x + n, t->cy);
         for (x = t->cols - n; x < t->cols; x++) *CELL(t, x, t->cy) = b;
+        if (b.bg) row_used(t, t->cy, t->cols);
         break;
     }
     case 'X': clear_span(t, t->cy, t->cx, t->cx + P(t, 0, 1)); break;
@@ -1646,6 +1738,7 @@ static void vt_feed(Term *t, const unsigned char *s, int n) {
                 *c = t->pen;
                 c->ch = b;
                 t->cx++;
+                if (t->cx > t->rlen[t->alt][t->cy]) t->rlen[t->alt][t->cy] = (uint16_t)t->cx;
                 t->last_ch = b;
                 continue;
             }
@@ -1744,7 +1837,16 @@ static int tab_drain(Tab *tb) {
     InterlockedExchange(&tb->posted, 0);
     LeaveCriticalSection(&tb->lock);
     if (n && g_vtlog) { fwrite(data, 1, (size_t)n, g_vtlog); fflush(g_vtlog); }
-    if (n) vt_feed(&tb->t, (unsigned char *)data, n);
+    if (n && g_perf) {
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        vt_feed(&tb->t, (unsigned char *)data, n);
+        QueryPerformanceCounter(&b);
+        g_pf.parse += lat_ms(a, b);
+        g_pf.bytes += n;
+        g_pf.drains++;
+        perf_tick();
+    } else if (n) vt_feed(&tb->t, (unsigned char *)data, n);
     free(data);
     return n;
 }
@@ -2080,6 +2182,7 @@ static void config_load(void) {
         n = strlen(v);
         while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
         if (!strcmp(line, "dir") && *v) snprintf(g_start_dir, sizeof(g_start_dir), "%s", v);
+        else if (!strcmp(line, "last")) snprintf(g_last_dir, sizeof(g_last_dir), "%s", v);
         else if (!strcmp(line, "distro")) snprintf(g_distro, sizeof(g_distro), "%s", v);
         else if (!strcmp(line, "shell")) g_shell_ps = !_stricmp(v, "powershell");
         else if (!strcmp(line, "width")) g_win_w = atoi(v);
@@ -2102,6 +2205,8 @@ static void config_save(void) {
     fprintf(f, "# shell=powershell runs PowerShell in tabs instead of WSL; empty = WSL\n");
     fprintf(f, "shell=%s\n", g_shell_ps ? "powershell" : "");
     fprintf(f, "width=%d\nheight=%d\n", g_win_w, g_win_h);
+    fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
+    fprintf(f, "last=%s\n", g_last_dir);
     fclose(f);
 }
 
@@ -2137,7 +2242,11 @@ static int utf8_encode(uint32_t cp, char *o) {
 
 static int g_focused = 1;
 static int g_mouse_x = -1, g_mouse_y = -1;
+#ifdef _WIN32
+static LARGE_INTEGER g_last_paint;   /* QPC: GetTickCount only moves every ~15.6 ms */
+#else
 static DWORD g_last_paint;
+#endif
 
 static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 
@@ -2219,17 +2328,6 @@ static void sel_norm(long long *r0, int *c0, long long *r1, int *c1) {
     } else {
         *r0 = g_sel_b_row; *c0 = g_sel_b_col; *r1 = g_sel_a_row; *c1 = g_sel_a_col;
     }
-}
-
-static int sel_contains(long long row, int col) {
-    long long r0, r1;
-    int c0, c1;
-    if (!g_sel_on) return 0;
-    sel_norm(&r0, &c0, &r1, &c1);
-    if (row < r0 || row > r1) return 0;
-    if (row == r0 && col < c0) return 0;
-    if (row == r1 && col > c1) return 0;
-    return 1;
 }
 
 static void sel_copy(void) {
@@ -2449,6 +2547,7 @@ static void paste(void) {
 /* ── glyph atlas: on-demand 16×16 slots in one texture ─────────────── */
 
 #define ATLAS 2048
+#define ATLAS_S "2048.0"
 #define SLOTS_PER_ROW (ATLAS / 16)
 #define MAX_SLOTS (SLOTS_PER_ROW * SLOTS_PER_ROW)
 #define HASH_SIZE 65536
@@ -2459,19 +2558,24 @@ static int g_nslots;
 
 static void glyph_cache_reset(void);
 
-/* The drawing code is immediate mode: r_color() sets the color, r_quad() /
-   r_quad_uv() append two triangles to one CPU-side vertex array, and
-   r_present() hands it to the GPU in a single draw. The backends (Direct3D 11
-   below, OpenGL in hardcore_mac.m) supply r_flush / r_upload / r_begin /
-   r_present. */
+/* The drawing code is immediate mode: r_color() sets the color, and quad() /
+   r_quad_uv() append one 20-byte instance (pixel rectangle, atlas rectangle,
+   color) to a CPU-side array. The backend's vertex shader turns each instance
+   into two triangles, and r_present() hands the array over and draws it all
+   at once: a full screen of text is a few hundred KB, not the 120 bytes per
+   quad that six float vertices took. The backends (Direct3D 11 below, Metal
+   in hardcore_mac.m) supply r_flush / r_upload / r_begin / r_present. */
 
-typedef struct { float x, y, u, v; uint32_t rgba; } Vtx;
+typedef struct {
+    int16_t x0, y0, x1, y1;      /* pixels */
+    uint16_t u0, v0, u1, v1;     /* atlas pixels; u0 == 0xFFFF: a solid quad */
+    uint32_t rgba;
+} Inst;
 
-static float g_rw = 1, g_rh = 1; /* current frame size, for pixel → clip space */
 static uint32_t g_rgba = 0xFFFFFFFF;
-#define VB_VERTS 65536           /* per Draw; a frame that needs more draws in pieces */
-static Vtx g_vtx[VB_VERTS];
-static int g_nvtx;
+#define VB_INST 65536            /* per draw; a frame that needs more draws in pieces */
+static Inst g_inst[VB_INST];
+static int g_ninst;
 
 static void r_flush(void);
 static void r_upload(int x, int y, const unsigned char *bmp);
@@ -2480,23 +2584,20 @@ static void r_color(uint32_t rgb, float a) {
     g_rgba = ((rgb >> 16) & 255) | (rgb & 0xFF00) | ((rgb & 255) << 16) | ((uint32_t)(a * 255.0f + 0.5f) << 24);
 }
 
-static void r_vert(float x, float y, float u, float v) {
-    Vtx *p = &g_vtx[g_nvtx++];
-    p->x = x * 2.0f / g_rw - 1.0f;
-    p->y = 1.0f - y * 2.0f / g_rh;
-    p->u = u;
-    p->v = v;
-    p->rgba = g_rgba;
+/* pixel positions round to whole pixels: the font is a bitmap, it should land on the grid */
+static int16_t px(float v) { return (int16_t)(v < 0 ? v - 0.5f : v + 0.5f); }
+
+/* textured quad, atlas rectangle in atlas pixels */
+static void r_quad_uv(float x0, float y0, float x1, float y1, int u0, int v0, int u1, int v1) {
+    Inst *q;
+    if (g_ninst == VB_INST) r_flush();
+    q = &g_inst[g_ninst++];
+    q->x0 = px(x0); q->y0 = px(y0); q->x1 = px(x1); q->y1 = px(y1);
+    q->u0 = (uint16_t)u0; q->v0 = (uint16_t)v0; q->u1 = (uint16_t)u1; q->v1 = (uint16_t)v1;
+    q->rgba = g_rgba;
 }
 
-/* textured quad; u0 < 0 means a solid one */
-static void r_quad_uv(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1) {
-    if (g_nvtx + 6 > VB_VERTS) r_flush();
-    r_vert(x0, y0, u0, v0); r_vert(x1, y0, u1, v0); r_vert(x1, y1, u1, v1);
-    r_vert(x0, y0, u0, v0); r_vert(x1, y1, u1, v1); r_vert(x0, y1, u0, v1);
-}
-
-static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1, y1, -1, -1, -1, -1); }
+static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1, y1, 0xFFFF, 0, 0, 0); }
 
 #ifdef _WIN32
 /* ── renderer: Direct3D 11 on a flip-model swap chain ──────────────── */
@@ -2508,7 +2609,7 @@ static void quad(float x0, float y0, float x1, float y1) { r_quad_uv(x0, y0, x1,
    allowed Windows can promote the window to an independent flip or a
    hardware overlay plane, skipping composition altogether.
 
-   The vertex array is drawn with a single Draw per frame. */
+   The instance array (see quad() above) is drawn with one DrawInstanced per frame. */
 
 
 /* not in every mingw libuuid */
@@ -2530,11 +2631,20 @@ static ID3D11SamplerState *g_samp;
 static ID3D11RasterizerState *g_rs;
 static int g_tearing;            /* DXGI_FEATURE_PRESENT_ALLOW_TEARING */
 static int g_gfx_ready;          /* swap chain exists: GDI no longer paints */
+static ID3D11Buffer *g_cb;       /* the frame size, for pixel → clip space */
+static int g_cb_w, g_cb_h;
 
 static const char HLSL[] =
-    "struct VI { float2 p : POSITION; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
+    "cbuffer F : register(b0) { float2 inv; };\n"     /* 2 / frame size */
+    "struct VI { int4 r : RECT; uint4 t : TEX; float4 c : COLOR; uint id : SV_VertexID; };\n"
     "struct VO { float4 p : SV_Position; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
-    "VO vs(VI i) { VO o; o.p = float4(i.p, 0, 1); o.uv = i.uv; o.c = i.c; return o; }\n"
+    "VO vs(VI i) {\n"
+    "  uint k = i.id < 3 ? i.id : i.id - 2;\n"         /* 0 1 2, 1 3 2: corners of a quad */
+    "  float2 f = float2(k & 1, k >> 1);\n"
+    "  float2 p = lerp(float2(i.r.xy), float2(i.r.zw), f);\n"
+    "  VO o; o.p = float4(p.x * inv.x - 1, 1 - p.y * inv.y, 0, 1);\n"
+    "  o.uv = i.t.x == 65535 ? float2(-1, -1) : lerp(float2(i.t.xy), float2(i.t.zw), f) / " ATLAS_S ";\n"
+    "  o.c = i.c; return o; }\n"
     "Texture2D t : register(t0); SamplerState s : register(s0);\n"
     "float4 ps(VO i) : SV_Target {\n"
     "  float a = i.uv.x < 0 ? 1 : t.SampleLevel(s, i.uv, 0).a;\n"
@@ -2546,13 +2656,13 @@ typedef HRESULT (WINAPI *PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHAD
 
 static void r_flush(void) {
     D3D11_MAPPED_SUBRESOURCE m;
-    if (!g_nvtx || !g_ctx) return;
+    if (!g_ninst || !g_ctx) return;
     if (SUCCEEDED(ID3D11DeviceContext_Map(g_ctx, (ID3D11Resource *)g_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        memcpy(m.pData, g_vtx, sizeof(Vtx) * g_nvtx);
+        memcpy(m.pData, g_inst, sizeof(Inst) * g_ninst);
         ID3D11DeviceContext_Unmap(g_ctx, (ID3D11Resource *)g_vb, 0);
-        ID3D11DeviceContext_Draw(g_ctx, (UINT)g_nvtx, 0);
+        ID3D11DeviceContext_DrawInstanced(g_ctx, 6, (UINT)g_ninst, 0, 0);
     }
-    g_nvtx = 0;
+    g_ninst = 0;
 }
 
 
@@ -2584,10 +2694,14 @@ static void r_resize(void) {
 static void r_begin(int w, int h) {
     static const float bg[4] = {((DEF_BG >> 16) & 255) / 255.0f, ((DEF_BG >> 8) & 255) / 255.0f, (DEF_BG & 255) / 255.0f, 1};
     D3D11_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
-    UINT stride = sizeof(Vtx), off = 0;
-    g_rw = (float)w;
-    g_rh = (float)h;
-    g_nvtx = 0;
+    UINT stride = sizeof(Inst), off = 0;
+    if (w != g_cb_w || h != g_cb_h) {
+        float inv[4] = {2.0f / (float)w, 2.0f / (float)h, 0, 0};
+        ID3D11DeviceContext_UpdateSubresource(g_ctx, (ID3D11Resource *)g_cb, 0, NULL, inv, 0, 0);
+        g_cb_w = w;
+        g_cb_h = h;
+    }
+    g_ninst = 0;
     ID3D11DeviceContext_OMSetRenderTargets(g_ctx, 1, &g_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(g_ctx, g_rtv, bg);
     ID3D11DeviceContext_RSSetViewports(g_ctx, 1, &vp);
@@ -2596,6 +2710,7 @@ static void r_begin(int w, int h) {
     ID3D11DeviceContext_IASetInputLayout(g_ctx, g_il);
     ID3D11DeviceContext_IASetVertexBuffers(g_ctx, 0, 1, &g_vb, &stride, &off);
     ID3D11DeviceContext_VSSetShader(g_ctx, g_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(g_ctx, 0, 1, &g_cb);
     ID3D11DeviceContext_PSSetShader(g_ctx, g_ps, NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1, &g_srv);
     ID3D11DeviceContext_PSSetSamplers(g_ctx, 0, 1, &g_samp);
@@ -2633,16 +2748,19 @@ static int gfx_init_device(void) {
     ID3D11Device_CreatePixelShader(g_dev, ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb), NULL, &g_ps);
     {
         D3D11_INPUT_ELEMENT_DESC el[3] = {
-            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0}};
+            {"RECT", 0, DXGI_FORMAT_R16G16B16A16_SINT, 0, 0, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+            {"TEX", 0, DXGI_FORMAT_R16G16B16A16_UINT, 0, 8, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+            {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1}};
         ID3D11Device_CreateInputLayout(g_dev, el, 3, ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb), &g_il);
     }
     ID3D10Blob_Release(vsb);
     ID3D10Blob_Release(psb);
     {
-        D3D11_BUFFER_DESC bd = {sizeof(g_vtx), D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+        D3D11_BUFFER_DESC bd = {sizeof(g_inst), D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+        D3D11_BUFFER_DESC cd = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
         ID3D11Device_CreateBuffer(g_dev, &bd, NULL, &g_vb);
+        ID3D11Device_CreateBuffer(g_dev, &cd, NULL, &g_cb);
+        g_cb_w = g_cb_h = 0;
     }
     {
         D3D11_TEXTURE2D_DESC td;
@@ -2748,7 +2866,7 @@ static int gfx_init_swapchain(HWND hwnd) {
 static void gfx_lost(void) {
     g_gfx_ready = 0;
     REL(g_rtv); REL(g_sc); REL(g_rs); REL(g_samp); REL(g_blend); REL(g_srv); REL(g_atlas);
-    REL(g_vb); REL(g_il); REL(g_ps); REL(g_vs); REL(g_ctx); REL(g_dev);
+    REL(g_vb); REL(g_cb); REL(g_il); REL(g_ps); REL(g_vs); REL(g_ctx); REL(g_dev);
     glyph_cache_reset();
     if (gfx_init_device()) gfx_init_swapchain(g_hwnd);
     InvalidateRect(g_hwnd, NULL, FALSE);
@@ -2805,8 +2923,7 @@ static void fill_rect(float x0, float y0, float x1, float y1, uint32_t rgb, floa
 static void draw_glyph(uint32_t cp, float x, float y, int w_cells, int scale) {
     int gw, slot = glyph_slot(cp, &gw);
     float cw = (float)(FONT_W * scale), chh = (float)(FONT_H * scale);
-    float u0 = (float)((slot % SLOTS_PER_ROW) * 16) / ATLAS, v0 = (float)((slot / SLOTS_PER_ROW) * 16) / ATLAS;
-    float u1 = u0 + (float)gw / ATLAS, v1 = v0 + 16.0f / ATLAS;
+    int u0 = (slot % SLOTS_PER_ROW) * 16, v0 = (slot / SLOTS_PER_ROW) * 16, u1 = u0 + gw, v1 = v0 + 16;
     float x0 = x, y0 = y, x1, y1 = y + chh;
     if (gw == 16 && w_cells == 1) {
         float pad = (chh - cw) * 0.5f;
@@ -3028,6 +3145,48 @@ static int caption_hit(int mx, int my) {
 }
 
 static int g_nc_hover, g_nc_press, g_win_active = 1;
+static int g_top_hover;          /* the mouse is on the top line: it drags the window */
+
+/* the top line, left of the buttons: a title bar that only shows itself on hover */
+static int in_top_line(int mx, int my) { return mx >= sidebar_w() && my >= 0 && my < caption_h(); }
+
+/* ── low disk ─────────────────────────────────────────────────────────
+   WSL's disk is a .vhdx on a Windows drive that grows as Linux writes. When
+   that drive fills, the guest still thinks it has room; its writes fail
+   underneath it, programs die with SIGBUS ("Bus error") and then the whole
+   VM goes, taking every tab with it. So the tab column warns early. */
+#define DISK_WARN_GB 20.0
+#define DISK_BAD_GB 5.0
+static double g_disk_free_gb = -1;
+static wchar_t g_disk_name[4] = L"C:";
+
+static void check_disk(void) {
+    wchar_t p[MAX_PATH], *la = _wgetenv(L"LOCALAPPDATA");
+    ULARGE_INTEGER avail;
+    double gb, was = g_disk_free_gb;
+    _snwprintf(p, MAX_PATH, L"%ls\\wsl\\", la ? la : L"C:");
+    p[MAX_PATH - 1] = 0;
+    if (!GetDiskFreeSpaceExW(p, &avail, NULL, NULL) && !GetDiskFreeSpaceExW(la ? la : L"C:\\", &avail, NULL, NULL)) return;
+    if (la && la[0] && la[1] == ':') { g_disk_name[0] = towupper(la[0]); g_disk_name[1] = ':'; g_disk_name[2] = 0; }
+    gb = (double)avail.QuadPart / (1024.0 * 1024 * 1024);
+    g_disk_free_gb = gb;
+    if ((was < DISK_WARN_GB) != (gb < DISK_WARN_GB) || (gb < DISK_WARN_GB && (int)(was * 10) != (int)(gb * 10)))
+        InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+static void render_disk_warning(int win_h) {
+    wchar_t l1[64], l2[64];
+    float x = (float)(10 * g_scale), w = (float)(sidebar_w() - 14 * g_scale), y = (float)(win_h - 3 * CH - 6 * g_scale);
+    uint32_t col;
+    if (g_disk_free_gb < 0 || g_disk_free_gb >= DISK_WARN_GB) return;
+    col = g_disk_free_gb < DISK_BAD_GB ? 0xE74856 : AMBER;
+    _snwprintf(l1, 64, L"%ls %.1f GB free", g_disk_name, g_disk_free_gb);
+    _snwprintf(l2, 64, L"WSL crashes when %ls fills", g_disk_name);
+    fill_rect(0, y - 4 * g_scale, (float)sidebar_w(), (float)win_h, BAR_BG, 1);
+    fill_rect(0, y - 4 * g_scale, (float)(2 * g_scale), y + 2 * CH + 4 * g_scale, col, 1);
+    layout_text(l1, x, y, w, 1, col, 1);
+    layout_text(l2, x, y + CH, w, 2, 0x8A8A8A, 1);
+}
 
 /* one-pixel-wide strokes, scaled: the caption glyphs stay as sharp as the font */
 static void px_line(float x0, float y0, int n, int dx, int dy, uint32_t rgb) {
@@ -3127,6 +3286,9 @@ static void render_tabbar(int win_w, int win_h) {
         fill_rect(cx - arm, cy - th, cx + arm + th, cy + th, col, 1);
         fill_rect(cx - th, cy - arm, cx + th, cy + arm + th, col, 1);
     }
+#ifdef _WIN32
+    render_disk_warning(win_h);  /* WSL's disk: the Mac has no VM to take down */
+#endif
 }
 
 static void r_begin(int w, int h);
@@ -3148,29 +3310,38 @@ static void render(void) {
     t = &tb->t;
     base = term_base(t);
 
-    /* backgrounds + selection */
+    /* One pass per row: backgrounds, then glyphs, then underlines, so a bold
+       smear or underline is never painted over by the next cell's background.
+       Rows don't overlap, so this draws the same pixels as three full-screen
+       passes. Past a screen row's rlen everything is a default blank. */
     for (y = 0; y < t->rows; y++) {
         const Cell *cells;
-        int n, wrapped, L = t->hcount - t->view + y;
+        int n, wrapped, L = t->hcount - t->view + y, s0 = 1, s1 = 0, end;
+        float y0 = (float)(oy + y * CH);
         term_line(t, L, &cells, &n, &wrapped);
-        for (x = 0; x < t->cols; x++) {
+        if (L >= t->hcount && L - t->hcount < t->rows && t->rlen[t->alt][L - t->hcount] < n)
+            n = t->rlen[t->alt][L - t->hcount];
+        if (g_sel_on) {          /* this row's selected columns, [s0, s1] */
+            long long r0, r1, row = base + L;
+            int c0, c1;
+            sel_norm(&r0, &c0, &r1, &c1);
+            if (row >= r0 && row <= r1) {
+                s0 = row == r0 ? c0 : 0;
+                s1 = row == r1 ? c1 : t->cols - 1;
+            }
+        }
+        if (n > t->cols) n = t->cols;
+        end = s1 >= s0 && s1 + 1 > n ? (s1 + 1 < t->cols ? s1 + 1 : t->cols) : n;
+        for (x = 0; x < end; x++) {
             uint32_t fg, bg;
-            int sel = sel_contains(base + L, x);
             if (x < n) cell_colors(&cells[x], &fg, &bg);
             else bg = DEF_BG;
-            if (sel) bg = SEL_BG;
+            if (x >= s0 && x <= s1) bg = SEL_BG;
             if (bg == DEF_BG) continue;
             r_color(bg, 1);
-            quad((float)(ox + x * CW), (float)(oy + y * CH), (float)(ox + (x + 1) * CW), (float)(oy + (y + 1) * CH));
+            quad((float)(ox + x * CW), y0, (float)(ox + (x + 1) * CW), y0 + CH);
         }
-    }
-
-    /* glyphs */
-    for (y = 0; y < t->rows; y++) {
-        const Cell *cells;
-        int n, wrapped, L = t->hcount - t->view + y;
-        term_line(t, L, &cells, &n, &wrapped);
-        for (x = 0; x < n && x < t->cols; x++) {
+        for (x = 0; x < n; x++) {
             const Cell *c = &cells[x];
             uint32_t fg, bg;
             int w;
@@ -3179,22 +3350,15 @@ static void render(void) {
             if (fg == bg && !(c->attr & A_HIDDEN)) continue;
             w = (c->wflag == W_WIDE) ? 2 : 1;
             r_color(fg, 1);
-            draw_glyph(c->ch, (float)(ox + x * CW), (float)(oy + y * CH), w, g_scale);
+            draw_glyph(c->ch, (float)(ox + x * CW), y0, w, g_scale);
             /* Unifont has no bold; smear one pixel right, except box drawing */
             if ((c->attr & A_BOLD) && !(c->ch >= 0x2500 && c->ch <= 0x259F))
-                draw_glyph(c->ch, (float)(ox + x * CW + g_scale), (float)(oy + y * CH), w, g_scale);
+                draw_glyph(c->ch, (float)(ox + x * CW + g_scale), y0, w, g_scale);
         }
-    }
-
-    /* underline / strike */
-    for (y = 0; y < t->rows; y++) {
-        const Cell *cells;
-        int n, wrapped, L = t->hcount - t->view + y;
-        term_line(t, L, &cells, &n, &wrapped);
-        for (x = 0; x < n && x < t->cols; x++) {
+        for (x = 0; x < n; x++) {
             const Cell *c = &cells[x];
             uint32_t fg, bg;
-            float x0 = (float)(ox + x * CW), y0 = (float)(oy + y * CH);
+            float x0 = (float)(ox + x * CW);
             if (!(c->attr & (A_UNDER | A_STRIKE)) && !c->link) continue;
             cell_colors(c, &fg, &bg);
             if (c->link && !(c->attr & A_UNDER)) {   /* OSC 8 link: dotted underline */
@@ -3245,6 +3409,8 @@ static void render(void) {
                   track_top + pos * (track_h - bar_h) + bar_h, AMBER, t->view ? 0.8f : 0.3f);
     }
 #ifdef _WIN32
+    if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
+        fill_rect((float)sidebar_w(), 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
     render_caption_buttons(r.right);   /* last: glass over whatever is under it */
 #endif
 }
@@ -3338,6 +3504,9 @@ static void r_present(void);
 
 static void paint_now(void) {
     Tab *tb = active_tab();
+#ifdef _WIN32
+    LARGE_INTEGER p0, p1, p2;
+#endif
     if (tb && tb->t.m_sync && GetTickCount() - tb->t.sync_since < 200) {
         plat_timer(TIMER_SYNC, 20);
         return;
@@ -3357,6 +3526,7 @@ static void paint_now(void) {
     }
 #ifdef _WIN32
     if (g_lat && g_lat_out.QuadPart) QueryPerformanceCounter(&g_lat_render);
+    if (g_perf) QueryPerformanceCounter(&p0);
 #endif
     render();
     if (g_snap_path[0]) {
@@ -3364,9 +3534,35 @@ static void paint_now(void) {
         snap_backbuffer();
         g_snap_path[0] = 0;
     }
-    r_present();
-    g_last_paint = GetTickCount();
 #ifdef _WIN32
+    if (g_perf) QueryPerformanceCounter(&p1);
+#endif
+    r_present();
+#ifdef _WIN32
+    if (g_perf) {
+        QueryPerformanceCounter(&p2);
+        g_pf.build += lat_ms(p0, p1);
+        g_pf.present += lat_ms(p1, p2);
+        g_pf.frames++;
+        perf_tick();
+    }
+    QueryPerformanceCounter(&g_last_paint);
+    if (g_lat && g_nt_t0.QuadPart && active_tab() && active_tab()->id == g_nt_id) {
+        LARGE_INTEGER t;
+        Term *nt = &active_tab()->t;
+        int y, x, ink = 0;
+        QueryPerformanceCounter(&t);
+        if (g_nt_shown < 0) g_nt_shown = lat_ms(g_nt_t0, t);
+        for (y = 0; y < nt->rows && !ink; y++)
+            for (x = 0; x < nt->rlen[nt->alt][y] && !ink; x++) ink = CELL(nt, x, y)->ch > ' ';
+        if (ink) {
+            FILE *f;
+            wchar_t tp[MAX_PATH];
+            _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-newtab.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
+            if ((f = _wfopen(tp, L"ab"))) { fprintf(f, "%.2f %.2f\n", g_nt_shown, lat_ms(g_nt_t0, t)); fclose(f); }
+            g_nt_t0.QuadPart = 0;
+        }
+    }
     if (g_lat && g_lat_out.QuadPart) {
         LARGE_INTEGER t;
         QueryPerformanceCounter(&t);
@@ -3376,6 +3572,8 @@ static void paint_now(void) {
         IDXGISwapChain1_GetLastPresentCount(g_sc, &g_lat_pid);
         g_lat_key.QuadPart = g_lat_out.QuadPart = 0;
     }
+#else
+    g_last_paint = GetTickCount();
 #endif
 }
 
@@ -3469,12 +3667,24 @@ static void new_tab_here(void) {
     activate(g_ntabs == 1 ? 0 : g_active + 1);
 }
 
+/* The folder the window is closing in, for the next window to open in. */
+static void remember_dir(Tab *tb) {
+    const char *d;
+    if (!tb || tb->help) return;
+    d = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir;
+    if (d[0]) snprintf(g_last_dir, sizeof(g_last_dir), "%s", d);
+}
+
 static void close_tab(int i) {
     Tab *tb;
     if (i < 0 || i >= g_ntabs) return;
     tb = g_tabs[i];
     memmove(&g_tabs[i], &g_tabs[i + 1], sizeof(Tab *) * (g_ntabs - i - 1));
     g_ntabs--;
+    if (!g_ntabs) {             /* the last tab: its folder is where the next window opens */
+        remember_dir(tb);
+        config_save();
+    }
     tab_destroy_async(tb);
     if (!g_ntabs) {
         plat_close_window();
@@ -3892,6 +4102,89 @@ static void bench_series(FILE *out, const char *name, Term **ts, int nt, const i
     free(v);
 }
 
+/* --unit, both platforms: what each kind of row leaves in history (rlen
+   bookkeeping), and recycling past HIST_LINES. Returns the failures. */
+static int unit_scrollback(FILE *f) {
+    int fails = 0;
+    {   /* scrollback: what each kind of row leaves in history (rlen bookkeeping) */
+        static const struct { const char *in, *want; int n; } sb[] = {
+            {"abc\r\n", "abc", 3},
+            {"\x1b[41m\x1b[K\x1b[0m\r\n", "", 20},          /* colored blanks are kept */
+            {"abcdefghij\r\x1b[K\r\n", "", 0},
+            {"abcdefghij\x1b[5G\x1b[K\r\n", "abcd", 4},
+            {"abc\x1b[1G\x1b[2@\r\n", "  abc", 5},
+            {"abcdef\x1b[1G\x1b[2P\r\n", "cdef", 4},
+            {"\xe6\x97\xa5\xe6\x9c\xac\r\n", "\xe6\x97\xa5\xe6\x9c\xac", 4},
+            {"abcdefghijklmnopqrstuvwxyz\r\n", "abcdefghijklmnopqrst", 20},
+        };
+        int k;
+        for (k = 0; k < (int)(sizeof(sb) / sizeof(sb[0])); k++) {
+            Term t;
+            char got[256];
+            int len = 0, x, ok;
+            const HLine *h;
+            if (!term_init(&t, 20, 4)) return fails + 1;
+            vt_feed(&t, (const unsigned char *)sb[k].in, (int)strlen(sb[k].in));
+            vt_feed(&t, (const unsigned char *)"\x1b[4H\n\n\n\n", 8);   /* push it up into history */
+            h = t.hcount ? &t.hist[t.hstart] : NULL;
+            for (x = 0; h && x < h->n; x++)
+                if (h->c[x].wflag != W_CONT) len += utf8_encode(h->c[x].ch, got + len);
+            while (len && got[len - 1] == ' ') len--;
+            got[len] = 0;
+            ok = h && h->n == sb[k].n && !strcmp(got, sb[k].want);
+            fprintf(f, "%s hist  #%d n=%d \"%s\"\n", ok ? "ok  " : "FAIL", k, h ? h->n : -1, got);
+            fails += !ok;
+            term_free(&t);
+        }
+        {   /* past HIST_LINES: the oldest lines go, their buffers are reused */
+            Term t;
+            char line[32];
+            const HLine *h;
+            int ok;
+            if (!term_init(&t, 20, 4)) return fails + 1;
+            for (k = 0; k < HIST_LINES + 10; k++) {
+                int n = snprintf(line, sizeof(line), "line %d\r\n", k);
+                vt_feed(&t, (const unsigned char *)line, n);
+            }
+            h = &t.hist[(t.hstart + t.hcount - 1) % HIST_LINES];
+            ok = t.hcount == HIST_LINES && h->n == 10 && h->c[5].ch == '2' && h->c[9].ch == '6';   /* "line 20006" */
+            fprintf(f, "%s hist  recycled, count %d\n", ok ? "ok  " : "FAIL", t.hcount);
+            fails += !ok;
+            term_free(&t);
+        }
+    }
+    return fails;
+}
+
+/* --bench OUT COLS ROWS FILE: parser speed on a captured output stream
+   (HARDCORE_VTLOG on Windows), fed in 64 KB chunks the way the reader does;
+   HARDCORE_BENCH_CHUNK=N feeds N bytes at a time instead. */
+static int parse_bench(const char *out_path, int cols, int rows, const char *file) {
+    FILE *out = fopen(out_path, "wb"), *f = fopen(file, "rb");
+    Tab *tb = (Tab *)calloc(1, sizeof(Tab));
+    unsigned char *data;
+    long n, k;
+    int rep, best = 0, chunk = getenv("HARDCORE_BENCH_CHUNK") ? atoi(getenv("HARDCORE_BENCH_CHUNK")) : 65536;
+    double best_ms = 1e9;
+    if (!out || !f || !tb || !term_init(&tb->t, cols, rows) || chunk < 1) return 3;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    data = (unsigned char *)malloc((size_t)n);
+    if (!data || fread(data, 1, (size_t)n, f) != (size_t)n) return 3;
+    fclose(f);
+    for (rep = 0; rep < 5; rep++) {
+        double t0 = bench_now_ms(), ms;
+        for (k = 0; k < n; k += chunk) vt_feed(&tb->t, data + k, (int)(n - k < chunk ? n - k : chunk));
+        ms = bench_now_ms() - t0;
+        fprintf(out, "run %d: %.1f ms\n", rep, ms);
+        if (ms < best_ms) { best_ms = ms; best = rep; }
+    }
+    fprintf(out, "%.1f MB in %.1f ms best of 5 (run %d): %.1f MB/s\n", n / 1e6, best_ms, best, n / 1e3 / best_ms);
+    fclose(out);
+    return 0;
+}
+
 #define BENCH_TABS 16             /* the stress case: this many tabs, each with full scrollback */
 
 /* 1 if two terminals hold the same text: every screen row and every
@@ -4193,6 +4486,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DragAcceptFiles(hwnd, TRUE);
         return 0;
     case WM_CLOSE:
+        remember_dir(active_tab());
         save_window_size();
         config_save();
         DestroyWindow(hwnd);
@@ -4215,10 +4509,18 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             help_key(tb, buf[0] == '\n' ? '\r' : (unsigned char)buf[0]);
         } else if (cd->dwData == 0x48430001 && tb) {   /* type: \n becomes Enter */
             size_t i;
+            if (g_lat && !g_lat_key.QuadPart) {        /* time it like a key, without taking focus */
+                lat_finish();
+                QueryPerformanceCounter(&g_lat_key);
+            }
             for (i = 0; i < n; i++) if (buf[i] == '\n') buf[i] = '\r';
             tab_write(tb, buf, (int)n);
         } else if (cd->dwData == 0x48430002) {          /* a hardcore command */
-            if (!strcmp(buf, "newtab")) new_tab_here();
+            if (!strcmp(buf, "newtab")) {
+                if (g_lat) { QueryPerformanceCounter(&g_nt_t0); g_nt_shown = -1; }
+                new_tab_here();
+                if (g_lat) g_nt_id = active_tab() ? active_tab()->id : 0;
+            }
             else if (!strcmp(buf, "nexttab")) activate((g_active + 1) % g_ntabs);
             else if (!strcmp(buf, "closetab")) close_tab(g_active);
             else if (!strcmp(buf, "jump")) jump_to_attention();
@@ -4227,6 +4529,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_mouse_x = atoi(buf + 6);
                 g_mouse_y = strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1;
             } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);
+            else if (!strncmp(buf, "tophover ", 9)) g_top_hover = atoi(buf + 9);
+            else if (!strncmp(buf, "sel ", 4) && tb) {   /* sel Y0 X0 Y1 X1: select, in screen rows */
+                int y0, x0, y1, x1;
+                if (sscanf(buf + 4, "%d %d %d %d", &y0, &x0, &y1, &x1) != 4) return FALSE;
+                g_sel_a_row = term_abs_line(&tb->t, y0); g_sel_a_col = x0;
+                g_sel_b_row = term_abs_line(&tb->t, y1); g_sel_b_col = x1;
+                g_sel_on = 1;
+            }
             else return FALSE;
             InvalidateRect(hwnd, NULL, FALSE);
         } else if (cd->dwData == 0x48430003 && g_gfx_ready) {   /* snapshot the next frame to a .bmp */
@@ -4260,19 +4570,24 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return pt.x < corner ? HTTOPLEFT : pt.x >= r.right - corner ? HTTOPRIGHT : HTTOP;
         }
         if ((cap = caption_hit(pt.x, pt.y))) return cap;
+        if (in_top_line(pt.x, pt.y)) return HTCAPTION;
         if (hit_tabbar(pt.x, pt.y, &idx) == HIT_BAR) return HTCAPTION;
         return HTCLIENT;
     }
     case WM_NCMOUSEMOVE: {
-        int h = (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) ? (int)wp : 0;
+        int h = (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE) ? (int)wp : 0, top;
+        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE | TME_NONCLIENT, hwnd, 0};
         TrackMouseEvent(&tme);
+        ScreenToClient(hwnd, &pt);
+        top = (wp == HTCAPTION || h) && in_top_line(pt.x, pt.y);
+        if (top != g_top_hover) { g_top_hover = top; InvalidateRect(hwnd, NULL, FALSE); }
         if (g_mouse_y >= 0) { g_mouse_x = g_mouse_y = -1; InvalidateRect(hwnd, NULL, FALSE); }
         if (h != g_nc_hover) { g_nc_hover = h; InvalidateRect(hwnd, NULL, FALSE); }
         break;                   /* DefWindowProc still runs: Win11 snap layouts hang off HTMAXBUTTON */
     }
     case WM_NCMOUSELEAVE:
-        if (g_nc_hover || g_nc_press) { g_nc_hover = g_nc_press = 0; InvalidateRect(hwnd, NULL, FALSE); }
+        if (g_nc_hover || g_nc_press || g_top_hover) { g_nc_hover = g_nc_press = g_top_hover = 0; InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
     case WM_NCLBUTTONDOWN:
     case WM_NCLBUTTONDBLCLK:
@@ -4310,6 +4625,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         drop_files((HDROP)wp);
         return 0;
     case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCAPTION) {   /* the top line and the empty tab column move the window */
+            SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL));
+            return TRUE;
+        }
         if (LOWORD(lp) == HTCLIENT) {
             POINT pt;
             int col, row;
@@ -4347,6 +4666,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_TIMER:
         if (wp == TIMER_THROB) { update_busy(); return 0; }
+        if (wp == TIMER_DISK) { check_disk(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
         else if (wp == TIMER_SETTLE) settle_all();
@@ -4412,8 +4732,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (first) { first = 0; trace("first child output"); }
             update_title();
             InvalidateRect(hwnd, NULL, FALSE);
-            /* under a flood of output, still show a frame every ~30ms */
-            if (GetTickCount() - g_last_paint > 30) UpdateWindow(hwnd);
+            /* under a flood of output WM_PAINT never comes (the queue is never
+               empty), so draw one here at least every frame of a 60 Hz display */
+            {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                if (lat_ms(g_last_paint, now) > 16.0) UpdateWindow(hwnd);
+            }
         }
         return 0;
     }
@@ -4667,6 +4992,18 @@ static void dark_titlebar(HWND h) {
     f(h, 36, &txt, sizeof(txt));     /* DWMWA_TEXT_COLOR */
 }
 
+/* Drive folders are checked; a folder inside the distro is taken on trust
+   (looking would mean booting WSL before the window is up). */
+static int dir_exists(const char *p) {
+    wchar_t w[MAX_PATH * 2];
+    DWORD a;
+    if (p[0] == '/' && strncmp(p, g_mnt_root, strlen(g_mnt_root))) return 1;
+    to_windows_dir(p, w, MAX_PATH * 2);
+    if (!wcsncmp(w, L"\\\\wsl", 5)) return 1;
+    a = GetFileAttributesW(w);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 static void default_start_dir(void) {
     wchar_t *up = _wgetenv(L"USERPROFILE");
     if (g_start_dir[0]) return;
@@ -4750,6 +5087,7 @@ static int unit_tests(const char *out_path) {
         fprintf(f, "%s drop  %s\n", strcmp(a, b) ? "FAIL" : "ok  ", a);
         fails += strcmp(a, b) != 0;
     }
+    fails += unit_scrollback(f);
     for (i = 0; i < (int)(sizeof(urls) / sizeof(urls[0])); i++) {
         char got[256] = "";
         int hit = url_in_word(urls[i].word, urls[i].at, got, sizeof(got));
@@ -4815,6 +5153,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-vt.log", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
         g_vtlog = _wfopen(tp, L"wb");
     }
+    if (_wgetenv(L"HARDCORE_PERF")) {
+        wchar_t tp[MAX_PATH];
+        _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-perf.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
+        g_perf = _wfopen(tp, L"wb");
+    }
     if (_wgetenv(L"HARDCORE_LAT")) {
         wchar_t tp[MAX_PATH];
         _snwprintf(tp, MAX_PATH, L"%ls\\hardcore-lat.txt", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".");
@@ -4825,6 +5168,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     drip_init();
     config_load();
     snprintf(g_cfg_dir_line, sizeof(g_cfg_dir_line), "%s", g_start_dir);
+    if (g_last_dir[0] && dir_exists(g_last_dir)) snprintf(g_start_dir, sizeof(g_start_dir), "%s", g_last_dir);
     for (i = 1; i < argc; i++) {
         char a[1024];
         WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, a, sizeof(a), NULL, NULL);
@@ -4844,6 +5188,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             show = SW_SHOWNOACTIVATE;       /* tests: open behind, never take the keyboard */
         } else if (!strcmp(a, "--inbox-conpty")) {
             g_inbox_conpty = 1;
+        } else if (!strcmp(a, "--bench") && i + 4 < argc) {
+            char out[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
+            char in[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, argv[i + 4], -1, in, sizeof(in), NULL, NULL);
+            return parse_bench(out, _wtoi(argv[i + 2]), _wtoi(argv[i + 3]), in);
         } else if (!strcmp(a, "--replay") && i + 3 < argc) {
             /* --replay OUT COLS ROWS FILE... */
             char out[MAX_PATH * 3];
@@ -4901,6 +5251,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     ShowWindow(h, show);
     UpdateWindow(h);
     trace("window shown");
+    check_disk();
+    SetTimer(h, TIMER_DISK, 60 * 1000, NULL);
     new_tab_here();              /* wsl.exe boots while the D3D device is created */
     trace("first tab spawned");
     if (gfx_thread) { WaitForSingleObject(gfx_thread, 5000); CloseHandle(gfx_thread); }

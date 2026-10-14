@@ -1,16 +1,23 @@
-// hardcore's one shader pair (macOS). The vertex layout matches Vtx in
-// hardcore.c: pixel → clip position, atlas uv (u < 0: a solid quad), RGBA8.
+// hardcore's one shader pair (macOS), the Metal twin of the HLSL in
+// hardcore.c: one 20-byte instance per quad (Inst in hardcore.c), expanded
+// here into two triangles. Pixel rectangle, atlas rectangle in atlas pixels
+// (u0 == 65535: a solid quad), RGBA8.
 #include <metal_stdlib>
 using namespace metal;
 
-struct Vtx { packed_float2 p; packed_float2 uv; uchar4 c; };
+struct Inst { packed_short4 r; packed_ushort4 t; uchar4 c; };
 struct VO { float4 p [[position]]; float2 uv; float4 c; };
 
-vertex VO vs(const device Vtx *v [[buffer(0)]], uint id [[vertex_id]]) {
+vertex VO vs(const device Inst *q [[buffer(0)]], constant float2 &inv [[buffer(1)]],   // inv: 2 / frame size
+             uint vid [[vertex_id]], uint iid [[instance_id]]) {
+    Inst i = q[iid];
+    uint k = vid < 3 ? vid : vid - 2;                  // 0 1 2, 1 2 3: the corners of a quad
+    float2 f = float2(k & 1, k >> 1);
+    float2 p = mix(float2(short2(i.r.xy)), float2(short2(i.r.zw)), f);
     VO o;
-    o.p = float4(float2(v[id].p), 0, 1);
-    o.uv = float2(v[id].uv);
-    o.c = float4(v[id].c) / 255.0;
+    o.p = float4(p.x * inv.x - 1, 1 - p.y * inv.y, 0, 1);
+    o.uv = i.t.x == 65535 ? float2(-1, -1) : mix(float2(ushort2(i.t.xy)), float2(ushort2(i.t.zw)), f) / 2048.0;
+    o.c = float4(i.c) / 255.0;
     return o;
 }
 

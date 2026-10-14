@@ -1,4 +1,4 @@
-# WSL: "Bus error" a few minutes into a Claude Code session (open, 2026-10-13)
+# WSL: "Bus error" a few minutes into a Claude Code session (open, 2026-10-13; low-disk warning shipped)
 
 ## Symptoms (Windows 11, hardcore → WSL 2 → Claude Code)
 
@@ -86,6 +86,12 @@ pwd     # is the session on /mnt/c?
 3. Update Claude Code, or pin 2.1.265 if you're on 2.1.266 (#93038). If the
    binary might be truncated, reinstall it (#84051).
 4. If `dmesg` shows ext4 errors, run `e2fsck` on the distro's disk.
+
+## Done in hardcore (main, 0921cb3)
+
+The tab column now warns when the drive that holds WSL's disk runs low on
+space. It shows amber under 20 GB free and red under 5 GB, checked every
+minute. That's the most likely cause above, caught before it takes WSL down.
 
 ## Possible hardcore changes (not done; they need a Windows box to test)
 

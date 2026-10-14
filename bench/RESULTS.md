@@ -87,6 +87,82 @@ driver promotes it needs PresentMon run as administrator.
 | Pre-warmed spare shell | New-tab prompt: 73 ms → 6 ms |
 | Window shown before GL init, GL driver loaded on a worker thread, open animation off | Launch → window on screen: ~195 → ~60 ms. Launch → prompt: ~155 → ~130 ms |
 
+### Parser and renderer tuning (second pass, same day)
+
+Measured with tools that never take the keyboard or focus. They launch a private
+copy of hardcore behind your windows and drive it only through the WM_COPYDATA test
+channel:
+- `bench/run-bg.sh`: throughput and input→frame latency.
+- `bench/render-bench.sh`: full-screen colored redraws.
+- `bench/parse-bench.sh`: the parser alone, on captured ConPTY streams.
+- `bench/cpu-flood.sh`: CPU seconds per process.
+- `bench/snapdiff.sh`: checks two builds draw identical pixels.
+
+`HARDCORE_PERF=1` makes hardcore log once a second what its UI thread did: bytes
+parsed, reads, frames, and the milliseconds spent parsing, building frames and
+presenting.
+
+| | before | after |
+|---|---|---|
+| Parser alone, `seq` stream (2 M lines, 178×55) | 31.5 MB/s | **189 MB/s** |
+| Parser alone, SGR + truecolor stream | 172 MB/s | **249 MB/s** |
+| Parser alone, box drawing + CJK stream | 101 MB/s | 107 MB/s |
+| Full-screen colored redraw, 216×66: CPU to build a frame | 0.52 ms | **0.29 ms** |
+| Same: upload + `Present` | 0.39 ms | 0.34 ms |
+| Same: frames per second, round trip included | 447 | 471 |
+| Frames drawn per second during a `cat` flood | 35–59 | **69–152** |
+| hardcore CPU during 3× `cat` of the `seq` file | 2.70 s | **2.30 s** |
+| Input → frame handed to the compositor, p50 / p99 (n=121) | 1.33 / 2.28 ms | 1.26 / 1.97 ms |
+| `cat` of the `seq` file, wall time | 0.85 s | 0.91 s |
+
+Timed inside hardcore with `HARDCORE_LAT=1` and no focus taken
+(`bench/newtab-bg.sh`; `NOTP=1 NLAT=200 bench/run-bg.sh`):
+
+| | p50 | p90 | p99 |
+|---|---|---|---|
+| New tab → first frame showing it (pre-warmed shell waiting, the normal case) | 0.9 ms | | |
+| New tab → prompt drawn (pre-warmed) | 4.4 ms | 5.7 ms | |
+| New tab → prompt drawn, right behind another tab (no spare yet: wsl.exe + bash start) | 72 ms | 76 ms | |
+| Input → frame handed to the compositor (n=201) | 1.27 ms | 1.60 ms | 2.53 ms |
+| Input → that frame scanned out (DXGI `SyncQPCTime`) | 15.8 ms | 27.2 ms | 35.6 ms |
+
+The new-tab times stop at the frame being handed to the compositor. Add the
+compositor and the display's ~16 ms per frame on top to get the time to the
+screen, the same as for a keystroke.
+
+What changed:
+- **Per-row extent (`rlen`).** Each screen row records where its default-blank tail
+  starts. A line feed used to scan all 178 cells of the row going into scrollback
+  and rewrite all 178 cells of the row coming back. That's about 5.6 KB of memory
+  traffic for a 7-byte line. Now it touches only the cells in use. Scrollback line
+  buffers are also recycled once the history is full, instead of being freed and
+  allocated again for every line.
+- **Instanced quads.** Every rectangle, glyph or fill is one 20-byte instance: a
+  pixel rectangle, an atlas rectangle and a color. The vertex shader expands it, so
+  it no longer takes six 20-byte vertices. One `DrawInstanced` draws the frame.
+  Positions snap to whole pixels, as before.
+- **One pass per row.** Backgrounds, glyphs and underlines are drawn row by row
+  instead of in three full-screen passes. Selection is worked out once per row, and
+  drawing stops at the row's extent. `bench/snapdiff.sh` confirms the frames are
+  pixel-identical to the old renderer, with and without a selection.
+- **Frame pacing under floods.** A frame is forced at least every 16 ms by the
+  high-resolution timer. Before, the limit was "more than 30 ms" by `GetTickCount`,
+  which only moves every 15.6 ms, so frames came 31–47 ms apart.
+
+Why plain `seq` didn't get faster end to end:
+- The parser now needs about 0.1 s for the whole stream.
+- The window size (700×400 to 2400×1300), ConPTY's flags (inherit cursor, resize
+  quirk, win32 input mode) and the output pipe (anonymous at 1 MB, or a named pipe
+  at 64 KB or 1 MB) all gave the same 0.87–0.96 s.
+- During a flood, the WSL VM ↔ Windows traffic slows every Windows thread. The same
+  offline parse runs 3.5× slower while another window is flooding. Keeping WSL busy
+  with 8 plain CPU loops slows it only 9%.
+- The wall time went up about 6% (0.85 → 0.91 s, repeated 5 times). A build with
+  only the parser change already shows it. The likely cause: the UI thread now idles
+  between reads, so each 9 KB read costs a wake-up that it used to absorb while
+  busy. Pausing the reader after large reads made it much worse (4 s), because
+  Windows rounds `Sleep(1)` up to its 15.6 ms timer tick.
+
 ## Conformance
 
 | Suite | hardcore | Windows Terminal |
@@ -131,6 +207,17 @@ bench/run-newtab.sh 4 --class hardcore --left 164;  bench/run-newtab.sh 46 $W
 bench/run-throughput.sh hardcore --class hardcore;  bench/run-throughput.sh wt $W
 bench/run-esctest.sh hardcore --class hardcore;     bench/run-esctest.sh wt $W
 $B launch --class hardcore --top 4 "$(wslpath -w build/hardcore-run.exe) --cd C:\\Users\\you"
+```
+
+Background runs, which leave your keyboard and focus alone:
+
+```bash
+bench/run-bg.sh hardcore.exe 1600,900     # throughput + latency + HARDCORE_PERF log
+bench/render-bench.sh hardcore.exe        # full-screen colored redraws, 1920×1080
+bench/cpu-flood.sh hardcore.exe           # CPU seconds per process during a seq flood
+bench/plain3.sh hardcore.exe X=0          # seq wall time ×3; ENV=VAL pairs go to that copy
+bench/parse-bench.sh hardcore.exe         # parser alone on build/vt-*.bin (HARDCORE_VTLOG captures)
+bench/snapdiff.sh old.exe hardcore.exe    # same screen in both builds, compared pixel for pixel
 ```
 
 `--top` is the distance in pixels from the top of the client area to the first text row:
