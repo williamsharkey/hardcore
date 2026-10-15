@@ -510,6 +510,7 @@ typedef struct Tab {
     long long mark_off[512];
     int inherit;                 /* restored text above: ConPTY starts at our cursor, not at the top */
     char start_dir[1024];
+    char program[64];             /* macOS foreground app, refreshed independently of output */
 } Tab;
 
 enum { TK_WSL, TK_PS, TK_CMD };
@@ -1721,6 +1722,7 @@ static void osc_dispatch(Term *t) {
             if (!t->claude[0]) t->claude_args[0] = 0;
         } else if (!strncmp(rest, "cmd=", 4)) {
             snprintf(t->cmd, sizeof(t->cmd), "%s", rest + 4);
+            t->side = 1;
         } else if (!strncmp(rest, "claude-args=", 12)) {
             snprintf(t->claude_args, sizeof(t->claude_args), "%s", rest + 12);
         } else if (!strncmp(rest, "mnt=", 4) && rest[4] == '/') {
@@ -3792,19 +3794,77 @@ static int draw_label(const wchar_t *s, float x, float y, float max_w, uint32_t 
     return layout_text(s, x, y, max_w, 1, rgb, 1);
 }
 
-/* tab label: the folder's name and nothing else. Programs' titles are
-   mostly noise ("✳ Claude Code — ...", "user@host: ~/x"); the only thing we
-   take from them is whether they're animating a spinner (see title_spin). */
+/* A short executable name, never the program's decorative window title.
+   Shell reports may start with assignments or the transparent exec/env wrappers. */
+static void command_program(const char *command, char *out, int cap) {
+    char word[1024];
+    const char *p = command;
+    out[0] = 0;
+    while (*p) {
+        int n = 0, quote = 0;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        while (*p && (quote || (*p != ' ' && *p != '\t'))) {
+            int c = (unsigned char)*p++;
+            if (!quote && (c == '\'' || c == '"')) { quote = c; continue; }
+            if (quote && c == quote) { quote = 0; continue; }
+            if (n < (int)sizeof(word)-1) word[n++] = (char)c;
+        }
+        word[n] = 0;
+        if (strchr(word, '=') || !strcmp(word, "env") || !strcmp(word, "exec") || !strcmp(word, "command")) continue;
+        if (word[0] == '-') continue;
+        const char *base = word;
+        for (const char *q = word; *q; q++) if (*q == '/' || *q == '\\') base = q+1;
+        snprintf(out, cap, "%s", base);
+        n = (int)strlen(out);
+        if (n > 4 && !strcmp(out+n-4, ".exe")) out[n-4] = 0;
+        return;
+    }
+}
+
 static void tab_label(Tab *tb, wchar_t *out, int cap) {
     const char *dir = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, *b = NULL, *p;
-    for (p = dir; *p; p++)
-        if ((*p == '/' || *p == '\\') && p[1]) b = p + 1;
+    char app[64];
+    for (p = dir; *p; p++) if ((*p == '/' || *p == '\\') && p[1]) b = p+1;
 #ifdef _WIN32
-    if (!dir[0]) { _snwprintf(out, cap, L"wsl"); out[cap - 1] = 0; return; }
+    if (!dir[0]) dir = "wsl";
+    command_program(tb->t.cmd, app, sizeof(app));
 #else
     if (!dir[0]) dir = "~";
+    snprintf(app, sizeof(app), "%s", tb->program);
 #endif
     utf8_to_wide(b ? b : dir, out, cap);
+    int n = (int)wcslen(out);
+    if (app[0] && n + 2 < cap) {
+        out[n++] = ':';
+        utf8_to_wide(app, out+n, cap-n);
+    }
+}
+
+static int unit_tab_labels(FILE *f) {
+    static const struct { const char *in, *want; } cases[] = {
+        {"", ""}, {"codex --resume", "codex"}, {"/usr/local/bin/claude", "claude"},
+        {"FOO=1 env exec codex", "codex"}, {"\"/path with spaces/grok\" --help", "grok"},
+        {"C:\\tools\\codex.exe", "codex"}
+    };
+    int fails = 0;
+    char got[64];
+    for (int i=0;i<(int)(sizeof(cases)/sizeof(cases[0]));i++) {
+        command_program(cases[i].in, got, sizeof(got));
+        fails += strcmp(got,cases[i].want) != 0;
+    }
+    Tab *tb = calloc(1, sizeof(Tab));
+    if (!tb) return fails+1;
+    snprintf(tb->start_dir, sizeof(tb->start_dir), "/work/hardcore");
+    snprintf(tb->program, sizeof(tb->program), "codex");
+    snprintf(tb->t.cmd, sizeof(tb->t.cmd), "codex --resume");
+    wchar_t label[256]; tab_label(tb,label,256);
+    fails += wcscmp(label,L"hardcore:codex") != 0;
+    tb->program[0] = tb->t.cmd[0] = 0; tab_label(tb,label,256);
+    fails += wcscmp(label,L"hardcore") != 0;
+    free(tb);
+    fprintf(f,"%s folder:program tab labels\n",fails ? "FAIL" : "ok  ");
+    return fails;
 }
 
 /* The throbber: braille drops fall one at a time and stack up in a single
@@ -6923,6 +6983,7 @@ static int unit_tests(const char *out_path) {
     }
     fails += unit_scrollback(f);
     fails += unit_underlay(f);
+    fails += unit_tab_labels(f);
     for (i = 0; i < (int)(sizeof(urls) / sizeof(urls[0])); i++) {
         char got[256] = "";
         int hit = url_in_word(urls[i].word, urls[i].at, got, sizeof(got));

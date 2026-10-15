@@ -402,6 +402,9 @@ static void snap_backbuffer(void) {
 
 /* bash: login-shell startup files, then report $PWD and mark each prompt.
    Written on every launch to the config folder; your dotfiles never change. */
+/* Login profiles can reorder PATH. Reassert this installation's CLI at the
+   prompt, after the user's startup files, not only before exec'ing the shell. */
+#define MAC_CLI_PATH "if [ -n \"$HARDCORE_BIN_DIR\" ] && [ \"${PATH%%:*}\" != \"$HARDCORE_BIN_DIR\" ]; then export PATH=\"$HARDCORE_BIN_DIR:$PATH\"; fi; "
 static const char RC_BASH_MAC[] =
     "# written by hardcore on every launch; edits here are overwritten\n"
     "[ -r /etc/profile ] && . /etc/profile\n"
@@ -416,7 +419,7 @@ static const char RC_BASH_MAC[] =
     "  IFS= read -rs __hardcore_dir && cd -- \"$__hardcore_dir\" 2>/dev/null\n"
     "  unset __hardcore_dir\n"
     "fi\n"
-    "__hardcore_cwd() { printf '\\033]9;9;%s\\033\\\\\\033]133;A\\033\\\\' \"$PWD\"; }\n"
+    "__hardcore_cwd() { " MAC_CLI_PATH "printf '\\033]9;9;%s\\033\\\\\\033]133;A\\033\\\\' \"$PWD\"; }\n"
     "# report the folder on every cd too, so \"cd x && claude\" labels the tab x right away\n"
     "if ! declare -F cd >/dev/null; then\n"
     "  cd() { builtin cd \"$@\" && printf '\\033]9;9;%s\\033\\\\' \"$PWD\"; }\n"
@@ -434,7 +437,7 @@ static const char ZSHENV[] =
     "unset HARDCORE_ZDOTDIR\n"
     "[[ -r ${ZDOTDIR:-$HOME}/.zshenv ]] && builtin source ${ZDOTDIR:-$HOME}/.zshenv\n"
     "if [[ -o interactive ]]; then\n"
-    "  __hardcore_cwd() { builtin printf '\\e]9;9;%s\\e\\\\\\e]133;A\\e\\\\' \"$PWD\" }\n"
+    "  __hardcore_cwd() { " MAC_CLI_PATH "builtin printf '\\e]9;9;%s\\e\\\\\\e]133;A\\e\\\\' \"$PWD\" }\n"
     "  __hardcore_dir() { builtin printf '\\e]9;9;%s\\e\\\\' \"$PWD\" }\n"
     "  typeset -ag precmd_functions chpwd_functions\n"
     "  precmd_functions+=(__hardcore_cwd)\n"
@@ -453,7 +456,7 @@ static const char ZSHENV[] =
 
 /* fish: one --init-command */
 static const char FISH_INIT[] =
-    "function __hardcore_cwd --on-event fish_prompt; printf '\\e]9;9;%s\\e\\\\\\e]133;A\\e\\\\' $PWD; end; "
+    "function __hardcore_cwd --on-event fish_prompt; if test -n \"$HARDCORE_BIN_DIR\"; and test \"$PATH[1]\" != \"$HARDCORE_BIN_DIR\"; set -gx PATH $HARDCORE_BIN_DIR $PATH; end; printf '\\e]9;9;%s\\e\\\\\\e]133;A\\e\\\\' $PWD; end; "
     "function __hardcore_dir --on-variable PWD; printf '\\e]9;9;%s\\e\\\\' $PWD; end";
 
 static void write_file(const char *dir, const char *name, const char *text) {
@@ -627,6 +630,7 @@ static void child_env(void) {
     char cli_path[16384];
     snprintf(cli_path, sizeof(cli_path), "%s:%s", g_mac_bin_dir, path ? path : "/usr/bin:/bin");
     setenv("PATH", cli_path, 1);
+    setenv("HARDCORE_BIN_DIR", g_mac_bin_dir, 1);
     /* 24-bit color (chalk drops to 256 colors without it), OSC 8 links */
     setenv("TERM", "xterm-256color", 1);
     setenv("COLORTERM", "truecolor", 1);
@@ -770,6 +774,51 @@ static int tab_busy_program(Tab *tb, char *name, int cap) {
     if (fg <= 0 || fg == tb->pid) return 0;
     if (proc_name(fg, name, (uint32_t)cap) <= 0) snprintf(name, cap, "a program");
     return 1;
+}
+
+/* Read argv without consulting titles. JS launchers often keep "node" as
+   their process name; their script gives us "codex", "claude", or "grok". */
+static void mac_foreground_name(Tab *tb, char *out, int cap) {
+    out[0] = 0;
+    if (tb->fd < 0 || tb->exited) return;
+    pid_t fg = tcgetpgrp(tb->fd);
+    if (fg <= 0 || fg == tb->pid) return;
+    if (proc_name(fg, out, (uint32_t)cap) <= 0) return;
+    if (strcmp(out,"node") && strcmp(out,"bun") && strcmp(out,"deno")) return;
+    int mib[3] = {CTL_KERN, KERN_PROCARGS2, fg};
+    size_t n = 1024 * 1024;
+    char *data = malloc(n);
+    if (!data) return;
+    if (!sysctl(mib,3,data,&n,NULL,0) && n > sizeof(int)) {
+        int argc; memcpy(&argc,data,sizeof(argc));
+        char *p = data+sizeof(int), *end = data+n;
+        while (p < end && *p) p++; /* executable path */
+        while (p < end && !*p) p++;
+        for (int i=0;i<argc && p<end;i++) {
+            char *next = memchr(p,0,(size_t)(end-p));
+            if (!next) break;
+            if (i && *p != '-') {
+                const char *base = strrchr(p,'/'); base = base ? base+1 : p;
+                if (!strncmp(base,"codex",5)) snprintf(out,cap,"codex");
+                else if (!strncmp(base,"claude",6) || strstr(p,"claude-code")) snprintf(out,cap,"claude");
+                else if (!strncmp(base,"grok",4) || strstr(p,"grok-cli")) snprintf(out,cap,"grok");
+                break;
+            }
+            p = next+1;
+        }
+    }
+    free(data);
+}
+static void mac_refresh_programs(void) {
+    int changed = 0;
+    for (int i=0;i<g_ntabs;i++) {
+        char name[64]; mac_foreground_name(g_tabs[i],name,sizeof(name));
+        if (strcmp(name,g_tabs[i]->program)) {
+            snprintf(g_tabs[i]->program,sizeof(g_tabs[i]->program),"%s",name);
+            changed = 1;
+        }
+    }
+    if (changed) { update_title(); plat_invalidate(); }
 }
 
 /* the folder a shell is in, from the kernel: for shells without our hooks */
@@ -1825,7 +1874,8 @@ static void ctl_line(char *s) {
                 Tab *t = g_tabs[k];
                 [tabs addObject:@{@"pid":@(t->pid), @"fd":@(t->fd), @"view":@(t->t.view), @"hist":@(t->t.hcount),
                                   @"alt":@(t->t.alt), @"cols":@(t->t.cols), @"rows":@(t->t.rows),
-                                  @"cx":@(t->t.cx), @"cy":@(t->t.cy), @"parser":@(t->t.st)}];
+                                  @"cx":@(t->t.cx), @"cy":@(t->t.cy), @"parser":@(t->t.st),
+                                  @"program":[NSString stringWithUTF8String:t->program] ?: @""}];
             }
             NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"pid":@(getpid()), @"active":@(g_active),
                 @"frame":NSStringFromRect([g_win frame]), @"tabs":tabs} options:0 error:nil];
@@ -1997,6 +2047,7 @@ static int unit_tests(const char *out_path) {
     }
     fails += unit_scrollback(f);
     fails += unit_underlay(f);
+    fails += unit_tab_labels(f);
     fails += mac_update_unit(f);
     {
         int e, ok = reflow_check(5000, &e) && !e, rt = reflow_roundtrip();
@@ -2229,6 +2280,11 @@ int main(int argc, char **argv) {
     if (!getenv("HARDCORE_NO_ACTIVATE") && (!g_mac_adopt || [g_mac_adopt[@"focused"] boolValue])) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
     mac_update_listen();
     mac_adopt_ready();
+    mac_refresh_programs();
+    NSTimer *program_timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        (void)t; mac_refresh_programs();
+    }];
+    [[NSRunLoop currentRunLoop] addTimer:program_timer forMode:NSEventTrackingRunLoopMode];
     [NSApp run];
     [pool release];
     return 0;

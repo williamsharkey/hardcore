@@ -35,10 +35,7 @@ ifeq ($(UNAME),Darwin)
 all: $(APP)
 test: mac-test
 install: $(APP)
-	mkdir -p "$(HOME)/Applications"
-	rm -rf "$(HOME)/Applications/$(APP)"
-	cp -R $(APP) "$(HOME)/Applications/"
-	@echo "installed $(HOME)/Applications/$(APP)"
+	python3 tools/install_mac.py "$(APP)" "$(HOME)/Applications/$(APP)" "$(HOME)/.local/bin"
 else
 all: hardcore.exe
 test: win-test

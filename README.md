@@ -59,8 +59,10 @@ by every window.
   it turns red.
 - **+** (or Ctrl+Shift+T) opens a new WSL tab **in the same folder as the
   tab you're in**.
-- **A tab's label is its folder's name.** Nothing else: no icons, no
-  program titles, no `✳ Claude Code — …` noise.
+- **A tab's label is `folder:program`**, for example `hardcore:codex`.
+  At a shell prompt it is just the folder. On macOS, the foreground process
+  is checked even when it produces no output; common JavaScript launchers
+  show the app name instead of `node`. WSL uses the shell's command reports.
 - **One status cell before the name**, plus a dim line under it saying what
   Claude is doing, asking or just did (see [Claude Code](#claude-code)):
   - **Amber `?`.** Claude is blocked on you: a permission, a question, a
@@ -200,6 +202,10 @@ is rebuilt; jobs continue throughout.
 New macOS tabs put the app's executable directory on `PATH`, so
 `!hardcore update` works from Claude Code. From an outside terminal, use the
 installed executable's full path if `hardcore` isn't on your `PATH`.
+`make install` also creates `~/.local/bin/hardcore`, pointing at the installed
+app, so existing shells and tools such as Codex can find it when that directory
+is on their `PATH`. Existing app bundles are kept as backups, and supported
+running windows reload after installation.
 
 For a locally built version, without waiting for a release:
 

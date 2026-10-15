@@ -280,10 +280,14 @@ static void mac_update_listen(void) {
         int client = accept(fd, NULL, NULL);
         if (client < 0) return;
         fcntl(client, F_SETFD, FD_CLOEXEC);
+        /* BSD accept inherits O_NONBLOCK: wait for the request bytes after
+           accepting, bounded by SO_RCVTIMEO below. */
+        fcntl(client, F_SETFL, fcntl(client, F_GETFL) & ~O_NONBLOCK);
         struct timeval timeout = {1, 0}; setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         char cmd[32] = {0}; size_t got = 0;
         if (mac_peer_ok(client)) while (got < sizeof(cmd)-1) {
             ssize_t n = read(client, cmd+got, 1);
+            if (n < 0 && errno == EINTR) continue;
             if (n != 1 || cmd[got++] == '\n') break;
         }
         if (!strcmp(cmd, "info\n")) {
@@ -307,7 +311,12 @@ static NSData *mac_request(NSString *socket_path, const char *command, int secon
     struct timeval tv = {seconds, 0}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) || !mac_peer_ok(fd) || !mac_write_all(fd, command, strlen(command))) { close(fd); return nil; }
     NSMutableData *data = [NSMutableData data]; char buf[4096]; ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf))) > 0 && [data length] < 65536) [data appendBytes:buf length:n];
+    while ([data length] < 65536) {
+        n = read(fd, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        [data appendBytes:buf length:n];
+    }
     close(fd); return data;
 }
 static int mac_reload_windows(void) {

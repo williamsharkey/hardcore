@@ -94,6 +94,19 @@ for line in sys.stdin:
 
             wait_for(lambda: Path(f"/tmp/hardcore-{os.getuid()}/{proc.pid}.sock").exists())
             send("cmd resize 901,503")
+            send("type sleep 30\\n")
+            wait_for(lambda: state()['tabs'][0]['program'] == 'sleep')
+            send("type \x03")
+            wait_for(lambda: state()['tabs'][0]['program'] == '')
+            node = shutil.which("node")
+            if node:
+                script = root / "codex.js"
+                script.write_text("setInterval(() => {}, 1000);\n")
+                send("type " + shlex.join([node, str(script)]) + "\\n")
+                wait_for(lambda: state()['tabs'][0]['program'] == 'codex')
+                send("type \x03")
+                wait_for(lambda: state()['tabs'][0]['program'] == '')
+            print("PASS: silent foreground jobs change the tab label; idle prompts clear it; Node app names are recognized")
             command = shlex.join([sys.executable, str(worker), str(root), str(exe), str(candidate)])
             send("type " + command + "\\n")
             wait_for((root / "identity").exists)
@@ -113,7 +126,11 @@ for line in sys.stdin:
             after = state()
             assert before == after, (before, after)
             assert proc.poll() is None
-            assert time.monotonic() - float((root/'heartbeat').read_text()) < 2
+            # Background macOS processes can have their timers coalesced. Check
+            # that the same worker keeps advancing, rather than its tick age at
+            # the exact instant the GUI finishes reloading.
+            tick = (root / 'heartbeat').read_text()
+            wait_for(lambda: (root / 'heartbeat').read_text() not in ('', tick))
             print("PASS: same app PID, shell PIDs, active tab, window frame, alt screen, scrollback and scroll position after reload")
 
             invalid = root / "invalid.app"
@@ -167,6 +184,9 @@ for line in sys.stdin:
             assert result.returncode == 0, result.stdout + result.stderr
             assert state()['pid'] == proc.pid
             print("PASS: repeated live reload")
+            send("type quit\\n")
+            wait_for(lambda: state()['tabs'][0]['program'] == '')
+            print("PASS: foreground app label clears after the app exits")
         except BaseException:
             log.flush(); log.seek(0)
             print(log.read(), file=sys.stderr)
