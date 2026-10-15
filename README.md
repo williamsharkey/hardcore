@@ -1,30 +1,36 @@
 # hardcore
 
-The **Tab underlay** checkbox in Settings enables a full-width terminal with
-right-side tabs beneath the content. Tabs show over whitespace; text obscuring
-a tab leaves its initial visible, with the throbber overlaid while busy. Hover
-a tab to bring it forward. Unchecked (the default), tabs occupy a fixed left
-sidebar. The choice is saved and shared by all windows.
+Settings → **Layout** chooses a fixed left **Sidebar**, **Right underlay**,
+or **Left underlay**. Both underlays give the terminal its full width. The dim
+menu sits beneath terminal cells; hovering anywhere in its bounds brings the
+entire menu forward. Tabs occupy one row each, with thin box borders drawn at
+cell edges. No column is reserved for a tab initial.
 
-Both layouts use one font-sized grid from the drawable origin (0, 0), with no
-padding or reserved scrollbar strip. Only incomplete cells at the right and
-bottom remain background.
+All three layouts use one font-sized grid from the drawable origin (0, 0),
+with no padding or reserved scrollbar strip. Only incomplete cells at the
+right and bottom remain background.
+
+The optional **Local reflow** checkbox rearranges recognizable prose around
+an underlay for display only. It first uses spare space in the paragraph's
+existing rows, then at most three following blank rows. Words stay whole and
+later text stays on its original row. A left dock shifts only the rows beside
+the menu; other rows retain the full width. Code, boxes, non-ASCII text,
+styled backgrounds, input rows, and applications requesting mouse reports are
+left alone. The original terminal data, scrollback, and PTY dimensions are
+unchanged; selection maps displayed characters back to their source cells.
+**Reflow markers** adds a small arrow in existing indentation for inspection.
 
 A terminal for WSL on Windows 11, built for running Claude Code. It also runs
-natively on macOS (see [macOS](#macos)). It does one
-job, running your WSL shell, and it isn't a jack of all trades. The only
-settings are a font, a color scheme, and the tab underlay checkbox, shared
-by every window.
+natively on macOS (see [macOS](#macos)). Font, theme, and layout settings are
+shared by every window.
 
-```
-⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕⡪⢕ │ wm@w11:~/github/thing$ claude          ░ ─  □  × ░
-▏⣿thing           × │
-  Running make test │ > ...
- ?api               │
-  approve Bash: git │
-  push origin main  │
- ⍾notes             │
- s                + │
+```text
+┌⠿⠿ hardcore ⠿⠿───────────┐  wm@w11:~/github/thing$ claude
+│● thing:claude          ×│
+│! api:codex             ×│  > ...
+│· notes                 ×│
+│Settings +              +│
+└─────────────────────────┘
 ```
 
 - **Close it, open it, and your tabs come back.** Closing the window (or
@@ -41,7 +47,7 @@ by every window.
   last window closed in. The very first time it's `/mnt/c/Users/<you>` (your
   `%USERPROFILE%`), not `~` inside the distro.
 - **Tabs run down the left edge**, like Chrome's vertical tabs: tabs, then
-  **s** (settings) and **+**. The tab column is 20 cells wide and sits on the terminal's own text
+  **Settings** and **+**. The tab column is 28 cells wide and sits on the terminal's own text
   grid, so each of its rows lines up with a terminal row. Row 0 is a grip of
   dim braille dots: drag the window there. Each tab is a status cell, then the
   folder's name. The active tab is marked by a one-pixel amber line down its
@@ -63,19 +69,15 @@ by every window.
   At a shell prompt it is just the folder. On macOS, the foreground process
   is checked even when it produces no output; common JavaScript launchers
   show the app name instead of `node`. WSL uses the shell's command reports.
-- **One status cell before the name**, plus a dim line under it saying what
-  Claude is doing, asking or just did (see [Claude Code](#claude-code)):
-  - **Amber `?`.** Claude is blocked on you: a permission, a question, a
-    login. Its question is shown under the name, two lines if needed.
+- **One status cell before the name** keeps each tab on a single row
+  (see [Claude Code](#claude-code)):
+  - **Amber `!`.** The program needs attention, including a permission or
+    question from Claude, or a background tab that finished or rang a bell.
   - **Red `!`.** The turn failed (API error, overloaded, ...).
-  - **Throbber.** Claude is working: a braille drip, where dots fall, stack
-    up and drain. Programs that spin their title or send OSC 9;4 progress get
-    it too.
-  - **Bell mark.** An amber bell appears when a background tab finishes (its
-    throbber stops) or rings (BEL, or an OSC 9 / 99 / 777 notification). If
-    hardcore isn't the focused window, its taskbar button flashes too. The
-    mark clears when you look at the tab.
+  - **Throbber.** The program is working: a braille drip, where dots fall,
+    stack up and drain. Title spinners and OSC 9;4 progress drive it too.
   - **Gray dot.** Plain output in a background tab.
+  - **Amber dot and border.** The active tab.
 - **Fast where you feel it.**
   - A new tab's prompt is there within a frame or so (6–13 ms, against 127 ms
     in Windows Terminal), because a pre-warmed shell is waiting.
@@ -333,8 +335,7 @@ A terminal that answers gets told, as things change:
 - its background tasks.
 
 hardcore answers, and that's what drives the tab column:
-- the `?`, `!` and throbber marks;
-- the dim detail line under each name;
+- the attention, error and throbber marks on each tab;
 - **Ctrl+Shift+J**, which jumps to the next tab that needs you (blocked
   first, then failed, then finished);
 - a flashing taskbar button when Claude stops to ask while you're in
@@ -569,9 +570,11 @@ If your login shell is zsh or fish, the tab still opens bash.
 
 ## Settings
 
-Point at the gray **s** under the tabs and it reads **settings**; click it.
-The tab column then shows two box-drawn tabs, **font** and **theme**, and
-under them the name of what you've picked, or of what you're pointing at.
+Click **Settings** beneath the tabs. The compact **Font / Theme / Layout**
+strip selects the list below it. Tabs and settings use pages when they cannot
+fit. Back/forward buttons and the page count share the first actual item row;
+the label between them still selects that item. Fonts, themes, and tabs keep
+independent page positions. Menu lists do not scroll.
 
 - **font**: a row per font, its letter, name and cell size in device pixels
   (the 2×-scaled ones are listed at their doubled size):
@@ -600,9 +603,11 @@ under them the name of what you've picked, or of what you're pointing at.
 
 Pointing at a scheme previews it on the whole window. Fonts apply on click,
 keeping the terminal and tab controls on the same grid at all times.
-Clicking picks it for every hardcore window at once. The **Tab underlay**
-checkbox below the list switches between the fixed left sidebar and the
-right-side underlay; it is saved as `tab_underlay=0` or `tab_underlay=1`.
+Clicking picks it for every hardcore window at once. **Layout** contains the
+sidebar/right/left selector, the **Local reflow** and **Reflow markers** checkboxes,
+and controls for the underlay's vertical position. The dock stays at the chosen
+row, clamped to fit the window; it does not chase terminal output. Complex text
+that cannot safely reflow continues to cover the dim menu until hover.
 
 `%LOCALAPPDATA%\hardcore\config.ini` (on a Mac,
 `~/Library/Application Support/hardcore/config.ini`) holds them, along with
@@ -616,6 +621,10 @@ shell=           # powershell = PowerShell tabs instead of WSL
 width=… height=… # last window size
 font=U           # a font's letter
 theme=h          # a color scheme's letter
+tab_underlay=0   # 0=sidebar, 1=right underlay, 2=left underlay
+chrome_reflow=1  # display-only prose reflow beside an underlay
+chrome_debug=0   # arrows in existing indentation
+dock_row=0       # desired underlay top row (clamped to fit)
 ```
 
 The command line overrides it: `hardcore.exe [--cd DIR] [--distro NAME] [DIR]`.
@@ -623,6 +632,11 @@ The command line overrides it: `hardcore.exe [--cd DIR] [--distro NAME] [DIR]`.
 comparison.
 
 ## Testing
+
+- `make reflow-test` exercises local word wrapping, both dock directions,
+  source-cell mapping, paragraph boundaries, and protected terminal content.
+- `make chrome-test` (macOS desktop) checks native menu layout, pagination,
+  both underlays, whole-menu hover, and reflow using isolated terminal windows.
 
 - `tests/run_xtermjs.py` replays xterm.js's escape-sequence fixtures through the
   parser (`hardcore.exe --replay`) and diffs against screens captured from real

@@ -184,6 +184,8 @@ static int mac_reload(int ack, char *why, size_t cap) {
         @"focused": @([NSApp isActive]), @"miniaturized": @([g_win isMiniaturized]),
         @"fullscreen": @(([g_win styleMask] & NSWindowStyleMaskFullScreen) != 0),
         @"settings_open": @(g_settings_open), @"settings_tab": @(g_settings_tab),
+        @"tab_offset": @(g_tab_offset),
+        @"setting_offsets": @[@(g_setting_offset[0]), @(g_setting_offset[1]), @(g_setting_offset[2])],
         @"exe": g_mac_exe, @"target": g_mac_target
     };
     /* The suffix belongs outside the .app bundle; construct its executable explicitly. */
@@ -233,7 +235,13 @@ static int mac_adopt_read(void) {
     }
     g_active = [state[@"active"] intValue];
     if (g_active < 0 || g_active >= g_ntabs) g_active = 0;
-    g_settings_open = [state[@"settings_open"] boolValue]; g_settings_tab = [state[@"settings_tab"] boolValue];
+    g_settings_open = [state[@"settings_open"] boolValue]; g_settings_tab = [state[@"settings_tab"] intValue];
+    if (g_settings_tab < 0 || g_settings_tab > 2) g_settings_tab = 0;
+    g_tab_offset = [state[@"tab_offset"] intValue];
+    NSArray *offsets = state[@"setting_offsets"];
+    if ([offsets isKindOfClass:[NSArray class]] && [offsets count] == 3)
+        for (int i = 0; i < 3; i++) g_setting_offset[i] = [offsets[i] intValue];
+    g_layout_active = g_active; g_layout_ntabs = g_ntabs;
     g_mac_exe = [state[@"exe"] copy]; g_mac_target = [state[@"target"] copy];
     snprintf(g_mac_bin_dir, sizeof(g_mac_bin_dir), "%s", [[g_mac_exe stringByDeletingLastPathComponent] fileSystemRepresentation]);
     for (int i = 0; i < g_ntabs; i++) if (g_tabs[i]->fd >= 0) mac_watch_tab(g_tabs[i]);

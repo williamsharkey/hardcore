@@ -973,6 +973,7 @@ static void config_save(void) {
 #define SETTINGS_NOTE @"com.williamsharkey.hardcore.settings"
 
 static void plat_settings_tell(void) {
+    if (getenv("HARDCORE_TEST_CONFIG")) return;
     [[NSDistributedNotificationCenter defaultCenter] postNotificationName:SETTINGS_NOTE object:nil userInfo:nil deliverImmediately:YES];
 }
 
@@ -1512,7 +1513,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (hit == HIT_TAB) { activate(idx); return; }
     if (hit == HIT_CLOSE) { user_close_tab(idx); return; }
     if (hit == HIT_PLUS) { new_tab_mac(); return; }
-    if (hit == HIT_UNDERLAY || hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_SCLOSE || hit == HIT_FONT || hit == HIT_SCHEME) { settings_click(mx, my); return; }
+    if (chrome_setting_hit(hit)) { settings_click(mx, my); return; }
     if (hit == HIT_BAR) {        /* the tab column's empty part is the title bar */
         if ([e clickCount] == 2) [g_win performZoom:nil];
         else [g_win performWindowDragWithEvent:e];
@@ -1644,6 +1645,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     CGFloat dy = [e scrollingDeltaY];
     if (!tb) return;
     view_px(e, &mx, &my);
+    if (over_chrome(mx, my)) { scroll_acc = 0; return; }
     /* trackpads report points: a line per cell height; wheels report notches: three lines each */
     scroll_acc += [e hasPreciseScrollingDeltas] ? (float)(dy * [g_win backingScaleFactor] / CH) : (float)(dy * 3);
     lines = (int)scroll_acc;
@@ -1849,6 +1851,54 @@ static NSString *ctl_unescape(const char *s) {
     return out;
 }
 
+/* Native renderer inspection, available only through the opt-in local test FIFO. */
+static void ctl_chrome(const char *path) {
+    Tab *tb = active_tab();
+    if (!tb) return;
+    Term *t = &tb->t;
+    chrome_prepare_display(t);
+    NSMutableArray *source = [NSMutableArray array], *display = [NSMutableArray array];
+    NSMutableArray *markers = [NSMutableArray array], *tab_rows = [NSMutableArray array];
+    for (int y = 0; y < t->rows; y++) {
+        const Cell *cells;
+        int n, wrapped;
+        term_line(t, t->hcount - t->view + y, &cells, &n, &wrapped);
+        NSMutableString *a = [NSMutableString string], *b = [NSMutableString string];
+        for (int x = 0; x < t->cols; x++) {
+            uint32_t cp = x < n && cells[x].ch ? cells[x].ch : ' ';
+            char utf[8]; int count = utf8_encode(cp, utf);
+            NSString *part = [[[NSString alloc] initWithBytes:utf length:count encoding:NSUTF8StringEncoding] autorelease];
+            [a appendString:part ?: @"?"];
+            cp = g_display.cells ? g_display.cells[y*t->cols+x].ch : cp;
+            count = utf8_encode(cp ? cp : ' ', utf);
+            part = [[[NSString alloc] initWithBytes:utf length:count encoding:NSUTF8StringEncoding] autorelease];
+            [b appendString:part ?: @"?"];
+        }
+        [source addObject:a]; [display addObject:b];
+        [markers addObject:@(g_display.cells ? g_display.markers[y] : -1)];
+    }
+    for (int i = 0; i < g_ntabs; i++) [tab_rows addObject:@(g_row_y[i])];
+    NSMutableDictionary *state = [@{
+        @"mode":@(g_tab_underlay), @"cols":@(t->cols), @"rows":@(t->rows),
+        @"dock":@{@"x":@(sidebar_x()/CW), @"y":@(chrome_top_row()), @"width":@(SB_COLS),
+                  @"height":@(chrome_bottom_row()-chrome_top_row())},
+        @"cell":@{@"width":@(CW), @"height":@(CH)}, @"hovered":@(chrome_hovered()),
+        @"settings_open":@(g_settings_open), @"settings_tab":@(g_settings_tab),
+        @"reflow_enabled":@(g_chrome_reflow), @"reflow_changed":@(g_display.changed),
+        @"source":source, @"display":display, @"markers":markers, @"tab_rows":tab_rows
+    } mutableCopy];
+    state[@"fontkey"] = [NSString stringWithFormat:@"%c", g_font->key];
+    state[@"schemekey"] = [NSString stringWithFormat:@"%c", g_scheme->key];
+    state[@"pages"] = @{
+        @"tabs":@{@"offset":@(g_tab_offset), @"capacity":@(g_chrome.tab_capacity), @"total":@(g_ntabs), @"row":@(g_chrome.tab_row)},
+        @"settings":@{@"offset":@(g_setting_offset[g_settings_tab]), @"capacity":@(g_chrome.list_capacity), @"total":@(chrome_item_total()), @"row":@(g_chrome.list_row)},
+        @"settings_row":@(g_chrome.settings_row), @"section_row":@(g_chrome.section_row)
+    };
+    NSData *data = [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
+    [data writeToFile:[NSString stringWithUTF8String:path] atomically:YES];
+    [state release];
+}
+
 static void ctl_line(char *s) {
     Tab *tb = active_tab();
     if (!strncmp(s, "type ", 5) && tb) {
@@ -1868,7 +1918,23 @@ static void ctl_line(char *s) {
         else if (!strcmp(c, "closetab")) close_tab(g_active);
         else if (!strcmp(c, "jump")) jump_to_attention();
         else if (!strncmp(c, "tab ", 4)) activate(atoi(c + 4));
-        else if (!strncmp(c, "state ", 6)) {
+        else if (!strncmp(c, "chrome ", 7)) ctl_chrome(c+7);
+        else if (!strncmp(c, "feed ", 5) && tb) {
+            NSData *bytes = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:c+5]];
+            if (bytes && [bytes length] <= 1024*1024) {
+                g_sel_on = g_sel_drag = 0;
+                vt_feed(&tb->t, [bytes bytes], (int)[bytes length]);
+            }
+        } else if (!strncmp(c, "map ", 4) && tb) {
+            int x, y; char path[4096];
+            if (sscanf(c+4, "%d,%d %4095[^\n]", &x, &y, path) == 3) {
+                chrome_prepare_display(&tb->t);
+                int col, row;
+                mouse_cell(term_ox() + x*CW + CW/2, term_oy() + y*CH + CH/2, &col, &row);
+                NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"col":@(col), @"row":@(row)} options:0 error:nil];
+                [data writeToFile:[NSString stringWithUTF8String:path] atomically:YES];
+            }
+        } else if (!strncmp(c, "state ", 6)) {
             NSMutableArray *tabs = [NSMutableArray array];
             for (int k = 0; k < g_ntabs; k++) {
                 Tab *t = g_tabs[k];
@@ -2047,6 +2113,7 @@ static int unit_tests(const char *out_path) {
     }
     fails += unit_scrollback(f);
     fails += unit_underlay(f);
+    fails += unit_chrome(f);
     fails += unit_tab_labels(f);
     fails += mac_update_unit(f);
     {
