@@ -348,8 +348,10 @@ def test_pagination(app):
     app.send("cmd resize 1001,160")
     c = walk_pages(app, "settings")
     before_font = c["fontkey"]
-    c = app.click(c["dock"]["x"] + 8, c["pages"]["settings"]["row"])
-    assert c["fontkey"] != before_font, "first paginated option row did not select its font"
+    button = next(button for button in c["font_buttons"] if button["fontkey"] != before_font)
+    c = app.click(c["dock"]["x"] + button["left"], button["row"])
+    assert c["fontkey"] == button["fontkey"], "font size button selected the wrong font"
+    assert c["cell"] == {"width": button["width"], "height": button["height"]}, c
     font_offset = c["pages"]["settings"]["offset"]
     app.snap("sidebar-font-last-page")
     c = app.click(c["dock"]["x"] + 10, c["pages"]["section_row"])

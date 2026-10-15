@@ -2598,6 +2598,8 @@ static void to_windows_dir(const char *p, wchar_t *out, int cap) {
    same two things rc.bash does for bash. Your profile still loads. */
 static void powershell_cmd(wchar_t *out, int cap) {
     static const char hook[] =
+        "if ($env:HARDCORE_TEST_CONFIG) { try { Set-PSReadLineOption -HistorySaveStyle SaveNothing "
+        "-HistorySavePath (Join-Path $env:HARDCORE_TEST_CONFIG 'history.txt') } catch {} }\n"
         "$global:__hc_prompt = $function:prompt\n"
         "function global:prompt { $e = [char]27; "
         "[Console]::Write(\"$e]9;9;$($executionContext.SessionState.Path.CurrentLocation.ProviderPath)$e\\$e]133;A$e\\\"); "
@@ -2623,7 +2625,8 @@ static void powershell_cmd(wchar_t *out, int cap) {
         GetSystemDirectoryW(sys, MAX_PATH);
         _snwprintf(exe, MAX_PATH, L"%ls\\WindowsPowerShell\\v1.0\\powershell.exe", sys);
     }
-    _snwprintf(out, cap, L"\"%ls\" -NoLogo -NoExit -EncodedCommand %hs", exe, b64);
+    _snwprintf(out, cap, L"\"%ls\" -NoLogo -NoExit %ls-EncodedCommand %hs", exe,
+               _wgetenv(L"HARDCORE_TEST_CONFIG") ? L"-NoProfile " : L"", b64);
     out[cap - 1] = 0;
 }
 
@@ -2839,10 +2842,11 @@ static void tab_destroy_async(Tab *tb) {
 static void config_path(wchar_t *out) { _snwprintf(out, MAX_PATH, L"%ls\\config.ini", g_cfg_dir); out[MAX_PATH - 1] = 0; }
 
 static void config_load(void) {
-    wchar_t path[MAX_PATH], *la = _wgetenv(L"LOCALAPPDATA");
+    wchar_t path[MAX_PATH], *la = _wgetenv(L"LOCALAPPDATA"), *test = _wgetenv(L"HARDCORE_TEST_CONFIG");
     char line[1200];
     FILE *f;
-    _snwprintf(g_cfg_dir, MAX_PATH, L"%ls\\hardcore", la ? la : L".");
+    if (test) _snwprintf(g_cfg_dir, MAX_PATH, L"%ls", test);
+    else _snwprintf(g_cfg_dir, MAX_PATH, L"%ls\\hardcore", la ? la : L".");
     g_cfg_dir[MAX_PATH - 1] = 0;
     CreateDirectoryW(g_cfg_dir, NULL);
     config_path(path);
@@ -5816,7 +5820,52 @@ static BOOL CALLBACK tell_window(HWND h, LPARAM unused) {
     if (h != g_hwnd && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"hardcore")) PostMessageW(h, WM_APP_SETTINGS, 0, 0);
     return TRUE;
 }
-static void plat_settings_tell(void) { EnumWindows(tell_window, 0); }
+static void plat_settings_tell(void) {
+    if (_wgetenv(L"HARDCORE_TEST_CONFIG")) return;
+    EnumWindows(tell_window, 0);
+}
+
+/* Geometry inspection for an explicitly isolated GUI test. The controls and
+   screenshot channel still exercise the normal native renderer and input. */
+static int font_menu_test_state(const char *path) {
+    wchar_t wide[MAX_PATH];
+    FILE *f;
+    int n, i, comma = 0;
+    if (!_wgetenv(L"HARDCORE_TEST_CONFIG") ||
+        !MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH)) return 0;
+    tab_layout();
+    f = _wfopen(wide, L"wb");
+    if (!f) return 0;
+    fprintf(f, "{\"fontkey\":\"%c\",\"settings_open\":%d,\"settings_tab\":%d,\"scale\":%d,"
+               "\"cell\":{\"width\":%d,\"height\":%d},\"dock\":{\"x\":%d,\"width\":%d},"
+               "\"pages\":{\"settings_row\":%d,\"section_row\":%d,"
+               "\"settings\":{\"row\":%d,\"offset\":%d,\"capacity\":%d,\"total\":%d}},\"fonts\":[",
+            g_font->key, g_settings_open, g_settings_tab, g_scale,
+            cell_w(g_font), cell_h(g_font), sidebar_x() / cell_w(g_font), SB_COLS,
+            g_chrome.settings_row, g_chrome.section_row, g_chrome.list_row,
+            g_setting_offset[g_settings_tab], g_chrome.list_capacity, chrome_item_total());
+    for (i = 0; i < NFONTS; i++) {
+        const Font *font = &FONTS[i];
+        fprintf(f, "%s{\"fontkey\":\"%c\",\"name\":\"%s\",\"width\":%d,\"height\":%d,\"dev\":%d}",
+                i ? "," : "", font->key, font->name, cell_w(font), cell_h(font), font->dev);
+    }
+    fputs("],\"font_buttons\":[", f);
+    if (g_settings_open && g_settings_tab == 0) {
+        for (n = 0; n < g_chrome.list_count; n++) {
+            const FontMenuRow *row = &g_font_menu_rows[g_setting_offset[0] + n];
+            for (i = 0; i < row->count; i++) {
+                const FontMenuSize *size = &row->sizes[i];
+                const Font *font = &FONTS[size->font];
+                fprintf(f, "%s{\"fontkey\":\"%c\",\"name\":\"%s\",\"width\":%d,\"height\":%d,"
+                           "\"row\":%d,\"left\":%d,\"right\":%d}",
+                        comma++ ? "," : "", font->key, font->name, cell_w(font), cell_h(font),
+                        g_chrome.list_row + n, size->left, size->right);
+            }
+        }
+    }
+    fputs("]}\n", f);
+    return fclose(f) == 0;
+}
 
 static void tab_set_size(Tab *tb, int cols, int rows) {
     COORD sz;
@@ -6063,6 +6112,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_mouse_x = atoi(buf + 6);
                 g_mouse_y = strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1;
                 settings_point();
+            } else if (!strncmp(buf, "fontmenu ", 9)) {
+                return font_menu_test_state(buf + 9);
             } else if (!strncmp(buf, "click ", 6)) {
                 settings_click(atoi(buf + 6), strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1);
             } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);

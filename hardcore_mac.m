@@ -2094,6 +2094,23 @@ static void ctl_chrome(const char *path) {
         @"settings":@{@"offset":@(g_setting_offset[g_settings_tab]), @"capacity":@(g_chrome.list_capacity), @"total":@(chrome_item_total()), @"row":@(g_chrome.list_row)},
         @"settings_row":@(g_chrome.settings_row), @"section_row":@(g_chrome.section_row)
     };
+    NSMutableArray *font_buttons = [NSMutableArray array];
+    if (g_settings_open && g_settings_tab == 0) {
+        for (int n = 0; n < g_chrome.list_count; n++) {
+            const FontMenuRow *row = &g_font_menu_rows[g_setting_offset[0] + n];
+            for (int i = 0; i < row->count; i++) {
+                const FontMenuSize *size = &row->sizes[i];
+                const Font *font = &FONTS[size->font];
+                [font_buttons addObject:@{
+                    @"fontkey":[NSString stringWithFormat:@"%c", font->key],
+                    @"name":[NSString stringWithUTF8String:font->name],
+                    @"width":@(cell_w(font)), @"height":@(cell_h(font)),
+                    @"row":@(g_chrome.list_row + n), @"left":@(size->left), @"right":@(size->right)
+                }];
+            }
+        }
+    }
+    state[@"font_buttons"] = font_buttons;
     NSData *data = [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
     [data writeToFile:[NSString stringWithUTF8String:path] atomically:YES];
     [state release];

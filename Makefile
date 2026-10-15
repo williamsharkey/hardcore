@@ -52,7 +52,11 @@ build/font.bin: $(FONT) tools/gen_font.py
 
 # the other fonts for the settings (each one's own glyphs) and their list
 FONTS_SRC = font/terminus/ter-u24n.bdf.gz font/terminus/ter-u28n.bdf.gz font/terminus/ter-u32n.bdf.gz \
+            font/terminus/ter-u16n.bdf.gz font/terminus/ter-u18n.bdf.gz font/terminus/ter-u20n.bdf.gz font/terminus/ter-u22n.bdf.gz font/terminus/OFL.TXT \
             font/tamzen/Tamzen8x15r.bdf.gz font/misc-fixed/7x13.bdf.gz font/sony/12x24.bdf.gz font/etl/lt1-24-etl.bdf.gz \
+            font/tamzen/Tamzen8x16r.bdf.gz font/tamzen/Tamzen10x20r.bdf.gz font/tamzen/LICENSE \
+            font/misc-fixed/9x18.bdf.gz font/misc-fixed/10x20.bdf.gz font/misc-fixed/COPYING \
+            font/uw-ttyp0/t0-17-uni.bdf.gz font/uw-ttyp0/t0-18-uni.bdf.gz font/uw-ttyp0/LICENSE \
             font/courier/courier-75dpi-24.bdf.gz font/courier/courier-100dpi-24.bdf.gz font/courier/COPYING \
             font/hairline/hairline-12x26.bdf.gz font/hairline/OFL.txt
 
@@ -99,7 +103,7 @@ build/slurp-version.h: build/slurp-linux
 # which commit a build is (hardcore --version); the release number is HARDCORE_VERSION in hardcore.c
 BUILD := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
-hardcore.exe: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
+hardcore.exe: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_font_menu.h hardcore_display.h hardcore_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c build/res.o $(LIBS)
 
@@ -108,6 +112,7 @@ win-test: hardcore.exe reflow-test
 	python3 tests/run_xtermjs.py
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
+	python3 tests/test_small_fonts.py
 	$(MAKE) --no-print-directory selftest
 	$(MAKE) --no-print-directory slurp-test
 
@@ -140,7 +145,7 @@ build/hardcore.metallib: hardcore.metal
 	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
 	xcrun metallib build/hardcore.air -o $@
 
-build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
+build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_font_menu.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
@@ -173,6 +178,7 @@ mac-test: build/hardcore reflow-test
 	python3 tests/test_mac_update_dispatch.py
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
+	python3 tests/test_small_fonts.py
 	build/hardcore --selftest build/selftest.txt; rc=$$?; cat build/selftest.txt; exit $$rc
 
 clean:
@@ -194,6 +200,7 @@ mac-offline-test: mac-release reflow-test
 	python3 tests/test_mac_update_dispatch.py
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
+	python3 tests/test_small_fonts.py
 	$(MAKE) claude-adapter-test
 	python3 tools/verify_mac_slurp.py --offline
 
@@ -243,13 +250,18 @@ mac-update-test: $(APP)
 	python3 tests/test_update_mac.py
 
 # Opt-in desktop integration: disposable real application sessions in Windows Terminal.
-build/slurp-driver.exe: tests/slurp_driver.c hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
+build/slurp-driver.exe: tests/slurp_driver.c hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_font_menu.h hardcore_display.h hardcore_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-o $@ tests/slurp_driver.c build/res.o $(filter-out -mwindows,$(LIBS))
 
 .PHONY: slurp-app-test
 slurp-app-test: build/slurp-driver.exe
 	python3 tests/test_slurp_apps.py
+
+# Native settings clicks and D3D captures in a disposable, isolated Windows app.
+.PHONY: font-settings-test
+font-settings-test: hardcore.exe
+	python3 tests/test_font_settings_windows.py
 
 # Pure display-only paragraph reflow: also runnable without a desktop.
 .PHONY: reflow-test chrome-test

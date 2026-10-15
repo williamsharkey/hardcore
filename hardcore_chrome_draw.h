@@ -52,25 +52,36 @@ static void render_settings(int hover, int hidx) {
     for (n = 0; n < g_chrome.list_count; n++) {
         int item = offset + n, left = 1, right = SB_COLS - 1, selected = 0, pointed = 0;
         row = g_chrome.list_row + n;
-        if (!g_settings_tab) { selected = &FONTS[item] == g_font; pointed = hover == HIT_FONT && hidx == item; }
+        if (!g_settings_tab) {
+            const FontMenuRow *fonts = &g_font_menu_rows[item];
+            int k;
+            selected = !strcmp(FONTS[fonts->family].name, g_font->name);
+            for (k = 0; k < fonts->count; k++)
+                if (hover == HIT_FONT && hidx == fonts->sizes[k].font) pointed = 1;
+        }
         else if (g_settings_tab == 1) {
             selected = g_scheme->key == FAMILIES[item].dark || g_scheme->key == FAMILIES[item].light;
             pointed = hover == HIT_SCHEME && (SCHEMES[hidx].key == FAMILIES[item].dark || SCHEMES[hidx].key == FAMILIES[item].light);
         } else pointed = (item == 0 && hover == HIT_UNDERLAY) || (item == 1 && hover == HIT_REFLOW) ||
                           (item == 2 && hover == HIT_REFLOW_DEBUG) || (item == 3 && hover == HIT_DOCK_ROW);
-        chrome_row_fill(row, selected, pointed);
+        chrome_row_fill(row, g_settings_tab ? selected : 0, g_settings_tab ? pointed : 0);
         if (!n) chrome_pager_draw(row, offset, g_chrome.list_capacity, chrome_item_total(), 0,
                                   hover == HIT_SETPAGE, hidx, &left, &right);
         if (!g_settings_tab) {
-            const Font *font = &FONTS[item];
-            wchar_t size[24];
-            int size_col;
-            _snwprintf(size, 24, L"%d×%d", cell_w(font), cell_h(font)); size[23] = 0;
-            size_col = right - (int)wcslen(size);
-            grid_text(selected ? L"●" : L" ", left, row, AMBER);
-            _snwprintf(buf, 96, L"%hs", font->name); buf[95] = 0;
-            chrome_label(buf, left + 1, size_col - 1, row, selected ? AMBER : pointed ? on : off);
-            if (size_col > left) grid_text(size, size_col, row, selected ? AMBER : g_look.detail);
+            const FontMenuRow *fonts = &g_font_menu_rows[item];
+            int k;
+            if (fonts->show_name) {
+                utf8_to_wide(FONTS[fonts->family].name, buf, 96);
+                chrome_label(buf, fonts->name_left, fonts->name_right, row, selected ? AMBER : off);
+            }
+            for (k = 0; k < fonts->count; k++) {
+                const FontMenuSize *size = &fonts->sizes[k];
+                int current = &FONTS[size->font] == g_font;
+                int hovered = hover == HIT_FONT && hidx == size->font;
+                if (current || hovered)
+                    fill_rect((float)(size->left * CW), row_y(row), (float)(size->right * CW), row_y(row + 1), current ? AMBER : TAB_HOVER, 1);
+                grid_text(size->label, size->left, row, current ? DEF_BG : hovered ? on : g_look.detail);
+            }
         } else if (g_settings_tab == 1) {
             int k;
             utf8_to_wide(FAMILIES[item].name, buf, 96);

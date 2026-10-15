@@ -762,6 +762,10 @@ closing its original ConPTY; it never attaches to your existing sessions.
 windows, transfers them, checks input and state, and closes its fixtures. It
 requires Windows Terminal and uses whichever tested applications are installed.
 See the [test coverage and remaining work](slurp/README.md#application-matrix).
+`make font-settings-test` is an opt-in Windows desktop check that clicks every
+font size, verifies its saved setting and native cell dimensions, captures D3D
+screenshots, and walks the grouped menu in a short window. It uses a disposable
+process with private settings and shell history.
 
 ## Keys
 
@@ -821,27 +825,33 @@ fit. Back/forward buttons and the page count share the first actual item row;
 the label between them still selects that item. Fonts, themes, and tabs keep
 independent page positions. Menu lists do not scroll.
 
-- **font**: a row per font, its letter, name and cell size in device pixels
-  (the 2×-scaled ones are listed at their doubled size):
+- **font**: sizes are grouped beside their family name. Click a size to apply
+  it; the selected size has an amber background. The menu shows width × height
+  when the family fits, or just heights in compact rows. Long families continue
+  on the next row, and repeat their name at a page boundary. Every size remains
+  selectable when the menu is paginated. Sizes reflect device pixels, including
+  the current display scale for the three legacy scaled cuts.
 
-  | Letter | Font | Cell |
+  | Family | Cells, in size order | Saved preference keys |
   |---|---|---|
-  | `U` | GNU Unifont 18 (the default) | 8×16, scaled |
-  | `Z` | Tamzen 8×15 | 8×15, scaled |
-  | `F` | misc-fixed 7×13 (X11's "fixed") | 7×13, scaled |
-  | `t` | Terminus 24 | 12×24, 1:1 |
-  | `Y` | Sony 12×24 (X11) | 12×24, 1:1 |
-  | `E` | ETL 24 (GNU intlfonts) | 12×24, 1:1 |
-  | `M` | Terminus 28 | 14×28, 1:1 |
-  | `T` | Terminus 32 | 16×32, 1:1 |
-  | `C` | X11 Courier 24 | 15×24, 1:1 |
-  | `R` | X11 Courier 29 | 20×29, 1:1 |
-  | `H` | Hairline 26 (Terminus-derived) | 12×26, 1:1 |
+  | GNU Unifont 18 (default) | 8×16, scaled | `U` |
+  | Tamzen | 8×15 scaled; 8×16; 10×20 | `Z`, `z`, `x` |
+  | Fixed (X11) | 7×13 scaled; 9×18; 10×20 | `F`, `f`, `g` |
+  | Terminus | 8×16; 10×18; 10×20; 11×22; 12×24; 14×28; 16×32 | `a`, `b`, `c`, `d`, `t`, `M`, `T` |
+  | Sony (X11) | 12×24 | `Y` |
+  | ETL (GNU intlfonts) | 12×24 | `E` |
+  | Courier (X11) | 15×24; 20×29 | `C`, `R` |
+  | Hairline (Terminus-derived) | 12×26 | `H` |
+  | UW ttyp0 | 9×17; 9×18 | `p`, `q` |
 
   "Scaled" fonts are multiplied by the display scale like Unifont is: each
   pixel is 2×2 on a Retina screen. The 1:1 ones were drawn for the screen's
   own pixels. Sony and ETL only cover Latin-1, so the rest comes from
   Terminus 24, then Unifont.
+  All ten smaller comparison cuts are included at 1:1 device pixels, including
+  the heavier Fixed 10×20. Existing saved font keys keep their meanings. See
+  [small font sources and rendering](font/small-fonts.md) for exact metrics,
+  native box coverage, fallback behavior, and licenses.
   Courier's native bitmap strokes stay one device pixel wide in straight
   letter stems and bars, even on Retina displays. Curves, serifs, and joins
   can be wider. Its missing or overhanging glyphs use Unifont fitted to the
@@ -976,6 +986,13 @@ The other fonts are BDFs in `font/`, packed by `tools/gen_fonts.py` into
 The separate [Hairline Lab](experiments/font-lab/README.md) compares these
 bitmaps and experiments with taller Terminus-derived ASCII contours. Its
 per-glyph expansion controls do not change the installed fonts.
+
+The [Small Font Lab](experiments/small-font-lab/README.md) compares 11 original
+bitmap faces at native device size, focusing on 17–20 px cells for lower-DPI
+displays. It includes smaller Terminus, UW ttyp0, X11 Fixed, and Tamzen faces,
+terminal/code samples, box-join tests, and a pixel inspector that distinguishes
+native glyphs, generated boxes, and Unicode fallback. Build its self-contained
+preview with `python3 experiments/small-font-lab/build.py`.
 
 At scale 2, the scaled fonts' box drawing (U+2500–257F) is redrawn with
 1-pixel lines as it's drawn: each lit pixel of the glyph becomes a point,

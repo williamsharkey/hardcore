@@ -20,7 +20,10 @@ to the others' 1-pixel lines that looked heavy, so their box drawing
 lines 1 pixel, heavy 3, double two 1-pixel lines, on Terminus's own centre
 lines, and dashes where Terminus has them (it only has the 4-dash one; the
 others are drawn evenly). Terminus 24's own box drawing is already 1 pixel:
-only the dashed lines it lacks are drawn."""
+only the dashed lines it lacks are drawn. The smaller Terminus cuts preserve
+their native pixels too. Tamzen 16 and 20 use generated boxes where possible;
+an empty generated glyph is omitted so it can use the usual Unifont fallback.
+Fixed 18/20 and UW ttyp0 17/18 retain their complete native box drawing."""
 import gzip, math, struct, sys, unicodedata
 
 #  key  name        BDF                                  w   h  dev  thin fallback  box drawing: centre (col, row), and
@@ -37,16 +40,32 @@ FONTS = [
     ('C', 'Courier',  'font/courier/courier-75dpi-24.bdf.gz', 15, 24, 1, 0, None, None),
     ('R', 'Courier',  'font/courier/courier-100dpi-24.bdf.gz', 20, 29, 1, 0, None, None),
     ('H', 'Hairline', 'font/hairline/hairline-12x26.bdf.gz', 12, 26, 1, 0, None, None),
+    # Append sizes without changing existing config keys or table indices.
+    ('a', 'Terminus', 'font/terminus/ter-u16n.bdf.gz',   8, 16, 1,  0,   None,     (3, 7, 'missing')),
+    ('b', 'Terminus', 'font/terminus/ter-u18n.bdf.gz',  10, 18, 1,  0,   None,     (4, 8, 'missing')),
+    ('c', 'Terminus', 'font/terminus/ter-u20n.bdf.gz',  10, 20, 1,  0,   None,     (4, 9, 'missing')),
+    ('d', 'Terminus', 'font/terminus/ter-u22n.bdf.gz',  11, 22, 1,  0,   None,     (5, 10, 'missing')),
+    ('z', 'Tamzen',   'font/tamzen/Tamzen8x16r.bdf.gz', 8, 16, 1,  0,   None,     (3, 7, 'missing')),
+    ('x', 'Tamzen',   'font/tamzen/Tamzen10x20r.bdf.gz',10, 20, 1,  0,   None,     (4, 9, 'missing')),
+    ('f', 'Fixed',    'font/misc-fixed/9x18.bdf.gz',     9, 18, 1,  0,   None,     None),
+    ('g', 'Fixed',    'font/misc-fixed/10x20.bdf.gz',   10, 20, 1,  0,   None,     None),
+    ('p', 'UW ttyp0', 'font/uw-ttyp0/t0-17-uni.bdf.gz', 9, 17, 1,  0,   None,     None),
+    ('q', 'UW ttyp0', 'font/uw-ttyp0/t0-18-uni.bdf.gz', 9, 18, 1,  0,   None,     None),
 ]
 FONT_NOTICES = [
     ('X11 Courier font permission notice', 'font/courier/COPYING'),
     ('Hairline font copyright and Open Font License', 'font/hairline/OFL.txt'),
+    ('Terminus font copyright and Open Font License', 'font/terminus/OFL.TXT'),
+    ('Tamzen and Tamsyn font permission notices', 'font/tamzen/LICENSE'),
+    ('X11 Misc Fixed font public-domain notice', 'font/misc-fixed/COPYING'),
+    ('UW ttyp0 font copyright and permission notices', 'font/uw-ttyp0/LICENSE'),
 ]
 
 # Courier's original BBX includes some marks/block symbols that overhang the
 # nominal line cell. Let those whole glyphs use the usual Unifont fallback;
-# never silently crop an original bitmap to make it fit.
-NO_CLIP_FONTS = {'C', 'R'}
+# never silently crop an original bitmap to make it fit. Apply the same rule
+# to the new small cuts, matching their approved lab rendering.
+NO_CLIP_FONTS = {'C', 'R', 'a', 'b', 'c', 'd', 'z', 'x', 'f', 'g', 'p', 'q'}
 
 def read_bdf(path, W, H, *, omit_overhang=False, omitted=None):
     """cp -> (width, rows), placed on the BDF baseline; optionally reject clipping."""
@@ -238,7 +257,12 @@ def main():
                 if centre[2] == 'missing' and cp in g: continue
                 orig = g[cp][1] if cp in g else [0] * h
                 img = box_glyph(cp, w, h, centre[0], centre[1], orig)
-                g[cp] = (w, [int(''.join(map(str, r)), 2) for r in img])
+                bitmap = [int(''.join(map(str, r)), 2) for r in img]
+                # Four horizontal dashes do not fit the existing generator's
+                # gap rule at width 8. Keep Unifont fallback instead of storing
+                # a blank glyph that would hide it (Tamzen 16 U+2508/U+2509).
+                if any(bitmap):
+                    g[cp] = (w, bitmap)
         rows.append((key, name, w, h, dev, thin, fb, len(blob), len(g)))
         blob += table(g)
     # Keep the complete notices in every binary that embeds this generated file,

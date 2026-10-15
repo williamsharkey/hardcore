@@ -45,8 +45,30 @@ static int chrome_page_offset(int offset, int total, int capacity) {
     if (offset < 0) offset = 0;
     return chrome_min(offset / capacity, (total - 1) / capacity) * capacity;
 }
+/* The page arrows occupy separate targets on the first selectable row.
+   The counter is inert; tabs keep a close button after it. */
+static int chrome_pager_geometry(int offset, int capacity, int total, int tab,
+                                 int *next_col, int *counter_col) {
+    wchar_t counter[24];
+    if (capacity <= 0 || total <= capacity) return 0;
+    _snwprintf(counter, 24, L"%d/%d", offset / capacity + 1, (total + capacity - 1) / capacity);
+    counter[23] = 0;
+    *counter_col = SB_COLS - (tab ? 3 : 1) - (int)wcslen(counter);
+    *next_col = *counter_col - 4;
+    return 1;
+}
+static int chrome_page_hit(int col, int offset, int capacity, int total, int tab, int *direction) {
+    int next_col, counter_col;
+    if (!chrome_pager_geometry(offset, capacity, total, tab, &next_col, &counter_col)) return 0;
+    if (col >= 1 && col < 5) { *direction = -1; return 1; }
+    if (col >= next_col && col < counter_col) { *direction = 1; return 1; }
+    return col >= counter_col && col < SB_COLS - (tab ? 3 : 1) ? 2 : 0;
+}
+
+#include "hardcore_font_menu.h"
+
 static int chrome_item_total(void) {
-    return g_settings_tab == 0 ? NFONTS : g_settings_tab == 1 ? NFAMILIES : CHROME_LAYOUT_ITEMS;
+    return g_settings_tab == 0 ? g_font_menu_count : g_settings_tab == 1 ? NFAMILIES : CHROME_LAYOUT_ITEMS;
 }
 /* Capacity depends on the viewport and complete lists, never the short last
    page. A resize re-aligns each list's offset to the new page boundary. */
@@ -93,11 +115,26 @@ static int scheme_index(int key) {
     return s ? (int)(s - SCHEMES) : 0;
 }
 static void tab_layout(void) {
-    int i, win_w, win_h, items = chrome_item_total();
+    int i, win_w, win_h, items;
     UI_FONT;
+    if (!g_settings_tab) font_menu_build(0, 0);
+    items = chrome_item_total();
     plat_client_size(&win_w, &win_h);
     g_chrome = chrome_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
                               g_tab_underlay, g_dock_row, items);
+    if (!g_settings_tab && g_settings_open && g_chrome.list_capacity > 0 && items > g_chrome.list_capacity) {
+        /* Page controls share the first actual row. Pack that row into the
+           same reduced bounds as the arrows, so no size can be covered up.
+           A compact font row is still selectable in a one-row viewport. */
+        int pass;
+        for (pass = 0; pass < NFONTS; pass++) {
+            int previous = items, capacity = g_chrome.list_capacity;
+            items = font_menu_build(capacity, items);
+            g_chrome = chrome_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
+                                      g_tab_underlay, g_dock_row, items);
+            if (items == previous && capacity == g_chrome.list_capacity) break;
+        }
+    }
     if (g_tab_underlay) g_dock_row = g_chrome.top;
     if (g_active != g_layout_active || g_ntabs != g_layout_ntabs) {
         if (g_active >= 0) g_tab_offset = g_active;
@@ -130,25 +167,6 @@ static int chrome_hovered(void) {
     return g_mouse_x >= x && g_mouse_x < x + SB_COLS * cw &&
            g_mouse_y >= g_chrome.top * ch && g_mouse_y < g_chrome.bottom * ch;
 }
-/* The page arrows occupy separate targets on the first selectable row.
-   The counter is inert; tabs keep a close button after it. */
-static int chrome_pager_geometry(int offset, int capacity, int total, int tab,
-                                 int *next_col, int *counter_col) {
-    wchar_t counter[24];
-    if (capacity <= 0 || total <= capacity) return 0;
-    _snwprintf(counter, 24, L"%d/%d", offset / capacity + 1, (total + capacity - 1) / capacity);
-    counter[23] = 0;
-    *counter_col = SB_COLS - (tab ? 3 : 1) - (int)wcslen(counter);
-    *next_col = *counter_col - 4;
-    return 1;
-}
-static int chrome_page_hit(int col, int offset, int capacity, int total, int tab, int *direction) {
-    int next_col, counter_col;
-    if (!chrome_pager_geometry(offset, capacity, total, tab, &next_col, &counter_col)) return 0;
-    if (col >= 1 && col < 5) { *direction = -1; return 1; }
-    if (col >= next_col && col < counter_col) { *direction = 1; return 1; }
-    return col >= counter_col && col < SB_COLS - (tab ? 3 : 1) ? 2 : 0;
-}
 static int hit_tabbar(int mx, int my, int *idx) {
     int col, row, i, page_hit;
     UI_FONT;
@@ -175,7 +193,10 @@ static int hit_tabbar(int mx, int my, int *idx) {
         if (row == g_chrome.list_row && (page_hit = chrome_page_hit(col, g_setting_offset[g_settings_tab], g_chrome.list_capacity, chrome_item_total(), 0, idx))) {
             UI_DONE; return page_hit == 1 ? HIT_SETPAGE : HIT_CHROME_INERT;
         }
-        if (!g_settings_tab) { *idx = item; UI_DONE; return HIT_FONT; }
+        if (!g_settings_tab) {
+            *idx = font_menu_hit(item, col);
+            UI_DONE; return *idx >= 0 ? HIT_FONT : HIT_CHROME_INERT;
+        }
         if (g_settings_tab == 1) {
             /* The last two label cells select the light variant. On a page's
                first row those cells precede the next-page button. */
@@ -218,7 +239,7 @@ static void settings_apply(void) {
     settings_point();
 }
 static void settings_pick(int hit, int idx) {
-    if (hit == HIT_FONT) g_font = &FONTS[idx];
+    if (hit == HIT_FONT && idx >= 0 && idx < NFONTS) g_font = &FONTS[idx];
     else if (hit == HIT_SCHEME) g_scheme = &SCHEMES[idx];
     else return;
     config_save(); plat_settings_tell(); settings_apply();
@@ -240,6 +261,7 @@ static void settings_click(int mx, int my) {
 }
 static int unit_chrome(FILE *f) {
     int fails = 0, rows, open, tabs, underlay, next_col, counter_col, direction;
+    fails += unit_font_menu(f);
     for (rows = 1; rows <= 48; rows++) for (open = 0; open <= 1; open++)
         for (tabs = 1; tabs <= MAX_TABS; tabs += 7) for (underlay = 0; underlay <= 2; underlay++) {
             ChromeLayout a = chrome_measure(rows, 2, tabs, open, underlay, 8, NFONTS);
