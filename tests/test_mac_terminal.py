@@ -20,7 +20,7 @@ import tempfile
 import time
 import unittest
 
-from test_mac_import_resize import bounded_run
+from test_mac_import_resize import bounded_run, production_function
 
 exe=str(Path('build/hardcore').resolve())
 
@@ -60,6 +60,9 @@ METADATA_HARNESS = r'''
 #include <util.h>
 
 /* METADATA */
+
+typedef struct { int fd, exited; pid_t pid; } Tab;
+/* NATIVE_NAME */
 
 static pid_t owned;
 static void require(BOOL value, const char *message) {
@@ -148,6 +151,32 @@ int main(int argc, const char **argv) {
             NSData *data = [NSJSONSerialization dataWithJSONObject:mac_terminal_metadata(@(argv[2])) options:0 error:nil];
             fwrite(data.bytes, 1, data.length, stdout); putchar('\n'); return 0;
         }
+        if (!strcmp(argv[1], "native")) {
+            require(argc == 6, "native arguments");
+            int master;
+            owned = forkpty(&master, NULL, NULL, NULL);
+            require(owned >= 0, "native owned forkpty");
+            if (!owned) { execl(argv[2], argv[2], "--worker", argv[3], argv[4], argv[5], NULL); _exit(2); }
+            fcntl(master, F_SETFL, fcntl(master, F_GETFL) | O_NONBLOCK);
+            ready(master);
+            Tab tab = {.fd = master, .pid = owned}; char name[64];
+            mac_foreground_name(&tab, name, sizeof(name));
+            require(!name[0], "idle native shell has a foreground program");
+            require(write(master, "g", 1) == 1, "native foreground command"); ready(master);
+            mac_foreground_name(&tab, name, sizeof(name));
+            require(!strcmp(name, "claude"), "native Claude version displayed as program name");
+            tab.exited = 1;
+            mac_foreground_name(&tab, name, sizeof(name));
+            require(!name[0], "exited native tab retained foreground name");
+            tab.exited = 0;
+            require(write(master, "q", 1) == 1, "native foreground exit"); ready(master);
+            mac_foreground_name(&tab, name, sizeof(name));
+            require(!name[0], "native shell retained finished Claude label");
+            require(write(master, "q", 1) == 1, "native controller exit");
+            int status; require(waitpid(owned, &status, 0) == owned, "native controller reap"); owned = 0;
+            require(WIFEXITED(status) && !WEXITSTATUS(status), "native controller failed");
+            close(master); return 0;
+        }
         require(!strcmp(argv[1], "kernel") && (argc == 6 || argc == 7), "kernel arguments");
         int master; char device[128] = {0};
         owned = forkpty(&master, device, NULL, NULL);
@@ -196,7 +225,8 @@ class TerminalMetadataTests(unittest.TestCase):
         source = Path('hardcore_mac_terminal.m').read_text()
         metadata = source[source.index('#include <libproc.h>'):source.index('static NSAppleEventDescriptor *mac_terminal_script')]
         harness = cls.root / 'metadata.m'
-        harness.write_text(METADATA_HARNESS.replace('/* METADATA */', metadata))
+        native = production_function(Path('hardcore_mac.m'), 'static void mac_foreground_name(Tab *tb, char *out, int cap)')
+        harness.write_text(METADATA_HARNESS.replace('/* METADATA */', metadata).replace('/* NATIVE_NAME */', native))
         cls.binary = cls.root / 'metadata'
         compiled = bounded_run(['clang', '-Wall', '-Wextra', '-Werror', '-mmacosx-version-min=11.0',
                                 str(harness), '-o', str(cls.binary), '-framework', 'Cocoa'], 30)
@@ -234,6 +264,9 @@ class TerminalMetadataTests(unittest.TestCase):
         for binary in (self.versioned, self.older_versioned):
             with self.subTest(version=binary.name):
                 self.run_case('kernel', binary, self.root / 'first', self.root / 'second', self.root / 'ruffian', binary.name)
+
+    def test_native_tab_names_versioned_claude_and_clears_on_return_to_shell(self):
+        self.run_case('native', self.binary, self.root / 'first', self.root / 'second', self.versioned)
 
     def test_real_owned_foreground_metadata_changes(self):
         self.run_case('kernel', self.root / 'claude', self.root / 'first', self.root / 'second', self.root / 'ruffian')

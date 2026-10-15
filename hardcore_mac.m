@@ -926,12 +926,20 @@ static int tab_busy_program(Tab *tb, char *name, int cap) {
 
 /* Read argv without consulting titles. JS launchers often keep "node" as
    their process name; their script gives us "codex", "claude", or "grok". */
+static NSString *mac_terminal_known_program(NSString *path);
 static void mac_foreground_name(Tab *tb, char *out, int cap) {
     out[0] = 0;
     if (tb->fd < 0 || tb->exited) return;
     pid_t fg = tcgetpgrp(tb->fd);
     if (fg <= 0 || fg == tb->pid) return;
     if (proc_name(fg, out, (uint32_t)cap) <= 0) return;
+    /* Native Claude's process name is its release number (e.g. 2.1.301).
+       Use the same kernel executable-path classifier as source sessions. */
+    char executable[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    if (proc_pidpath(fg, executable, sizeof(executable)) > 0) {
+        NSString *known = mac_terminal_known_program([NSString stringWithUTF8String:executable] ?: @"");
+        if (known) { snprintf(out, cap, "%s", known.UTF8String); return; }
+    }
     if (strcmp(out,"node") && strcmp(out,"bun") && strcmp(out,"deno")) return;
     int mib[3] = {CTL_KERN, KERN_PROCARGS2, fg};
     size_t n = 1024 * 1024;
