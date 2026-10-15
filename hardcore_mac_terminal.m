@@ -52,6 +52,23 @@ static NSString *mac_terminal_known_program(NSString *path) {
     return nil;
 }
 
+/* The installed CLI on PATH can be newer than a running native Claude.
+ * Only the kernel's executable path identifies that process's release. */
+static NSString *mac_terminal_native_version(NSString *path) {
+    if (![mac_terminal_known_program(path) isEqual:@"claude"]) return @"";
+    NSString *parent = path.stringByDeletingLastPathComponent;
+    if (![parent.lastPathComponent isEqual:@"versions"] ||
+        ![parent.stringByDeletingLastPathComponent.lastPathComponent isEqual:@"claude"]) return @"";
+    NSString *version = path.lastPathComponent;
+    NSArray *parts = [version componentsSeparatedByString:@"."];
+    if (parts.count != 3) return @"";
+    NSCharacterSet *notDigit = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
+    for (NSString *part in parts)
+        if (!part.length || (part.length > 1 && [part hasPrefix:@"0"]) ||
+            [part rangeOfCharacterFromSet:notDigit].location != NSNotFound) return @"";
+    return version;
+}
+
 static int mac_terminal_is_shell(NSString *name) {
     return [@[@"sh", @"bash", @"zsh", @"fish", @"dash", @"ksh", @"csh", @"tcsh"] containsObject:name];
 }
@@ -115,6 +132,13 @@ static NSDictionary *mac_terminal_metadata(NSString *tty) {
     proc_name((pid_t)selected.pbi_pid, process, sizeof(process));
     NSString *program = mac_terminal_program_name([NSString stringWithUTF8String:process] ?: @"",
                                                   mac_terminal_arguments((pid_t)selected.pbi_pid));
+    char executable[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    NSString *programVersion = @"";
+    if (proc_pidpath((pid_t)selected.pbi_pid, executable, sizeof(executable)) > 0) {
+        NSString *path = [NSString stringWithUTF8String:executable] ?: @"";
+        programVersion = mac_terminal_native_version(path);
+        program = mac_terminal_known_program(path) ?: program;
+    }
     struct proc_vnodepathinfo paths;
     NSString *cwd = @"";
     if (proc_pidinfo((pid_t)selected.pbi_pid, PROC_PIDVNODEPATHINFO, 0, &paths, sizeof(paths)) == sizeof(paths))
@@ -125,9 +149,14 @@ static NSDictionary *mac_terminal_metadata(NSString *tty) {
     if (proc_pidinfo((pid_t)selected.pbi_pid, PROC_PIDTBSDINFO, 0, &current, sizeof(current)) != sizeof(current) ||
         current.pbi_start_tvsec != selected.pbi_start_tvsec || current.pbi_start_tvusec != selected.pbi_start_tvusec ||
         current.e_tdev != (uint32_t)device.st_rdev || current.e_tpgid != current.pbi_pgid) return @{};
+    if (executable[0]) {
+        char currentExecutable[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath((pid_t)selected.pbi_pid, currentExecutable, sizeof(currentExecutable)) <= 0 ||
+            strcmp(executable, currentExecutable)) return @{};
+    }
     int shell = mac_terminal_is_shell(program);
     return @{@"tty":tty, @"cwd":cwd, @"program":shell ? @"" : program,
-             @"shell":shell ? program : @"", @"pid":@(selected.pbi_pid)};
+             @"programVersion":programVersion, @"shell":shell ? program : @"", @"pid":@(selected.pbi_pid)};
 }
 
 static NSAppleEventDescriptor *mac_terminal_script(NSString *body, int report) {
@@ -165,7 +194,7 @@ static NSArray *mac_terminal_sessions(int report) {
             NSMutableDictionary *session = [NSMutableDictionary dictionaryWithDictionary:@{
                 @"tty":tty, @"window":@(window), @"host":@(host),
                 @"title":[item descriptorAtIndex:3].stringValue ?: @"",
-                @"cwd":@"", @"program":@"", @"shell":@"", @"pid":@0,
+                @"cwd":@"", @"program":@"", @"programVersion":@"", @"shell":@"", @"pid":@0,
                 @"identity":[NSString stringWithFormat:@"terminal:%d:%d:%@", host, window, tty]}];
             [session addEntriesFromDictionary:mac_terminal_metadata(tty)];
             [sessions addObject:session];

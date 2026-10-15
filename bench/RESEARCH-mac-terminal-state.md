@@ -343,6 +343,23 @@ Terminal views require explicit `--bridge`; they are not a fallback reported as
 a successful transfer. Claude conversation verification remains separate from
 the parent-shell and Terminal-history proofs needed to close the source.
 
+Read-only inspection also found two discovery boundaries. An installed CLI
+upgrade does not change the executable image of a running Claude process: live
+sources on this Mac were still version 2.1.296 while the installed command was
+2.1.300. The handoff needs the newer source-runtime API, so checking only
+`claude --version` is insufficient. Known older source versions must be reported
+and left running without adapter installation or queuing.
+
+A Terminal foreground Claude process can also be a parked interactive frontend.
+Its process-registry record retains `kind: interactive` but has a `parkedJobId`;
+the installed CLI deliberately excludes such records from its interactive
+session listing. In the inspected case, that parked job no longer had a matching
+job directory or live process-registry entry. Another background session in the
+same project was not evidence that it was the session currently displayed by
+that frontend. A background attachment route needs an independently verified
+job/client identity; it must not guess from a shared working directory or
+silently queue a different conversation.
+
 ## Implementation status and remaining work
 
 1. The manual styled-copy fixture and bounded archive decoder are implemented.

@@ -144,11 +144,14 @@ do not make arbitrary existing Terminal shells eligible for automatic closure.
 Run these commands from the repository root.
 
 On macOS, `hardcore slurp` discovers sources and chooses the available transfer
-route. For ordinary Terminal Claude sessions it installs the project adapter
-if needed and queues an exact-source handoff; first-time running sessions still
+route. For supported ordinary Terminal Claude sessions it installs the project
+adapter if needed and queues an exact-source handoff; first-time running sessions still
 need `/reload-plugins` in Claude and a subsequent safe completed turn. Unsupported
 sources stay in place. Plain-text Terminal views require explicit `--bridge`
 and show `folder:program [bridge]`; they keep depending on the original tab.
+The running Claude process must be version 2.1.300 or newer; upgrading the
+installed CLI leaves existing processes on their old version. Known older
+sources are reported and retained without adapter installation or queuing.
 Neither a bridge nor a verified Claude conversation transfers the parent shell
 and Terminal history or authorizes closing that window.
 
@@ -273,7 +276,7 @@ They also verify refusal of child-process trees and session leaders, protected
 shell attach failure, and an unusable receiver leaving the source functional.
 
 This backend remains **test-only**. `hardcore slurp --terminal TTY` selects a
-source for the supported host or Claude route, leaving unsupported jobs alone.
+source for the supported host or eligible Claude route, leaving unsupported jobs alone.
 `hardcore slurp --bridge --terminal TTY` explicitly selects the plain-text view
 described in the [Mac guide](../README.md#slurp-on-macos).
 The tests configure their source zsh with `NO_HUP`;

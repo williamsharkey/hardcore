@@ -1,8 +1,11 @@
 # Hardcore Claude handoff adapter
 
 The adapter requires a Hardcore build that includes Claude handoff and Claude
-Code 2.1.300 or later. Earlier Claude versions cannot supply the rich conversation
-snapshot. Use Hardcore's normal slurp command for a conversation already running
+Code 2.1.300 or later in the **running source process**. Updating the installed
+CLI does not upgrade an existing session. Earlier Claude versions cannot supply
+the rich conversation snapshot; slurp reports a known older source version and
+leaves it running without installing or queueing the adapter.
+Use Hardcore's normal slurp command for an eligible conversation already running
 in Terminal.app:
 
 ```sh
@@ -11,7 +14,7 @@ hardcore slurp
 hardcore slurp --terminal /dev/ttys003
 ```
 
-Slurp discovers the project's live Claude session, enables **both**
+Slurp discovers the project's eligible live Claude session, enables **both**
 `hardcore-slurp` and `hardcore-slurp-driver` for that project if needed, and
 queues a request bound to the exact source session and process identity. If the
 adapter is new to that running session, run `/reload-plugins` once in Claude.

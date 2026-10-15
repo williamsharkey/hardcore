@@ -34,6 +34,7 @@ class SlurpMacTests(unittest.TestCase):
         self.helper.valid_session_id.side_effect = lambda value: isinstance(value, str) and str(uuid.UUID(value)) == value
         self.helper.progress.return_value = {'ok': True, 'state': 'attaching', 'sourceSessionId': SID}
         self.adapter = mock.Mock()
+        self.adapter.MIN_VERSION = (2, 1, 300)
         self.adapter.handoff_helper.return_value = self.helper
         self.adapter.bundled_marketplace.return_value = Path('/bundled plugins')
         self.result = {'ok': True, 'state': 'queued', 'intentId': 'ab'*16, 'sourceSessionId': SID}
@@ -83,6 +84,63 @@ class SlurpMacTests(unittest.TestCase):
                 self.adapter.move.assert_not_called()
                 native.assert_called_once()
                 self.assertIn('source retained', err)
+
+    def test_known_old_running_runtime_refused_before_matching_or_configuration(self):
+        for version in ('2.1.296', '2.0.999', '1.99.999'):
+            with self.subTest(version=version):
+                source = {**self.source, 'programVersion': version}
+                status, _, err, native = self.coordinate(discovery={**self.snapshot, 'terminal': [source]})
+                self.assertEqual(status, 1)
+                self.assertIn(f'Running Claude Code {version}', err)
+                self.assertIn('2.1.300 required', err)
+                self.assertIn('updating the installed CLI does not update this running session', err)
+                self.assertIn('source retained', err)
+                self.adapter.handoff_helper.assert_not_called()
+                self.adapter.bundled_marketplace.assert_not_called()
+                self.adapter.move.assert_not_called()
+                self.helper.jobs.assert_not_called()
+                native.assert_called_once()
+
+    def test_supported_or_unknown_running_version_keeps_exact_session_guard(self):
+        for version in ('2.1.300', '2.1.301', '2.2.0', '3.0.0', ''):
+            with self.subTest(version=version):
+                self.adapter.move.reset_mock()
+                self.helper.jobs.reset_mock()
+                source = {**self.source, 'programVersion': version}
+                status, out, err, _ = self.coordinate(discovery={**self.snapshot, 'terminal': [source]})
+                self.assertEqual(status, 0, err)
+                self.adapter.move.assert_called_once()
+                self.helper.jobs.assert_called_once_with('/mock path/claude', str(self.project.resolve()))
+                self.assertIn('1 Claude queued (pending)', out)
+
+    def test_running_version_change_invalidates_exact_source_identity(self):
+        source = {**self.source, 'programVersion': '2.1.300'}
+        initial = {**self.snapshot, 'terminal': [source]}
+        for version in ('2.1.296', '2.1.301', ''):
+            with self.subTest(version=version):
+                self.adapter.move.reset_mock()
+                changed = {**self.snapshot, 'terminal': [{**source, 'programVersion': version}]}
+                status, _, err, _ = self.coordinate(discovery=[initial, changed])
+                self.assertEqual(status, 1)
+                self.assertIn('changed while preparing', err)
+                self.adapter.move.assert_not_called()
+        # Installation's validation callback also catches a same-PID exec
+        # after initial matching and before a handoff can be queued.
+        changed = {**self.snapshot, 'terminal': [{**source, 'programVersion': '2.1.301'}]}
+        status, _, err, _ = self.coordinate(discovery=[initial, initial, changed])
+        self.assertEqual(status, 1)
+        self.assertIn('changed while preparing', err)
+        self.adapter.move.assert_called_once()
+
+    def test_malformed_running_version_never_reaches_adapter_or_match(self):
+        for version in (None, 201300, '2.1', '2.1.300\x1b[2J', '2.1.300-beta', '9'*100+'.1.0'):
+            with self.subTest(version=version):
+                source = {**self.source, 'programVersion': version}
+                status, _, err, _ = self.coordinate(discovery={**self.snapshot, 'terminal': [source]})
+                self.assertEqual(status, 1)
+                self.assertIn('invalid running program version', err)
+                self.adapter.handoff_helper.assert_not_called()
+                self.adapter.move.assert_not_called()
 
     def test_kernel_identity_changes_prevent_adapter_mutation(self):
         for change in ({'pid': 2002}, {'cwd': str(self.project.parent)}, {'host': 999}, {'window': 88},

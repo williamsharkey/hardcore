@@ -133,12 +133,22 @@ int main(int argc, const char **argv) {
             require(![mac_terminal_metadata(@"/dev/ttys999999999") count], "absent tty gets metadata");
             return 0;
         }
+        if (!strcmp(argv[1], "versions")) {
+            equal(mac_terminal_native_version(@"/Users/test/.local/share/claude/versions/2.1.300"), @"2.1.300", "native running version missing");
+            equal(mac_terminal_native_version(@"/Users/test/.local/share/claude/versions/2.1.296"), @"2.1.296", "old running version replaced with current CLI version");
+            for (NSString *path in @[@"/usr/local/bin/claude", @"/tmp/codex/versions/2.1.300",
+                @"/Users/test/.local/share/claude/versions/2.1.300/claude", @"/Users/test/.local/share/claude/versions/latest",
+                @"/Users/test/.local/share/claude/versions/2.1.300.js", @"/Users/test/.local/share/claude/versions/2.01.300",
+                @"/Users/test/.local/share/claude/versions/2.1", @"/Users/test/.local/share/claude/versions/2.1.300-beta"])
+                equal(mac_terminal_native_version(path), @"", "non-release executable path invented version");
+            return 0;
+        }
         if (!strcmp(argv[1], "inspect")) {
             require(argc == 3, "tty required");
             NSData *data = [NSJSONSerialization dataWithJSONObject:mac_terminal_metadata(@(argv[2])) options:0 error:nil];
             fwrite(data.bytes, 1, data.length, stdout); putchar('\n'); return 0;
         }
-        require(!strcmp(argv[1], "kernel") && argc == 6, "kernel arguments");
+        require(!strcmp(argv[1], "kernel") && (argc == 6 || argc == 7), "kernel arguments");
         int master; char device[128] = {0};
         owned = forkpty(&master, device, NULL, NULL);
         require(owned >= 0, "owned forkpty");
@@ -148,10 +158,12 @@ int main(int argc, const char **argv) {
         NSDictionary *first = mac_terminal_metadata(@(device));
         equal(first[@"cwd"], @(argv[3]), "source cwd differs from bridge parent cwd");
         equal(first[@"program"], @"claude", "foreground native Claude not identified");
+        equal(first[@"programVersion"], argc == 7 ? @(argv[6]) : @"", "version not derived from owned executable path");
         require([first[@"pid"] intValue] == owned, "source pid differs");
         require(write(master, "g", 1) == 1, "owned foreground command"); ready(master);
         NSDictionary *foreground = mac_terminal_metadata(@(device));
         equal(foreground[@"program"], @"ruffian", "foreground job changed but source name did not");
+        equal(foreground[@"programVersion"], @"", "foreground child inherited old program version");
         equal(foreground[@"cwd"], @(argv[4]), "foreground job cwd ignored");
         require([foreground[@"pid"] intValue] != owned, "background controller was chosen over foreground job");
         require(write(master, "q", 1) == 1, "owned foreground exit"); ready(master);
@@ -161,6 +173,7 @@ int main(int argc, const char **argv) {
         require(write(master, "x", 1) == 1, "owned exec command"); ready(master);
         NSDictionary *next = mac_terminal_metadata(@(device));
         equal(next[@"program"], @"ruffian", "same-PID foreground exec was not refreshed");
+        equal(next[@"programVersion"], @"", "same-PID exec retained old program version");
         equal(next[@"cwd"], @(argv[4]), "cwd after exec differs");
         require([next[@"pid"] intValue] == owned, "exec changed source identity unexpectedly");
         require(write(master, "q", 1) == 1, "owned exit command");
@@ -192,6 +205,11 @@ class TerminalMetadataTests(unittest.TestCase):
         import shutil
         for name in ('claude', 'ruffian'):
             shutil.copy2(cls.binary, cls.root / name)
+        cls.versioned = cls.root / '.local/share/claude/versions/2.1.300'
+        cls.versioned.parent.mkdir(parents=True)
+        shutil.copy2(cls.binary, cls.versioned)
+        cls.older_versioned = cls.versioned.parent / '2.1.296'
+        shutil.copy2(cls.binary, cls.older_versioned)
         for name in ('first', 'second'):
             (cls.root / name).mkdir()
 
@@ -208,6 +226,14 @@ class TerminalMetadataTests(unittest.TestCase):
 
     def test_tty_validation(self):
         self.run_case('validation')
+
+    def test_native_version_only_from_recognized_release_path(self):
+        self.run_case('versions')
+
+    def test_running_native_version_and_exec_clear(self):
+        for binary in (self.versioned, self.older_versioned):
+            with self.subTest(version=binary.name):
+                self.run_case('kernel', binary, self.root / 'first', self.root / 'second', self.root / 'ruffian', binary.name)
 
     def test_real_owned_foreground_metadata_changes(self):
         self.run_case('kernel', self.root / 'claude', self.root / 'first', self.root / 'second', self.root / 'ruffian')

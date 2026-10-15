@@ -86,6 +86,23 @@ def source_label(source):
     return safe_text(f"{source.get('tty', 'unknown TTY')} {folder}:{program}", limit=500)
 
 
+def source_program_version(source):
+    """The running image's kernel-reported version, never the CLI on PATH."""
+    version = source.get('programVersion', '')
+    if not isinstance(version, str) or (version and not re.fullmatch(r'[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}', version)):
+        raise SlurpError('Source has an invalid running program version')
+    return version
+
+
+def require_supported_runtime(source, minimum):
+    version = source_program_version(source)
+    if version and tuple(map(int, version.split('.'))) < minimum:
+        required = '.'.join(map(str, minimum))
+        raise SlurpError(f'Running Claude Code {version} is older than {required} required by automatic handoff; '
+                         'updating the installed CLI does not update this running session; '
+                         'no plugin installation or handoff was requested')
+
+
 def source_identity(source):
     tty, pid, cwd = source.get('tty'), source.get('pid'), source.get('cwd')
     if (not isinstance(tty, str) or not TTY.fullmatch(tty) or type(pid) is not int or pid <= 1 or
@@ -96,7 +113,8 @@ def source_identity(source):
     project = Path(cwd).resolve(strict=True)
     if not project.is_dir():
         raise SlurpError('Source project is not a directory')
-    return (tty, source['window'], source['host'], pid, str(project), source['program'], source['managed'])
+    return (tty, source['window'], source['host'], pid, str(project), source['program'], source['managed'],
+            source_program_version(source))
 
 
 def match_claude(source, command, helper):
@@ -226,6 +244,10 @@ def coordinate(executable, terminal=None, *, adapter=None, bootstrap=None, stdou
             continue
         try:
             adapter = adapter or load_adapter()
+            # A newer `claude` on PATH does not upgrade an already-running
+            # native image. Refuse known unsupported runtimes before any CLI
+            # session matching, configuration, plugin install or queueing.
+            require_supported_runtime(source, adapter.MIN_VERSION)
             command = shutil.which('claude')
             if not command:
                 raise SlurpError('Claude Code is not installed or is not on PATH')

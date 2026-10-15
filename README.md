@@ -508,9 +508,10 @@ GUI/PTY integration tests using disposable installations on a logged-in Mac.
 
 Run `hardcore slurp` to discover sessions and use the available transfer route.
 It transfers native Hardcore tabs, attaches portable hosts and eligible tmux
-sessions, and prepares a cooperative handoff for Claude already running in
-Terminal. For Claude, it installs the project adapter if needed and queues a
-request for that exact source session. A first-time adapter still needs one
+sessions, and prepares a cooperative handoff for supported Claude sessions
+already running in Terminal. For an eligible Claude source, it installs the
+project adapter if needed and queues a request for that exact source session.
+A first-time adapter still needs one
 `/reload-plugins` in the existing Claude session, then a safely completed turn.
 The command reports this pending state; queuing a request is not a completed move.
 
@@ -652,8 +653,11 @@ original source, destination, receiving client and window still exist.
 `recover` creates a private JSON file containing the saved draft and cursor,
 refusing existing files. These commands do not submit text or restart a job.
 
-This experimental adapter requires Claude Code 2.1.300 or newer. It installs two
-project-scoped plugins using the official CLI; both must remain enabled during
+This experimental adapter requires the **running source Claude process** to be
+version 2.1.300 or newer. Updating the installed `claude` command does not upgrade
+an existing process. Slurp reports a known older source version and leaves that
+session running without installing or queueing its adapter.
+The adapter installs two project-scoped plugins using the official CLI; both must remain enabled during
 handoff. It uses Claude's shared plugin cache but does not enable the plugins
 in other projects. Managed settings that suppress user-installed hooks can
 prevent readiness. See [adapter details](plugins/hardcore-slurp/README.md).
