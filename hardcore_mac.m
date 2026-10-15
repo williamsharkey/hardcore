@@ -52,6 +52,7 @@ static int g_paint_pending;      /* a frame is wanted (see plat_invalidate) */
 static double uptime_ms(void);
 static NSTimer *g_timers[8];
 
+static char g_mac_bin_dir[4096];
 static const char *g_shell;      /* your login shell */
 
 /* ── platform layer ─────────────────────────────────────────────────── */
@@ -619,9 +620,13 @@ static void child_env(void) {
                                  "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
                                  "CLAUDE_CODE_MESSAGING_TOKEN", "OLDPWD",
                                  /* our own test knobs */
-                                 "HARDCORE_CTL", "HARDCORE_NO_ACTIVATE", "HARDCORE_SHELL"};
+                                 "HARDCORE_CTL", "HARDCORE_NO_ACTIVATE", "HARDCORE_SHELL", "HARDCORE_MAC_ROLLBACK", "HARDCORE_TEST_CONFIG"};
     size_t i;
     for (i = 0; i < sizeof(drop) / sizeof(drop[0]); i++) unsetenv(drop[i]);
+    const char *path = getenv("PATH");
+    char cli_path[16384];
+    snprintf(cli_path, sizeof(cli_path), "%s:%s", g_mac_bin_dir, path ? path : "/usr/bin:/bin");
+    setenv("PATH", cli_path, 1);
     /* 24-bit color (chalk drops to 256 colors without it), OSC 8 links */
     setenv("TERM", "xterm-256color", 1);
     setenv("COLORTERM", "truecolor", 1);
@@ -672,29 +677,11 @@ static void exec_shell(const char *dir, int spare) {
     _exit(127);
 }
 
-static int tab_spawn(Tab *tb) {
-    struct winsize ws;
-    pid_t pid;
-    int fd, id = tb->id;
+/* Reinstall dispatch watchers after spawn or an exec-based live update. */
+static void mac_watch_tab(Tab *tb) {
+    int fd = tb->fd, id = tb->id;
+    pid_t pid = tb->pid;
     dispatch_source_t r, p;
-    memset(&ws, 0, sizeof(ws));
-    ws.ws_col = (unsigned short)tb->t.cols;
-    ws.ws_row = (unsigned short)tb->t.rows;
-    ws.ws_xpixel = (unsigned short)(tb->t.cols * CW);
-    ws.ws_ypixel = (unsigned short)(tb->t.rows * CH);
-    pid = forkpty(&fd, NULL, NULL, &ws);
-    if (pid < 0) {
-        char msg[200];
-        snprintf(msg, sizeof(msg), "\x1b[31mhardcore: forkpty failed: %s\x1b[0m\r\n", strerror(errno));
-        term_message(&tb->t, msg);
-        return 0;
-    }
-    if (pid == 0) exec_shell(tb->start_dir, tb->spare);
-    fcntl(fd, F_SETFD, FD_CLOEXEC);    /* later tabs' shells mustn't hold this one open */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-    tb->fd = fd;
-    tb->pid = pid;
-    tb->born = GetTickCount();
     tb->wpending = (int *)calloc(1, sizeof(int));
     tb->wq = dispatch_queue_create("hardcore.tab.write",
                                    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
@@ -718,6 +705,32 @@ static int tab_spawn(Tab *tb) {
         on_tab_exited(id, code);
     });
     dispatch_resume(p);
+
+}
+
+static int tab_spawn(Tab *tb) {
+    struct winsize ws;
+    pid_t pid;
+    int fd;
+    memset(&ws, 0, sizeof(ws));
+    ws.ws_col = (unsigned short)tb->t.cols;
+    ws.ws_row = (unsigned short)tb->t.rows;
+    ws.ws_xpixel = (unsigned short)(tb->t.cols * CW);
+    ws.ws_ypixel = (unsigned short)(tb->t.rows * CH);
+    pid = forkpty(&fd, NULL, NULL, &ws);
+    if (pid < 0) {
+        char msg[200];
+        snprintf(msg, sizeof(msg), "\x1b[31mhardcore: forkpty failed: %s\x1b[0m\r\n", strerror(errno));
+        term_message(&tb->t, msg);
+        return 0;
+    }
+    if (pid == 0) exec_shell(tb->start_dir, tb->spare);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);    /* later tabs' shells mustn't hold this one open */
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    tb->fd = fd;
+    tb->pid = pid;
+    tb->born = GetTickCount();
+    mac_watch_tab(tb);
     return 1;
 }
 
@@ -872,7 +885,8 @@ static void config_load(void) {
     char path[MAX_PATH], line[1200];
     const char *home = getenv("HOME");
     FILE *f;
-    snprintf(g_cfg_dir, sizeof(g_cfg_dir), "%s/Library/Application Support/hardcore", home ? home : "/tmp");
+    if (getenv("HARDCORE_TEST_CONFIG")) snprintf(g_cfg_dir, sizeof(g_cfg_dir), "%s", getenv("HARDCORE_TEST_CONFIG"));
+    else snprintf(g_cfg_dir, sizeof(g_cfg_dir), "%s/Library/Application Support/hardcore", home ? home : "/tmp");
     mkdir(g_cfg_dir, 0755);
     snprintf(path, sizeof(path), "%s/config.ini", g_cfg_dir);
     if (!(f = fopen(path, "rb"))) return;
@@ -1805,6 +1819,20 @@ static void ctl_line(char *s) {
         else if (!strcmp(c, "closetab")) close_tab(g_active);
         else if (!strcmp(c, "jump")) jump_to_attention();
         else if (!strncmp(c, "tab ", 4)) activate(atoi(c + 4));
+        else if (!strncmp(c, "state ", 6)) {
+            NSMutableArray *tabs = [NSMutableArray array];
+            for (int k = 0; k < g_ntabs; k++) {
+                Tab *t = g_tabs[k];
+                [tabs addObject:@{@"pid":@(t->pid), @"fd":@(t->fd), @"view":@(t->t.view), @"hist":@(t->t.hcount),
+                                  @"alt":@(t->t.alt), @"cols":@(t->t.cols), @"rows":@(t->t.rows),
+                                  @"cx":@(t->t.cx), @"cy":@(t->t.cy), @"parser":@(t->t.st)}];
+            }
+            NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"pid":@(getpid()), @"active":@(g_active),
+                @"frame":NSStringFromRect([g_win frame]), @"tabs":tabs} options:0 error:nil];
+            [data writeToFile:[NSString stringWithUTF8String:c+6] atomically:YES];
+        } else if (!strncmp(c, "view ", 5) && tb) {
+            tb->t.view = atoi(c+5); if (tb->t.view > tb->t.hcount) tb->t.view = tb->t.hcount;
+        }
         else if (!strncmp(c, "sel ", 4) && tb) {   /* sel Y0 X0 Y1 X1: select, in screen rows */
             int y0, x0, y1, x1;
             if (sscanf(c + 4, "%d %d %d %d", &y0, &x0, &y1, &x1) == 4) {
@@ -1921,6 +1949,8 @@ static int selftest(const char *out_path) {
     return phase == 2 ? 0 : 1;
 }
 
+static int mac_update_unit(FILE *f);
+
 /* --unit OUT: table tests for the pure helpers behind drops, links and the UTF-8 decoder */
 static int unit_tests(const char *out_path) {
     static const struct { const char *in, *want; } paths[] = {
@@ -1967,6 +1997,7 @@ static int unit_tests(const char *out_path) {
     }
     fails += unit_scrollback(f);
     fails += unit_underlay(f);
+    fails += mac_update_unit(f);
     {
         int e, ok = reflow_check(5000, &e) && !e, rt = reflow_roundtrip();
         fprintf(f, "%s reflow tail-only + settle == full reflow\n", ok ? "ok  " : "FAIL");
@@ -1991,6 +2022,8 @@ static int replay(const char *out_path, int cols, int rows, char **files, int nf
     fclose(out);
     return 0;
 }
+
+#include "hardcore_mac_update.h"
 
 /* ── startup ───────────────────────────────────────────────────────── */
 
@@ -2040,6 +2073,22 @@ int main(int argc, char **argv) {
     dispatch_group_t gfx = dispatch_group_create();
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 
+    mac_executable_init();
+    if (argc == 2 && !strcmp(argv[1], "--mac-update-protocol")) { if (!mtl_init()) return 1; puts("hardcore-mac-reload-1"); return 0; }
+    if (argc == 2 && !strcmp(argv[1], "--version")) { printf("hardcore %s (build %s)\n", HARDCORE_VERSION, HARDCORE_BUILD); return 0; }
+    if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+        puts("hardcore [DIR]                         open a terminal\n"
+             "hardcore update                        install latest macOS release and reload live tabs\n"
+             "hardcore update --from PATH             install a local app bundle (or bare binary)\n"
+             "hardcore --reload                      reload windows using the installed executable\n"
+             "hardcore --version                     print version and build");
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "update")) return mac_update_cmd(argc - 2, argv + 2);
+    if (argc == 2 && !strcmp(argv[1], "--reload")) return mac_reload_windows();
+    if (argc == 4 && !strcmp(argv[1], "--mac-adopt")) {
+        g_mac_state_fd = atoi(argv[2]); g_mac_ack_fd = atoi(argv[3]);
+    }
     trace_init();
     trace("main");
     g_lat = getenv("HARDCORE_LAT") != NULL;
@@ -2053,7 +2102,7 @@ int main(int argc, char **argv) {
         struct stat st;
         if (g_last_dir[0] && stat(g_last_dir, &st) == 0 && S_ISDIR(st.st_mode)) snprintf(g_start_dir, sizeof(g_start_dir), "%s", g_last_dir);
     }
-    for (i = 1; i < argc; i++) {
+    for (i = g_mac_state_fd >= 0 ? argc : 1; i < argc; i++) {
         if ((!strcmp(argv[i], "--cd") || !strcmp(argv[i], "-d")) && i + 1 < argc) {
             snprintf(g_start_dir, sizeof(g_start_dir), "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--unit") && i + 1 < argc) {
@@ -2098,7 +2147,9 @@ int main(int argc, char **argv) {
         }
         if (w < 100 || h < 100) { w = 120 * CW; h = 36 * CH; }
         compute_grid(w, h, &g_cols, &g_rows);
-        new_tab_here();
+        if (g_mac_state_fd >= 0) {
+            if (!mac_adopt_read()) { mac_adopt_failure("could not restore terminal state"); return 1; }
+        } else new_tab_here();
         trace("first tab spawned");
     }
     /* the Metal device and shaders on a worker, while the window and the first shell get going */
@@ -2121,6 +2172,7 @@ int main(int argc, char **argv) {
                                           backing:NSBackingStoreBuffered defer:NO];
     [g_win center];
     [g_win setFrameAutosaveName:@"hardcore"];   /* size and place come back next time */
+    if (g_mac_adopt) [g_win setFrame:NSRectFromString(g_mac_adopt[@"frame"]) display:NO];
     g_scale = (int)([g_win backingScaleFactor] + 0.5);
     if (g_scale < 1) g_scale = 1;
     /* the tab column is the title bar: no title text, the traffic lights over the tabs */
@@ -2157,6 +2209,7 @@ int main(int argc, char **argv) {
     dispatch_group_wait(gfx, DISPATCH_TIME_FOREVER);
     trace("Metal ready");
     if (!g_gfx_ready) {
+        if (g_mac_adopt) { mac_adopt_failure("Metal initialization failed"); return 1; }
         NSAlert *a = [[NSAlert alloc] init];
         [a setMessageText:@"hardcore couldn't start Metal."];
         [a runModal];
@@ -2173,7 +2226,9 @@ int main(int argc, char **argv) {
     [CATransaction flush];
     paint_view_now();
     trace("window shown");
-    if (!getenv("HARDCORE_NO_ACTIVATE")) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
+    if (!getenv("HARDCORE_NO_ACTIVATE") && (!g_mac_adopt || [g_mac_adopt[@"focused"] boolValue])) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
+    mac_update_listen();
+    mac_adopt_ready();
     [NSApp run];
     [pool release];
     return 0;

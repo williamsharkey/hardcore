@@ -186,6 +186,47 @@ tabs come back through [sessions](#sessions). Copies left behind by earlier
 updates are deleted on the next update. `--force` reinstalls the latest
 release even if this one isn't older.
 
+### macOS live updates
+
+On a Mac, `hardcore update` downloads the latest release's
+`hardcore-macos.zip`, verifies GitHub's SHA-256 digest and the app's code
+signature, and replaces the app bundle. Each window running that installation
+then reloads in place. The shell and foreground programs keep their PIDs and
+PTYs; they are never restarted. The window, active tab, both terminal screens,
+scrollback, scroll position, and partial terminal escape sequences are carried
+over to the new executable. The Cocoa window may briefly disappear while it
+is rebuilt; jobs continue throughout.
+
+New macOS tabs put the app's executable directory on `PATH`, so
+`!hardcore update` works from Claude Code. From an outside terminal, use the
+installed executable's full path if `hardcore` isn't on your `PATH`.
+
+For a locally built version, without waiting for a release:
+
+```sh
+make hardcore.app
+~/Applications/hardcore.app/Contents/MacOS/hardcore update --from "$PWD/hardcore.app"
+```
+
+`hardcore --reload` reloads windows from the executable already installed.
+`hardcore --version` reports the release and build. A bare development binary
+can use `update --from /path/to/new/binary`; release downloads require an app
+bundle. The checkbox, font, theme and shared grid work in either case.
+
+The replacement is checked for protocol compatibility and Metal startup before
+installation. A pending paste postpones a window's reload. If `exec` fails,
+that window keeps running. The previous installation is kept beside the app
+as `hardcore.app.previous`; an adoption or Metal initialization failure can
+fall back to that executable. The updater reports any window that did not
+acknowledge a successful reload.
+
+**Bootstrap:** older Mac builds have no live-update listener. Install this
+support and restart those windows once; subsequent supported updates can
+preserve running sessions. The automatic download path also needs a release
+containing `hardcore-macos.zip`. `make release-mac` prepares that universal app
+archive; building it does not publish a release. `make mac-update-test` runs
+GUI/PTY integration tests using disposable installations on a logged-in Mac.
+
 ### Slurp: attach running sessions
 
 `hardcore slurp` discovers sessions and adds them to an existing Hardcore

@@ -132,8 +132,8 @@ build/hardcore.metallib: hardcore.metal
 	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
 	xcrun metallib build/hardcore.air -o $@
 
-build/hardcore: hardcore.c hardcore_mac.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
-	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -o $@ hardcore.c $(MAC_LIBS)
+build/hardcore: hardcore.c hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
+	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
 	@mkdir -p build
@@ -156,3 +156,14 @@ mac-test: build/hardcore
 
 clean:
 	rm -rf build hardcore.exe selftest.txt $(APP)
+
+# Upload this signed universal bundle as hardcore-macos.zip on a GitHub release.
+.PHONY: release-mac
+release-mac: $(APP)
+	rm -f build/hardcore-macos.zip
+	ditto -c -k --keepParent $(APP) build/hardcore-macos.zip
+
+# Requires a logged-in desktop. Uses disposable app bundles and isolated config.
+.PHONY: mac-update-test
+mac-update-test: $(APP)
+	python3 tests/test_update_mac.py
