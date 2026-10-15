@@ -1,0 +1,14 @@
+{
+  "format": "hardcore-hairline-design",
+  "version": 1,
+  "settings": {
+    "xHeightDelta": 2,
+    "capHeightDelta": 3,
+    "cellHeight": 26,
+    "redrawBoxes": true,
+    "glyphSeams": {
+      "100": [11, 15],
+      "102": [11, 15]
+    }
+  }
+}

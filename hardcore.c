@@ -3260,11 +3260,12 @@ static void paste(void) {
 
 #endif /* _WIN32: drops, clipboard formats */
 
-/* ── glyph atlas: on-demand 32×32 slots in one texture ─────────────── */
+/* ── glyph atlas: on-demand 40×40 slots in one texture ─────────────── */
 
 /* A slot holds one glyph in its font's pixels (the GPU scales those up to
-   the cell), or, for box drawing redrawn with thin lines, in the display's. */
-#define SLOT 32
+   the cell), or, for box drawing redrawn with thin lines, in the display's.
+   Courier's 20-pixel cell needs 40 pixels for a two-cell Unifont fallback. */
+#define SLOT 40
 #define ATLAS 4096
 #define ATLAS_S "4096.0"
 #define SLOTS_PER_ROW (ATLAS / SLOT)

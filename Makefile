@@ -52,11 +52,18 @@ build/font.bin: $(FONT) tools/gen_font.py
 
 # the other fonts for the settings (each one's own glyphs) and their list
 FONTS_SRC = font/terminus/ter-u24n.bdf.gz font/terminus/ter-u28n.bdf.gz font/terminus/ter-u32n.bdf.gz \
-            font/tamzen/Tamzen8x15r.bdf.gz font/misc-fixed/7x13.bdf.gz font/sony/12x24.bdf.gz font/etl/lt1-24-etl.bdf.gz
+            font/tamzen/Tamzen8x15r.bdf.gz font/misc-fixed/7x13.bdf.gz font/sony/12x24.bdf.gz font/etl/lt1-24-etl.bdf.gz \
+            font/courier/courier-75dpi-24.bdf.gz font/courier/courier-100dpi-24.bdf.gz font/courier/COPYING \
+            font/hairline/hairline-12x26.bdf.gz font/hairline/OFL.txt
 
-build/fonts.bin build/fonts.inc &: $(FONTS_SRC) tools/gen_fonts.py
+# One recipe owns both outputs. Apple's make 3.81 does not support grouped
+# targets (&:), which otherwise runs two writers during a parallel build.
+build/fonts.bin: $(FONTS_SRC) tools/gen_fonts.py
 	@mkdir -p build
 	python3 tools/gen_fonts.py build/fonts.bin build/fonts.inc
+
+build/fonts.inc: build/fonts.bin
+	@test -f $@ || python3 tools/gen_fonts.py build/fonts.bin build/fonts.inc
 
 build/width.inc: font/ucd/EastAsianWidth.txt font/ucd/DerivedGeneralCategory.txt tools/gen_width.py
 	@mkdir -p build
@@ -99,6 +106,8 @@ hardcore.exe: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_displ
 win-test: hardcore.exe reflow-test
 	./hardcore.exe --unit "$$(wslpath -w build/unit.txt)"; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
 	python3 tests/run_xtermjs.py
+	python3 tests/test_courier_fonts.py
+	python3 tests/test_hairline_font.py
 	$(MAKE) --no-print-directory selftest
 	$(MAKE) --no-print-directory slurp-test
 
@@ -162,6 +171,8 @@ mac-test: build/hardcore reflow-test
 	python3 tests/test_mac_import_resize.py
 	python3 tests/test_mac_frame_order.py
 	python3 tests/test_mac_update_dispatch.py
+	python3 tests/test_courier_fonts.py
+	python3 tests/test_hairline_font.py
 	build/hardcore --selftest build/selftest.txt; rc=$$?; cat build/selftest.txt; exit $$rc
 
 clean:
@@ -181,6 +192,8 @@ mac-offline-test: mac-release reflow-test
 	python3 tests/test_mac_install.py
 	python3 tests/test_mac_update.py
 	python3 tests/test_mac_update_dispatch.py
+	python3 tests/test_courier_fonts.py
+	python3 tests/test_hairline_font.py
 	$(MAKE) claude-adapter-test
 	python3 tools/verify_mac_slurp.py --offline
 

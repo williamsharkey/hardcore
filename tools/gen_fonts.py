@@ -34,10 +34,22 @@ FONTS = [
     ('E', 'ETL',      'font/etl/lt1-24-etl.bdf.gz',     12, 24, 1,  0,   't',      None),
     ('M', 'Terminus', 'font/terminus/ter-u28n.bdf.gz',  14, 28, 1,  0,   None,     (6, 14, 'all')),
     ('T', 'Terminus', 'font/terminus/ter-u32n.bdf.gz',  16, 32, 1,  0,   None,     (8, 16, 'all')),
+    ('C', 'Courier',  'font/courier/courier-75dpi-24.bdf.gz', 15, 24, 1, 0, None, None),
+    ('R', 'Courier',  'font/courier/courier-100dpi-24.bdf.gz', 20, 29, 1, 0, None, None),
+    ('H', 'Hairline', 'font/hairline/hairline-12x26.bdf.gz', 12, 26, 1, 0, None, None),
+]
+FONT_NOTICES = [
+    ('X11 Courier font permission notice', 'font/courier/COPYING'),
+    ('Hairline font copyright and Open Font License', 'font/hairline/OFL.txt'),
 ]
 
-def read_bdf(path, W, H):
-    """cp -> (width, rows), for glyphs W or 2W wide, placed in a W x H cell on the font's baseline"""
+# Courier's original BBX includes some marks/block symbols that overhang the
+# nominal line cell. Let those whole glyphs use the usual Unifont fallback;
+# never silently crop an original bitmap to make it fit.
+NO_CLIP_FONTS = {'C', 'R'}
+
+def read_bdf(path, W, H, *, omit_overhang=False, omitted=None):
+    """cp -> (width, rows), placed on the BDF baseline; optionally reject clipping."""
     glyphs, asc = {}, None
     lines = gzip.open(path, 'rt', encoding='latin-1').read().split('\n')
     i = 0
@@ -58,14 +70,22 @@ def read_bdf(path, W, H):
                 i += 1
             # printable, not private use (hardcore's own glyphs live there), one or two cells wide
             if cp is not None and cp > 32 and not 0xE000 <= cp <= 0xF8FF and bbx and dw in (W, 2 * W):
-                bw, bh, bx, by = bbx; rows = [0] * H; top = asc - (by + bh)
+                bw, bh, bx, by = bbx; rows = [0] * H; top = asc - (by + bh); overhang = False
                 for k, hx in enumerate(bm):
                     y = top + k
+                    if omit_overhang and hx:
+                        v = int(hx, 16) >> (len(hx) * 4 - bw)
+                        for x in range(bw):
+                            if v & (1 << (bw - 1 - x)) and not (0 <= y < H and 0 <= bx + x < dw):
+                                overhang = True
                     if 0 <= y < H and hx:
                         v = int(hx, 16) >> (len(hx) * 4 - bw)
                         sh = dw - bw - bx
                         rows[y] = (v << sh if sh >= 0 else v >> -sh) & ((1 << dw) - 1)
-                glyphs[cp] = (dw, rows)
+                if overhang:
+                    if omitted is not None: omitted.append(cp)
+                else:
+                    glyphs[cp] = (dw, rows)
         i += 1
     return glyphs
 
@@ -209,7 +229,10 @@ def main():
     for key, name, bdf, w, h, dev, thin, fb, centre in FONTS:
         if bdf is None:
             rows.append((key, name, w, h, dev, thin, fb, -1, 0)); continue
-        g = read_bdf(bdf, w, h)
+        omitted = []
+        g = read_bdf(bdf, w, h, omit_overhang=key in NO_CLIP_FONTS, omitted=omitted)
+        if omitted:
+            print('%s: %d overhanging glyphs use Unifont fallback (original bitmaps were not clipped)' % (bdf, len(omitted)))
         if centre:
             for cp in range(0x2500, 0x2580):
                 if centre[2] == 'missing' and cp in g: continue
@@ -218,6 +241,11 @@ def main():
                 g[cp] = (w, [int(''.join(map(str, r)), 2) for r in img])
         rows.append((key, name, w, h, dev, thin, fb, len(blob), len(g)))
         blob += table(g)
+    # Keep the complete notices in every binary that embeds this generated file,
+    # as well as their original files in the source distribution.
+    for heading, path in FONT_NOTICES:
+        with open(path, encoding='utf-8') as notice:
+            blob += ('\n' + heading + '\n' + notice.read()).encode('utf-8') + b'\0'
     open(out_bin, 'wb').write(blob)
     with open(out_inc, 'w') as f:
         f.write('/* tools/gen_fonts.py: the font list. off: this font\'s glyph table in fonts.bin, -1 = Unifont (font.bin) */\n')
@@ -226,4 +254,5 @@ def main():
                     % (key, name, w, h, dev, thin, "'%s'" % fb if fb else '0', off, n))
     print('%s: %d fonts, %d bytes' % (out_bin, len(rows), len(blob)))
 
-main()
+if __name__ == '__main__':
+    main()

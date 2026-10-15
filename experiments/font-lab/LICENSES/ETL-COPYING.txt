@@ -1,0 +1,14 @@
+Copyright (C) 1994 Electrotechnical Laboratory, Japan.
+You can use, copy, modify, distribute this file for free.
+
+Original BDF author note:
+94.09.14 Created by Takahashi N. <ntakahas@etl.go.jp>
+
+GNU intlfonts distribution notice:
+3. Copyright information
+
+* Bitmap fonts (BDF format)
+
+All those fonts are Public Domain or contain copyright notices
+explicitly stating as freely usable.
+

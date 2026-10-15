@@ -101,7 +101,7 @@ shared by every window.
   Full numbers and the method are in [bench/RESULTS.md](bench/RESULTS.md).
 - **Bitmap fonts on the pixel grid.** GNU Unifont 18 at an integer scale
   picked from the monitor's DPI: 115k glyphs, every emoji, and hand-drawn
-  Powerline symbols. Or one of seven hand-drawn bitmap fonts (see
+  Powerline symbols. Or one of ten alternative bitmap fonts (see
   [Settings](#settings)), with Unifont filling in whatever they lack. On a
   Retina or 200% screen, box-drawing lines are 1 device pixel thin.
 - **One static `.exe`** (about 8 MB) with the fonts, Windows Terminal's own
@@ -834,11 +834,24 @@ independent page positions. Menu lists do not scroll.
   | `E` | ETL 24 (GNU intlfonts) | 12×24, 1:1 |
   | `M` | Terminus 28 | 14×28, 1:1 |
   | `T` | Terminus 32 | 16×32, 1:1 |
+  | `C` | X11 Courier 24 | 15×24, 1:1 |
+  | `R` | X11 Courier 29 | 20×29, 1:1 |
+  | `H` | Hairline 26 (Terminus-derived) | 12×26, 1:1 |
 
   "Scaled" fonts are multiplied by the display scale like Unifont is: each
   pixel is 2×2 on a Retina screen. The 1:1 ones were drawn for the screen's
   own pixels. Sony and ETL only cover Latin-1, so the rest comes from
   Terminus 24, then Unifont.
+  Courier's native bitmap strokes stay one device pixel wide in straight
+  letter stems and bars, even on Retina displays. Curves, serifs, and joins
+  can be wider. Its missing or overhanging glyphs use Unifont fitted to the
+  selected cell; the 20×29 font also supports 40-pixel-wide Unicode fallback.
+  Hairline is the saved Terminus-derived design with lowercase x-height +2,
+  capital/digit height +3, and a 26-pixel cell. It preserves one-pixel strokes
+  and the original `f` hook, and fills the taller cell with continuous box and
+  block graphics. Select **H · Hairline · 12×26** in the font menu, or use
+  `font=H` in `config.ini`. Other source letters and punctuation retain their
+  original contours; only ASCII letters and digits have enlarged bodies.
 - **theme**: a row per family, with the dark scheme's letter and, for the
   families that have one, the light one's: `h` hardcore (Campbell with an
   amber cursor, the default), `d` Dracula, `m` Monokai, `n` Nord, `g`/`G`
@@ -942,6 +955,10 @@ The other fonts are BDFs in `font/`, packed by `tools/gen_fonts.py` into
   Its 28 and 32 sizes draw box lines 2 pixels wide, so their box drawing is
   redrawn from the Unicode names with 1-pixel lines on Terminus's own center
   lines.
+- Hairline 12×26 (`font/hairline/`, SIL OFL 1.1), a modified Terminus 24
+  with the selected +2 lowercase / +3 capitals design and adapted terminal
+  graphics. It uses a distinct family name, retains the original attribution,
+  and embeds the complete OFL notice. See its [design and regeneration notes](font/hairline/README.md).
 - Tamzen 8×15 by Suraj N. Kurapati, from Tamsyn by Scott Fial (`font/tamzen/`,
   free to use, copy, modify and distribute).
 - misc-fixed 7×13 from X.Org (`font/misc-fixed/`, public domain).
@@ -949,6 +966,16 @@ The other fonts are BDFs in `font/`, packed by `tools/gen_fonts.py` into
   notice).
 - ETL 24 Latin-1 from GNU intlfonts 1.4.2 (`font/etl/`, Electrotechnical
   Laboratory, freely usable).
+- X11 Courier regular from X.Org's Adobe 75dpi and 100dpi fonts
+  (`font/courier/`, Adobe/DEC permission notice). These are native 15×24 and
+  20×29 line cells. The latter BDF's nominal `PIXEL_SIZE` is 34; its ascent
+  and descent total 29. Native pixels are retained; glyphs that would be
+  clipped by the cell are omitted so the normal Unicode fallback can draw
+  the complete character.
+
+The separate [Hairline Lab](experiments/font-lab/README.md) compares these
+bitmaps and experiments with taller Terminus-derived ASCII contours. Its
+per-glyph expansion controls do not change the installed fonts.
 
 At scale 2, the scaled fonts' box drawing (U+2500–257F) is redrawn with
 1-pixel lines as it's drawn: each lit pixel of the glyph becomes a point,
