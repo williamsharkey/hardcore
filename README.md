@@ -58,7 +58,7 @@ shared by every window.
   **Settings** and **+**. The tab column is 28 cells wide and sits on the terminal's own text
   grid, so each of its rows lines up with a terminal row. Row 0 is a grip of
   dim braille dots: drag the window there. Each tab is a status cell, then the
-  folder's name. The active tab is marked by a one-pixel amber line down its
+  folder's name. The active tab is marked by a one-pixel line in the theme's cursor color down its
   left edge, drawn over the status cell rather than taking a column. Min/max/close float over the terminal's top-right corner on smoked
   glass. Text runs underneath and only the mouse belongs to them, so no row
   is lost to a title bar. The whole top line works as a title bar: point at
@@ -401,6 +401,28 @@ See [PRODUCT.md](PRODUCT.md) for what sharing it more widely would take.
 The same terminal runs natively on a Mac: same parser, tab column, Unifont
 and Claude Code integration, on Cocoa, `forkpty` and Metal instead of
 Win32, ConPTY and Direct3D. It's one universal (arm64 + x86_64) app.
+
+While running, the Dock icon is a small terminal showing the active
+tab's folder and foreground program, such as `wm` / `codex`. The lower line
+shows its activity or attention state, with a count when there are multiple
+tabs. Switching tabs or foreground programs updates the summary, including
+while the window is minimized. Each window runs in its own process and
+updates its application's Dock tile.
+
+The tile uses the window's theme colors and the selected bitmap font,
+including Hairline and both Courier sizes. Theme previews appear in the Dock
+too. Glyphs come from the same font tables as the terminal and are fitted to
+the tile; their physical size depends on your Dock size. Fresh installs start
+with **Gruvbox Dark (`g`)**, and the installed app icon uses its cream and dark
+gray colors. Existing saved theme choices are preserved.
+
+**Window → Show Active Tab in Dock Icon** toggles the summary and saves the
+choice across windows; `dock_summary=0` in the Mac `config.ini` restores the
+standard icon (`1` enables the summary, the default). The tile uses folder and
+program metadata, not terminal contents or command arguments. Long labels
+are shortened to fit. Updates are checked at most four times per second and
+the Dock only redraws when the summary, font, or theme changes; no Dock
+animation runs for every terminal output chunk.
 
 ### Build and install on macOS
 
@@ -864,8 +886,9 @@ independent page positions. Menu lists do not scroll.
   original contours; only ASCII letters and digits have enlarged bodies.
 - **theme**: a row per family, with the dark scheme's letter and, for the
   families that have one, the light one's: `h` hardcore (Campbell with an
-  amber cursor, the default), `d` Dracula, `m` Monokai, `n` Nord, `g`/`G`
-  Gruvbox, `s`/`S` Solarized, `o`/`O` One Dark/Light, `c`/`C` Catppuccin
+  amber cursor), `d` Dracula, `m` Monokai, `n` Nord, `g`/`G`
+  Gruvbox (**`g` Gruvbox Dark is the default**), `s`/`S` Solarized,
+  `o`/`O` One Dark/Light, `c`/`C` Catppuccin
   Mocha/Latte, `k`/`K` Tokyo Night/Day, `r`/`R` Rosé Pine/Dawn. Pointing at
   the row tries the dark one; at the light letter, the light one.
 
@@ -888,7 +911,7 @@ distro=          # WSL distro; empty = default
 shell=           # powershell = PowerShell tabs instead of WSL
 width=… height=… # last window size
 font=U           # a font's letter
-theme=h          # a color scheme's letter
+theme=g          # a color scheme's letter; default is Gruvbox Dark
 tab_underlay=0   # 0=sidebar, 1=right underlay, 2=left underlay
 chrome_reflow=1  # display-only prose reflow beside an underlay
 chrome_debug=0   # arrows in existing indentation

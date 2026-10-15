@@ -113,6 +113,7 @@ win-test: hardcore.exe reflow-test
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
 	python3 tests/test_small_fonts.py
+	python3 tests/test_default_theme.py
 	$(MAKE) --no-print-directory selftest
 	$(MAKE) --no-print-directory slurp-test
 
@@ -145,14 +146,12 @@ build/hardcore.metallib: hardcore.metal
 	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
 	xcrun metallib build/hardcore.air -o $@
 
-build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_font_menu.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
+build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_font_menu.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_dock.m hardcore_mac_update.h hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
 	@mkdir -p build
-	rm -rf build/hardcore.iconset
-	python3 tools/gen_icon.py build/hardcore.iconset
-	iconutil -c icns -o $@ build/hardcore.iconset
+	python3 tools/gen_icon.py $@
 
 CLAUDE_PLUGINS = plugins/.claude-plugin/marketplace.json \
                  $(wildcard plugins/*/.claude-plugin/*.json plugins/*/hooks/*.json plugins/*/hooks/*.js plugins/*/README.md)
@@ -175,10 +174,12 @@ mac-test: build/hardcore reflow-test
 	python3 tests/test_mac_install.py
 	python3 tests/test_mac_import_resize.py
 	python3 tests/test_mac_frame_order.py
+	python3 tests/test_mac_dock.py
 	python3 tests/test_mac_update_dispatch.py
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
 	python3 tests/test_small_fonts.py
+	python3 tests/test_default_theme.py
 	build/hardcore --selftest build/selftest.txt; rc=$$?; cat build/selftest.txt; exit $$rc
 
 clean:
@@ -201,7 +202,9 @@ mac-offline-test: mac-release reflow-test
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
 	python3 tests/test_small_fonts.py
+	python3 tests/test_default_theme.py
 	$(MAKE) claude-adapter-test
+	python3 tests/test_mac_dock.py
 	python3 tools/verify_mac_slurp.py --offline
 
 # GUI integration tests use isolated sockets/shells; Terminal test needs Automation
