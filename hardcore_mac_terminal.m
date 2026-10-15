@@ -5,6 +5,130 @@
  * so this is explicitly a plain-text live bridge, not a PTY transfer.
  */
 #import <ApplicationServices/ApplicationServices.h>
+#include <libproc.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+
+static int mac_terminal_valid_tty(NSString *tty) {
+    if (![tty isKindOfClass:[NSString class]] || ![tty hasPrefix:@"/dev/ttys"] || tty.length <= 9 || tty.length > 64) return 0;
+    const char *path = tty.UTF8String;
+    for (const char *p = path + 9; *p; p++) if (*p < '0' || *p > '9') return 0;
+    return 1;
+}
+
+/* argv is used only to identify a launcher and its first script/module. It
+ * is never displayed, logged, or interpreted as a command. */
+static NSArray *mac_terminal_arguments(pid_t pid) {
+    int mib[] = {CTL_KERN, KERN_PROCARGS2, pid};
+    size_t size = 1024 * 1024;
+    char *data = malloc(size);
+    if (!data) return @[];
+    NSMutableArray *arguments = [NSMutableArray array];
+    if (!sysctl(mib, 3, data, &size, NULL, 0) && size > sizeof(int)) {
+        int argc; memcpy(&argc, data, sizeof(argc));
+        char *p = data + sizeof(argc), *end = data + size;
+        while (p < end && *p) p++; /* executable path precedes argv */
+        while (p < end && !*p) p++;
+        for (int i = 0; i < argc && i < 16 && p < end; i++) {
+            char *next = memchr(p, 0, (size_t)(end - p));
+            if (!next) break;
+            NSString *argument = [[[NSString alloc] initWithBytes:p length:(NSUInteger)(next - p)
+                                                        encoding:NSUTF8StringEncoding] autorelease];
+            [arguments addObject:argument ?: @""];
+            p = next + 1;
+        }
+    }
+    free(data);
+    return arguments;
+}
+
+static NSString *mac_terminal_known_program(NSString *path) {
+    NSString *base = path.lastPathComponent;
+    if ([base isEqual:@"claude"] || [path containsString:@"/claude-code/"] ||
+        [path containsString:@"/.local/share/claude/"]) return @"claude";
+    if ([base isEqual:@"codex"] || [path containsString:@"/@openai/codex/"]) return @"codex";
+    if ([base isEqual:@"grok"] || [path containsString:@"/grok-cli/"]) return @"grok";
+    if ([base isEqual:@"agy"] || [base isEqual:@"ruffian"]) return base;
+    return nil;
+}
+
+static int mac_terminal_is_shell(NSString *name) {
+    return [@[@"sh", @"bash", @"zsh", @"fish", @"dash", @"ksh", @"csh", @"tcsh"] containsObject:name];
+}
+
+static NSString *mac_terminal_program_name(NSString *process, NSArray *arguments) {
+    NSString *name = process.lastPathComponent ?: @"";
+    NSString *arg0 = arguments.count ? arguments[0] : @"";
+    NSString *known = mac_terminal_known_program(arg0) ?: mac_terminal_known_program(name);
+    if (known) return known;
+    NSString *lower = name.lowercaseString;
+    int python = [lower isEqual:@"python"] || [lower hasPrefix:@"python3"] || [lower hasPrefix:@"python2"];
+    int runtime = python || [@[@"node", @"bun", @"deno", @"ruby", @"perl"] containsObject:lower];
+    if (!runtime) return name;
+    for (NSUInteger i = 1; i < arguments.count; i++) {
+        NSString *arg = arguments[i];
+        if ([arg isEqual:@"-e"] || [arg isEqual:@"--eval"] || (python && [arg isEqual:@"-c"])) break;
+        if (python && [arg isEqual:@"-m"] && i + 1 < arguments.count)
+            return [[arguments[i + 1] componentsSeparatedByString:@"."] firstObject] ?: name;
+        if ([@[@"-r", @"--require", @"--loader", @"--import"] containsObject:arg]) { i++; continue; }
+        if ([arg hasPrefix:@"-"] || !arg.length ||
+            (([lower isEqual:@"bun"] || [lower isEqual:@"deno"]) && [arg isEqual:@"run"])) continue;
+        known = mac_terminal_known_program(arg);
+        if (known) return known;
+        NSString *base = arg.lastPathComponent;
+        if ([@[@"js", @"mjs", @"cjs", @"py", @"rb", @"pl"] containsObject:base.pathExtension])
+            base = base.stringByDeletingPathExtension;
+        return base.length ? base : name;
+    }
+    return name;
+}
+
+/* Kernel-only metadata: no Apple Events, input injection, source resizing,
+ * title heuristics, or terminal-output parsing. The bridge's own PTY does not
+ * describe the source job, so callers must pass its original Terminal TTY. */
+static NSDictionary *mac_terminal_metadata(NSString *tty) {
+    if (!mac_terminal_valid_tty(tty)) return @{};
+    struct stat device;
+    if (stat(tty.fileSystemRepresentation, &device) || !S_ISCHR(device.st_mode)) return @{};
+    int bytes = proc_listpids(PROC_TTY_ONLY, (uint32_t)device.st_rdev, NULL, 0);
+    if (bytes <= 0 || bytes > 1024 * 1024) return @{};
+    bytes += 32 * (int)sizeof(pid_t);
+    pid_t *pids = calloc(1, (size_t)bytes);
+    if (!pids) return @{};
+    int got = proc_listpids(PROC_TTY_ONLY, (uint32_t)device.st_rdev, pids, bytes);
+    struct proc_bsdinfo selected = {0};
+    for (int i = 0; i < MIN(got, bytes) / (int)sizeof(pid_t); i++) {
+        struct proc_bsdinfo info;
+        if (pids[i] <= 1 || proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info) ||
+            info.pbi_uid != getuid() || info.e_tdev != (uint32_t)device.st_rdev ||
+            !info.e_tpgid || info.pbi_pgid != info.e_tpgid) continue;
+        /* Keep the foreground group leader, or its oldest surviving member
+         * when a launcher has exited but the foreground job is still alive. */
+        int older = info.pbi_start_tvsec < selected.pbi_start_tvsec ||
+            (info.pbi_start_tvsec == selected.pbi_start_tvsec && info.pbi_start_tvusec < selected.pbi_start_tvusec);
+        if (!selected.pbi_pid || info.pbi_pid == info.e_tpgid ||
+            (selected.pbi_pid != selected.e_tpgid && older)) selected = info;
+    }
+    free(pids);
+    if (!selected.pbi_pid) return @{};
+    char process[256] = {0};
+    proc_name((pid_t)selected.pbi_pid, process, sizeof(process));
+    NSString *program = mac_terminal_program_name([NSString stringWithUTF8String:process] ?: @"",
+                                                  mac_terminal_arguments((pid_t)selected.pbi_pid));
+    struct proc_vnodepathinfo paths;
+    NSString *cwd = @"";
+    if (proc_pidinfo((pid_t)selected.pbi_pid, PROC_PIDVNODEPATHINFO, 0, &paths, sizeof(paths)) == sizeof(paths))
+        cwd = [NSString stringWithUTF8String:paths.pvi_cdir.vip_path] ?: @"";
+    /* Revalidate after reading argv/cwd: do not mix two jobs across PID/TTY
+     * reuse or a foreground transition. The next refresh can retry. */
+    struct proc_bsdinfo current;
+    if (proc_pidinfo((pid_t)selected.pbi_pid, PROC_PIDTBSDINFO, 0, &current, sizeof(current)) != sizeof(current) ||
+        current.pbi_start_tvsec != selected.pbi_start_tvsec || current.pbi_start_tvusec != selected.pbi_start_tvusec ||
+        current.e_tdev != (uint32_t)device.st_rdev || current.e_tpgid != current.pbi_pgid) return @{};
+    int shell = mac_terminal_is_shell(program);
+    return @{@"tty":tty, @"cwd":cwd, @"program":shell ? @"" : program,
+             @"shell":shell ? program : @"", @"pid":@(selected.pbi_pid)};
+}
 
 static NSAppleEventDescriptor *mac_terminal_script(NSString *body, int report) {
     NSString *source = [NSString stringWithFormat:@"with timeout of 3 seconds\ntell application id \"com.apple.Terminal\"\n%@\nend tell\nend timeout", body];
@@ -22,20 +146,30 @@ static NSAppleEventDescriptor *mac_terminal_script(NSString *body, int report) {
     return result;
 }
 
+static int g_mac_terminal_discovery_failed;
 static NSArray *mac_terminal_sessions(int report) {
+    g_mac_terminal_discovery_failed = 0;
     NSArray *apps = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.Terminal"];
     if (!apps.count) return @[];
     NSAppleEventDescriptor *result = mac_terminal_script(
         @"set found to {}\nrepeat with w in windows\nrepeat with t in tabs of w\n"
          "if (count of processes of t) > 0 then set end of found to {tty of t, id of w, custom title of t}\nend repeat\nend repeat\nreturn found", report);
+    if (!result) g_mac_terminal_discovery_failed = 1;
     NSMutableArray *sessions = [NSMutableArray array];
     for (NSInteger i = 1; i <= result.numberOfItems; i++) {
         NSAppleEventDescriptor *item = [result descriptorAtIndex:i];
         NSString *tty = [item descriptorAtIndex:1].stringValue;
-        if ([tty hasPrefix:@"/dev/ttys"])
-            [sessions addObject:@{@"tty": tty, @"window": @([item descriptorAtIndex:2].int32Value),
-                                  @"title": [item descriptorAtIndex:3].stringValue ?: @"",
-                                  @"host": @(((NSRunningApplication *)apps[0]).processIdentifier)}];
+        if (mac_terminal_valid_tty(tty)) {
+            int window = [item descriptorAtIndex:2].int32Value;
+            pid_t host = ((NSRunningApplication *)apps[0]).processIdentifier;
+            NSMutableDictionary *session = [NSMutableDictionary dictionaryWithDictionary:@{
+                @"tty":tty, @"window":@(window), @"host":@(host),
+                @"title":[item descriptorAtIndex:3].stringValue ?: @"",
+                @"cwd":@"", @"program":@"", @"shell":@"", @"pid":@0,
+                @"identity":[NSString stringWithFormat:@"terminal:%d:%d:%@", host, window, tty]}];
+            [session addEntriesFromDictionary:mac_terminal_metadata(tty)];
+            [sessions addObject:session];
+        }
     }
     return sessions;
 }
@@ -115,8 +249,7 @@ static size_t mac_terminal_input(pid_t pid, const unsigned char *s, size_t n, in
 
 static int mac_terminal_bridge(const char *device, const char *window_arg) {
     NSString *tty = @(device);
-    if (![tty hasPrefix:@"/dev/ttys"] || tty.length > 64) return 2;
-    for (const char *p = device+9; *p; p++) if (!isdigit((unsigned char)*p)) return 2;
+    if (!mac_terminal_valid_tty(tty)) return 2;
     int window = atoi(window_arg); pid_t host = 0;
     for (NSDictionary *s in mac_terminal_sessions(1))
         if ([s[@"tty"] isEqual:tty] && [s[@"window"] intValue] == window) host = [s[@"host"] intValue];

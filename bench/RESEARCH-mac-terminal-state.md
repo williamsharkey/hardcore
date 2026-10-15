@@ -293,6 +293,56 @@ point would still be needed. Only a disposable owned-PTY test with explicit
 read/write, signal, child-wait and failure observations would justify pursuing
 the idea further; never try it against the user's Terminal session.
 
+## Late Claude adapter activation
+
+A separate 2026-10-15 round checked the installed Claude Code 2.1.300 and an
+owned disposable PTY, using private project settings and a private plugin
+cache. It did not operate the user's Terminal session or send a model prompt.
+Installing the observer plugin after startup did not load it during a five-second
+observation period. With known composer focus and no existing stash, Claude's
+Ctrl+S followed by `/reload-plugins` preserved the exact Unicode draft and its
+middle cursor; the original frontend stayed alive. Private diagnostics were
+saved at `/private/tmp/hc-claude-bootstrap-audit-x2pv4fw3/result.json`. The
+repeatable broader probe is `python3 tests/probe_claude_bootstrap.py`.
+
+This does not justify injecting that key sequence into an arbitrary session.
+An existing stash, attachment, autocomplete, dialog or different focus can change
+its meaning. The public prompt API cannot inspect all of that state before the
+adapter loads. Hardcore can install the adapter and queue a request bound to the
+exact live source; first activation still needs `/reload-plugins` in that source,
+followed by a normally completed turn that establishes readiness. A previously
+loaded adapter can accept the request without typing over the source draft.
+
+Other bootstrap routes checked:
+
+- The owned ordinary session exposed `/tmp/cc-socks/<pid>.sock`. Read-only
+  inspection of the shipped message handler found peer messages and limited
+  rename, idle and artifact controls, but no plugin-reload operation. Peer user
+  messages explicitly set `skipSlashCommands: true`. Sending a reload string
+  there would risk a model submission rather than perform the local command;
+  no such message was sent. The separate `reload_plugins` control request found
+  in the installed code belongs to hosted/SDK transports and is not evidence of
+  an ordinary-session reload endpoint.
+- Classic settings hooks hot-load, but their documented results cannot run an
+  arbitrary local slash command. `SessionStart.reloadSkills` rescans skills and
+  commands, while `initialUserMessage` applies to non-interactive startup; neither
+  activates a late mod in an interactive session. See the
+  [hook output reference](https://code.claude.com/docs/en/hooks#sessionstart-decision-control).
+- JavaScript `modules` live in a plugin's `hooks/hooks.json`, not the normal
+  settings hook schema. Loading that module still depends on plugin activation.
+  See the [mod file reference](https://code.claude.com/docs/en/plugins/mods/reference#files).
+- Claude's plugin panel applies its own pending changes when closed. Changes
+  installed externally still need `/reload-plugins`; the documented
+  `--plugin-dir` watch workflow requires that source to have been supplied to
+  the running session. These routes do not solve arbitrary late bootstrap.
+  See the [plugin command reference](https://code.claude.com/docs/en/plugins/cli-reference#reload-plugins).
+
+The production boundary is therefore automatic discovery, project installation
+and exact-source queuing, with honest pending-activation feedback. Plain-text
+Terminal views require explicit `--bridge`; they are not a fallback reported as
+a successful transfer. Claude conversation verification remains separate from
+the parent-shell and Terminal-history proofs needed to close the source.
+
 ## Implementation status and remaining work
 
 1. The manual styled-copy fixture and bounded archive decoder are implemented.

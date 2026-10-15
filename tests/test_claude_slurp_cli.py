@@ -225,6 +225,55 @@ class InstallTests(unittest.TestCase):
             adapter.move('/mock/claude',self.project,self.market,sid)
         helper.queue.assert_not_called()
 
+    def test_discovered_pid_and_identity_are_bound_before_configuration(self):
+        helper,sid=self.move_helper()
+        for pid,identity in ((9999,'source instance'),(1234,'other instance'),(True,'source instance'),(None,'source instance')):
+            with self.subTest(pid=pid,identity=identity), \
+                 mock.patch.object(adapter,'handoff_helper',return_value=helper), \
+                 mock.patch.object(adapter,'run_claude',side_effect=AssertionError('source mismatch must not read/change configuration')), \
+                 self.assertRaisesRegex(adapter.AdapterError,'source process changed'):
+                adapter.move('/mock/claude',self.project,self.market,sid,
+                             expected_source_pid=pid,expected_source_identity=identity)
+        helper.queue.assert_not_called()
+
+    def test_source_validator_runs_before_configuration_install_and_queue(self):
+        helper,sid=self.move_helper()
+        self.rows=[self.row(name,version='0.0.1') for name in adapter.PLUGINS]
+        stages=[]
+        def validate():stages.append('validate')
+        def install(*args):stages.append('install');return {'state':'configured'}
+        def queue(data):stages.append('queue');return {'ok':True,'state':'queued'}
+        helper.queue.side_effect=queue
+        with mock.patch.object(adapter,'handoff_helper',return_value=helper), \
+             mock.patch.object(adapter,'run_claude',side_effect=self.cli), \
+             mock.patch.object(adapter,'install',side_effect=install):
+            adapter.move('/mock/claude',self.project,self.market,sid,expected_source_pid=1234,
+                         expected_source_identity='source instance',validate_source=validate)
+        self.assertEqual(stages,['validate','validate','install','validate','queue'])
+
+    def test_revalidation_failure_before_install_or_queue_does_not_queue(self):
+        for failure_at in (0,1,2):
+            helper,sid=self.move_helper()
+            self.rows=[self.row(name,version='0.0.1') for name in adapter.PLUGINS]
+            validate=mock.Mock(side_effect=[None]*failure_at+[ValueError('Terminal source changed')])
+            with self.subTest(failure_at=failure_at), \
+                 mock.patch.object(adapter,'handoff_helper',return_value=helper), \
+                 mock.patch.object(adapter,'run_claude',side_effect=self.cli), \
+                 mock.patch.object(adapter,'install',return_value={'state':'configured'}) as install, \
+                 self.assertRaisesRegex(ValueError,'Terminal source changed'):
+                adapter.move('/mock/claude',self.project,self.market,sid,validate_source=validate)
+            helper.queue.assert_not_called()
+            self.assertEqual(install.call_count,1 if failure_at==2 else 0)
+
+    def test_process_reuse_during_configuration_prevents_queue(self):
+        helper,sid=self.move_helper()
+        helper.process_identity.side_effect=['source instance','source instance','new instance']
+        with mock.patch.object(adapter,'handoff_helper',return_value=helper), \
+             mock.patch.object(adapter,'run_claude',side_effect=self.cli), \
+             self.assertRaisesRegex(adapter.AdapterError,'source process changed'):
+            adapter.move('/mock/claude',self.project,self.market,sid)
+        helper.queue.assert_not_called()
+
     def test_recovery_inspection_does_not_require_claude_or_modify_project(self):
         helper=mock.Mock()
         helper.list_moves.return_value={'ok':True,'moves':[],'unreadableRecords':[],'liveChecked':False}

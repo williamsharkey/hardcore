@@ -146,7 +146,7 @@ build/hardcore.metallib: hardcore.metal
 	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
 	xcrun metallib build/hardcore.air -o $@
 
-build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_font_menu.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_dock.m hardcore_mac_update.h hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
+build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_font_menu.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_dock.m hardcore_mac_update.h hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_tmux_metadata.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
@@ -156,13 +156,13 @@ build/hardcore.icns: tools/gen_icon.py
 CLAUDE_PLUGINS = plugins/.claude-plugin/marketplace.json \
                  $(wildcard plugins/*/.claude-plugin/*.json plugins/*/hooks/*.json plugins/*/hooks/*.js plugins/*/README.md)
 
-$(APP): build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py $(CLAUDE_PLUGINS)
+$(APP): build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
 	rm -rf $@
 	mkdir -p $@/Contents/MacOS $@/Contents/Resources
 	cp build/hardcore $@/Contents/MacOS/hardcore
 	cp build/hardcore.icns $@/Contents/Resources/hardcore.icns
 	cp tools/update_mac.py $@/Contents/Resources/update_mac.py
-	cp tools/claude_slurp.py tools/claude_handoff.py $@/Contents/Resources/
+	cp tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $@/Contents/Resources/
 	mkdir -p $@/Contents/Resources/plugins
 	cp -R plugins/.claude-plugin plugins/hardcore-slurp plugins/hardcore-slurp-driver $@/Contents/Resources/plugins/
 	sed 's/@VERSION@/$(shell sed -n 's/^#define HARDCORE_VERSION "\(.*\)"/\1/p' hardcore.c)/' tools/Info.plist > $@/Contents/Info.plist
@@ -175,6 +175,11 @@ mac-test: build/hardcore reflow-test
 	python3 tests/test_mac_import_resize.py
 	python3 tests/test_mac_frame_order.py
 	python3 tests/test_mac_dock.py
+	python3 tests/test_mac_terminal.py
+	python3 tests/test_mac_tmux_metadata.py
+	python3 tests/test_mac_slurp_report.py
+	python3 tests/test_mac_session_labels.py
+	python3 tests/test_mac_slurp_dispatch.py
 	python3 tests/test_mac_update_dispatch.py
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
@@ -205,6 +210,11 @@ mac-offline-test: mac-release reflow-test
 	python3 tests/test_default_theme.py
 	$(MAKE) claude-adapter-test
 	python3 tests/test_mac_dock.py
+	python3 tests/test_mac_terminal.py
+	python3 tests/test_mac_tmux_metadata.py
+	python3 tests/test_mac_slurp_report.py
+	python3 tests/test_mac_session_labels.py
+	python3 tests/test_mac_slurp_dispatch.py
 	python3 tools/verify_mac_slurp.py --offline
 
 # GUI integration tests use isolated sockets/shells; Terminal test needs Automation
@@ -216,6 +226,7 @@ mac-pty-lifetime-test:
 .PHONY: claude-adapter-test
 claude-adapter-test:
 	python3 tests/test_claude_slurp_cli.py
+	python3 tests/test_slurp_mac.py
 	python3 tests/test_claude_handoff.py
 	python3 tests/test_mac_terminal_retire.py
 	node --test plugins/hardcore-slurp/tests/*.test.mjs
@@ -239,7 +250,7 @@ mac-integration-test: mac-release
 	$(MAKE) mac-exit-watch-test
 	python3 tests/test_mac_update.py
 	python3 tests/test_mac_handoff.py
-	python3 tests/test_mac_terminal.py
+	python3 tests/test_mac_terminal.py --live
 	$(MAKE) mac-host-test
 	$(MAKE) mac-takeover-test
 

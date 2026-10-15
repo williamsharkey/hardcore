@@ -199,7 +199,8 @@ def handoff_helper():
     return helper
 
 
-def move(command,project,marketplace,source_session):
+def move(command,project,marketplace,source_session,*,expected_source_pid=None,
+         expected_source_identity=None,validate_source=None):
     """Install if needed, then ask an existing loaded mod to move itself."""
     helper=handoff_helper()
     sid,cwd=helper.valid_source({'sourceSessionId':source_session,'cwd':str(project)})
@@ -207,12 +208,24 @@ def move(command,project,marketplace,source_session):
     identity=helper.process_identity(sources[0].get('pid')) if len(sources)==1 else None
     if len(sources)!=1 or not identity:
         raise AdapterError('The requested source is not exactly one live interactive Claude session in this project')
+    if expected_source_pid is not None or expected_source_identity is not None:
+        if (type(expected_source_pid) is not int or expected_source_pid!=sources[0].get('pid') or
+                not isinstance(expected_source_identity,str) or expected_source_identity!=identity):
+            raise AdapterError('The discovered Terminal source process changed; request a new slurp')
+    def revalidate():
+        if helper.process_identity(sources[0].get('pid'))!=identity:
+            raise AdapterError('The source process changed while preparing its adapter; request a new slurp')
+        if validate_source is not None:
+            validate_source()
+    revalidate()
     # Resolve and validate the source before making any project settings changes.
     market,plugins=validate_bundle(marketplace)
     version=check_claude(command,project)
     configured=configuration(command,project,version)
     if configured['state']!='configured' or any(configured['plugins'][name].get('version')!=plugins[name]['version'] for name in PLUGINS):
+        revalidate()
         configured=install(command,project,market)
+    revalidate()
     queued=helper.queue({'sourceSessionId':sid,'cwd':cwd,'expectedSourcePid':sources[0]['pid'],
                          'expectedSourceIdentity':identity})
     return {**queued,'project':cwd,'sourceSessionId':sid,'runtimeLoaded':None,

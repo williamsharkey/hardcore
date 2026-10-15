@@ -236,6 +236,12 @@ def poll(data):
             raise ValueError('queued handoff source mismatch')
         if process_identity(record.get('sourcePid'))!=record.get('sourceIdentity'):
             raise ValueError('queued handoff source process changed')
+        # Receipt from the running adapter, distinct from installation. The
+        # coordinator can now tell an unloaded adapter from one waiting for a
+        # safe turn, without inspecting the draft or typing into Terminal.
+        if time.time()-record.get('observedAt',0)>=2:
+            record['observedAt']=time.time()
+            write_json(path,record)
         return {'ok':True,'action':'wait','intentId':record['intentId']}
 
 

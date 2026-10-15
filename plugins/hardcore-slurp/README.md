@@ -2,18 +2,34 @@
 
 The adapter requires a Hardcore build that includes Claude handoff and Claude
 Code 2.1.300 or later. Earlier Claude versions cannot supply the rich conversation
-snapshot. From the existing conversation's project directory:
+snapshot. Use Hardcore's normal slurp command for a conversation already running
+in Terminal.app:
 
 ```sh
-hardcore claude install
-hardcore claude status
+hardcore slurp
+# Or choose one source Terminal tab:
+hardcore slurp --terminal /dev/ttys003
 ```
 
-Installation enables **both** `hardcore-slurp` and `hardcore-slurp-driver` for
-that project. In the existing Claude session, run `/reload-plugins`, then
-`/hardcore-slurp wait`. A newly installed plugin does not load into an existing
-session until it is reloaded. Keep the source shell and Terminal window open;
-the adapter moves the conversation, not the parent shell or Terminal history.
+Slurp discovers the project's live Claude session, enables **both**
+`hardcore-slurp` and `hardcore-slurp-driver` for that project if needed, and
+queues a request bound to the exact source session and process identity. If the
+adapter is new to that running session, run `/reload-plugins` once in Claude.
+The adapter then consumes the queued request; there is no second slurp or
+`/hardcore-slurp` command to remember. Installation alone does not load a plugin
+into an existing session. Queued means pending, not moved.
+
+After activation, the adapter waits for the next safe, normally completed turn.
+It does not type a command into the source composer or submit a model prompt.
+Keep the source shell and Terminal window open: parent-shell aliases, variables,
+jobs, command history and Terminal scrollback remain there. Verifying the Claude
+conversation does not establish that the source window can close safely.
+
+The same generic command transfers native Hardcore tabs and attaches portable
+hosts and eligible tmux sessions. Unsupported ordinary sessions are reported
+and left running. A plain-text bridge is available only when explicitly requested
+with `hardcore slurp --bridge`; its tab is labelled `folder:program [bridge]`
+and depends on the original Terminal tab staying open.
 
 `/hardcore-slurp` prepares a Hardcore receiver and moves a verified settled
 conversation using Claude's background-session mechanism. `/hardcore-slurp wait`
@@ -36,12 +52,13 @@ Visible `[Image #…]` and `[Pasted text #…]` labels refuse handoff: Claude's 
 composer API exposes the label but not its hidden image or collapsed-text
 payload. A literal label also refuses because the API cannot distinguish it.
 
-Once the adapter is loaded, Hardcore can queue a request through the native
-helper. The mod polls for a request bound to its exact session and working
-directory; no slash command is typed over the draft. A newly installed adapter
-still requires `/reload-plugins` in an already running Claude session.
+The mod polls for requests bound to its exact session and working directory;
+no slash command is typed over the draft. These lower-level commands are useful
+for installation diagnostics, explicit session-ID selection, and recovery:
 
 ```sh
+hardcore claude status                  # inspect this project's installation
+hardcore claude install                 # install without requesting a move
 claude agents --json --all --cwd "$PWD" # find the interactive source sessionId
 hardcore claude move SESSION_ID         # optional: --project /path/to/project
 hardcore claude moves

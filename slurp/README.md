@@ -143,6 +143,15 @@ different protocols and preserve different state. The research probes below
 do not make arbitrary existing Terminal shells eligible for automatic closure.
 Run these commands from the repository root.
 
+On macOS, `hardcore slurp` discovers sources and chooses the available transfer
+route. For ordinary Terminal Claude sessions it installs the project adapter
+if needed and queues an exact-source handoff; first-time running sessions still
+need `/reload-plugins` in Claude and a subsequent safe completed turn. Unsupported
+sources stay in place. Plain-text Terminal views require explicit `--bridge`
+and show `folder:program [bridge]`; they keep depending on the original tab.
+Neither a bridge nor a verified Claude conversation transfers the parent shell
+and Terminal history or authorizes closing that window.
+
 ### Noninteractive verification
 
 ```sh
@@ -263,8 +272,11 @@ Unicode, Ctrl-C, resize signals, Python and Node REPLs, and a curses application
 They also verify refusal of child-process trees and session leaders, protected
 shell attach failure, and an unusable receiver leaving the source functional.
 
-This backend remains **test-only**; `hardcore slurp --terminal` still uses the
-bridge described in the [Mac guide](../README.md#slurp-on-macos). The tests configure their source zsh with `NO_HUP`;
+This backend remains **test-only**. `hardcore slurp --terminal TTY` selects a
+source for the supported host or Claude route, leaving unsupported jobs alone.
+`hardcore slurp --bridge --terminal TTY` explicitly selects the plain-text view
+described in the [Mac guide](../README.md#slurp-on-macos).
+The tests configure their source zsh with `NO_HUP`;
 arbitrary source jobs still need safe disowning. The experimental Node fix
 restores ordinary kqueue terminal registrations using a private macOS ABI.
 Descriptor discovery must be synchronized with stopped threads before this

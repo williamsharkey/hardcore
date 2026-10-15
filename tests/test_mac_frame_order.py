@@ -28,7 +28,7 @@ HARNESS = r'''
 #include <unistd.h>
 
 typedef struct { int nmarks; } Term;
-typedef struct { Term t; int fd, id; char run[600], hist[400], start_dir[1024]; } Tab;
+typedef struct { Term t; int fd, id; char run[600], hist[400], start_dir[1024], program[64]; } Tab;
 typedef struct Frame {
     int snap, handoff, painted, trace_tab;
     uint64_t serial;
@@ -56,6 +56,9 @@ static void frame_free(Frame *frame) { free(frame); }
 static int term_init(Term *t, int cols, int rows) { (void)t; (void)cols; (void)rows; return 1; }
 static void term_free(Term *t) { (void)t; }
 static int tab_spawn(Tab *tab) { (void)tab; spawn_count++; return 1; }
+static NSDictionary *mac_terminal_metadata(NSString *tty) { (void)tty; return nil; }
+static NSDictionary *mac_tmux_metadata(NSString *session, NSString *socket) { (void)session; (void)socket; return nil; }
+static int mac_apply_session_metadata(Tab *tab, NSDictionary *metadata) { (void)tab; (void)metadata; return 0; }
 
 static void draw_frame_contents(Frame *f) {
     int active = __atomic_add_fetch(&active_draws, 1, __ATOMIC_SEQ_CST);

@@ -92,7 +92,7 @@ enum { PS_NONE, PS_IDLE, PS_WORKING, PS_BLOCKED, PS_ERROR, PS_DONE };
 typedef struct { char cwd[1024]; int ps_state; } Term;
 typedef struct {
     Term t;
-    char start_dir[1024], program[64];
+    char start_dir[1024], program[64], run[1024];
     int exited, help, attention, busy;
 } Tab;
 static Tab fixture;
@@ -257,6 +257,8 @@ int main(int argc, const char **argv) {
             [working release]; [blocked release];
             fixture.busy = fixture.t.ps_state = 0; fixture.program[0] = 0; mac_dock_update(1);
             equal([g_mac_dock_view summary][@"program"], @"zsh", "foreground exit did not restore shell label");
+            strcpy(fixture.run, "terminal:/dev/ttys123"); mac_dock_update(1);
+            equal([g_mac_dock_view summary][@"status"], @"bridge", "Terminal mirror is not identified in Dock");
             finish_controller();
         } else if (!strcmp(which, "summary-fallbacks")) {
             start_controller();

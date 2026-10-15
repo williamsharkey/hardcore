@@ -422,10 +422,12 @@ class BrokerTests(unittest.TestCase):
         queued=self.queue()
         self.assertEqual(queued["state"],"queued")
         self.assertEqual(self.queue(),queued)
+        self.assertNotIn('observedAt', handoff.read_json(handoff.intent_path(self.sid)))
         with mock.patch.object(handoff,"process_identity",side_effect=self.identity):
             for _ in range(2):
                 polled=handoff.poll({"sessionId":self.sid,"cwd":str(self.project)})
                 self.assertEqual(polled,{"ok":True,"action":"wait","intentId":queued["intentId"]})
+                self.assertEqual(handoff.read_json(handoff.intent_path(self.sid))['observedAt'], self.now)
             handoff.bind_intent({"sourceSessionId":self.sid,"cwd":str(self.project),"intentId":queued["intentId"]},self.request_id)
             self.assertIsNone(handoff.poll({"sessionId":self.sid,"cwd":str(self.project)})["action"])
         self.assertEqual(self.queue()["requestId"],self.request_id)
@@ -434,6 +436,7 @@ class BrokerTests(unittest.TestCase):
         self.queue()
         with mock.patch.object(handoff,"process_identity",return_value="reused PID"), self.assertRaisesRegex(ValueError,"process changed"):
             handoff.poll({"sessionId":self.sid,"cwd":str(self.project)})
+        self.assertNotIn('observedAt', handoff.read_json(handoff.intent_path(self.sid)))
         with self.assertRaisesRegex(ValueError,"mismatch"):
             handoff.poll({"sessionId":self.sid,"cwd":str(self.root)})
         self.now+=handoff.INTENT_TTL+1

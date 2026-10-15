@@ -116,6 +116,7 @@ static NSDictionary *mac_dock_summary(void) {
         if (tb->busy) status = @"busy";
         if (tb->attention || tb->t.ps_state == PS_BLOCKED) status = @"needs you";
         if (tb->t.ps_state == PS_ERROR) status = @"error";
+        if (!strncmp(tb->run, "terminal:", 9)) status = @"bridge";
         if (tb->help) { program = @"help"; status = @"help"; }
         if (tb->exited) { program = @"exited"; status = @"exited"; }
     }
@@ -956,12 +957,53 @@ static void mac_foreground_name(Tab *tb, char *out, int cap) {
     }
     free(data);
 }
+static NSDictionary *mac_terminal_metadata(NSString *tty);
+static NSDictionary *mac_tmux_metadata(NSString *session, NSString *socket);
+
+/* External views own a local client PTY, but their labels belong to the source
+   session. Do not let the helper's HOME/cwd or process name replace that source. */
+static int mac_apply_session_metadata(Tab *tb, NSDictionary *metadata) {
+    if (!metadata) return 0;
+    int changed = 0;
+    NSString *cwd = metadata[@"cwd"], *program = metadata[@"program"];
+    if ([cwd isKindOfClass:[NSString class]] && [cwd hasPrefix:@"/"] &&
+        [cwd lengthOfBytesUsingEncoding:NSUTF8StringEncoding] < sizeof(tb->t.cwd) &&
+        strcmp(tb->t.cwd, cwd.UTF8String)) {
+        set_cwd(&tb->t, cwd.UTF8String);
+        changed = 1;
+    }
+    if ([program isKindOfClass:[NSString class]]) {
+        char name[sizeof(tb->program)];
+        const char *utf8 = program.UTF8String ?: "";
+        size_t length = MIN(strlen(utf8), sizeof(name) - 1);
+        while (length && ((unsigned char)utf8[length] & 0xc0) == 0x80) length--;
+        memcpy(name, utf8, length); name[length] = 0;
+        if (strcmp(name, tb->program)) {
+            snprintf(tb->program, sizeof(tb->program), "%s", name);
+            changed = 1;
+        }
+    }
+    return changed;
+}
+
 static void mac_refresh_programs(void) {
     int changed = 0;
     for (int i=0;i<g_ntabs;i++) {
-        char name[64]; mac_foreground_name(g_tabs[i],name,sizeof(name));
-        if (strcmp(name,g_tabs[i]->program)) {
-            snprintf(g_tabs[i]->program,sizeof(g_tabs[i]->program),"%s",name);
+        Tab *tb = g_tabs[i];
+        if (tb->run[0] && !tb->exited) {
+            if (!strncmp(tb->run, "terminal:", 9))
+                changed |= mac_apply_session_metadata(tb, mac_terminal_metadata(@(tb->run + 9)));
+            else if (strncmp(tb->run, "claude-wait:", 12))
+                changed |= mac_apply_session_metadata(tb, mac_tmux_metadata(@(tb->run), tb->hist[0] ? @(tb->hist) : nil));
+            else if (strcmp(tb->program, "claude")) {
+                snprintf(tb->program, sizeof(tb->program), "claude");
+                changed = 1;
+            }
+            continue;
+        }
+        char name[64]; mac_foreground_name(tb,name,sizeof(name));
+        if (strcmp(name,tb->program)) {
+            snprintf(tb->program,sizeof(tb->program),"%s",name);
             changed = 1;
         }
     }
@@ -2686,7 +2728,7 @@ int main(int argc, char **argv) {
     if (!mac_commit_imports()) return 1;
     mac_server();
     if (g_mac_ready_fd >= 0) {
-        mac_send(g_mac_ready_fd, @{@"ok": @YES, @"pid": @(getpid())});
+        mac_send(g_mac_ready_fd, mac_slurp_result());
         close(g_mac_ready_fd); g_mac_ready_fd = -1;
     }
     if (!getenv("HARDCORE_NO_ACTIVATE") && (!g_mac_adopt || [g_mac_adopt[@"focused"] boolValue])) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */

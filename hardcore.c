@@ -3874,6 +3874,12 @@ static void tab_label(Tab *tb, wchar_t *out, int cap) {
         out[n++] = ':';
         utf8_to_wide(app, out+n, cap-n);
     }
+#ifndef _WIN32
+    if (!strncmp(tb->run, "terminal:", 9)) {
+        n = (int)wcslen(out);
+        if (n + 9 < cap) wcscpy(out+n, L" [bridge]");
+    }
+#endif
 }
 
 static int unit_tab_labels(FILE *f) {
@@ -3897,6 +3903,13 @@ static int unit_tab_labels(FILE *f) {
     fails += wcscmp(label,L"hardcore:codex") != 0;
     tb->program[0] = tb->t.cmd[0] = 0; tab_label(tb,label,256);
     fails += wcscmp(label,L"hardcore") != 0;
+#ifndef _WIN32
+    snprintf(tb->run, sizeof(tb->run), "terminal:/dev/ttys123");
+    snprintf(tb->t.cwd, sizeof(tb->t.cwd), "/work/ruffian");
+    snprintf(tb->program, sizeof(tb->program), "claude");
+    tab_label(tb,label,256);
+    fails += wcscmp(label,L"ruffian:claude [bridge]") != 0;
+#endif
     free(tb);
     fprintf(f,"%s folder:program tab labels\n",fails ? "FAIL" : "ok  ");
     return fails;

@@ -506,25 +506,33 @@ GUI/PTY integration tests using disposable installations on a logged-in Mac.
 
 ### Slurp on macOS
 
-Choose the route that matches how the source session was started:
+Run `hardcore slurp` to discover sessions and use the available transfer route.
+It transfers native Hardcore tabs, attaches portable hosts and eligible tmux
+sessions, and prepares a cooperative handoff for Claude already running in
+Terminal. For Claude, it installs the project adapter if needed and queues a
+request for that exact source session. A first-time adapter still needs one
+`/reload-plugins` in the existing Claude session, then a safely completed turn.
+The command reports this pending state; queuing a request is not a completed move.
 
 | Source | Current behavior | Can the source close? |
 | --- | --- | --- |
 | Hardcore window | Transfers its live PTYs and terminal state. | Donor closes after verified handoff. |
-| Ordinary Terminal.app tab | Bridges its live text and keyboard input. | Keep Terminal open. |
-| Claude already running in Terminal | Optional cooperative conversation handoff; see below. | Keep the original shell and Terminal open. |
+| Ordinary Terminal.app tab | Reports that direct transfer is unavailable; `--bridge` explicitly opens a plain-text view. | Keep Terminal open. |
+| Claude already running in Terminal | Installs the adapter if needed and queues a cooperative conversation handoff; see below. | Keep the original shell and Terminal open. |
 | `hardcore host` or tmux | Attaches another client to the existing tmux session. | The original client can detach after attachment. |
 | Plain iTerm2 or other terminal | Direct takeover is not implemented. | No automatic closure. |
 
 ```sh
 hardcore slurp --list                 # preview sources
-hardcore slurp --terminal /dev/ttys003 # bridge one Terminal.app tab
+hardcore slurp --terminal /dev/ttys003 # select one Terminal.app source
 hardcore slurp --pid 12345            # transfer one Hardcore window
-hardcore slurp                        # gather eligible sources in a new window
+hardcore slurp                        # discover and prepare eligible transfers
 hardcore slurp --tmux session-name    # attach a live tmux session explicitly
+hardcore slurp --bridge --terminal /dev/ttys003 # explicit plain-text bridge
 ```
 
-**Terminal.app is a live bridge, not a process takeover.** Its original tab
+**Plain-text bridges require `--bridge`.** Default slurp leaves unsupported
+sources alone and explains what is unavailable. In a bridge, the original tab
 and programs remain running; keep Terminal open. Hardcore displays the tab's
 live plain text and forwards keyboard input to that specific tab. Closing the
 Hardcore tab detaches the bridge without terminating the original job. The
@@ -537,14 +545,19 @@ position, so these are not preserved in the bridge. It polls screen text,
 resizes the source grid to match, and selects the source tab when forwarding
 input. This is less faithful than a native Hardcore PTY transfer, especially
 for full-screen applications. Avoid typing into the source tab concurrently.
+Bridge tabs show `folder:program [bridge]`, using the source process's working
+directory and foreground program instead of the receiving helper's home
+directory. tmux tabs likewise follow their active pane's directory and program.
+An idle shell clears the previous foreground-program label.
 
 **Hardcore-to-Hardcore slurp transfers live PTYs** to a receiving window,
 including scrollback, both screens, cursor, modes, prompt marks and partial
 escape/UTF-8 sequences. The donor windows close only after the new
 window is ready. Windows without handoff support are not eligible.
 
-**tmux sessions stay alive in their tmux server.** Default slurp attaches only
-detached sessions. `--tmux NAME` can also attach an already attached session;
+**tmux sessions stay alive in their tmux server.** Default slurp attaches detached
+ordinary tmux sessions and portable `hardcore host` sessions, including hosts
+with a connected Terminal client. `--tmux NAME` can also attach an already attached session;
 other clients remain connected. `--tmux-socket PATH` selects a nondefault
 server. This also works for tmux sessions used in Terminal or iTerm2. Direct
 attachment to plain iTerm2 sessions is not implemented yet.
@@ -577,38 +590,45 @@ Codex, Grok and Antigravity binaries tested on this Mac deny debugger attach.
 
 ### Claude conversation handoff on macOS
 
-An existing Claude conversation has a cooperative route that can be installed
-after it starts:
+Use the same `hardcore slurp` command for an existing Claude conversation in
+Terminal; the adapter can be installed after Claude starts:
 
 ```sh
-# From the project directory, using a build that includes the adapter:
-hardcore claude install
-hardcore claude status
+hardcore slurp
+# Or select one existing Terminal tab:
+hardcore slurp --terminal /dev/ttys003
 ```
 
-In the existing Claude conversation, run `/reload-plugins`, then
-`/hardcore-slurp wait`. The adapter waits to observe a normally completed turn
-with no background work, scheduled tasks or active agents. It
-prepares a receiving Hardcore window, checks readiness again, and asks Claude
+Slurp discovers the project's live Claude session, installs both adapter
+plugins for that project if needed, and queues a request bound to the exact
+session and process identity. If this running session has not loaded the
+adapter, run `/reload-plugins` once in Claude. The queued request then reaches
+the adapter without a second slurp command or a `/hardcore-slurp` command.
+Installation alone does not activate plugins inside an already-running Claude
+session. Hardcore does not type a reload command over an unsent draft.
+
+The adapter waits to observe a normally completed turn with no background work,
+scheduled tasks or active agents. It prepares a receiving Hardcore window,
+checks readiness again, and asks Claude
 to background the conversation. The destination restores its title and
 acknowledges readiness before Hardcore attaches that exact session.
 `/hardcore-slurp status` explains any wait; `/hardcore-slurp cancel`
 cancels it. A late-loaded idle conversation needs its next ordinary turn before
 readiness can be established; the adapter never sends a model prompt itself.
 
-Once the adapter is loaded, Hardcore can request the move without entering a
-command in Claude or replacing its unsent text:
+For diagnosis or selecting a source by Claude's session ID, the lower-level
+commands remain available:
 
 ```sh
 claude agents --json --all --cwd "$PWD" # find the interactive source sessionId
 hardcore claude move SESSION_ID         # optional: --project /path/to/project
+hardcore claude status                  # inspect this project's adapter installation
 ```
 
-`move` verifies the exact live source, installs the project's adapter if needed,
-and queues a request for up to one hour. A newly installed adapter still needs
-`/reload-plugins` in the existing Claude session; installation alone does not
-load it. The queued request waits for the same readiness checks as the slash
-command. Text drafts transfer without being submitted, including multiline
+`move` uses the same project installation, exact-source verification and
+one-hour request queue as generic slurp. `/hardcore-slurp wait` also requests
+a handoff from within Claude. All routes use the same readiness checks.
+Text drafts transfer without being submitted, including multiline
 Unicode text and a cursor in the middle. The receiver temporarily holds input
 while restoring and checking the exact text and cursor. It also checks a SHA-256
 digest of Claude's available rich conversation blocks, including image,

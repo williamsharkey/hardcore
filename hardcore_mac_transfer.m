@@ -195,8 +195,14 @@ static NSDictionary *mac_info(void) {
     NSMutableArray *tabs = [NSMutableArray array];
     for (int i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
-        if (tb->fd >= 0 && !tb->exited)
-            [tabs addObject:@{@"pid": @(tb->pid), @"cwd": @(tb->t.cwd), @"command": @(tb->t.cmd)}];
+        if (tb->fd >= 0 && !tb->exited) {
+            wchar_t label[256]; tab_label(tb, label, 256);
+            NSString *text = [[NSString alloc] initWithBytes:label length:wcslen(label) * sizeof(wchar_t)
+                                                  encoding:NSUTF32LittleEndianStringEncoding];
+            [tabs addObject:@{@"pid": @(tb->pid), @"cwd": @(tb->t.cwd), @"command": @(tb->t.cmd),
+                             @"program": @(tb->program), @"source": @(tb->run), @"label": text ?: @""}];
+            [text release];
+        }
     }
     return @{@"protocol": @(MAC_HANDOFF_VERSION), @"pid": @(getpid()), @"image": g_mac_image ?: @"",
              @"exe": g_mac_install_exe ?: @(g_mac_exe_path), @"tabs": tabs};
@@ -535,16 +541,25 @@ static NSString *mac_host_socket(void) {
     return runtime ? [runtime stringByAppendingPathComponent:@"host.tmux"] : nil;
 }
 
-/* Prepared Terminal sessions keep their entire process tree in tmux. */
+#include "hardcore_mac_tmux_metadata.m"
+
+/* Prepared hosts and ordinary tmux clients keep their process tree in tmux.
+   Find an exact source TTY on either known server; never infer ownership from
+   the title or attach a merely similar session name. */
 static NSDictionary *mac_host_for_tty(NSString *tty) {
-    NSString *socket = mac_host_socket();
-    if (!socket) return nil;
-    int status;
-    NSString *result = mac_task(@[@"tmux", @"-S", socket, @"list-clients", @"-F", @"#{client_tty}\t#{session_id}"], &status);
-    if (status) return nil;
-    for (NSString *line in [result componentsSeparatedByString:@"\n"]) {
-        NSArray *v = [line componentsSeparatedByString:@"\t"];
-        if (v.count == 2 && [tty isEqual:v[0]]) return @{@"id": v[1], @"socket": socket};
+    if (!mac_terminal_valid_tty(tty)) return nil;
+    NSString *host = mac_host_socket();
+    for (NSString *socket in host ? @[host, @""] : @[@""]) {
+        NSMutableArray *args = [NSMutableArray arrayWithObjects:@"env", @"-u", @"TMUX", @"-u", @"TMUX_PANE", @"tmux", @"-N", nil];
+        if (socket.length) [args addObjectsFromArray:@[@"-S", socket]];
+        [args addObjectsFromArray:@[@"list-clients", @"-F", @"#{client_tty}\t#{session_id}"]];
+        NSData *data = mac_tmux_metadata_output(args);
+        NSString *result = data ? [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease] : nil;
+        for (NSString *line in [result componentsSeparatedByString:@"\n"]) {
+            NSArray *v = [line componentsSeparatedByString:@"\t"];
+            if (v.count == 2 && [tty isEqual:v[0]] && mac_tmux_metadata_id(v[1], '$'))
+                return @{@"id": v[1], @"socket": socket};
+        }
     }
     return nil;
 }
@@ -585,6 +600,7 @@ static int mac_slurp_options(int argc, char **argv, int *pid, NSString **session
     *pid = 0; *session = nil; *socket = nil; *terminal = nil; *list = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--list")) *list = 1;
+        else if (!strcmp(argv[i], "--bridge")) { /* explicit legacy view, never a transfer fallback */ }
         else if (!strcmp(argv[i], "--terminal") && i + 1 < argc) *terminal = @(argv[++i]);
         else if (!strcmp(argv[i], "--pid") && i + 1 < argc) {
             char *end; long n = strtol(argv[++i], &end, 10);
@@ -598,15 +614,28 @@ static int mac_slurp_options(int argc, char **argv, int *pid, NSString **session
     return ((*pid != 0) + (*session != nil) + (*terminal != nil)) <= 1;
 }
 
+static int mac_slurp_bridge(int argc, char **argv) {
+    for (int i = 2; i < argc; i++) if (!strcmp(argv[i], "--bridge")) return 1;
+    return 0;
+}
+
 static Tab *mac_tmux_tab(NSString *session, NSString *socket) {
     if ([session lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >= sizeof(((Tab *)0)->run) ||
         [socket lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >= sizeof(((Tab *)0)->hist)) return NULL;
     Tab *tb = calloc(1, sizeof(Tab));
     if (!tb || !term_init(&tb->t, g_cols, g_rows)) { free(tb); return NULL; }
     tb->fd = -1; tb->id = g_next_id++;
-    snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", getenv("HOME") ?: "/");
+    /* Before source discovery completes, identify the source instead of
+       presenting the receiving process's HOME as the session's directory. */
+    snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", session.UTF8String);
     snprintf(tb->run, sizeof(tb->run), "%s", session.UTF8String);
     snprintf(tb->hist, sizeof(tb->hist), "%s", socket.UTF8String ?: "");
+    if ([session hasPrefix:@"terminal:"])
+        mac_apply_session_metadata(tb, mac_terminal_metadata([session substringFromIndex:9]));
+    else if ([session hasPrefix:@"claude-wait:"])
+        snprintf(tb->program, sizeof(tb->program), "claude");
+    else
+        mac_apply_session_metadata(tb, mac_tmux_metadata(session, socket));
     if (!tab_spawn(tb)) { term_free(&tb->t); free(tb); return NULL; }
     return tb;
 }
@@ -653,9 +682,10 @@ static int mac_prepare(int argc, char **argv) {
         mac_socket_setup(g_mac_ready_fd);
     }
     NSArray *terminal_sessions = !pid && !session ? mac_terminal_sessions(1) : @[];
+    int bridge = mac_slurp_bridge(argc, argv);
     int need_bridge = 0;
     for (NSDictionary *source in terminal_sessions)
-        if ((!terminal || [terminal isEqual:source[@"tty"]]) && !mac_host_for_tty(source[@"tty"])) need_bridge = 1;
+        if (bridge && (!terminal || [terminal isEqual:source[@"tty"]]) && !mac_host_for_tty(source[@"tty"])) need_bridge = 1;
     if (need_bridge && !AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES})) {
         fprintf(stderr, "hardcore: Terminal input needs Accessibility permission. Enable it for Hardcore or the launching app in System Settings, then retry.\n");
         if (terminal) return -1;
@@ -696,6 +726,7 @@ static int mac_prepare(int argc, char **argv) {
             }
             continue;
         }
+        if (!bridge) continue;
         NSString *marker = [@"terminal:" stringByAppendingString:source[@"tty"]];
         int duplicate = 0;
         for (int i = 0; i < g_ntabs; i++) if (!strcmp(g_tabs[i]->run, marker.UTF8String)) duplicate = 1;
@@ -722,6 +753,47 @@ static int mac_transfer_reload_windows(NSArray *windows, NSString *exe) {
     return bad ? 1 : 0;
 }
 
+/* Describe what the receiver actually opened. A bridge client is not evidence
+   that Terminal's process, shell, colors, or cursor were transferred. */
+static NSDictionary *mac_slurp_result(void) {
+    int native = 0, bridges = 0, tmux = 0, claude = 0;
+    for (int i = 0; i < g_ntabs; i++) {
+        const char *run = g_tabs[i]->run;
+        if (!strncmp(run, "terminal:", 9)) bridges++;
+        else if (!strncmp(run, "claude-wait:", 12)) claude++;
+        else if (*run) tmux++;
+        else native++;
+    }
+    return @{@"ok": @YES, @"pid": @(getpid()), @"nativeTabs": @(native),
+             @"terminalBridges": @(bridges), @"tmuxClients": @(tmux), @"claudeClients": @(claude)};
+}
+
+static NSString *mac_slurp_terminal_label(NSDictionary *source) {
+    NSString *path = [source[@"cwd"] isKindOfClass:[NSString class]] ? source[@"cwd"] : nil;
+    NSString *folder = hc_dock_label(path.lastPathComponent, @"unknown folder");
+    NSString *program = hc_dock_label(source[@"program"], hc_dock_label(source[@"shell"], @"shell"));
+    return [NSString stringWithFormat:@"%@:%@", folder, program];
+}
+
+static void mac_slurp_report(NSDictionary *reply, FILE *out) {
+    if (![reply[@"nativeTabs"] isKindOfClass:[NSNumber class]]) {
+        fprintf(out, "hardcore: opened receiving window %d\n", [reply[@"pid"] intValue]);
+        return;
+    }
+    int native = [reply[@"nativeTabs"] intValue], bridges = [reply[@"terminalBridges"] intValue];
+    int tmux = [reply[@"tmuxClients"] intValue], claude = [reply[@"claudeClients"] intValue];
+    if (native) fprintf(out, "  %d native Hardcore tab%s transferred with live PTYs and terminal state.\n", native, native == 1 ? "" : "s");
+    if (tmux) fprintf(out, "  %d tmux client%s opened; sessions remain in their tmux server.\n", tmux, tmux == 1 ? "" : "s");
+    if (claude) fprintf(out, "  %d Claude attachment client%s opened.\n", claude, claude == 1 ? "" : "s");
+    if (bridges) {
+        fprintf(out, "  %d Terminal bridge view%s opened; source processes remain in Terminal.\n", bridges, bridges == 1 ? "" : "s");
+        fputs("Keep the original Terminal tabs open. Bridge views show plain text; colors and exact cursor position are not preserved.\n", out);
+        fputs("For Claude conversation handoff, see hardcore claude install --help and /hardcore-slurp wait. The parent shell and Terminal history still remain at the source.\n", out);
+    }
+    /* Keep the final window PID readable by existing command-line callers. */
+    fprintf(out, "hardcore: opened receiving window %d\n", [reply[@"pid"] intValue]);
+}
+
 static int mac_cli(int argc, char **argv) {
     uint32_t cap = sizeof(g_mac_exe_path);
     char path[MAX_PATH];
@@ -729,6 +801,20 @@ static int mac_cli(int argc, char **argv) {
     g_mac_image = [mac_hash(@(g_mac_exe_path)) retain];
     g_mac_install_exe = [@(g_mac_exe_path) copy];
     if (argc < 2) return -1;
+    if (!strcmp(argv[1], "--slurp-sources")) {
+        if (argc != 2) return 2;
+        NSMutableArray *terminal = [NSMutableArray array];
+        for (NSDictionary *source in mac_terminal_sessions(1)) {
+            NSMutableDictionary *entry = [[source mutableCopy] autorelease];
+            entry[@"managed"] = @(mac_host_for_tty(source[@"tty"]) != nil);
+            [terminal addObject:entry];
+        }
+        NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"terminal":terminal,
+            @"terminalDiscoveryFailed":@(g_mac_terminal_discovery_failed),
+            @"hardcore":mac_windows(), @"tmux":mac_attachable_tmux(nil)} options:0 error:nil];
+        if (!data) return 1;
+        fwrite(data.bytes, 1, data.length, stdout); putchar('\n'); return 0;
+    }
     if (!strcmp(argv[1], "claude")) {
         if (argc < 3) { fprintf(stderr, "Usage: hardcore claude install|status|move [--project DIR]\n"); return 2; }
         int setup = !strcmp(argv[2], "install") || !strcmp(argv[2], "status") || !strcmp(argv[2], "move") || !strcmp(argv[2], "moves") || !strcmp(argv[2], "inspect") || !strcmp(argv[2], "recover");
@@ -801,8 +887,9 @@ static int mac_cli(int argc, char **argv) {
              "hardcore update --from PATH     install a local app bundle or bare executable, then reload\n"
              "hardcore reload / --reload      replace the installed process image, preserving its PID\n"
              "hardcore reload --exe PATH      hand live tabs to a different executable in a new process\n"
-             "hardcore slurp [--list]         gather Terminal bridges, Hardcore tabs and detached tmux sessions\n"
-             "hardcore slurp --terminal TTY   live bridge to a Terminal.app tab (source stays open)\n"
+             "hardcore slurp [--list]         discover sessions and choose their transfer method\n"
+             "hardcore slurp --terminal TTY   transfer one Terminal.app session\n"
+             "hardcore slurp --bridge         explicitly open plain-text Terminal bridge views\n"
              "hardcore slurp --pid PID        move one Hardcore window's live tabs\n"
              "hardcore slurp --tmux SESSION [--tmux-socket PATH]\n"
              "                               attach a live tmux session (existing clients stay attached)\n"
@@ -813,10 +900,11 @@ static int mac_cli(int argc, char **argv) {
              "hardcore claude inspect REQUEST_ID [--json]  inspect verification and recovery state\n"
              "hardcore claude recover REQUEST_ID --export-draft FILE  save an unsent draft without overwriting\n"
              "hardcore --version\n\n"
-             "Claude: after installation, run /reload-plugins then /hardcore-slurp in Claude.\n"
-             "A loaded adapter accepts move requests without typing over your draft.\n"
+             "Slurp installs and queues Claude's adapter automatically. First-time running sessions\n"
+             "still need /reload-plugins in Claude. A loaded adapter accepts requests without replacing your draft.\n"
              "It waits for a verified completed turn and no background work; Terminal stays open.\n"
-             "Terminal bridges show plain text and require Automation + Accessibility permission. Keep Terminal open.\n"
+             "Unsupported transfers stay at the source. Only --bridge opens a plain-text mirror; keep Terminal open.\n"
+             "Terminal bridges require Automation + Accessibility permission; colors and exact cursor position are unavailable.\n"
              "Arbitrary iTerm PTYs are not supported yet; tmux-backed sessions can attach.\n"
              "Pre-handoff Hardcore builds require one manual restart."); return 0;
     }
@@ -842,30 +930,60 @@ static int mac_cli(int argc, char **argv) {
                 return mac_reload_windows();
         return mac_update_cmd(argc - 2, argv + 2);
     }
-    if (!strcmp(argv[1], "slurp")) {
+    if (!strcmp(argv[1], "slurp") || !strcmp(argv[1], "--slurp-native")) {
         int pid, list; NSString *session, *socket, *terminal;
         if (!mac_slurp_options(argc, argv, &pid, &session, &socket, &terminal, &list)) { fprintf(stderr, "hardcore: invalid slurp options; see --help\n"); return 2; }
+        int bridge = mac_slurp_bridge(argc, argv), native = !strcmp(argv[1], "--slurp-native");
+        if (native && (bridge || pid || session || socket || list)) return 2;
         if (list) {
             if (!pid && !session) for (NSDictionary *t in mac_terminal_sessions(1))
                 if (!terminal || [terminal isEqual:t[@"tty"]])
-                    printf("terminal tty=%s (%s)\n", [t[@"tty"] UTF8String], mac_host_for_tty(t[@"tty"]) ? "portable host; original tab can close after attachment" : "live plain-text bridge; original tab stays open");
+                    printf("terminal tty=%s %s (%s)\n", [t[@"tty"] UTF8String], mac_slurp_terminal_label(t).UTF8String,
+                           mac_host_for_tty(t[@"tty"]) ? "portable host; live tmux attachment" :
+                           [t[@"program"] isEqual:@"claude"] ? "Claude handoff; adapter installed automatically if needed" :
+                           "direct transfer unavailable; source retained");
             for (NSDictionary *w in mac_windows())
                 if (!session && !terminal && (!pid || [w[@"pid"] intValue] == pid))
                     printf("hardcore pid=%d tabs=%lu\n", [w[@"pid"] intValue], (unsigned long)[w[@"tabs"] count]);
             if (!pid && !terminal) for (NSDictionary *t in mac_attachable_tmux(socket))
                 printf("tmux %s name=%s clients=%d %s\n", [t[@"id"] UTF8String], [t[@"name"] UTF8String], [t[@"attached"] intValue],
                        [t[@"managed"] boolValue] ? "(portable host; eligible)" : [t[@"attached"] intValue] ? "(use --tmux to attach explicitly)" : "(eligible)");
-            puts("Terminal uses a live bridge; iTerm requires tmux for now. Older Hardcore windows need one manual restart.");
+            puts("Default slurp never substitutes a plain-text mirror for a transfer. --bridge explicitly requests that view. iTerm requires tmux for now.");
             return 0;
         }
+        if (!native && !bridge && !pid && !session && !socket) {
+            NSString *helper = mac_helper(@"slurp_mac.py");
+            if (!helper) { fprintf(stderr, "hardcore: missing slurp coordinator; rebuild or reinstall Hardcore\n"); return 1; }
+            NSMutableArray *arguments = [NSMutableArray arrayWithObjects:@"env", @"python3", helper,
+                @"--executable", @(g_mac_exe_path), nil];
+            if (terminal) [arguments addObjectsFromArray:@[@"--terminal", terminal]];
+            char **command = calloc(arguments.count + 1, sizeof(char *));
+            if (!command) return 1;
+            for (NSUInteger i = 0; i < arguments.count; i++) command[i] = (char *)[arguments[i] UTF8String];
+            execv("/usr/bin/env", command);
+            perror("hardcore: slurp coordinator"); free(command); return 1;
+        }
+        if (native) {
+            int eligible = 0;
+            if (!terminal) {
+                for (NSDictionary *window in mac_windows()) if ([window[@"tabs"] count]) eligible = 1;
+                for (NSDictionary *tmux in mac_attachable_tmux(nil))
+                    if (![tmux[@"attached"] intValue] || [tmux[@"managed"] boolValue]) eligible = 1;
+            }
+            for (NSDictionary *source in mac_terminal_sessions(1))
+                if ((!terminal || [terminal isEqual:source[@"tty"]]) && mac_host_for_tty(source[@"tty"])) eligible = 1;
+            if (!eligible) { puts("hardcore: no native Hardcore or portable sessions to transfer"); return 0; }
+        }
         int needs_accessibility = 0;
-        if (!pid && !session) for (NSDictionary *t in mac_terminal_sessions(1))
+        if (bridge && !pid && !session) for (NSDictionary *t in mac_terminal_sessions(1))
             if ((!terminal || [terminal isEqual:t[@"tty"]]) && !mac_host_for_tty(t[@"tty"])) needs_accessibility = 1;
         if (needs_accessibility &&
             !AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES})) {
             fprintf(stderr, "hardcore: Terminal input needs Accessibility permission for Hardcore or its launching app. Enable it in System Settings > Privacy & Security > Accessibility, then retry.\n");
             return 1;
         }
+        if (needs_accessibility)
+            fputs("hardcore: opening plain-text Terminal bridge views. The source processes stay in Terminal; leave those tabs open.\n", stderr);
         int pair[2]; pid_t child;
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) return 1;
         mac_socket_setup(pair[0]); mac_socket_setup(pair[1]);
@@ -876,7 +994,7 @@ static int mac_cli(int argc, char **argv) {
         NSDictionary *reply = started ? mac_recv(pair[0]) : nil;
         close(pair[0]);
         if (![reply[@"ok"] boolValue]) { fprintf(stderr, "hardcore: slurp did not complete; check the original windows\n"); return 1; }
-        printf("hardcore: live sessions gathered into window %d\n", [reply[@"pid"] intValue]);
+        mac_slurp_report(reply, stdout);
         return 0;
     }
     return -1;
