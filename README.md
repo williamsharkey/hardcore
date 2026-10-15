@@ -3,8 +3,11 @@
 Settings → **Layout** chooses a fixed left **Sidebar**, **Right underlay**,
 or **Left underlay**. Both underlays give the terminal its full width. The dim
 menu sits beneath terminal cells; hovering anywhere in its bounds brings the
-entire menu forward. Tabs occupy one row each, with thin box borders drawn at
-cell edges. No column is reserved for a tab initial.
+entire menu forward. Tabs occupy one row each, sharing a single device-pixel
+separator. Settings options use highlights without horizontal row borders;
+the right dock extends offscreen with no outside border. Lists use all available
+height and paginate only when needed. Harmless styles on blank cells, such as
+dim text after Codex’s “(^t to expand)”, do not obscure the menu.
 
 All three layouts use one font-sized grid from the drawable origin (0, 0),
 with no padding or reserved scrollbar strip. Only incomplete cells at the
@@ -14,10 +17,15 @@ The optional **Local reflow** checkbox rearranges recognizable prose around
 an underlay for display only. It first uses spare space in the paragraph's
 existing rows, then at most three following blank rows. Words stay whole and
 later text stays on its original row. A left dock shifts only the rows beside
-the menu; other rows retain the full width. Code, boxes, non-ASCII text,
-styled backgrounds, input rows, and applications requesting mouse reports are
-left alone. The original terminal data, scrollback, and PTY dimensions are
-unchanged; selection maps displayed characters back to their source cells.
+the menu; other rows retain the full width. Foreground colors, bold/dim/italic
+text, ordinary Unicode punctuation, and prose bullets retain their styling and
+hanging indentation. Codex “• Ran …” summaries may wrap at existing word spaces
+when local space permits, keeping paths and arguments intact. Structured output,
+boxes, wide/combining text, meaningful backgrounds, input rows, and applications
+requesting mouse reports keep their original layout. When there is no safe local
+fit, terminal content continues to cover the underlay until hover. The original
+terminal data, scrollback, and PTY dimensions are unchanged; selection maps
+displayed characters back to their source cells.
 **Reflow markers** adds a small arrow in existing indentation for inspection.
 
 A terminal for WSL on Windows 11, built for running Claude Code. It also runs
@@ -470,7 +478,11 @@ What's different on the Mac:
   `dir=` in `~/Library/Application Support/hardcore/config.ini`, or with
   `hardcore.app/Contents/MacOS/hardcore DIR`. A folder dropped on the Dock
   icon opens a tab there.
-- **The window's own traffic lights** sit over the tab column. The empty
+- **The window's traffic lights** rest as dim gray circles beneath terminal
+  text. Hovering the native title area reveals the real controls and smokes the
+  full-width band; drag there to move the window or double-click to zoom. An
+  upward text-selection drag keeps the controls and band hidden and continues
+  scrolling. The terminal still starts at the drawable origin. The empty
   part of the column still drags the window, and double-clicking it zooms.
 - **Mac keys:**
 

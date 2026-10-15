@@ -16,30 +16,39 @@ typedef struct {
 
 static int checks;
 
+static uint32_t next_character(const char **text) {
+    const unsigned char *s = (const unsigned char *)*text;
+    uint32_t c = *s++;
+    int n = c < 0x80 ? 0 : c < 0xe0 ? 1 : c < 0xf0 ? 2 : 3;
+    if (n) c &= (1u << (6 - n)) - 1;
+    while (n--) { assert((*s & 0xc0) == 0x80); c = (c << 6) | (*s++ & 0x3f); }
+    *text = (const char *)s;
+    return c;
+}
+
 static Cell *make_grid(const char *const *lines, int rows, int cols) {
     Cell *grid = (Cell *)calloc((size_t)rows * (size_t)cols, sizeof(*grid));
     int y, x;
     assert(grid);
     for (y = 0; y < rows; y++) {
-        size_t len = strlen(lines[y]);
-        assert(len <= (size_t)cols);
-        for (x = 0; x < cols; x++) grid[y * cols + x].ch = x < (int)len ? (unsigned char)lines[y][x] : ' ';
+        const char *text = lines[y];
+        for (x = 0; x < cols; x++) grid[y * cols + x].ch = *text ? next_character(&text) : ' ';
+        assert(!*text);
     }
     return grid;
 }
 
 static void expect_row(const ChromeReflow *out, int row, const char *expected) {
     int x;
-    size_t length = strlen(expected);
-    assert(length <= (size_t)out->cols);
     for (x = 0; x < out->cols; x++) {
         uint32_t actual = out->cells[row * out->cols + x].ch;
-        uint32_t want = x < (int)length ? (unsigned char)expected[x] : ' ';
+        uint32_t want = *expected ? next_character(&expected) : ' ';
         if (actual != want) {
-            fprintf(stderr, "row %d, col %d: wanted %c, got %c\n", row, x, (char)want, (char)actual);
+            fprintf(stderr, "row %d, col %d: wanted U+%04x, got U+%04x\n", row, x, want, actual);
             abort();
         }
     }
+    assert(!*expected);
 }
 
 static uint32_t *normalized_words(const Cell *cells, int cols, int rows) {
@@ -94,19 +103,26 @@ static void invariants(const ChromeReflow *out, const Cell *input) {
     }
 }
 
-static ChromeReflow run(const Cell *grid, int cols, int rows, const unsigned char *protected_rows,
-                        int side, int x, int y, int width, int height, int blank_rows) {
+static ChromeReflow run_checked(const Cell *grid, int cols, int rows, const unsigned char *protected_rows,
+                        int side, int x, int y, int width, int height, int blank_rows,
+                        ChromeReflowBackgroundSafe background_safe) {
     ChromeReflow result;
     size_t bytes = (size_t)cols * (size_t)rows * sizeof(Cell);
     Cell *snapshot = (Cell *)malloc(bytes);
     assert(snapshot);
     memcpy(snapshot, grid, bytes);
-    assert(chrome_reflow_build(&result, grid, cols, rows, protected_rows, side, x, y, width, height, blank_rows));
+    assert(chrome_reflow_build_checked(&result, grid, cols, rows, protected_rows, side,
+                                       x, y, width, height, blank_rows, background_safe));
     assert(!memcmp(snapshot, grid, bytes));
     assert(result.rows == rows && result.cols == cols);
     invariants(&result, grid);
     free(snapshot);
     return result;
+}
+
+static ChromeReflow run(const Cell *grid, int cols, int rows, const unsigned char *protected_rows,
+                        int side, int x, int y, int width, int height, int blank_rows) {
+    return run_checked(grid, cols, rows, protected_rows, side, x, y, width, height, blank_rows, NULL);
 }
 
 static void unchanged(const char *const *lines, int rows, int cols) {
@@ -260,7 +276,7 @@ static void test_cells_and_cursor_protection(void) {
         unsigned char protect[5] = {0, 0, 0, 0, 0};
         switch (kind) {
         case 0: grid[10].bg = 0x02010203; break;
-        case 1: grid[10].attr = 1; break;
+        case 1: grid[10].attr = 16; break;
         case 2: grid[10].attr = 8; break;
         case 3: grid[10].link = 1; break;
         case 4: grid[10].wflag = 1; break;
@@ -306,6 +322,118 @@ static void test_cells_and_cursor_protection(void) {
             chrome_reflow_free(&out);
             grid[styled_row * 48 + 8].bg = 0;
         }
+        free(grid);
+    }
+    checks++;
+}
+
+static int test_default_background(const Cell *cell) {
+    return cell->bg == 0x022e3440;
+}
+
+static void test_styled_codex_prose(void) {
+    const char *lines[] = {
+        "• All checks are passing: the macOS build, 12 native UI checks, 71 terminal fixtures, reflow sanitizer tests, and live-update tests. Windows also passes a syntax",
+        "  check; I haven’t run its GUI here. I’m committing the feature, pushing main, and installing the macOS build now.",
+        "", "456"
+    };
+    Cell *grid = make_grid(lines, 4, 170);
+    ChromeReflow out;
+    int i, side, y, x;
+    for (i = 0; i < 340; i++) {
+        grid[i].attr = (uint8_t)(1 + i % 7); /* bold, dim, italic combinations */
+        grid[i].fg = 0x01000000u | (uint32_t)(i % 16);
+    }
+    for (side = 1; side <= 2; side++) {
+        out = run(grid, 170, 4, NULL, side, side == 1 ? 142 : 0, 0, 28, 2, 0);
+        assert(out.changed == 1);
+        assert(out.cells[side == 1 ? 0 : 28].ch == 0x2022);
+        assert(out.source[side == 1 ? 0 : 28] == 0);
+        for (y = 0; y < 2; y++)
+            for (x = 0; x < 28; x++) assert(cr_space(out.cells[y * 170 + (side == 1 ? 142 : 0) + x].ch));
+        expect_row(&out, 2, "");
+        expect_row(&out, 3, "456");
+        assert(out.markers[1] == (side == 1 ? 1 : 29));
+        chrome_reflow_free(&out);
+    }
+    /* An explicit RGB encoding of the canvas is safe only when the native
+     * color resolver has confirmed it. Preserve that encoding in moved cells. */
+    for (i = 0; i < 340; i++) grid[i].bg = 0x022e3440;
+    out = run(grid, 170, 4, NULL, 1, 142, 0, 28, 2, 0);
+    assert(!out.changed);
+    chrome_reflow_free(&out);
+    out = run_checked(grid, 170, 4, NULL, 1, 142, 0, 28, 2, 0, test_default_background);
+    assert(out.changed == 1);
+    chrome_reflow_free(&out);
+    grid[60].bg = 0x02010203;
+    out = run_checked(grid, 170, 4, NULL, 1, 142, 0, 28, 2, 0, test_default_background);
+    assert(!out.changed);
+    chrome_reflow_free(&out);
+    grid[60].bg = 0x022e3440;
+    /* A protected cursor/link/effect on either half protects the entire bullet
+     * paragraph; it must not leave a detached reflowed continuation. */
+    for (y = 0; y < 2; y++) {
+        unsigned char protect[] = {0, 0, 0, 0};
+        protect[y] = 1;
+        out = run_checked(grid, 170, 4, protect, 2, 0, 0, 28, 2, 0, test_default_background);
+        assert(!out.changed);
+        chrome_reflow_free(&out);
+    }
+    for (i = 8; i <= 128; i *= 2) {
+        Cell saved = grid[170 + 10];
+        grid[170 + 10].attr |= (uint8_t)i;
+        out = run_checked(grid, 170, 4, NULL, 2, 0, 0, 28, 2, 0, test_default_background);
+        assert(!out.changed);
+        chrome_reflow_free(&out);
+        grid[170 + 10] = saved;
+    }
+    free(grid);
+    checks++;
+}
+
+static void test_bullet_commands_and_boundaries(void) {
+    const char *lines[] = {
+        "• Ran git add Makefile README.md hardcore.c hardcore_mac.m hardcore_mac_update.h",
+        "", "└ created a file", "456"
+    };
+    Cell *grid = make_grid(lines, 4, 100);
+    ChromeReflow out = run(grid, 100, 4, NULL, 1, 60, 0, 40, 4, 1);
+    assert(out.changed == 1);
+    assert(out.cells[0].ch == 0x2022);
+    assert(out.cells[100 + 2].ch == 'h');
+    expect_row(&out, 2, lines[2]);
+    expect_row(&out, 3, "456");
+    chrome_reflow_free(&out);
+    free(grid);
+    {
+        const char *occupied[] = { lines[0], "└ created a file", "", "456" };
+        grid = make_grid(occupied, 4, 100);
+        out = run(grid, 100, 4, NULL, 1, 60, 0, 40, 4, 3);
+        assert(!out.changed); /* Never borrow occupied structured output. */
+        chrome_reflow_free(&out);
+        free(grid);
+    }
+    {
+        const char *bullets[] = {
+            "• the quick brown fox jumps over the sleeping dog",
+            "  in the quiet house", "",
+            "• another sentence stands alone and keeps its position", "", "456"
+        };
+        grid = make_grid(bullets, 6, 70);
+        out = run(grid, 70, 6, NULL, 1, 35, 0, 35, 6, 2);
+        assert(out.changed == 2);
+        assert(out.cells[0].ch == 0x2022 && out.cells[3 * 70].ch == 0x2022);
+        assert(out.cells[70].ch == ' ' && out.cells[70 + 1].ch == ' ');
+        expect_row(&out, 5, "456");
+        chrome_reflow_free(&out);
+        free(grid);
+    }
+    {
+        const char *tight[] = { "• elephant", "", "", "456" };
+        grid = make_grid(tight, 4, 20);
+        out = run(grid, 20, 4, NULL, 1, 2, 0, 18, 1, 3);
+        assert(!out.changed); /* Never strand the bullet on its own row. */
+        chrome_reflow_free(&out);
         free(grid);
     }
     checks++;
@@ -453,6 +581,8 @@ int main(void) {
     test_left_and_band();
     test_protected_syntax();
     test_cells_and_cursor_protection();
+    test_styled_codex_prose();
+    test_bullet_commands_and_boundaries();
     test_row_budget_and_geometry();
     test_unindented_and_mapping();
     test_fixed_following_rows();

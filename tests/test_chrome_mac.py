@@ -280,7 +280,7 @@ def test_hover(app):
     app.hover(-1, -1)
     back = app.snap(f"mode-{app.mode}-underlay")
     # Point at the first row and verify a distant row changes too.
-    c = app.hover(dock["x"] + dock["width"] // 2, dock["y"])
+    c = app.hover(dock["x"] + dock["width"] // 2, c["pages"]["tabs"]["row"])
     assert c["hovered"], c
     front = app.snap(f"mode-{app.mode}-hover-menu")
     for row in {dock["y"], dock["y"] + dock["height"] - 1}:
@@ -336,6 +336,16 @@ def test_pagination(app):
     c = app.chrome()
     c = app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
     assert c["settings_open"] and c["settings_tab"] == 0, c
+    assert c["pages"]["settings"]["capacity"] == c["pages"]["settings"]["total"], "roomy font list unnecessarily paginated"
+    c = app.click(c["dock"]["x"] + 10, c["pages"]["section_row"])
+    assert c["pages"]["settings"]["capacity"] == c["pages"]["settings"]["total"], "roomy theme list unnecessarily paginated"
+    app.snap("sidebar-full-settings")
+    c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
+    for expected in range(2, 12):
+        app.send("cmd newtab")
+        wait_for(lambda: len(app.state()["tabs"]) == expected, description="new test tab")
+        app.send("type sleep 600\\n")
+    app.send("cmd resize 1001,160")
     c = walk_pages(app, "settings")
     before_font = c["fontkey"]
     c = app.click(c["dock"]["x"] + 8, c["pages"]["settings"]["row"])
@@ -350,11 +360,7 @@ def test_pagination(app):
     assert c["schemekey"] != before_scheme, "first paginated option row did not select its theme"
     theme_offset = c["pages"]["settings"]["offset"]
     app.snap("sidebar-theme-last-page")
-    # More tabs than fit on a page, with a deliberately partial final page.
-    for expected in range(2, 12):
-        app.send("cmd newtab")
-        wait_for(lambda: len(app.state()["tabs"]) == expected, description="new test tab")
-        app.send("type sleep 600\\n")
+    # The constrained viewport gives both lists independent pages.
     c = walk_pages(app, "tabs")
     visible = [row for row in c["tab_rows"] if row >= 0]
     assert visible and len(visible) < len(c["tab_rows"]), c
@@ -387,6 +393,11 @@ def test_pagination(app):
 
     # Reload only this disposable install, preserving the actual process and
     # independent page positions. In particular Layout is index 2, not a bool.
+    c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
+    font_offset = c["pages"]["settings"]["offset"]
+    c = app.click(c["dock"]["x"] + 11, c["pages"]["section_row"])
+    theme_offset = c["pages"]["settings"]["offset"]
+    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
     keys = ("mode", "settings_open", "settings_tab", "fontkey", "schemekey", "reflow_enabled", "dock", "pages")
     before = {key: c[key] for key in keys}
     result = subprocess.run([str(app.root / "hardcore.app/Contents/MacOS/hardcore"), "--reload"],
@@ -400,6 +411,124 @@ def test_pagination(app):
     c = app.click(c["dock"]["x"] + 11, c["pages"]["section_row"])
     assert c["settings_tab"] == 1 and c["pages"]["settings"]["offset"] == theme_offset, c
     print("PASS: in-place reload preserves Layout selection, dock settings, independent Font/Theme pages and app PID")
+
+
+def pixel(bitmap, x, y):
+    return bitmap.crop(int(x), int(y), 1, 1)
+
+
+def test_codex_prose(app):
+    import textwrap
+    c = app.chrome()
+    paragraph = ("All checks are passing: the macOS build, 12 native UI checks, 71 terminal fixtures, "
+                 "reflow sanitizer tests, and live-update tests. Windows also passes a syntax check; "
+                 "I haven’t run its GUI here. I’m committing the feature, pushing main, and installing the macOS build now.")
+    wrapped = textwrap.wrap(paragraph, width=c["cols"], initial_indent="• ", subsequent_indent="  ")
+    lines = [""] * c["rows"]
+    for row, line in enumerate(wrapped):
+        lines[row] = "\x1b[2;48;2;12;12;12m" + line.ljust(c["cols"]) + "\x1b[0m"
+    lines[len(wrapped) + 4] = "123"
+    c = app.feed(lines)
+    assert c["reflow_changed"], "styled Codex bullet paragraph did not reflow"
+    assert words(c["display"]) == words(c["source"]), "Codex words changed"
+    assert_mapping(app, c)
+    for row in range(c["dock"]["y"], c["dock"]["y"] + c["dock"]["height"]):
+        text = c["display"][row].rstrip()
+        if not text or text == "123":
+            continue
+        if app.mode == 1:
+            assert len(text) <= c["dock"]["x"], (row, text)
+        else:
+            assert text.startswith(" " * c["dock"]["width"]), (row, text)
+    app.hover(-1, -1)
+    app.snap(f"mode-{app.mode}-codex-prose")
+    print(f"PASS: styled Codex prose, Unicode punctuation and hanging bullet reflow around dock {app.mode}")
+
+
+def test_visible_whitespace_and_rules(app):
+    c = app.chrome()
+    row = c["pages"]["tabs"]["row"]
+    lines = [""] * c["rows"]
+    lines[row] = "  + 46 lines (^t to expand)"
+    c = app.feed(lines)
+    app.hover(-1, -1)
+    plain = app.snap("codex-plain-blank-tail")
+    # Codex's harmless attributes and explicitly default background may extend
+    # to the row edge, including blank cells after the expand annotation.
+    lines[row] = "\x1b[2;3;48;2;12;12;12m" + lines[row].ljust(c["cols"]) + "\x1b[0m"
+    c = app.feed(lines)
+    dim = app.snap("codex-dim-blank-tail")
+    d, cell = c["dock"], c["cell"]
+    box = (d["x"] * cell["width"], row * cell["height"], d["width"] * cell["width"], cell["height"])
+    assert plain.crop(*box) == dim.crop(*box), "invisible styled spaces still obscure the menu"
+    lines[row] = "\x1b[48;2;60;70;80m" + " " * c["cols"] + "\x1b[0m"
+    app.feed(lines)
+    shaded = app.snap("codex-meaningful-background")
+    assert shaded.crop(*box) != dim.crop(*box), "meaningful terminal background stopped masking menu"
+
+    c = app.feed([""] * c["rows"])
+    c = app.click(d["x"] + 6, c["pages"]["settings_row"])
+    assert c["pages"]["settings"]["capacity"] == c["pages"]["settings"]["total"], c
+    c = app.hover(d["x"] + 6, c["pages"]["tabs"]["row"])
+    front = app.snap("right-collapsed-rules-full-settings")
+    cw, ch = cell["width"], cell["height"]
+    x = (d["x"] + 20) * cw
+    boundary = c["pages"]["tabs"]["row"] * ch
+    assert pixel(front, x, boundary) != pixel(front, x, boundary - 1), "tab border still occupies preceding device pixel"
+    assert pixel(front, x, boundary) != pixel(front, x, boundary + 1), "tab border thicker than one device pixel"
+    edge = (d["x"] + d["width"]) * cw - 1
+    y = c["pages"]["settings"]["row"] * ch + ch // 2
+    assert pixel(front, edge, y) == pixel(front, edge - 1, y), "right dock has a visible outside border"
+    y = (c["pages"]["settings"]["row"] + 1) * ch
+    assert pixel(front, edge - 2, y) == pixel(front, edge - 2, y - 1) == pixel(front, edge - 2, y + 1), "settings option rows still have separator rules"
+    c = app.click(d["x"] + 6, c["pages"]["settings_row"])
+    app.hover(-1, -1)
+    print("PASS: invisible styled spaces reveal chrome; borders collapse to one pixel, settings omit row rules, right edge is open")
+
+
+def test_title_underlay(app):
+    c = app.chrome()
+    app.feed([""] * c["rows"])
+    c = app.hover(-1, -1)
+    title = c["titlebar"]
+    assert 0 < title["height"] < 5 * c["cell"]["height"], title
+    assert not title["hovered"] and not title["buttons_visible"], title
+    assert min(r for r in c["tab_rows"] if r >= 0) >= title["height"], "title hover obscures a clickable tab"
+    back = app.snap("title-dim-underlay")
+    b = title["button_rects"][0]
+    x, y = int(b["x"] + b["width"] / 2), int(b["y"] + b["height"] / 2)
+    p = pixel(back, x, y)
+    assert p[0] == p[1] == p[2] and p[0] > 12, ("quiet traffic light is not a visible gray circle", p)
+    # Fill the title rows with literal characters. Compare the cell containing
+    # the circle with a distant identical cell: circle pixels must be beneath it.
+    lines = [""] * c["rows"]
+    for row in range((title["height"] + c["cell"]["height"] - 1) // c["cell"]["height"]):
+        lines[row] = "X" * c["cols"]
+    app.feed(lines)
+    text = app.snap("title-text-over-circles")
+    cw, ch = c["cell"]["width"], c["cell"]["height"]
+    assert text.crop(x // cw * cw, y // ch * ch, cw, ch) == text.crop(40*cw, y // ch * ch, cw, ch), "traffic circle drew above terminal text"
+    app.send(f"cmd hover {c['cols'] * cw // 2},{title['height'] // 2}")
+    c = app.chrome()
+    assert c["titlebar"]["hovered"] and c["titlebar"]["buttons_visible"], c["titlebar"]
+    front = app.snap("title-hover-smoke")
+    assert front.crop(40*cw, 0, cw, ch) != text.crop(40*cw, 0, cw, ch), "full-width title band did not smoke terminal text"
+    app.hover(-1, -1)
+    # Create scrollback and drag a real selection upwards into/out of the band.
+    app.feed([""] * c["rows"], "history line\r\n" * (c["rows"] * 2))
+    x = 40 * cw
+    app.send(f"cmd pointer down {x},{title['height'] + 3*ch}")
+    app.send(f"cmd pointer drag {x},{title['height'] // 2}")
+    c = app.chrome()
+    assert c["titlebar"]["selection_drag"] and c["titlebar"]["selection_on"], c["titlebar"]
+    assert not c["titlebar"]["hovered"] and not c["titlebar"]["buttons_visible"], c["titlebar"]
+    app.send(f"cmd pointer drag {x},-5")
+    assert app.state()["tabs"][0]["view"] > 0, "upward selection stopped scrolling"
+    app.send(f"cmd pointer up {x},-5")
+    c = app.chrome()
+    assert not c["titlebar"]["selection_drag"] and not c["titlebar"]["buttons_visible"], c["titlebar"]
+    app.hover(-1, -1)
+    print("PASS: gray traffic lights sit beneath text; top hover smokes full width; upward selection keeps controls hidden and scrolls")
 
 
 def main():
@@ -418,6 +547,10 @@ def main():
                 columns[mode] = c["cols"]
                 if mode:
                     test_reflow(app)
+                    test_codex_prose(app)
+                    if mode == 1:
+                        test_visible_whitespace_and_rules(app)
+                        test_title_underlay(app)
                     test_hover(app)
                 else:
                     app.snap("sidebar")

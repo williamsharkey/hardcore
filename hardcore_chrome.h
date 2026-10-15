@@ -13,7 +13,7 @@ static int sb_row_y(int k) { return k * CH; }
 #endif
 static float row_y(int r) { return (float)(r * CH); }
 static int first_row(void) {
-    int b = g_tab_underlay == 1 ? 0 : plat_lights_bottom();
+    int b = plat_lights_bottom();
 #ifdef _WIN32
     b = caption_h();
 #endif
@@ -53,20 +53,26 @@ static int chrome_item_total(void) {
 static ChromeLayout chrome_measure(int rows, int lights, int tabs, int open,
                                    int underlay, int dock, int items) {
     ChromeLayout a;
-    int preferred_tabs, preferred_list, preferred_height, available;
+    int minimum_height, available, budget;
     memset(&a, 0, sizeof(a));
     a.settings_row = a.section_row = a.list_row = -1;
     if (rows < 1) return a;
-    preferred_tabs = chrome_min(tabs, open ? 4 : underlay ? 6 : tabs);
-    preferred_list = open ? chrome_min(items, 4) : 0;
-    preferred_height = chrome_max(1, lights) + preferred_tabs + 1 + (open ? 1 + preferred_list : 0);
-    a.top = underlay ? chrome_min(chrome_max(dock, 0), chrome_max(0, rows - preferred_height)) : 0;
+    /* Opening settings may use all rows below the grip. Do not move a dock
+       upward just to fit the whole list: its chosen row is stable, and pages
+       handle actual overflow. Keep enough space for one of each control. */
+    minimum_height = 1 + (tabs > 0) + 1 + (open ? 1 + (items > 0) : 0);
+    a.top = underlay ? chrome_min(chrome_max(dock, 0), chrome_max(0, rows - minimum_height)) : 0;
     a.grip_rows = chrome_min(rows - a.top, chrome_max(1, lights - a.top));
     available = rows - a.top - a.grip_rows;
-    a.tab_capacity = chrome_min(preferred_tabs, chrome_max(0, available - 1));
+    a.tab_capacity = chrome_min(tabs, chrome_max(0, available - 1));
     if (open) {
-        a.tab_capacity = chrome_min(preferred_tabs, chrome_max(0, (available - 2) / 2));
-        a.list_capacity = chrome_min(preferred_list, chrome_max(0, available - a.tab_capacity - 2));
+        /* Give both lists room when they overflow, then lend any unused rows
+           to the longer list. Capacity depends on the complete lists, never
+           on the number of entries left on a short final page. */
+        budget = chrome_max(0, available - 2);
+        a.tab_capacity = chrome_min(tabs, (budget + 1) / 2);
+        a.list_capacity = chrome_min(items, budget - a.tab_capacity);
+        a.tab_capacity = chrome_min(tabs, budget - a.list_capacity);
     }
     a.tab_row = a.top + a.grip_rows;
     a.tab_count = chrome_min(tabs, a.tab_capacity);
@@ -118,6 +124,7 @@ static void tab_layout(void) {
 static int chrome_top_row(void) { tab_layout(); return g_chrome.top; }
 static int chrome_bottom_row(void) { tab_layout(); return g_chrome.bottom; }
 static int chrome_hovered(void) {
+    if (g_sel_drag) return 0;
     int x = sidebar_x(), cw = cell_w(g_font), ch = cell_h(g_font);
     tab_layout();
     return g_mouse_x >= x && g_mouse_x < x + SB_COLS * cw &&
@@ -242,6 +249,20 @@ static int unit_chrome(FILE *f) {
             if (a.settings_row >= 0) fails += a.settings_row < a.tab_row + a.tab_count;
             if (a.list_count) fails += a.list_row <= a.section_row || a.list_row + a.list_count > rows;
         }
+    {
+        ChromeLayout a = chrome_measure(48, 1, 2, 1, 1, 8, NFONTS);
+        fails += a.top != 8 || a.tab_capacity != 2 || a.list_capacity != NFONTS;
+        a = chrome_measure(48, 1, 2, 1, 2, 8, NFAMILIES);
+        fails += a.top != 8 || a.list_capacity != NFAMILIES;
+        a = chrome_measure(48, 1, 12, 0, 1, 8, 0);
+        fails += a.tab_capacity != 12; /* no arbitrary closed-underlay cap */
+        a = chrome_measure(16, 1, 2, 1, 1, 8, NFAMILIES);
+        fails += a.top != 8 || a.tab_capacity != 2 || a.list_capacity != 3;
+        a = chrome_measure(16, 1, 12, 1, 1, 0, NFAMILIES);
+        fails += a.tab_capacity != 7 || a.list_capacity != 6;
+        a = chrome_measure(16, 1, 12, 1, 1, 0, 2);
+        fails += a.tab_capacity != 11 || a.list_capacity != 2;
+    }
     /* Last-page navigation must retain the full capacity, including after a resize. */
     fails += chrome_page_offset(8, 10, 4) != 8;
     fails += chrome_page_offset(12, 10, 4) != 8;
@@ -253,6 +274,6 @@ static int unit_chrome(FILE *f) {
     fails += chrome_page_hit(next_col, 8, 4, 10, 0, &direction) != 1 || direction != 1;
     fails += chrome_page_hit(6, 8, 4, 10, 0, &direction) != 0;
     fails += chrome_page_hit(counter_col, 8, 4, 10, 0, &direction) != 2;
-    fprintf(f, "%s chrome: bounded rows, one-row tabs, stable pages and independent arrow targets\n", fails ? "FAIL" : "ok  ");
+    fprintf(f, "%s chrome: bounded rows, full-height lists, stable dock and pages, independent arrow targets\n", fails ? "FAIL" : "ok  ");
     return fails;
 }

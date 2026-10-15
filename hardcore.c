@@ -4038,7 +4038,13 @@ static void grid_text(const wchar_t *s, int col, int row, uint32_t rgb) {
 /* Default whitespace reveals chrome; every meaningful terminal cell owns its
    entire cell rectangle so chrome strokes cannot leak through glyph margins. */
 static int cell_covers_chrome(const Cell *c) {
-    return c->ch > ' ' || c->wflag || c->attr || c->link || c->bg;
+    uint32_t fg, bg;
+    int space = c->ch <= ' ' || c->ch == 0xA0 || (c->ch >= 0x2000 && c->ch <= 0x200A) ||
+                c->ch == 0x202F || c->ch == 0x205F || c->ch == 0x3000;
+    cell_colors(c, &fg, &bg);
+    if (bg != DEF_BG) return 1;
+    if (fg == bg) return 0;
+    return !space || c->wflag == W_CONT || (c->attr & (A_UNDER | A_STRIKE)) || c->link;
 }
 
 static int unit_underlay(FILE *f) {
@@ -4056,6 +4062,12 @@ static int unit_underlay(FILE *f) {
     blank.wflag = 0; blank.bg = C_PAL(2); fails += !cell_covers_chrome(&blank);
     blank.bg = 0; blank.attr = A_UNDER; fails += !cell_covers_chrome(&blank);
     blank.attr = 0; blank.link = 1; fails += !cell_covers_chrome(&blank);
+    blank.link = 0;
+    blank.attr = A_DIM | A_BOLD | A_ITALIC | A_BLINK; fails += cell_covers_chrome(&blank);
+    blank.bg = C_RGB((DEF_BG >> 16) & 255, (DEF_BG >> 8) & 255, DEF_BG & 255);
+    fails += cell_covers_chrome(&blank);
+    blank.ch = 'X'; blank.attr = A_HIDDEN; fails += cell_covers_chrome(&blank);
+    blank.ch = 0xA0; blank.attr = A_DIM; fails += cell_covers_chrome(&blank);
     const Font *saved_font = g_cf;
     int fi;
     for (fi = 0; fi < NFONTS; fi++) {
@@ -4109,6 +4121,11 @@ static int unit_underlay(FILE *f) {
 }
 
 static void r_begin(int w, int h);
+#ifndef _WIN32
+static int plat_title_height(void);
+static void plat_render_title_underlay(void);
+static void plat_render_title_overlay(void);
+#endif
 #include "hardcore_display.h"
 
 static void render(void) {
@@ -4123,7 +4140,7 @@ static void render(void) {
 #ifdef _WIN32
     if (!tb) { render_tabbar(r.right, r.bottom); render_caption_buttons(r.right); return; }
 #else
-    if (!tb) { render_tabbar(r.right, r.bottom); return; }
+    if (!tb) { render_tabbar(r.right, r.bottom); plat_render_title_underlay(); plat_render_title_overlay(); return; }
 #endif
     t = &tb->t;
     chrome_prepare_display(t);
@@ -4131,7 +4148,10 @@ static void render(void) {
         g_draw_alpha = .38f;
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
-    }
+    } else render_tabbar(r.right, r.bottom);
+#ifndef _WIN32
+    plat_render_title_underlay();
+#endif
 
     /* One pass per row: backgrounds, then glyphs, then underlines, so a bold
        smear or underline is never painted over by the next cell's background.
@@ -4140,7 +4160,11 @@ static void render(void) {
     for (y = 0; y < t->rows; y++) {
         const Cell *cells;
         int n, wrapped, L = t->hcount - t->view + y, end;
+        int underlay_cells = g_tab_underlay;
         float y0 = (float)(oy + y * CH);
+#ifndef _WIN32
+        underlay_cells |= y0 < plat_title_height();
+#endif
         if (g_display_term == t && g_display.cells) {
             cells = g_display.cells + y*t->cols;
             n = t->cols;
@@ -4158,7 +4182,7 @@ static void render(void) {
             if (display_selected(t, x, y)) bg = SEL_BG;
             /* Opaque terminal cells mask the underlay, including glyph margins,
                wide continuations, decorations and meaningful blank backgrounds. */
-            if (bg == DEF_BG && !(g_tab_underlay && x < n &&
+            if (bg == DEF_BG && !(underlay_cells && x < n &&
                 cell_covers_chrome(&cells[x]))) continue;
             r_color(bg, 1);
             quad((float)(ox + x * CW), y0, (float)(ox + (x + 1) * CW), y0 + CH);
@@ -4169,7 +4193,7 @@ static void render(void) {
             int w;
             if (c->ch <= ' ' || c->wflag == W_CONT) continue;
             cell_colors(c, &fg, &bg);
-            if (fg == bg && !(c->attr & A_HIDDEN)) continue;
+            if (fg == bg) continue;
             w = (c->wflag == W_WIDE) ? 2 : 1;
             r_color(fg, 1);
             draw_glyph(c->ch, (float)(ox + x * CW), y0, w, g_scale);
@@ -4183,6 +4207,7 @@ static void render(void) {
             float x0 = (float)(ox + x * CW);
             if (!(c->attr & (A_UNDER | A_STRIKE)) && !c->link) continue;
             cell_colors(c, &fg, &bg);
+            if (fg == bg) continue;
             if (c->link && !(c->attr & A_UNDER)) {   /* OSC 8 link: dotted underline */
                 int d;
                 r_color(fg, 0.6f);
@@ -4232,11 +4257,13 @@ static void render(void) {
         fill_rect(bx, track_top + pos * (track_h - bar_h), bx + SCROLLBAR_W - 2 * g_scale,
                   track_top + pos * (track_h - bar_h) + bar_h, AMBER, t->view ? 0.8f : 0.3f);
     }
-    if (!g_tab_underlay || chrome_hovered()) render_tabbar(r.right, r.bottom);
+    if (g_tab_underlay && chrome_hovered()) render_tabbar(r.right, r.bottom);
 #ifdef _WIN32
     if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
         fill_rect(0, 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
     render_caption_buttons(r.right);   /* last: glass over whatever is under it */
+#else
+    plat_render_title_overlay();
 #endif
 }
 

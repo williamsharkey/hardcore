@@ -1,14 +1,23 @@
-/* Pixel-edge frames share the glyph row. No separator-only rows or offsets. */
+/* Pixel-edge frames share the glyph row. A boundary belongs to the following
+   row, so adjacent rows share one device-pixel stroke. The right dock paints
+   past the drawable edge, with no outside vertical rule. Its controls remain
+   on the original grid and retain their full visible width. */
+static int chrome_draw_width(void) { return sidebar_w() + (g_tab_underlay == 1 ? CW : 0); }
+static void chrome_sides(int row, uint32_t color) {
+    float y = row_y(row), w = (float)chrome_draw_width();
+    fill_rect(0, y, 1, y + CH, color, 1);
+    if (g_tab_underlay != 1) fill_rect(w - 1, y, w, y + CH, color, 1);
+}
+static void chrome_rule(int row, uint32_t color) {
+    fill_rect(0, row_y(row), (float)chrome_draw_width(), row_y(row) + 1, color, 1);
+}
 static void chrome_frame(int row, uint32_t color) {
-    float y = row_y(row), w = (float)sidebar_w(), s = 1.0f;
-    fill_rect(s, y, w - s, y + s, color, 1);
-    fill_rect(s, y + CH - s, w - s, y + CH, color, 1);
-    fill_rect(0, y + s, s, y + CH - s, color, 1);
-    fill_rect(w - s, y + s, w, y + CH - s, color, 1);
+    chrome_sides(row, color);
+    chrome_rule(row, color);
 }
 static void chrome_row_fill(int row, int selected, int hovered) {
     if (hovered || selected)
-        fill_rect(0, row_y(row), (float)sidebar_w(), row_y(row + 1), hovered ? TAB_HOVER : DEF_BG, 1);
+        fill_rect(0, row_y(row), (float)chrome_draw_width(), row_y(row + 1), hovered ? TAB_HOVER : DEF_BG, 1);
 }
 static void chrome_label(const wchar_t *s, int left, int right, int row, uint32_t color) {
     if (right > left) draw_label(s, (float)(left * CW), row_y(row), (float)((right - left) * CW), color);
@@ -84,18 +93,19 @@ static void render_settings(int hover, int hidx) {
             chrome_label(buf, left, right - 8, row, pointed ? on : off);
             grid_text(L"[↑] [↓]", right - 8, row, g_tab_underlay ? off : g_look.dim);
         }
-        chrome_frame(row, selected ? AMBER : g_look.dim);
+        chrome_sides(row, g_look.dim);
+        if (!n) chrome_rule(row, g_look.dim);
     }
 }
 
 static void render_tabbar(int win_w, int win_h) {
-    int i, idx = -1, hover = HIT_NONE, sw = sidebar_w();
+    int i, idx = -1, hover = HIT_NONE;
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
     UI_FONT;
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
     g_chrome_x = sidebar_x();
-    fill_rect(0, g_tab_underlay ? row_y(g_chrome.top) : 0, (float)sw,
+    fill_rect(0, g_tab_underlay ? row_y(g_chrome.top) : 0, (float)chrome_draw_width(),
               g_tab_underlay ? row_y(g_chrome.bottom) : (float)win_h, BAR_BG, 1);
     for (i = g_chrome.top; i < g_chrome.top + g_chrome.grip_rows; i++) {
         int hovered = hover == HIT_BAR && g_mouse_y >= i * CH && g_mouse_y < (i + 1) * CH;
@@ -105,7 +115,8 @@ static void render_tabbar(int win_w, int win_h) {
             int col;
             for (col = 1; col < SB_COLS - 1; col++) grid_text(col & 1 ? L"⠿" : L" ", col, i, g_look.dim);
         }
-        chrome_frame(i, g_look.dim);
+        chrome_sides(i, g_look.dim);
+        if (i == g_chrome.top) chrome_rule(i, g_look.dim);
     }
     for (i = 0; i < g_chrome.tab_count; i++) {
         int tab = g_tab_offset + i, row = g_chrome.tab_row + i, left = 1, right = SB_COLS - 3;
@@ -132,6 +143,10 @@ static void render_tabbar(int win_w, int win_h) {
         chrome_frame(row, g_look.dim);
     }
     if (g_settings_open) render_settings(hover, idx);
+    /* Only the final row owns a bottom edge. All interior horizontal strokes
+       are drawn by the following tab or section, never doubled. */
+    if (g_chrome.bottom > g_chrome.top)
+        fill_rect(0, row_y(g_chrome.bottom) - 1, (float)chrome_draw_width(), row_y(g_chrome.bottom), g_look.dim, 1);
 #ifdef _WIN32
     render_disk_warning(win_h);
 #endif

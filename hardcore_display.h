@@ -1,5 +1,10 @@
 /* Display-only chrome reflow. The terminal and scrollback remain authoritative;
    moved cells carry source addresses so selection and copying use real text. */
+static int chrome_background_safe(const Cell *c) {
+    uint32_t fg, bg;
+    cell_colors(c, &fg, &bg);
+    return bg == DEF_BG;
+}
 static void chrome_prepare_display(Term *t) {
     Cell *input;
     unsigned char *protected_rows;
@@ -40,9 +45,9 @@ static void chrome_prepare_display(Term *t) {
     if (t->cy + t->view >= 0 && t->cy + t->view < t->rows)
         protected_rows[t->cy + t->view] = 1;
     tab_layout();
-    if (chrome_reflow_build(&g_display, input, t->cols, t->rows, protected_rows,
+    if (chrome_reflow_build_checked(&g_display, input, t->cols, t->rows, protected_rows,
                             g_tab_underlay, sidebar_x()/CW, chrome_top_row(), SB_COLS,
-                            chrome_bottom_row()-chrome_top_row(), 3)) {
+                            chrome_bottom_row()-chrome_top_row(), 3, chrome_background_safe)) {
         g_display_term = t;
         g_display_view = t->view;
         g_display_hcount = t->hcount;

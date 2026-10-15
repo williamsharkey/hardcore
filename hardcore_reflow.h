@@ -33,10 +33,11 @@ typedef struct ChromeReflow {
 enum { CR_BLANK, CR_PROSE, CR_PROTECTED };
 enum { CR_REASON_OTHER, CR_REASON_LIST, CR_REASON_UNSAFE };
 typedef struct {
-    int type, reason, indent, end, words;
+    int type, reason, indent, body, end, words, bullet, command;
 } ChromeReflowRow;
 typedef struct { int source, length; } ChromeReflowWord;
-typedef struct { int first, count, offset; } ChromeReflowPlacement;
+typedef struct { int first, count, offset, indent; } ChromeReflowPlacement;
+typedef int (*ChromeReflowBackgroundSafe)(const Cell *cell);
 
 static void chrome_reflow_free(ChromeReflow *out) {
     if (!out) return;
@@ -47,10 +48,20 @@ static void chrome_reflow_free(ChromeReflow *out) {
 }
 
 static int cr_letter(uint32_t c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= 0xc0 && c <= 0xff && c != 0xd7 && c != 0xf7);
 }
 
 static int cr_space(uint32_t c) { return c == 0 || c == ' '; }
+
+/* Curly quotes, apostrophes, dashes and an ellipsis occur in ordinary CLI
+ * prose. Their Cell width flags must still report one cell. Box drawings,
+ * combining marks and arbitrary Unicode symbols remain protected. */
+static int cr_prose_character(uint32_t c) {
+    return (c >= 0x21 && c <= 0x7e) || cr_letter(c) ||
+           (c >= 0x2010 && c <= 0x2015) || (c >= 0x2018 && c <= 0x201f) ||
+           c == 0x2026 || c == 0x2022;
+}
 
 static int cr_word_is(const Cell *line, int begin, int end, const char *word) {
     int x;
@@ -73,10 +84,12 @@ static int cr_fence(const Cell *line, int begin, int end) {
     return cr_starts(line, begin, end, "```") || cr_starts(line, begin, end, "~~~");
 }
 
-/* Foreground colors travel with the actual cells. Backgrounds, text effects,
- * hyperlinks and uncertain cell widths may convey structure: leave them
- * literal, including when they occur only in a row's trailing spaces. */
-static ChromeReflowRow cr_classify(const Cell *line, int cols, int protected_row, int fenced) {
+/* Foreground colors and bold/dim/italic attributes travel with each cell.
+ * Meaningful backgrounds, other effects, links and uncertain widths can
+ * convey structure; protect them even in trailing spaces. Native callers may
+ * recognize explicitly encoded background colors that equal the canvas. */
+static ChromeReflowRow cr_classify(const Cell *line, int cols, int protected_row, int fenced,
+                                   ChromeReflowBackgroundSafe background_safe) {
     static const char *const code_words[] = {
         "const", "let", "var", "function", "class", "def", "import", "from",
         "return", "export", "if", "else", "for", "while", "switch", "case",
@@ -93,18 +106,28 @@ static ChromeReflowRow cr_classify(const Cell *line, int cols, int protected_row
     r.end = cols;
     while (r.end > 0 && cr_space(line[r.end - 1].ch)) r.end--;
     while (r.indent < r.end && cr_space(line[r.indent].ch)) r.indent++;
+    r.body = r.indent;
+    /* A Unicode bullet is a fixed first-row prefix. Wrapped prose beneath it
+     * must have the matching hanging indent; shell/list markers stay literal. */
+    if (r.indent + 2 < r.end && line[r.indent].ch == 0x2022 &&
+        cr_space(line[r.indent + 1].ch) && !cr_space(line[r.indent + 2].ch)) {
+        r.bullet = 1;
+        r.reason = CR_REASON_LIST;
+        r.body += 2;
+    }
     if (protected_row) { r.reason = CR_REASON_UNSAFE; return r; }
     if (fenced || cr_fence(line, r.indent, r.end)) return r;
     for (x = 0; x < cols; x++) {
         const Cell *c = line + x;
-        if (c->bg || c->attr || c->link || c->wflag ||
-            (!cr_space(c->ch) && (c->ch < 0x21 || c->ch > 0x7e))) {
+        if ((c->bg && (!background_safe || !background_safe(c))) ||
+            (c->attr & ~(1u | 2u | 4u)) || c->link || c->wflag ||
+            (!cr_space(c->ch) && !cr_prose_character(c->ch))) {
             r.reason = CR_REASON_UNSAFE;
             return r;
         }
     }
     if (!r.end) { r.type = CR_BLANK; return r; }
-    x = r.indent;
+    x = r.body;
     if (line[x].ch == '$' || line[x].ch == '%' || line[x].ch == '>' ||
         line[x].ch == '#' || line[x].ch == '!') return r;
     if (((line[x].ch == '-' || line[x].ch == '*' || line[x].ch == '+') &&
@@ -116,31 +139,35 @@ static ChromeReflowRow cr_classify(const Cell *line, int cols, int protected_row
         return r;
     }
     while (x < r.end && line[x].ch >= '0' && line[x].ch <= '9') x++;
-    if (x > r.indent && x + 1 < r.end &&
+    if (x > r.body && x + 1 < r.end &&
         (line[x].ch == '.' || line[x].ch == ')') && cr_space(line[x + 1].ch)) {
         r.reason = CR_REASON_LIST;
         return r;
     }
-    if (line[r.indent].ch == '/' || cr_starts(line, r.indent, r.end, "~/") ||
-        cr_starts(line, r.indent, r.end, "./") || cr_starts(line, r.indent, r.end, "../") ||
-        cr_starts(line, r.indent, r.end, "console.")) return r;
-    if (line[r.end - 1].ch == ';') return r;
-    first_end = r.indent;
+    if (line[r.body].ch == '/' || cr_starts(line, r.body, r.end, "~/") ||
+        cr_starts(line, r.body, r.end, "./") || cr_starts(line, r.body, r.end, "../") ||
+        cr_starts(line, r.body, r.end, "console.")) return r;
+    /* Recognize the literal command in a Codex tool summary. It may wrap at
+     * existing single spaces, but never joins neighboring output rows. */
+    r.command = r.bullet && cr_starts(line, r.body, r.end, "Ran ");
+    if (!r.command && line[r.end - 1].ch == ';') return r;
+    first_end = r.body;
     while (first_end < r.end && !cr_space(line[first_end].ch)) first_end++;
     for (k = 0; k < sizeof(code_words) / sizeof(code_words[0]); k++)
-        if (cr_word_is(line, r.indent, first_end, code_words[k])) return r;
-    for (x = r.indent; x < r.end; x++) {
+        if (cr_word_is(line, r.body, first_end, code_words[k])) return r;
+    for (x = r.body; x < r.end; x++) {
         uint32_t c = line[x].ch;
-        if (c == '|' || c == '{' || c == '}' || c == '=' || c == '`' ||
+        if (cr_space(c) && x + 1 < r.end && cr_space(line[x + 1].ch)) return r;
+        if (r.command) continue;
+        if (c == 0x2022 || c == '|' || c == '{' || c == '}' || c == '=' || c == '`' ||
             c == '_' || c == '\\' || c == '<' || c == '>') return r;
         if (c == ':' && x + 1 < r.end && line[x + 1].ch == ':') return r;
         if (c == ':' && x + 2 < r.end && line[x + 1].ch == '/' && line[x + 2].ch == '/') return r;
         if (x < first_end && (c == '@' || c == '$' || c == '%' || c == '#')) return r;
-        if (cr_space(c) && x + 1 < r.end && cr_space(line[x + 1].ch)) return r;
         /* foo(arguments) is a call/literal; a separated parenthesis may be prose. */
-        if (c == '(' && x > r.indent && !cr_space(line[x - 1].ch)) return r;
+        if (c == '(' && x > r.body && !cr_space(line[x - 1].ch)) return r;
     }
-    for (x = r.indent; x < r.end;) {
+    for (x = r.body; x < r.end;) {
         int begin = x, has_letter = 0, is_title, ignore_title = 0;
         while (x < r.end && !cr_space(line[x].ch)) {
             if (cr_letter(line[x].ch)) has_letter = 1;
@@ -160,9 +187,11 @@ static ChromeReflowRow cr_classify(const Cell *line, int cols, int protected_row
         }
         while (x < r.end && cr_space(line[x].ch)) x++;
     }
-    if (!lexical || lexical * 5 < r.words * 3) return r;
-    if (r.words <= 8 && r.end - r.indent <= 60 &&
+    if (!r.command && (!lexical || lexical * 5 < r.words * 3)) return r;
+    if (r.words <= 8 && r.end - r.body <= 60 &&
         ((title_words && all_title) || line[r.end - 1].ch == ':')) return r;
+    r.reason = r.command ? CR_REASON_LIST : CR_REASON_OTHER;
+    r.words += r.bullet; /* Include the fixed bullet cell in copied words. */
     r.type = CR_PROSE;
     return r;
 }
@@ -192,10 +221,11 @@ static int cr_source_after(const ChromeReflowWord *word, int cols) {
     return last % cols + 1 < cols ? last + 1 : last;
 }
 
-static int chrome_reflow_build(ChromeReflow *out, const Cell *input,
+static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
                                int cols, int rows, const unsigned char *protected_rows,
                                int side, int dock_x, int dock_y, int dock_width,
-                               int dock_height, int max_blank) {
+                               int dock_height, int max_blank,
+                               ChromeReflowBackgroundSafe background_safe) {
     ChromeReflowRow *info = NULL;
     ChromeReflowWord *words = NULL;
     ChromeReflowPlacement *placement = NULL;
@@ -223,7 +253,7 @@ static int chrome_reflow_build(ChromeReflow *out, const Cell *input,
     if (!info || !placement) goto fail;
     for (row = 0; row < rows; row++) {
         const Cell *line = input + row * cols;
-        info[row] = cr_classify(line, cols, protected_rows && protected_rows[row], fenced);
+        info[row] = cr_classify(line, cols, protected_rows && protected_rows[row], fenced, background_safe);
         if (cr_fence(line, info[row].indent, info[row].end)) fenced = !fenced;
         if (info[row].type == CR_PROSE) total_words += (size_t)info[row].words;
     }
@@ -237,17 +267,20 @@ static int chrome_reflow_build(ChromeReflow *out, const Cell *input,
     if (max_blank < 0) max_blank = 0;
     if (max_blank > rows) max_blank = rows;
     for (row = 0; row < rows;) {
-        int start, end, indent, source_rows, blank_rows, word_count = 0;
+        int start, end, indent, hanging, bullet, source_rows, blank_rows, word_count = 0;
         int y, x, word, used_rows, fit, affected;
         if (info[row].type != CR_PROSE || info[row].words < 2) { row++; continue; }
         start = row;
         indent = info[row].indent;
+        bullet = info[row].bullet;
+        hanging = bullet ? info[row].body : indent;
         row++;
-        while (row < rows && info[row].type == CR_PROSE && info[row].indent == indent) {
+        while (!info[start].command && row < rows && info[row].type == CR_PROSE && !info[row].bullet &&
+               info[row].indent == hanging) {
             const Cell *previous = input + (row - 1) * cols;
             uint32_t next_first = input[row * cols + info[row].indent].ch;
             uint32_t previous_last = previous[info[row - 1].end - 1].ch;
-            if (next_first >= 'A' && next_first <= 'Z' &&
+            if (!bullet && next_first >= 'A' && next_first <= 'Z' &&
                 (long long)(info[row - 1].end - indent) * 100 < (long long)cols * 72) break;
             if (previous_last == ':') break;
             if (info[row].words == 1 && (previous_last == '.' || previous_last == '!' ||
@@ -256,14 +289,16 @@ static int chrome_reflow_build(ChromeReflow *out, const Cell *input,
         }
         end = row;
         source_rows = end - start;
-        if (start && info[start - 1].reason == CR_REASON_LIST) continue;
+        if (start && info[start - 1].reason == CR_REASON_LIST && !bullet) continue;
         /* Do not detach a plain-looking part of a styled/interactive
          * paragraph. Its unsafe row can carry formatting or a cursor that
          * makes the whole same-indent run ambiguous. */
         if (start && info[start - 1].reason == CR_REASON_UNSAFE &&
-            info[start - 1].indent == indent && info[start - 1].end > indent) continue;
+            (info[start - 1].indent == indent ||
+             (info[start - 1].bullet && info[start - 1].body == indent)) &&
+            info[start - 1].end > info[start - 1].indent) continue;
         if (end < rows && info[end].reason == CR_REASON_UNSAFE &&
-            info[end].indent == indent && info[end].end > indent) continue;
+            info[end].indent == hanging && info[end].end > hanging) continue;
         if (!cr_overlap(input, cols, start, end, dock_x, dock_y, dock_width, dock_height)) continue;
         blank_rows = 0;
         while (blank_rows < max_blank && end + blank_rows < rows &&
@@ -283,6 +318,7 @@ static int chrome_reflow_build(ChromeReflow *out, const Cell *input,
          * one pass finds the smallest number of following blanks needed. */
         while (word < word_count && used_rows < source_rows + blank_rows) {
             int offset = 0, limit = cols, used = 0, first = word;
+            int row_indent = used_rows ? hanging : indent;
             ChromeReflowPlacement *p = placement + used_rows;
             y = start + used_rows;
             if (cr_in_band(y, dock_y, dock_height)) {
@@ -291,14 +327,16 @@ static int chrome_reflow_build(ChromeReflow *out, const Cell *input,
             }
             while (word < word_count) {
                 int next = words[word].length + (word != first);
-                if (next > limit - offset - indent - used) break;
+                if (next > limit - offset - row_indent - used) break;
                 used += next;
                 word++;
             }
-            if (word == first) { fit = 0; break; }
+            /* Keep the bullet and at least its first word together. */
+            if (word == first || (bullet && !used_rows && word == 1)) { fit = 0; break; }
             p->first = first;
             p->count = word - first;
             p->offset = offset;
+            p->indent = row_indent;
             used_rows++;
         }
         if (!fit || word != word_count) continue;
@@ -316,17 +354,19 @@ static int chrome_reflow_build(ChromeReflow *out, const Cell *input,
             int base = (start + y) * cols, first_source = words[p->first].source;
             int last_word = p->first + p->count - 1;
             int endpoint = cr_source_after(words + last_word, cols);
-            int begin = p->offset + indent;
+            int begin = p->offset + p->indent;
             int source_col = first_source % cols;
+            int source_indent = info[first_source / cols].indent;
             /* Preserve real indentation at an original row start. For a
              * fragment starting mid-row, synthetic indentation points at the
              * preceding word separator. Space beneath a left dock maps to
              * that same boundary, never unrelated original hidden content. */
-            int boundary = source_col == indent ? first_source - indent :
+            int boundary = source_col == source_indent ? first_source - source_indent :
                            source_col ? first_source - 1 : first_source;
             for (x = 0; x < begin; x++) {
                 int mapped = boundary;
-                if (source_col == indent && x >= p->offset) mapped += x - p->offset;
+                if (source_col == source_indent && x >= p->offset && x - p->offset < source_indent)
+                    mapped += x - p->offset;
                 out->source[base + x] = mapped;
             }
             x = begin;
@@ -346,7 +386,7 @@ static int chrome_reflow_build(ChromeReflow *out, const Cell *input,
                 }
             }
             while (x < cols) out->source[base + x++] = endpoint;
-            if (indent && memcmp(out->cells + base, input + base, (size_t)cols * sizeof(Cell)))
+            if (p->indent && memcmp(out->cells + base, input + base, (size_t)cols * sizeof(Cell)))
                 out->markers[start + y] = begin - 1;
         }
         out->changed++;
@@ -362,6 +402,14 @@ fail:
     free(placement);
     chrome_reflow_free(out);
     return 0;
+}
+
+static inline int chrome_reflow_build(ChromeReflow *out, const Cell *input,
+                               int cols, int rows, const unsigned char *protected_rows,
+                               int side, int dock_x, int dock_y, int dock_width,
+                               int dock_height, int max_blank) {
+    return chrome_reflow_build_checked(out, input, cols, rows, protected_rows, side,
+                                       dock_x, dock_y, dock_width, dock_height, max_blank, NULL);
 }
 
 #endif /* HARDCORE_REFLOW_H */

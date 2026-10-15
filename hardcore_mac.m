@@ -42,6 +42,7 @@
 #include <pthread.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <math.h>
 
 @class HCView;
 static NSWindow *g_win;
@@ -51,6 +52,9 @@ static int g_quitting;           /* skip the "programs are running" question: la
 static int g_paint_pending;      /* a frame is wanted (see plat_invalidate) */
 static double uptime_ms(void);
 static NSTimer *g_timers[8];
+static int g_mac_title_hover;
+static int g_mac_title_drag;
+static id g_mac_title_monitor;
 
 static char g_mac_bin_dir[4096];
 static const char *g_shell;      /* your login shell */
@@ -987,14 +991,88 @@ static void plat_settings_shown(void) {
     plat_invalidate();
 }
 
-/* the traffic lights' bottom edge, in the view's pixels from the top: the
-   circle's, which is a little smaller than its button (12 of 14 points) */
-static int plat_lights_bottom(void) {
-    NSButton *b = g_win ? [g_win standardWindowButton:NSWindowCloseButton] : nil;
-    NSRect r;
-    if (!b || ([g_win styleMask] & NSWindowStyleMaskFullScreen)) return 0;
-    r = [b convertRect:[b bounds] toView:nil];   /* window coordinates, origin bottom left */
-    return (int)(([[g_win contentView] bounds].size.height - NSMidY(r) + NSWidth(r) / 2 - 1) * g_scale + 0.5);
+/* Native buttons float above a full-size content view. Keep them hidden until
+   the whole title band is hovered; their quiet counterparts are Metal circles
+   below the terminal. No title geometry consumes terminal grid rows. */
+static const NSWindowButton mac_title_buttons[] = {
+    NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton
+};
+
+static int mac_title_height(void) {
+    NSRect layout;
+    if (!g_win || !g_view || ([g_win styleMask] & NSWindowStyleMaskFullScreen)) return 0;
+    layout = [(NSView *)g_view convertRect:[g_win contentLayoutRect] fromView:nil];
+    /* AppKit may not have laid out the titlebar yet during initial creation. */
+    CGFloat height = NSMinY(layout);
+    if (height < 1) height = 22;
+    return (int)(height * [g_win backingScaleFactor] + .5);
+}
+
+static int mac_title_contains(int x, int y) {
+    int w, h;
+    plat_client_size(&w, &h);
+    return x >= 0 && x < w && y >= 0 && y < mac_title_height();
+}
+
+static void mac_title_sync_buttons(void) {
+    /* Full screen retains AppKit's own auto-hiding titlebar behavior. */
+    BOOL visible = g_mac_title_hover || ([g_win styleMask] & NSWindowStyleMaskFullScreen);
+    for (int i = 0; i < 3; i++)
+        [[g_win standardWindowButton:mac_title_buttons[i]] setHidden:!visible];
+}
+
+static void mac_title_hover_at(int x, int y) {
+    int hover = !g_sel_drag && !g_sb_drag && mac_title_contains(x, y);
+    if (g_mac_title_drag) hover = 1;
+    if (hover == g_mac_title_hover) return;
+    g_mac_title_hover = hover;
+    mac_title_sync_buttons();
+    plat_invalidate();
+}
+
+static NSRect mac_title_button_rect(int i) {
+    NSButton *button = [g_win standardWindowButton:mac_title_buttons[i]];
+    if (!button || !g_view) return NSZeroRect;
+    NSRect r = [button convertRect:[button bounds] toView:nil];
+    CGFloat scale = [g_win backingScaleFactor];
+    /* Standard button views sit in AppKit's unflipped titlebar hierarchy.
+       Convert window coordinates explicitly, as all renderer coordinates start
+       at the drawable's top left (including a full-size content view). */
+    r.origin.y = [(NSView *)g_view bounds].size.height - NSMaxY(r);
+    return NSMakeRect(r.origin.x*scale, r.origin.y*scale,
+                      r.size.width*scale, r.size.height*scale);
+}
+
+static int plat_lights_bottom(void) { return mac_title_height(); }
+static int plat_title_height(void) { return mac_title_height(); }
+
+static void plat_render_title_underlay(void) {
+    if (!g_win || !g_view || g_mac_title_hover || !mac_title_height()) return;
+    for (int i = 0; i < 3; i++) {
+        NSRect r = mac_title_button_rect(i);
+        float cx = NSMidX(r), cy = NSMidY(r);
+        float radius = (NSWidth(r) / 2) - [g_win backingScaleFactor];
+        if (radius <= 0) continue;
+        /* Pixel coverage at the edge keeps circles round at either scale. */
+        for (int y = (int)floorf(cy-radius); y < (int)ceilf(cy+radius); y++) {
+            for (int x = (int)floorf(cx-radius); x < (int)ceilf(cx+radius); x++) {
+                float dx = x + .5f - cx, dy = y + .5f - cy;
+                float coverage = radius + .5f - sqrtf(dx*dx + dy*dy);
+                if (coverage <= 0) continue;
+                if (coverage > 1) coverage = 1;
+                fill_rect(x, y, x+1, y+1, 0x808080, coverage * .42f);
+            }
+        }
+    }
+}
+
+static void plat_render_title_overlay(void) {
+    if (!g_mac_title_hover || g_sel_drag || g_sb_drag) return;
+    int w, h, clip = g_clip_w;
+    plat_client_size(&w, &h);
+    g_clip_w = w; /* The native title band covers even a partial rightmost cell. */
+    fill_rect(0, 0, w, mac_title_height(), BAR_BG, .91f);
+    g_clip_w = clip;
 }
 
 /* ── clipboard, drops, links ───────────────────────────────────────── */
@@ -1192,6 +1270,27 @@ static void view_px(NSEvent *e, int *x, int *y) {
     CGFloat s = [g_win backingScaleFactor];
     *x = (int)(p.x * s);
     *y = (int)(p.y * s);
+}
+
+/* A view tracking area alone misses motion delivered to the native buttons.
+   A local monitor observes the same window's events before AppKit routes them,
+   including traffic-light views, without capturing events from other apps. */
+static void mac_title_track_events(void) {
+    if (g_mac_title_monitor) return;
+    g_mac_title_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:
+        NSEventMaskMouseMoved | NSEventMaskMouseEntered | NSEventMaskMouseExited |
+        NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp
+        handler:^NSEvent *(NSEvent *e) {
+            if ([e window] == g_win) {
+                int x, y;
+                view_px(e, &x, &y);
+                mac_title_hover_at(x, y);
+            } else if ([e type] == NSEventTypeMouseMoved || [e type] == NSEventTypeLeftMouseDown) {
+                mac_title_hover_at(-1, -1);
+            }
+            return e;
+        }];
+    mac_title_sync_buttons();
 }
 
 static int ev_mods(NSEvent *e) {
@@ -1509,6 +1608,19 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     int mx, my, idx = -1, col, row, hit, w, h, mods = ev_mods(e);
     Tab *tb = active_tab();
     view_px(e, &mx, &my);
+    mac_title_hover_at(mx, my);
+    if (g_mac_title_hover) {
+        if ([e clickCount] == 2) [g_win performZoom:nil];
+        else {
+            g_mac_title_drag = 1;
+            [g_win performWindowDragWithEvent:e];
+            g_mac_title_drag = 0;
+            NSPoint p = [self convertPoint:[g_win mouseLocationOutsideOfEventStream] fromView:nil];
+            CGFloat scale = [g_win backingScaleFactor];
+            mac_title_hover_at((int)(p.x*scale), (int)(p.y*scale));
+        }
+        return;
+    }
     hit = hit_tabbar(mx, my, &idx);
     if (hit == HIT_TAB) { activate(idx); return; }
     if (hit == HIT_CLOSE) { user_close_tab(idx); return; }
@@ -1550,6 +1662,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     view_px(e, &mx, &my);
     g_mouse_x = mx;
     g_mouse_y = my;
+    mac_title_hover_at(mx, my);
     if (g_sb_drag) { scrollbar_set(my); return; }
     if (g_sel_drag && tb) {
         mouse_cell(mx, my, &col, &row);
@@ -1619,11 +1732,13 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     int mx, my, was_bar = g_mouse_y >= 0 && in_sidebar(g_mouse_x), on_bar;
     Tab *tb = active_tab();
     view_px(e, &mx, &my);
+    mac_title_hover_at(mx, my);
     on_bar = over_chrome(mx, my);
     g_mouse_x = mx;
     g_mouse_y = my;
     if (was_bar || on_bar) plat_invalidate();
     if (was_bar || on_bar) settings_point();
+    if (g_mac_title_hover) { [[NSCursor openHandCursor] set]; return; }
     if (on_bar) {                /* a hand on what clicks, an open hand where the window drags, as on a web page */
         int idx = -1, hit = hit_tabbar(mx, my, &idx);
         [(tabbar_action(mx, my) ? [NSCursor pointingHandCursor] : hit == HIT_BAR ? [NSCursor openHandCursor] : [NSCursor arrowCursor]) set];
@@ -1632,8 +1747,12 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (!on_bar) [self flagsChanged:e];
 }
 
+- (void)mouseEntered:(NSEvent *)e { [self mouseMoved:e]; }
+
 - (void)mouseExited:(NSEvent *)e {
-    (void)e;
+    int x, y;
+    view_px(e, &x, &y);
+    mac_title_hover_at(x, y);
     g_mouse_x = g_mouse_y = -1;
     settings_point();
     plat_invalidate();
@@ -1723,6 +1842,12 @@ static void focus_changed(int focused) {
 - (void)applicationDidFinishLaunching:(NSNotification *)n { (void)n; trace("applicationDidFinishLaunching"); }
 - (void)windowDidBecomeKey:(NSNotification *)n { (void)n; trace("window key"); focus_changed(1); }
 - (void)windowDidResignKey:(NSNotification *)n { (void)n; focus_changed(0); }
+- (void)windowDidEnterFullScreen:(NSNotification *)n {
+    (void)n; g_mac_title_hover = 0; mac_title_sync_buttons(); plat_invalidate();
+}
+- (void)windowDidExitFullScreen:(NSNotification *)n {
+    (void)n; g_mac_title_hover = 0; mac_title_sync_buttons(); plat_invalidate();
+}
 - (BOOL)windowShouldClose:(NSWindow *)w {
     (void)w;
     if (!confirm_close(-1)) return NO;
@@ -1826,7 +1951,8 @@ static void build_menus(void) {
 /* ── test channel ───────────────────────────────────────────────────
    HARDCORE_CTL=/path/fifo: lines of "type TEXT" (\n is Enter, \e is ESC),
    "cmd newtab|nexttab|closetab|jump|tab N|hover X,Y|click X,Y|resize W,H|sel Y0 X0 Y1 X1" (click: the
-   tab column's settings only), "snap OUT.bmp", and
+   tab column's settings only), "cmd pointer down|drag|up X,Y" (content-origin
+   selection drags, in backing pixels), "snap OUT.bmp", and
    "winid OUT" (the window number, for screencapture -l, which also gets the
    traffic lights), and "key KEYCODE FLAGS CHARS [UNMODIFIED]": a synthetic
    key event through the same keyDown: path as the keyboard (FLAGS in hex,
@@ -1882,11 +2008,20 @@ static void ctl_chrome(const char *path) {
         @"mode":@(g_tab_underlay), @"cols":@(t->cols), @"rows":@(t->rows),
         @"dock":@{@"x":@(sidebar_x()/CW), @"y":@(chrome_top_row()), @"width":@(SB_COLS),
                   @"height":@(chrome_bottom_row()-chrome_top_row())},
-        @"cell":@{@"width":@(CW), @"height":@(CH)}, @"hovered":@(chrome_hovered()),
+        @"cell":@{@"width":@(CW), @"height":@(CH)}, @"scale":@(g_scale), @"hovered":@(chrome_hovered()),
         @"settings_open":@(g_settings_open), @"settings_tab":@(g_settings_tab),
         @"reflow_enabled":@(g_chrome_reflow), @"reflow_changed":@(g_display.changed),
         @"source":source, @"display":display, @"markers":markers, @"tab_rows":tab_rows
     } mutableCopy];
+    NSMutableArray *button_rects = [NSMutableArray array];
+    for (int i = 0; i < 3; i++) {
+        NSRect r = mac_title_button_rect(i);
+        [button_rects addObject:@{@"x":@(NSMinX(r)), @"y":@(NSMinY(r)),
+                                 @"width":@(NSWidth(r)), @"height":@(NSHeight(r))}];
+    }
+    state[@"titlebar"] = @{@"height":@(mac_title_height()), @"hovered":@(g_mac_title_hover),
+        @"buttons_visible":@(![[g_win standardWindowButton:NSWindowCloseButton] isHidden]),
+        @"button_rects":button_rects, @"selection_drag":@(g_sel_drag), @"selection_on":@(g_sel_on)};
     state[@"fontkey"] = [NSString stringWithFormat:@"%c", g_font->key];
     state[@"schemekey"] = [NSString stringWithFormat:@"%c", g_scheme->key];
     state[@"pages"] = @{
@@ -1963,7 +2098,23 @@ static void ctl_line(char *s) {
         } else if (!strncmp(c, "hover ", 6)) {
             g_mouse_x = atoi(c + 6);
             g_mouse_y = strchr(c + 6, ',') ? atoi(strchr(c + 6, ',') + 1) : -1;
+            mac_title_hover_at(g_mouse_x, g_mouse_y);
             settings_point();
+        } else if (!strncmp(c, "pointer ", 8)) {
+            char action[16]; int x, y;
+            if (sscanf(c+8, "%15s %d,%d", action, &x, &y) == 3) {
+                NSEventType kind = !strcmp(action, "down") ? NSEventTypeLeftMouseDown :
+                                   !strcmp(action, "drag") ? NSEventTypeLeftMouseDragged : NSEventTypeLeftMouseUp;
+                CGFloat scale = [g_win backingScaleFactor];
+                NSPoint p = [(NSView *)g_view convertPoint:NSMakePoint(x/scale, y/scale) toView:nil];
+                NSEvent *e = [NSEvent mouseEventWithType:kind location:p modifierFlags:0 timestamp:0
+                    windowNumber:[g_win windowNumber] context:nil eventNumber:0 clickCount:1 pressure:1];
+                /* A synthetic titlebar down would enter AppKit's modal window-drag
+                   loop. This hook exercises selection drags starting in content. */
+                if (kind == NSEventTypeLeftMouseDown && !mac_title_contains(x, y)) [g_view mouseDown:e];
+                else if (kind == NSEventTypeLeftMouseDragged) [g_view mouseDragged:e];
+                else if (kind == NSEventTypeLeftMouseUp) [g_view mouseUp:e];
+            }
         } else if (!strncmp(c, "click ", 6)) {
             settings_click(atoi(c + 6), strchr(c + 6, ',') ? atoi(strchr(c + 6, ',') + 1) : -1);
         }
@@ -2300,7 +2451,7 @@ int main(int argc, char **argv) {
     if (g_mac_adopt) [g_win setFrame:NSRectFromString(g_mac_adopt[@"frame"]) display:NO];
     g_scale = (int)([g_win backingScaleFactor] + 0.5);
     if (g_scale < 1) g_scale = 1;
-    /* the tab column is the title bar: no title text, the traffic lights over the tabs */
+    /* Full-size terminal canvas; native controls are revealed by top-band hover. */
     [g_win setTitlebarAppearsTransparent:YES];
     [g_win setTitleVisibility:NSWindowTitleHidden];
     [g_win setBackgroundColor:[NSColor colorWithSRGBRed:((DEF_BG >> 16) & 255) / 255.0 green:((DEF_BG >> 8) & 255) / 255.0
@@ -2319,6 +2470,7 @@ int main(int argc, char **argv) {
     [g_view registerForDraggedTypes:@[NSPasteboardTypeFileURL, NSPasteboardTypeString]];
     [g_win setContentView:g_view];
     [g_win makeFirstResponder:g_view];
+    mac_title_track_events();
     build_menus();
     {
         if (@available(macOS 12.0, *))   /* 120 Hz ProMotion screens get 8 ms frames */
