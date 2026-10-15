@@ -234,8 +234,8 @@ typedef struct {
     uint32_t text, text_lo, busy_lo, dim, detail, detail_ask, red;
 } Look;
 static Look g_look;
-static const Scheme *g_scheme = SCHEMES;     /* the scheme you picked, for every window */
-static const Scheme *g_shown = SCHEMES;      /* the one on screen: g_scheme, or one you're pointing at */
+static const Scheme *g_scheme = &SCHEMES[4]; /* Gruvbox Dark until a saved theme= is read */
+static const Scheme *g_shown = &SCHEMES[4];  /* the one on screen: g_scheme, or one you're pointing at */
 
 #define AMBER (g_look.accent)    /* the cursor and the marks: dumbterm's phosphor amber in hardcore's scheme */
 #define DEF_FG (g_look.fg)

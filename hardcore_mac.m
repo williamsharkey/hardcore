@@ -63,6 +63,94 @@ static id g_mac_title_monitor;
 static char g_mac_bin_dir[4096];
 static const char *g_shell;      /* your login shell */
 
+#include "hardcore_mac_dock.m"
+
+/* A Dock tile summarizes metadata, never terminal output or command arguments.
+   Both the tab model and AppKit live on the main thread. Rendering is bounded
+   independently of terminal frames, including during output floods/resizing. */
+static int g_mac_dock_summary = 1, g_mac_dock_ready;
+static HCDockSummaryView *g_mac_dock_view;
+static double g_mac_dock_last_check = -1000;
+
+static NSString *mac_dock_text(const char *text, NSString *fallback) {
+    return hc_dock_label(text ? [NSString stringWithUTF8String:text] : nil, fallback);
+}
+
+/* Reuse the terminal's native bitmap lookup, including its Unicode fallback.
+   The Dock scales these pixels to its tile; it never substitutes a system font.
+   This callback is only used while drawing, not when polling unchanged tabs. */
+static int mac_dock_glyph(NSString *fontKey, uint32_t cp, unsigned char *pixels, int stride) {
+    const Font *font = font_by_key([fontKey length] ? [fontKey characterAtIndex:0] : 0);
+    if (!font) font = FONTS;
+    if (cp_width(cp) <= 0) return 0;
+    if (cp == ' ') return font->w; /* blank cells aren't stored in fonts.bin */
+    unsigned char bitmap[SLOT * SLOT] = {0};
+    int width = glyph_bits(font, cp, bitmap);
+    for (int y = 0; y < font->h; y++)
+        memcpy(pixels + y * stride, bitmap + y * SLOT, (size_t)MIN(width, stride));
+    return width;
+}
+
+static NSDictionary *mac_dock_appearance(void) {
+    /* g_shown/g_look also follow hover previews, just like the window. g_font
+       is the selected font; g_cf is temporary state used by chrome drawing. */
+    return @{@"fontKey":[NSString stringWithFormat:@"%c", g_font->key],
+             @"fontWidth":@(g_font->w), @"fontHeight":@(g_font->h),
+             @"themeKey":[NSString stringWithFormat:@"%c", g_shown->key],
+             @"bg":@(g_look.bg), @"fg":@(g_look.fg), @"accent":@(g_look.accent),
+             @"bar":@(g_look.bar), @"hover":@(g_look.hover), @"dim":@(g_look.dim),
+             @"red":@(g_shown->pal[9]), @"yellow":@(g_shown->pal[11]),
+             @"green":@(g_shown->pal[10]), @"blue":@(g_shown->pal[12])};
+}
+
+static NSDictionary *mac_dock_summary(void) {
+    Tab *tb = active_tab();
+    NSString *folder = @"no tabs", *program = @"hardcore", *status = @"no tabs";
+    if (tb) {
+        const char *dir = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir;
+        NSString *path = dir[0] ? [NSString stringWithUTF8String:dir] : nil;
+        folder = mac_dock_text([[path lastPathComponent] UTF8String], @"~");
+        program = mac_dock_text(tb->program, mac_dock_text(g_shell, @"shell").lastPathComponent);
+        status = tb->program[0] ? @"running" : @"ready";
+        if (tb->t.ps_state == PS_IDLE || tb->t.ps_state == PS_DONE) status = @"ready";
+        if (tb->busy) status = @"busy";
+        if (tb->attention || tb->t.ps_state == PS_BLOCKED) status = @"needs you";
+        if (tb->t.ps_state == PS_ERROR) status = @"error";
+        if (tb->help) { program = @"help"; status = @"help"; }
+        if (tb->exited) { program = @"exited"; status = @"exited"; }
+    }
+    return @{@"folder":folder, @"program":program, @"status":status, @"tabs":@(g_ntabs),
+             @"appearance":mac_dock_appearance()};
+}
+
+static void mac_dock_update(int force) {
+    if (!g_mac_dock_ready || !NSApp) return; /* early shell/title setup precedes AppKit */
+    double now = uptime_ms();
+    if (!force && now - g_mac_dock_last_check < 250) return;
+    g_mac_dock_last_check = now;
+    NSDockTile *tile = [NSApp dockTile];
+    if (!g_mac_dock_summary) {
+        if (g_mac_dock_view) {
+            if ([tile contentView] == g_mac_dock_view) {
+                [tile setContentView:nil]; /* AppKit resumes the installed application icon */
+                [tile display];
+            }
+            [g_mac_dock_view release]; g_mac_dock_view = nil;
+        }
+        return;
+    }
+    BOOL installed = NO;
+    hc_dock_read_glyph = mac_dock_glyph;
+    if (!g_mac_dock_view) {
+        g_mac_dock_view = [[HCDockSummaryView alloc] initWithFrame:NSMakeRect(0, 0, 128, 128)];
+        [g_mac_dock_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    }
+    if ([tile contentView] != g_mac_dock_view) {
+        [tile setContentView:g_mac_dock_view]; installed = YES;
+    }
+    if ([g_mac_dock_view setSummary:mac_dock_summary()] || installed) [tile display];
+}
+
 /* ── platform layer ─────────────────────────────────────────────────── */
 
 static void plat_invalidate(void);
@@ -110,6 +198,7 @@ static void plat_set_title(const wchar_t *title) {
     s = [[NSString alloc] initWithBytes:title length:wcslen(title) * sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding];
     [g_win setTitle:s ? s : @"hardcore"];
     [s release];
+    mac_dock_update(0);
 }
 
 static void plat_close_window(void) {
@@ -1012,6 +1101,7 @@ static void config_load(void) {
         while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
         if (!strcmp(line, "dir") && *v) expand_home(v, g_start_dir, sizeof(g_start_dir));
         else if (!strcmp(line, "last")) snprintf(g_last_dir, sizeof(g_last_dir), "%s", v);
+        else if (!strcmp(line, "dock_summary")) g_mac_dock_summary = strcmp(v, "0") != 0;
         else config_look(line, v);
     }
     fclose(f);
@@ -1027,6 +1117,7 @@ static void config_save(void) {
     fprintf(f, "dir=%s\n", g_cfg_dir_line);
     fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
     fprintf(f, "last=%s\n", g_last_dir);
+    fprintf(f, "# macOS Dock icon: 1=active folder/program summary, 0=standard icon\ndock_summary=%d\n", g_mac_dock_summary);
     config_look_save(f);
     fclose(f);
 }
@@ -1043,6 +1134,7 @@ static void plat_settings_tell(void) {
 
 /* the window's background shows while resizing, and the title bar's buttons follow light or dark */
 static void plat_settings_shown(void) {
+    mac_dock_update(1);
     if (!g_win) return;
     [g_win setBackgroundColor:[NSColor colorWithSRGBRed:((DEF_BG >> 16) & 255) / 255.0 green:((DEF_BG >> 8) & 255) / 255.0
                                                    blue:(DEF_BG & 255) / 255.0 alpha:1]];
@@ -1881,9 +1973,18 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (void)jumpAttention:(id)sender { (void)sender; jump_to_attention(); }
 - (void)prevMark:(id)sender { (void)sender; jump_mark(-1); }
 - (void)nextMark:(id)sender { (void)sender; jump_mark(1); }
+- (void)toggleDockSummary:(id)sender {
+    (void)sender;
+    g_mac_dock_summary = !g_mac_dock_summary;
+    mac_dock_update(1);
+    config_save();
+    plat_settings_tell();
+}
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     if ([item action] == @selector(copy:)) return g_sel_on;
+    if ([item action] == @selector(toggleDockSummary:))
+        [item setState:g_mac_dock_summary ? NSControlStateValueOn : NSControlStateValueOff];
     return YES;
 }
 
@@ -1896,6 +1997,7 @@ static void focus_changed(int focused) {
     g_focused = focused;
     if (g_focused && tb) tb->attention = 0;
     if (tb && tb->t.m_focus) tab_write(tb, g_focused ? "\x1b[I" : "\x1b[O", 3);
+    mac_dock_update(0);
     plat_invalidate();
 }
 
@@ -2009,6 +2111,8 @@ static void build_menus(void) {
     menu_item(win, @"Minimize", @selector(performMiniaturize:), @"m", C);
     menu_item(win, @"Zoom", @selector(performZoom:), @"", 0);
     menu_item(win, @"Enter Full Screen", @selector(toggleFullScreen:), @"f", C | NSEventModifierFlagControl);
+    [win addItem:[NSMenuItem separatorItem]];
+    menu_item(win, @"Show Active Tab in Dock Icon", @selector(toggleDockSummary:), @"", 0);
     [NSApp setMainMenu:bar];
     [NSApp setWindowsMenu:win];
 }
@@ -2571,8 +2675,10 @@ int main(int argc, char **argv) {
     if (!getenv("HARDCORE_NO_ACTIVATE") && (!g_mac_adopt || [g_mac_adopt[@"focused"] boolValue])) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
     mac_adopt_ready();
     mac_refresh_programs();
+    g_mac_dock_ready = 1;
+    mac_dock_update(1);
     NSTimer *program_timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-        (void)t; mac_refresh_programs();
+        (void)t; mac_refresh_programs(); mac_dock_update(0);
     }];
     [[NSRunLoop currentRunLoop] addTimer:program_timer forMode:NSEventTrackingRunLoopMode];
     [NSApp run];

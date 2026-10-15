@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Draws the hardcore icon (amber ">_" on near-black, dumbterm's phosphor color)
-as a PNG-in-ICO with 16/24/32/48/64/256 px frames, or, for an OUT ending in
-.iconset, the PNGs macOS's iconutil turns into an .icns. No dependencies."""
+"""Draws the hardcore icon (Gruvbox Dark cream ">_" on its dark background).
+OUT selects a PNG-in-ICO, a modern PNG-in-ICNS, or an .iconset directory.
+No dependencies or platform image-encoder services are needed."""
 import os
 import struct, sys, zlib
 
-AMBER = (0xFF, 0xA6, 0x0D)
-BG = (0x1B, 0x1B, 0x1B)
+FG = (0xEB, 0xDB, 0xB2)
+BG = (0x28, 0x28, 0x28)
 
 def render(n):
     px = [[(0, 0, 0, 0)] * n for _ in range(n)]
@@ -21,7 +21,7 @@ def render(n):
         for yy in range(int(y), int(y) + t):
             for xx in range(int(x), int(x) + t):
                 if 0 <= xx < n and 0 <= yy < n:
-                    px[yy][xx] = AMBER + (255,)
+                    px[yy][xx] = FG + (255,)
     # chevron ">"
     x0, y0, h = n * 0.22, n * 0.28, n * 0.40
     steps = max(8, n)
@@ -41,6 +41,25 @@ def png(n):
         return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xFFFFFFFF)
     return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', n, n, 8, 6, 0, 0, 0))
             + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
+
+def icns():
+    # macOS 11+ accepts PNG elements at every size. Each element and the file
+    # have a four-byte type and a big-endian length including that header.
+    # The 1x/2x types match the ten representations produced by .iconset mode.
+    # Format reference: Pillow's IcnsImagePlugin.py encoder/decoder.
+    types = ((b'icp4', 16), (b'ic11', 32), (b'icp5', 32), (b'ic12', 64),
+             (b'ic07', 128), (b'ic13', 256), (b'ic08', 256), (b'ic14', 512),
+             (b'ic09', 512), (b'ic10', 1024))
+    images = {n: png(n) for n in sorted({n for _, n in types})}
+    entries = [(kind, struct.pack('>I', 8 + len(images[n])), images[n]) for kind, n in types]
+    toc = b''.join(kind + size for kind, size, _ in entries)
+    body = b'TOC ' + struct.pack('>I', 8 + len(toc)) + toc
+    body += b''.join(kind + size + image for kind, size, image in entries)
+    return b'icns' + struct.pack('>I', 8 + len(body)) + body
+
+if sys.argv[1].endswith('.icns'):
+    open(sys.argv[1], 'wb').write(icns())
+    sys.exit(0)
 
 if sys.argv[1].endswith('.iconset'):
     os.makedirs(sys.argv[1], exist_ok=True)
