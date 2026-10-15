@@ -156,3 +156,12 @@ mac-test: build/hardcore
 
 clean:
 	rm -rf build hardcore.exe selftest.txt $(APP)
+
+# Opt-in desktop integration: disposable real application sessions in Windows Terminal.
+build/slurp-driver.exe: tests/slurp_driver.c hardcore.c hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
+	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
+		-o $@ tests/slurp_driver.c build/res.o $(filter-out -mwindows,$(LIBS))
+
+.PHONY: slurp-app-test
+slurp-app-test: build/slurp-driver.exe
+	python3 tests/test_slurp_apps.py

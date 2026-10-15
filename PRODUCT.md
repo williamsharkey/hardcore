@@ -54,7 +54,7 @@ restarting Hardcore.
 | Source | What transfers | What happens to the source |
 |---|---|---|
 | Direct WSL terminal, including WSL in Windows Terminal | The live PTY, shell and jobs, working directory, environment and terminal settings | After successful attachment the old connection can close; shared host windows are not automatically closed |
-| Classic PowerShell or cmd console window | The live console, available screen buffer and scrollback, cursor, colors and partial input | Hidden after the first frame; detaching or exiting Hardcore reveals it with processes still alive |
+| Classic PowerShell, cmd or Git Bash console window | The live console, available screen buffer and scrollback, cursor, colors and partial input | Hidden after the first frame; detaching or exiting Hardcore reveals it with processes still alive |
 | Native PowerShell/cmd in Windows Terminal or an IDE | Unsupported; reported and skipped | Left running in its original host |
 
 WSL attachment uses an adapted MIT-licensed reptyr source subset, built into
@@ -63,7 +63,7 @@ to take over WSL's relay. It cannot recover scrollback or selections held by
 the old terminal emulator. Native console attachment retains the source's
 buffer dimensions and displays its Win32 cells; it does not reproduce every
 terminal UI feature. See the [usage and limits](README.md#slurp-attach-running-sessions)
-and [implementation notes](slurp/README.md).
+and [implementation notes and application test matrix](slurp/README.md).
 
 ## Not handled yet
 

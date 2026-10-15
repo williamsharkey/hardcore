@@ -211,7 +211,7 @@ leader PID from the listing for `--wsl`, and a Windows console client PID for
   Hardcore's own sessions, SSH and tmux sessions. Once the tab says **attached
   live WSL session**, the old terminal connection is no longer needed. Shared
   terminal windows are never automatically closed.
-- **Classic PowerShell and cmd consoles:** attaches to the original console
+- **Classic PowerShell, cmd and Git Bash consoles:** attaches to the original console
   and displays its live screen buffer in a Hardcore tab. The original console
   is hidden only after the screen has been captured and Hardcore has drawn.
   Closing that tab, closing Hardcore, or Hardcore exiting unexpectedly reveals
@@ -222,7 +222,9 @@ leader PID from the listing for `--wsl`, and a Windows console client PID for
 - **Native PowerShell/cmd tabs inside Windows Terminal, IDE terminals and other
   pseudoconsole hosts:** skipped with a report. Those hosts do not expose the
   handoff needed to transfer their native console connection safely. The WSL
-  attachment path above is separate and does not have this restriction.
+  attachment path above is separate and does not have this restriction. Git
+  Bash inside mintty uses an MSYS PTY and is also skipped; Git Bash in a classic
+  Windows console is supported.
 
 WSL attachment uses the relevant MIT-licensed **reptyr** source routines, built
 as part of Hardcore; there is no reptyr installation or download. The static
@@ -246,6 +248,11 @@ and rectangular selections are not translated. Native attached tabs detach
 instead of becoming saved/restarted sessions, and must be detached before an
 in-place update. WSL attachment currently requires x86-64 Linux and an executable
 Windows drive mount inside WSL.
+
+The [application test matrix](slurp/README.md#application-matrix) covers real
+Windows Terminal WSL sessions, including editors and AI CLIs, and native shells.
+It distinguishes process/input checks from presentation state and active model
+requests that have not yet been tested.
 
 
 ## Claude Code
@@ -441,6 +448,10 @@ The Windows build also compiles the WSL attachment code from source using
 step. No prebuilt reptyr executable is checked in or downloaded. `make slurp-test`
 tests synthetic Linux and Windows consoles, including actual WSL takeover and
 closing its original ConPTY; it never attaches to your existing sessions.
+`make slurp-app-test` is an opt-in desktop test: it opens disposable application
+windows, transfers them, checks input and state, and closes its fixtures. It
+requires Windows Terminal and uses whichever tested applications are installed.
+See the [test coverage and remaining work](slurp/README.md#application-matrix).
 
 ## Keys
 

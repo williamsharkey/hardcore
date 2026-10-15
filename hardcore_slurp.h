@@ -436,6 +436,7 @@ static char *slurp_capture(wchar_t *cmd, DWORD *length) {
     PROCESS_INFORMATION pi = {0};
     char *data = calloc(1, 131074);
     DWORD n = 0, code = 1, start = GetTickCount();
+    int eof = 0;
     if (!data || !CreatePipe(&r, &w, &sa, 65536)) goto done;
     SetHandleInformation(r, HANDLE_FLAG_INHERIT, 0);
     in = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
@@ -443,7 +444,9 @@ static char *slurp_capture(wchar_t *cmd, DWORD *length) {
     CloseHandle(w); w = NULL;
     for (;;) {
         DWORD avail = 0, got;
-        if (!PeekNamedPipe(r, NULL, 0, NULL, &avail, NULL)) break;
+        if (!PeekNamedPipe(r, NULL, 0, NULL, &avail, NULL)) {
+            eof = GetLastError() == ERROR_BROKEN_PIPE; break;
+        }
         if (avail) {
             if (n + avail > 131072) break;
             if (!ReadFile(r, data + n, avail, &got, NULL)) break;
@@ -455,7 +458,11 @@ static char *slurp_capture(wchar_t *cmd, DWORD *length) {
         }
         if (GetTickCount() - start > 15000) break;
     }
-    if (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+    /* A probe can close stdout before its CRT/process teardown finishes.
+       EOF is not a failed probe: allow exit within the original time budget. */
+    DWORD elapsed = GetTickCount() - start;
+    if (WaitForSingleObject(pi.hProcess, eof && elapsed < 15000 ? 15000 - elapsed : 0) == WAIT_TIMEOUT)
+        TerminateProcess(pi.hProcess, 1);
     else GetExitCodeProcess(pi.hProcess, &code);
 done:
     if (r) CloseHandle(r);
@@ -575,7 +582,7 @@ static DWORD WINAPI slurp_scan(LPVOID arg) {
     PROCESSENTRY32W pe = {sizeof(pe)};
     HWND seen[256]; int nseen = 0;
     if (snap != INVALID_HANDLE_VALUE && Process32FirstW(snap, &pe)) do {
-        int kind = !_wcsicmp(pe.szExeFile, L"cmd.exe") ? TK_CMD :
+        int kind = (!_wcsicmp(pe.szExeFile, L"cmd.exe") || !_wcsicmp(pe.szExeFile, L"bash.exe")) ? TK_CMD :
                    (!_wcsicmp(pe.szExeFile, L"powershell.exe") || !_wcsicmp(pe.szExeFile, L"pwsh.exe")) ? TK_PS : -1;
         if (g_slurp_mode == 1) { if (pe.th32ProcessID != g_slurp_pid) continue; if (kind < 0) kind = TK_CMD; }
         else if (kind < 0) continue;
@@ -588,7 +595,10 @@ static DWORD WINAPI slurp_scan(LPVOID arg) {
             for (int i = 0; i < nseen; i++) if (seen[i] == t.hwnd) duplicate = 1;
             if (!duplicate && nseen < 256) {
                 seen[nseen++] = t.hwnd;
-                snprintf(t.label, sizeof(t.label), "%s %lu", kind == TK_PS ? "PowerShell" : "cmd", t.pid);
+                char executable[1024];
+                if (!WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, executable, sizeof(executable), NULL, NULL))
+                    strcpy(executable, "console");
+                snprintf(t.label, sizeof(t.label), "%.230s %lu", executable, t.pid);
                 slurp_deliver(&t, listing); found++;
             }
         } else unsupported++;

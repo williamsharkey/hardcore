@@ -55,14 +55,16 @@ save and must be detached before a live reload. The console's dimensions stay
 unchanged; Hardcore reflows the captured cells for its own display. Snapshot
 size is bounded to 20,000 rows and four million cells. Native pseudoconsole
 hosts, including Windows Terminal's PowerShell/cmd tabs, are skipped because
-this bridge cannot safely take over their connection.
+this bridge cannot safely take over their connection. Automatic discovery also
+includes `bash.exe` for Git Bash in a classic console. Git Bash inside mintty
+uses an MSYS PTY and cannot use this console bridge.
 
 ## Validation
 
 `make slurp-test` builds the executable and runs three integration checks:
 
 - `tests/test_slurp_linux.py` creates synthetic Linux terminals and checks
-  process identity, shell memory, background jobs, input and interrupts, stale
+  process identity, shell memory, background jobs (including stop/resume), input and interrupts, stale
   identities, duplicate attachment, and closure of the old master.
 - The native console selftest checks screen state, scrollback, cursor and
   colors, delayed hiding, input, detach, reattachment, and restoration after
@@ -74,3 +76,60 @@ These tests create and clean up their own sessions. They never attach to user
 terminals or change system-wide ptrace policy. `make test` includes these checks
 alongside the existing terminal and ConPTY tests. Running them requires WSL
 with Windows executable interop and a working default distribution.
+
+## Application matrix
+
+`make slurp-app-test` is a separate, opt-in desktop integration suite. It opens
+fresh Windows Terminal windows running WSL applications and attaches them with
+the production source-built helper, ConPTY transport and terminal parser. The
+test driver is a separate test build, not an alternate implementation of slurp.
+Its destination is headless: it checks terminal text/state rather than rendered
+pixels or graphical tab interactions.
+It closes each original fixture window and checks process creation times,
+terminal modes, input and resize behavior. Native fixtures run in classic
+conhost windows and verify that detaching reveals the original console.
+
+```sh
+make slurp-app-test
+# Or select a subset after building build/slurp-driver.exe:
+python3 tests/test_slurp_apps.py --apps shell nano vim
+python3 tests/test_slurp_apps.py --apps claude grok codex agy
+python3 tests/test_slurp_apps.py --apps cmd powershell pwsh git-bash wt-powershell mintty
+```
+
+Reports, captured terminal text and fixture files are under `build/slurp-apps/`.
+Missing applications are reported as skipped. The tests use existing CLI
+installations and credentials; they do not install applications or submit model
+prompts. agy's workspace-trust prompt is accepted only for the new disposable
+fixture directory. Tests never attach to existing user sessions, write Hardcore
+settings, or send global keyboard input.
+
+Validated on 2026-10-14 with Windows Terminal 1.24.12741.0 and Debian WSL:
+
+| Source/application | Checks |
+|---|---|
+| Windows Terminal / bash | Same shell and background job, variables, history, terminal modes, resize, Ctrl-C after source closure |
+| Windows Terminal / nano 8.4 | Same process and terminal modes; cursor position, editing and saving after transfer |
+| Windows Terminal / Vim 9.1 minimal build | Unsaved buffer and cursor position retained; edit/save after transfer |
+| Windows Terminal / Claude Code 2.1.300 | Live CLI survives source closure; resize and unsent draft input |
+| Windows Terminal / Grok 1.0.52 | Live CLI survives source closure; resize and unsent draft input |
+| Windows Terminal / Codex CLI 0.162.1 | Live CLI survives source closure; resize and unsent draft input |
+| Windows Terminal / agy | Live CLI survives source closure; workspace-trust UI and unsent draft input |
+| Classic cmd, Windows PowerShell 5.1, PowerShell 7.6.7 | In-memory variable and input preserved; source console restored on detach |
+| Classic Git Bash 5.3.9 | In-memory variable and input preserved; source console restored on detach |
+| Native PowerShell inside Windows Terminal | Unsupported connection is rejected; original window remains visible |
+| Git Bash inside mintty | Unsupported MSYS PTY is rejected; original window remains visible |
+
+The suite also exercises the discovery pipe closing before the child process
+exits. This caught a race where a successful probe could be terminated during
+normal teardown. Wrapped screen-text assertions caught an incorrect conversion
+between screen wrap flags and scrollback wrap widths.
+
+Remaining work includes transfer during active AI generation/tool execution,
+pre-existing multiline CLI drafts, application-specific mouse/paste modes,
+Windows-hosted editors, and testing WSL sessions in hosts such as WezTerm and
+Alacritty. The matrix verifies idle AI interfaces, not network request continuity
+or every UI mode. WSL's old terminal-emulator scrollback and selections still
+cannot be recovered from the PTY. Native Windows Terminal and MSYS/mintty session
+handoff would require a different implementation or cooperation from the host;
+they are not supported by the classic-console bridge.

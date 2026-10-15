@@ -66,6 +66,12 @@ def main():
         read_until(old, b"] ")
         jobs = [int(p) for p in pathlib.Path(f"/proc/{pid}/task/{pid}/children").read_text().split()]
         assert jobs, "background fixture job did not start"
+        # A stopped job must stay stopped during transfer, then resume normally.
+        os.kill(jobs[0], signal.SIGSTOP)
+        until = time.monotonic() + 3
+        while pathlib.Path(f"/proc/{jobs[0]}/stat").read_text().rsplit(")", 1)[1].split()[0] != 'T':
+            assert time.monotonic() < until, "fixture job did not stop"
+            time.sleep(.02)
         start = identity(pid)
         # Identity mismatch must leave the original shell and its input intact.
         bad = subprocess.run([HELPER, "--attach", str(pid), str(int(start) + 1), str(os.getuid())],
@@ -89,6 +95,8 @@ def main():
         for job in jobs:
             os.kill(job, 0)
             assert os.getsid(job) == pid, "background job moved out of the original session"
+        assert pathlib.Path(f"/proc/{jobs[0]}/stat").read_text().rsplit(")", 1)[1].split()[0] == 'T', "stopped job was resumed unexpectedly"
+        os.kill(jobs[0], signal.SIGCONT)
         duplicate, duplicate_slave = os.openpty()
         try:
             second = subprocess.Popen([HELPER, "--attach", str(pid), start, str(os.getuid())],
@@ -113,7 +121,7 @@ def main():
         os.write(new, b"kill $(jobs -p); exit\n")
         relay.wait(timeout=8)
         assert relay.returncode == 0
-        print("ok: PID, shell memory, background job, input, Ctrl-C, old-master release, identity/duplicate rejection, EOF")
+        print("ok: PID, shell memory, background job stop/resume, input, Ctrl-C, old-master release, identity/duplicate rejection, EOF")
     finally:
         if relay and relay.poll() is None:
             relay.kill()
