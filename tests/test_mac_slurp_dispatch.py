@@ -25,7 +25,8 @@ class SlurpDispatchTests(unittest.TestCase):
         self.exe = self.root/'build/hardcore'
         shutil.copy2(EXE, self.exe)
         self.helper = self.root/'tools/slurp_mac.py'
-        self.helper.write_text('import json,sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(23)\n')
+        self.helper.write_text('import json,sys,local_fixture\nprint(json.dumps(sys.argv[1:]))\nsys.exit(23)\n')
+        (self.root/'tools/local_fixture.py').write_text('VALUE = 1\n')
         self.env = dict(os.environ, HARDCORE_RUNTIME_DIR=str(self.root/'run'))
 
     def run_cli(self, *args):
@@ -37,6 +38,14 @@ class SlurpDispatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 23, result.stdout+result.stderr)
         self.assertEqual(json.loads(result.stdout), ['--executable', str(self.exe)])
         self.assertEqual(list((self.root/'run').iterdir()), [])
+        self.assertFalse((self.root/'tools/__pycache__').exists(), 'helper imports modified the signed app resources')
+
+    def test_claude_helper_imports_do_not_modify_signed_resources(self):
+        shutil.copy2(self.helper, self.root/'tools/claude_slurp.py')
+        result = self.run_cli('claude', 'status')
+        self.assertEqual(result.returncode, 23, result.stdout+result.stderr)
+        self.assertEqual(json.loads(result.stdout), ['status'])
+        self.assertFalse((self.root/'tools/__pycache__').exists(), 'Claude imports modified the signed app resources')
 
     def test_targeted_slurp_uses_same_coordinator(self):
         result = self.run_cli('slurp', '--terminal', '/dev/ttys123')

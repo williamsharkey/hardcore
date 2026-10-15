@@ -829,7 +829,9 @@ static int mac_cli(int argc, char **argv) {
         char **args = calloc(argc + 6, sizeof(char *));
         if (!args) return 1;
         int n = 0;
-        args[n++] = "env"; args[n++] = "python3"; args[n++] = (char *)helper.fileSystemRepresentation;
+        /* Helpers import bundled modules. Bytecode caches inside Resources
+           would change the signed bundle on the first invocation. */
+        args[n++] = "env"; args[n++] = "python3"; args[n++] = "-B"; args[n++] = (char *)helper.fileSystemRepresentation;
         for (int i = 2; i < argc; i++) args[n++] = argv[i];
         if (broker) { args[n++] = "--executable"; args[n++] = g_mac_exe_path; }
         execv("/usr/bin/env", args);
@@ -958,7 +960,7 @@ static int mac_cli(int argc, char **argv) {
         if (!native && !bridge && !pid && !session && !socket) {
             NSString *helper = mac_helper(@"slurp_mac.py");
             if (!helper) { fprintf(stderr, "hardcore: missing slurp coordinator; rebuild or reinstall Hardcore\n"); return 1; }
-            NSMutableArray *arguments = [NSMutableArray arrayWithObjects:@"env", @"python3", helper,
+            NSMutableArray *arguments = [NSMutableArray arrayWithObjects:@"env", @"python3", @"-B", helper,
                 @"--executable", @(g_mac_exe_path), nil];
             if (terminal) [arguments addObjectsFromArray:@[@"--terminal", terminal]];
             char **command = calloc(arguments.count + 1, sizeof(char *));

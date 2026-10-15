@@ -863,7 +863,7 @@ static int tab_spawn(Tab *tb) {
     if (pid == 0) {
         if (!strncmp(tb->run, "claude-wait:", 12)) {
             child_env();
-            execl("/usr/bin/env", "env", "python3", tb->hist, "wait", "--request", tb->run + 12, (char *)NULL);
+            execl("/usr/bin/env", "env", "python3", "-B", tb->hist, "wait", "--request", tb->run + 12, (char *)NULL);
             _exit(127);
         }
         if (!strncmp(tb->run, "terminal:", 9)) {
