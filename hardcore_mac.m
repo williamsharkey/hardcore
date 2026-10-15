@@ -2131,9 +2131,16 @@ int main(int argc, char **argv) {
         puts("hardcore [DIR]                         open a terminal\n"
              "hardcore update                        install latest macOS release and reload live tabs\n"
              "hardcore update --from PATH             install a local app bundle (or bare binary)\n"
+             "hardcore slurp                         unsupported on macOS (Windows/WSL only)\n"
              "hardcore --reload                      reload windows using the installed executable\n"
              "hardcore --version                     print version and build");
         return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "slurp")) {
+        fprintf(stderr, "hardcore: slurp is not implemented on macOS; it currently supports Windows/WSL only.\n"
+                        "Existing sessions in other Mac terminals cannot be imported by this build.\n"
+                        "To open a directory named slurp, use hardcore ./slurp.\n");
+        return 1;
     }
     if (argc > 1 && !strcmp(argv[1], "update")) return mac_update_cmd(argc - 2, argv + 2);
     if (argc == 2 && !strcmp(argv[1], "--reload")) return mac_reload_windows();

@@ -248,6 +248,10 @@ GUI/PTY integration tests using disposable installations on a logged-in Mac.
 
 ### Slurp: attach running sessions
 
+**Windows/WSL only.** macOS does not yet support importing live sessions from
+other terminals. On macOS, `hardcore slurp` exits with an explanatory error;
+live updating preserves Hardcore’s own sessions but does not import others.
+
 `hardcore slurp` discovers sessions and adds them to an existing Hardcore
 window, or opens a new window. A **slurp** tab reports candidates and skipped
 hosts; individual attachment errors remain visible in their tabs. It does not

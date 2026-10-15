@@ -30,6 +30,13 @@ def main():
     if sys.platform != "darwin":
         print("SKIP: macOS GUI required")
         return
+    # A reserved subcommand must fail promptly, even though the repository
+    # contains a real slurp directory. It must never launch a GUI window.
+    for args in [['slurp'], ['slurp', '--list']]:
+        result = subprocess.run([str(ROOT / 'hardcore.app/Contents/MacOS/hardcore'), *args],
+                                cwd=ROOT, capture_output=True, text=True, timeout=5)
+        assert result.returncode != 0 and 'not implemented on macOS' in result.stderr, result
+    print('PASS: macOS slurp reports unsupported instead of opening a directory')
     with tempfile.TemporaryDirectory(prefix="hardcore-update-test-") as tmp:
         root = Path(tmp)
         install = root / "installed" / "hardcore.app"
