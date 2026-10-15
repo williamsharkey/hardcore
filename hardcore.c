@@ -1959,7 +1959,7 @@ static void term_line(const Term *t, int L, const Cell **cells, int *n, int *wra
         if (y < 0 || y >= t->rows) { *cells = NULL; *n = 0; *wrapped = 0; return; }
         *cells = t->row[t->alt][y];
         *n = t->cols;
-        *wrapped = t->wrapf[t->alt][y];
+        *wrapped = t->wrapf[t->alt][y] ? wrap_width(*cells, t->cols) : 0;
     }
 }
 
@@ -6982,6 +6982,18 @@ static int unit_tests(const char *out_path) {
         fails += strcmp(a, b) != 0;
     }
     fails += unit_scrollback(f);
+    {
+        Term wrapped;
+        int ok = term_init(&wrapped, 10, 3);
+        if (ok) {
+            vt_feed(&wrapped, (const unsigned char *)"ABCDEFGHIJKLMNO", 15);
+            char *text = term_text(&wrapped);
+            ok = text && strstr(text, "ABCDEFGHIJKLMNO");
+            free(text); term_free(&wrapped);
+        }
+        fprintf(f, "%s wrapped screen text retains every column\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
     fails += unit_underlay(f);
     fails += unit_tab_labels(f);
     for (i = 0; i < (int)(sizeof(urls) / sizeof(urls[0])); i++) {

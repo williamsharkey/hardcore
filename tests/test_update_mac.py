@@ -157,7 +157,8 @@ for line in sys.stdin:
             result = subprocess.run([str(exe), "update", "--from", str(invalid)], capture_output=True, text=True, timeout=30)
             assert result.returncode != 0
             assert exe.read_bytes() == original and proc.poll() is None
-            assert state()['tabs'] == after['tabs']
+            after_invalid = state()
+            assert after_invalid['tabs'] == after['tabs'], (after['tabs'], after_invalid['tabs'])
             print("PASS: invalid replacement rejected without changing installation or sessions")
 
             fifo2 = root / "control2"
