@@ -45,6 +45,10 @@
 #include <math.h>
 
 @class HCView;
+static char g_mac_exe_path[MAX_PATH];
+#ifndef HARDCORE_BUILD
+#define HARDCORE_BUILD "unknown"
+#endif
 static NSWindow *g_win;
 static HCView *g_view;
 static int g_gfx_ready;          /* Metal device and shaders are up */
@@ -207,6 +211,8 @@ typedef struct Frame {
     Inst *v;                     /* the frame's quads */
     int n, cap, w, h;
     int snap;                    /* test channel: write this frame to snap_path */
+    int handoff, painted;        /* receipt belongs only to this exact frame */
+    uint64_t serial;             /* main-thread submission order */
     char snap_path[MAX_PATH];
     double lat_key, lat_out, lat_down, lat_written;   /* HARDCORE_LAT, for the key this frame answers */
     int trace_tab;               /* HARDCORE_TRACE: the new tab's first frame */
@@ -216,6 +222,8 @@ static Frame *g_build;           /* being built by render() */
 static Frame *g_pending;         /* built, waiting for the render thread */
 static pthread_mutex_t g_fmx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_fcv = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_draw_mx = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_frame_serial, g_last_draw_serial;
 
 static void frame_free(Frame *f) {
     if (!f) return;
@@ -264,9 +272,11 @@ static void write_bmp(const char *path, const void *px, int w, int h) {
     fclose(f);
 }
 
-/* Encodes and presents one frame; on the render thread, or on the main
-   thread during a live resize (presentsWithTransaction wants that). */
-static void draw_frame(Frame *f) {
+/* Encodes and presents on the render thread, including during live resize.
+   Only explicit test snapshots draw synchronously on the main thread. */
+static int g_handoff_paint, g_handoff_painted;
+
+static void draw_frame_contents(Frame *f) {
     id<CAMetalDrawable> d = [g_layer nextDrawable];
     id<MTLCommandBuffer> cb;
     id<MTLRenderCommandEncoder> enc;
@@ -327,13 +337,11 @@ static void draw_frame(Frame *f) {
             if (dd.presentedTime > 0) fprintf(stderr, "%8.2f ms  frame %d on screen\n", dd.presentedTime * 1000.0 - g_t_exec, k);
         }];
     }
-    if (g_layer.presentsWithTransaction) {   /* live resize: land with the window's new size, not before */
-        [cb commit];
-        [cb waitUntilScheduled];
-        [d present];
-    } else {
-        [cb presentDrawable:d];
-        [cb commit];
+    [cb presentDrawable:d];
+    [cb commit];
+    if (f->handoff) {
+        [cb waitUntilCompleted];
+        f->painted = cb.status == MTLCommandBufferStatusCompleted && w == f->w && h == f->h;
     }
     if (snap) {
         [cb waitUntilCompleted];
@@ -342,11 +350,25 @@ static void draw_frame(Frame *f) {
     }
 }
 
+/* Synchronous receipts and worker frames share one presentation order. A
+   worker may already hold an old frame when the main thread paints a receipt;
+   it must never present that stale frame afterward or certify the receipt. */
+static void draw_frame(Frame *f) {
+    pthread_mutex_lock(&g_draw_mx);
+    if (f->serial > g_last_draw_serial) {
+        g_last_draw_serial = f->serial;
+        draw_frame_contents(f);
+    }
+    pthread_mutex_unlock(&g_draw_mx);
+}
+
 static void r_present(void) {
     Frame *f;
     r_flush();
     if (!(f = g_build)) return;
     g_build = NULL;
+    f->serial = ++g_frame_serial;
+    f->handoff = g_handoff_paint;
     if (g_lat && g_lat_key && g_lat_out) {
         f->lat_key = g_lat_key;
         f->lat_out = g_lat_out;
@@ -359,8 +381,9 @@ static void r_present(void) {
         trace("new tab's first frame with its prompt, handed to the render thread");
         f->trace_tab = 1;
     }
-    if (g_layer.presentsWithTransaction || f->snap) {   /* in step with a live resize; or a test wants the file now */
+    if (f->snap || f->handoff) {   /* snapshot or the first frame before acknowledging a handoff */
         @autoreleasepool { draw_frame(f); }
+        if (f->handoff) g_handoff_painted = f->painted;
         frame_free(f);
         return;
     }
@@ -507,6 +530,11 @@ static void schedule_output(void) {
    pty can't take right now (a big paste into a busy program) goes to the tab's
    serial queue, which waits for room; later writes queue behind it so the
    order holds. The window never blocks on a child that isn't reading. */
+static int mac_input_held(Tab *tb) {
+    return tb && tb->claude_guard && !tb->claude_released && !tb->exited &&
+           (DWORD)(GetTickCount() - tb->claude_guard_at) < 120000;
+}
+
 static void tab_write(Tab *tb, const void *s, int n) {
     char *copy;
     int fd = tb->fd, off = 0;
@@ -639,6 +667,7 @@ static void child_env(void) {
     setenv("TERM", "xterm-256color", 1);
     setenv("COLORTERM", "truecolor", 1);
     setenv("TERM_PROGRAM", "hardcore", 1);
+    { char pid[32]; snprintf(pid, sizeof(pid), "%d", getppid()); setenv("HARDCORE_WINDOW_PID", pid, 1); }
     setenv("TERM_PROGRAM_VERSION", HARDCORE_VERSION, 1);
     setenv("FORCE_HYPERLINK", "1", 1);
     setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);   /* macOS bash 3.2's "now zsh" nag */
@@ -685,11 +714,15 @@ static void exec_shell(const char *dir, int spare) {
     _exit(127);
 }
 
-/* Reinstall dispatch watchers after spawn or an exec-based live update. */
-static void mac_watch_tab(Tab *tb) {
+static void tab_start_io(Tab *tb) {
     int fd = tb->fd, id = tb->id;
     pid_t pid = tb->pid;
     dispatch_source_t r, p;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);    /* later tabs' shells mustn't hold this one open */
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    tb->fd = fd;
+    tb->pid = pid;
+    tb->born = GetTickCount();
     tb->wpending = (int *)calloc(1, sizeof(int));
     tb->wq = dispatch_queue_create("hardcore.tab.write",
                                    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
@@ -706,16 +739,21 @@ static void mac_watch_tab(Tab *tb) {
     p = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)pid, DISPATCH_PROC_EXIT, dispatch_get_main_queue());
     dispatch_source_set_event_handler(p, ^{
         int st = 0, code;
-        if (waitpid(pid, &st, WNOHANG) == 0) return;
+        pid_t waited = waitpid(pid, &st, WNOHANG);
+        if (waited == 0) return;
+        /* A transferred shell is no longer our child. The process source still
+           reports its exit; waitpid then returns ECHILD. */
         code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+        Tab *t = tab_by_id(id);
+        if (!t && g_spare && g_spare->id == id) t = g_spare;
+        if (t) t->psrc = NULL;
         dispatch_source_cancel(p);
         dispatch_release(p);
         on_tab_exited(id, code);
     });
+    tb->psrc = p;
     dispatch_resume(p);
-
 }
-
 static int tab_spawn(Tab *tb) {
     struct winsize ws;
     pid_t pid;
@@ -732,13 +770,29 @@ static int tab_spawn(Tab *tb) {
         term_message(&tb->t, msg);
         return 0;
     }
-    if (pid == 0) exec_shell(tb->start_dir, tb->spare);
-    fcntl(fd, F_SETFD, FD_CLOEXEC);    /* later tabs' shells mustn't hold this one open */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    if (pid == 0) {
+        if (!strncmp(tb->run, "claude-wait:", 12)) {
+            child_env();
+            execl("/usr/bin/env", "env", "python3", tb->hist, "wait", "--request", tb->run + 12, (char *)NULL);
+            _exit(127);
+        }
+        if (!strncmp(tb->run, "terminal:", 9)) {
+            child_env();
+            execl(g_mac_exe_path, "hardcore", "--terminal-bridge", tb->run + 9, tb->hist, (char *)NULL);
+            _exit(127);
+        }
+        if (tb->run[0]) {   /* tmux slurp: argv only, never shell-evaluate a session name */
+            child_env();
+            signal(SIGPIPE, SIG_DFL);
+            if (tb->hist[0]) execl("/usr/bin/env", "env", "tmux", "-S", tb->hist, "attach-session", "-t", tb->run, (char *)NULL);
+            else execl("/usr/bin/env", "env", "tmux", "attach-session", "-t", tb->run, (char *)NULL);
+            _exit(127);
+        }
+        exec_shell(tb->start_dir, tb->spare);
+    }
     tb->fd = fd;
     tb->pid = pid;
-    tb->born = GetTickCount();
-    mac_watch_tab(tb);
+    tab_start_io(tb);
     return 1;
 }
 
@@ -919,11 +973,17 @@ static void on_tab_exited(int id, int code) {
     }
     tab_drain(tb);
     tb->exited = 1;
-    if (code != 0 && GetTickCount() - tb->born < 3000 && !tb->help) {
+    int claude_receiver = !strncmp(tb->run, "claude-wait:", 12);
+    if (code != 0 && (claude_receiver || GetTickCount() - tb->born < 3000) && !tb->help) {
         tb->help = HELP_FAILED;
         tb->t.m_cursor_vis = 0;
-        snprintf(buf, sizeof(buf), "\r\n\x1b[2m%s exited right away (code %d).\x1b[0m\r\n\r\n"
-                                   "  \x1b[38;2;255;166;13mEnter\x1b[0m  try again\r\n", g_shell, code);
+        if (claude_receiver)
+            snprintf(buf, sizeof(buf), "\r\n\x1b[2mClaude attachment ended (code %d).\x1b[0m\r\n"
+                     "The conversation may still be available in claude agents.\r\n\r\n"
+                     "  \x1b[38;2;255;166;13mEnter\x1b[0m  open a shell\r\n", code);
+        else
+            snprintf(buf, sizeof(buf), "\r\n\x1b[2m%s exited right away (code %d).\x1b[0m\r\n\r\n"
+                                       "  \x1b[38;2;255;166;13mEnter\x1b[0m  try again\r\n", g_shell, code);
         term_message(&tb->t, buf);
         plat_invalidate();
         return;
@@ -1146,6 +1206,7 @@ static int paste_image(NSPasteboard *pb) {
 
 /* Text pastes as text; files as their paths; an image as a saved PNG's path. */
 static void paste(void) {
+    if (mac_input_held(active_tab())) { NSBeep(); return; }
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
     NSString *s;
     if (paste_file_urls(pb)) return;
@@ -1335,6 +1396,7 @@ static int plain_layout(void) {
     l.framebufferOnly = NO;      /* the test channel's snapshot reads it back */
     l.maximumDrawableCount = 2;  /* one on screen, one on its way: a third only adds a frame of queue */
     l.displaySyncEnabled = NO;   /* present now: display sync measured ~4 ms slower at p50 */
+    l.presentsWithTransaction = NO; /* keep drawable/GPU waits off AppKit's resize event loop */
     l.opaque = YES;
     l.colorspace = cs;           /* the palette is sRGB, as on Windows */
     l.contentsGravity = kCAGravityTopLeft;   /* mid-resize, never stretch the old frame */
@@ -1353,16 +1415,17 @@ static int plain_layout(void) {
     layer_fit();
     resize_all();
     t1 = g_lat ? uptime_ms() : 0;
-    /* during a live resize, draw now and land with the window's new frame */
-    g_layer.presentsWithTransaction = [self inLiveResize];
+    /* Build the latest frame now, but let the render thread acquire/present
+       its drawable. A transaction-synchronous draw here can stall AppKit for
+       nextDrawable's one-second timeout during a drag. Pending frames coalesce. */
     paint_view_now();
-    /* the main thread's whole step, and of it the reflow (the rest is drawing, and waiting for the display) */
+    /* Main-thread time: reflow plus building/enqueuing the frame, never GPU waits. */
     if (g_lat) fprintf(stderr, "resize %dx%d %.3f %.3f\n", g_cols, g_rows, uptime_ms() - t0, t1 - t0);
 }
 
 - (void)viewDidEndLiveResize {
     [super viewDidEndLiveResize];
-    g_layer.presentsWithTransaction = NO;
+    paint_view_now();   /* enqueue the final size even if the last drag frame was replaced */
 }
 
 - (void)viewDidChangeBackingProperties {
@@ -1524,6 +1587,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
         [self specialKey:e];     /* Cmd+←/→/Backspace; other Cmd keys belong to the menus or nobody */
         return;
     }
+    if (mac_input_held(tb)) { NSBeep(); return; }
     if ([self specialKey:e] || [self controlKey:e]) return;
     /* Plain typing on a plain keyboard layout goes straight out: the text-input
        system (interpretKeyEvents) costs a few ms at p90, measured. Dead keys
@@ -1773,6 +1837,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (tb->t.m_mouse && !(ev_mods(e) & M_SHIFT)) {
         for (i = 0; i < abs(lines); i++) mouse_report(lines > 0 ? 64 : 65, 1, 0, mx, my, ev_mods(e));
     } else if (tb->t.alt) {
+        if (mac_input_held(tb)) return;
         /* alternate scroll: less, man, git log scroll with the wheel */
         const char *seq = lines > 0 ? (tb->t.m_appcursor ? "\x1bOA" : "\x1b[A") : (tb->t.m_appcursor ? "\x1bOB" : "\x1b[B");
         for (i = 0; i < abs(lines); i++) tab_write(tb, seq, 3);
@@ -2045,7 +2110,7 @@ static void ctl_line(char *s) {
             else *o++ = *p;
         }
         if (tb->help) { int at; for (at = 0; at < g_ntabs; at++) if (g_tabs[at] == tb) { replace_tab(at); break; } }
-        else tab_write(tb, s, (int)(o - s));
+        else if (!mac_input_held(tb)) tab_write(tb, s, (int)(o - s));
     } else if (!strncmp(s, "cmd ", 4)) {
         const char *c = s + 4;
         if (!strcmp(c, "newtab")) { g_trace_tab_t = uptime_ms(); trace("ctl newtab"); new_tab_mac(); }
@@ -2292,7 +2357,6 @@ static int replay(const char *out_path, int cols, int rows, char **files, int nf
     return 0;
 }
 
-#include "hardcore_mac_update.h"
 
 /* ── startup ───────────────────────────────────────────────────────── */
 
@@ -2334,6 +2398,12 @@ static void trace_init(void) {
     g_t_exec -= (now.tv_sec - kp.kp_proc.p_starttime.tv_sec) * 1000.0 + (now.tv_usec - kp.kp_proc.p_starttime.tv_usec) / 1000.0;
 }
 
+static int mac_update_cmd(int argc, char **argv);
+static int mac_reload_windows(void);
+static int mac_reload(int ack, char *why, size_t cap);
+#include "hardcore_mac_transfer.m"
+#include "hardcore_mac_update.h"
+
 int main(int argc, char **argv) {
     int i;
     char selftest_out[MAX_PATH] = "";
@@ -2344,24 +2414,6 @@ int main(int argc, char **argv) {
 
     mac_executable_init();
     if (argc == 2 && !strcmp(argv[1], "--mac-update-protocol")) { if (!mtl_init()) return 1; puts("hardcore-mac-reload-1"); return 0; }
-    if (argc == 2 && !strcmp(argv[1], "--version")) { printf("hardcore %s (build %s)\n", HARDCORE_VERSION, HARDCORE_BUILD); return 0; }
-    if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
-        puts("hardcore [DIR]                         open a terminal\n"
-             "hardcore update                        install latest macOS release and reload live tabs\n"
-             "hardcore update --from PATH             install a local app bundle (or bare binary)\n"
-             "hardcore slurp                         unsupported on macOS (Windows/WSL only)\n"
-             "hardcore --reload                      reload windows using the installed executable\n"
-             "hardcore --version                     print version and build");
-        return 0;
-    }
-    if (argc > 1 && !strcmp(argv[1], "slurp")) {
-        fprintf(stderr, "hardcore: slurp is not implemented on macOS; it currently supports Windows/WSL only.\n"
-                        "Existing sessions in other Mac terminals cannot be imported by this build.\n"
-                        "To open a directory named slurp, use hardcore ./slurp.\n");
-        return 1;
-    }
-    if (argc > 1 && !strcmp(argv[1], "update")) return mac_update_cmd(argc - 2, argv + 2);
-    if (argc == 2 && !strcmp(argv[1], "--reload")) return mac_reload_windows();
     if (argc == 4 && !strcmp(argv[1], "--mac-adopt")) {
         g_mac_state_fd = atoi(argv[2]); g_mac_ack_fd = atoi(argv[3]);
     }
@@ -2370,6 +2422,8 @@ int main(int argc, char **argv) {
     g_lat = getenv("HARDCORE_LAT") != NULL;
     g_reflow_all = getenv("HARDCORE_REFLOW_ALL") != NULL;   /* bench: every resize step rewraps all history, as before */
     signal(SIGPIPE, SIG_IGN);    /* a write to a pty whose shell just died returns EIO instead */
+    int cli_status = mac_cli(argc, argv);
+    if (cli_status >= 0) return cli_status;
     palette_init();
     drip_init();
     config_load();
@@ -2378,7 +2432,7 @@ int main(int argc, char **argv) {
         struct stat st;
         if (g_last_dir[0] && stat(g_last_dir, &st) == 0 && S_ISDIR(st.st_mode)) snprintf(g_start_dir, sizeof(g_start_dir), "%s", g_last_dir);
     }
-    for (i = g_mac_state_fd >= 0 ? argc : 1; i < argc; i++) {
+    for (i = g_mac_state_fd >= 0 ? argc : 1; i < argc && strcmp(argv[1], "--adopt-fd") && strcmp(argv[1], "--slurp-window") && strcmp(argv[1], "--claude-window"); i++) {
         if ((!strcmp(argv[i], "--cd") || !strcmp(argv[i], "-d")) && i + 1 < argc) {
             snprintf(g_start_dir, sizeof(g_start_dir), "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--unit") && i + 1 < argc) {
@@ -2403,11 +2457,14 @@ int main(int argc, char **argv) {
     if (!g_start_dir[0]) snprintf(g_start_dir, sizeof(g_start_dir), "%s", getenv("HOME") ? getenv("HOME") : "/");
     write_rc();
     if (selftest_out[0]) return selftest(selftest_out);
+    int importing;
+    @autoreleasepool { importing = mac_prepare(argc, argv); }
+    if (importing < 0) return 1;
     /* The first shell starts before AppKit does (that's ~60 ms of loading and
        launching): its grid comes from where the window was last time, and the
        display's scale, both known without AppKit. If the window comes up a
        different size, resize_all sends the shell a SIGWINCH. */
-    {
+    if (!importing) {
         NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"NSWindow Frame hardcore"];
         CGDisplayModeRef mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
         int w = 0, h = 0;
@@ -2447,8 +2504,9 @@ int main(int argc, char **argv) {
                                                   NSWindowStyleMaskResizable | NSWindowStyleMaskFullSizeContentView
                                           backing:NSBackingStoreBuffered defer:NO];
     [g_win center];
-    [g_win setFrameAutosaveName:@"hardcore"];   /* size and place come back next time */
+    [g_win setFrameAutosaveName:@"hardcore"];
     if (g_mac_adopt) [g_win setFrame:NSRectFromString(g_mac_adopt[@"frame"]) display:NO];
+    else if (g_mac_placement) [g_win setFrame:NSRectFromString(g_mac_placement[@"frame"]) display:NO];
     g_scale = (int)([g_win backingScaleFactor] + 0.5);
     if (g_scale < 1) g_scale = 1;
     /* Full-size terminal canvas; native controls are revealed by top-band hover. */
@@ -2493,18 +2551,24 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_layer.device = g_mtl;
+    if (g_mac_imports.count) g_handoff_paint = 1;
     render_thread_start();
     layer_fit();
     resize_all();
-    first_prompt_now(40);
+    if (!importing && !g_mac_adopt) first_prompt_now(40);
     trace("first prompt read");
     [g_win makeKeyAndOrderFront:nil];
     /* on screen now, not after AppKit finishes launching (~30 ms more) */
     [CATransaction flush];
     paint_view_now();
     trace("window shown");
+    if (!mac_commit_imports()) return 1;
+    mac_server();
+    if (g_mac_ready_fd >= 0) {
+        mac_send(g_mac_ready_fd, @{@"ok": @YES, @"pid": @(getpid())});
+        close(g_mac_ready_fd); g_mac_ready_fd = -1;
+    }
     if (!getenv("HARDCORE_NO_ACTIVATE") && (!g_mac_adopt || [g_mac_adopt[@"focused"] boolValue])) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
-    mac_update_listen();
     mac_adopt_ready();
     mac_refresh_programs();
     NSTimer *program_timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {

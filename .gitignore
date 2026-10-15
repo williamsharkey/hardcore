@@ -6,3 +6,5 @@ bench/*.exe
 !vendor/conpty/*.exe
 hardcore.app/
 bench/macbench
+__pycache__/
+*.pyc

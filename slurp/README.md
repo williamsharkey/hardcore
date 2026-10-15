@@ -133,3 +133,158 @@ or every UI mode. WSL's old terminal-emulator scrollback and selections still
 cannot be recovered from the PTY. Native Windows Terminal and MSYS/mintty session
 handoff would require a different implementation or cooperation from the host;
 they are not supported by the classic-console bridge.
+
+## macOS validation and research
+
+Mac user-facing commands and the supported source types are in the
+[macOS guide](../README.md#slurp-on-macos). Live Hardcore-to-Hardcore PTY
+transfer, the Terminal.app bridge, tmux attachment, and the Claude adapter use
+different protocols and preserve different state. The research probes below
+do not make arbitrary existing Terminal shells eligible for automatic closure.
+Run these commands from the repository root.
+
+### Noninteractive verification
+
+```sh
+python3 tools/verify_mac_slurp.py
+python3 tools/verify_mac_slurp.py --offline
+```
+
+`make mac-offline-test` additionally builds the universal app and release
+archive, runs the core/xterm.js/reflow, installer/updater, and Claude adapter
+suites, then runs the offline verification command above. It does not install
+the app or publish a release.
+
+The default `verify_mac_slurp.py` run checks archive decoding and saved captures, shell-state cloning,
+and a disposable native Hardcore receiver. It sends no model requests and does
+not operate existing Terminal sessions or read the clipboard. `--offline` skips
+the live shell and GUI probes; some headless regressions still allocate owned
+PTYs. Each run writes private stage logs, `report.json`, and `SUMMARY.txt`.
+
+All eleven selected stages passed in the audited 2026-10-15 version-3 run.
+The native fixture verified exact visible Unicode draft, middle cursor, one
+subsequent edit, captured shell memory/history, and shell/PTY/grid dimensions.
+See the [recorded evidence and its limits](../bench/RESULTS-mac.md#verified-live-native-draft-cursor-and-geometry).
+
+### Claude and manual Terminal fixtures
+
+Run `make claude-adapter-test` for deterministic adapter checks and
+`make claude-window-test` for isolated native receiver tests. An opt-in live
+probe exercises a fresh ordinary Claude session, late plugin loading, a
+disposable foreground command and conversation recall inside Hardcore:
+
+```sh
+python3 tests/probe_claude_handoff_guard.py --handoff build/hardcore \
+  --wait-next-turn --foreground-work
+```
+
+It sends small real model prompts; it does not control your existing Terminal
+sessions.
+
+For a user-operated test on Terminal.app's actual TTY, run this in a fresh
+Terminal window after `make install`:
+
+```sh
+python3 tests/manual_mac_terminal_handoff.py
+```
+
+It starts a disposable Claude conversation directly on Terminal's descriptors,
+installs the adapter afterward, and guides you through plugin reload, one tiny
+prompt, and an unsent Unicode draft with a middle cursor. It never types into
+Terminal. Private results, persistent `STATUS.txt` progress, and cleanup
+instructions are saved under `~/Desktop/Hardcore-Terminal-Test-Results/`.
+The phase and next action can also be read from another shell without contacting
+Claude or changing the run:
+
+```sh
+python3 tests/manual_mac_terminal_handoff.py --status RUN_DIRECTORY
+```
+
+A verified destination stays open
+for inspection; the original Terminal and parent shell are retained. The run's
+temporary login copy is removed by the printed cleanup command after its
+disposable processes have stopped.
+
+A separate user-operated test measures Terminal's styled scrollback export:
+
+```sh
+python3 tools/manual_mac_terminal_archive.py
+```
+
+Run it in a fresh Terminal window. It prints a known fixture and guides ordinary
+Command-A/Command-C, then captures only after you press Return. The private
+archive includes the original RTF/text and reports text, Unicode and style
+coverage. It does not transfer a shell or close the window. The
+[presentation research](../bench/RESEARCH-mac-terminal-state.md) describes the
+remaining cursor, wrap and emulator-state gaps. Offline checks are available
+with `python3 tests/test_mac_terminal_archive.py`.
+
+If capture refuses a text mismatch, it retains private comparison diagnostics
+and the original copies. It compares the uniquely marked fixture independently
+from surrounding Terminal history; differences inside the fixture remain
+visible in the comparison report. Canonical Unicode composition differences
+can be reconciled by keeping the exact plain text and mapping the RTF styles
+onto corresponding graphemes. Ambiguous style mappings and other text changes
+remain failures. To process an already saved capture entirely offline:
+
+```sh
+python3 tools/manual_mac_terminal_archive.py --decode-capture CAPTURE_DIRECTORY
+```
+
+This uses the current helper and saves a new attempt without reading the
+clipboard. To copy an existing fixture again and keep previous attempts intact:
+
+```sh
+python3 tools/manual_mac_terminal_archive.py --recapture RUN_DIRECTORY
+```
+
+Follow the copy instructions and press Return to capture. This does not start
+another Claude session or reprint the fixture.
+
+### Desktop integration and experimental takeover
+
+`make mac-integration-test` exercises live reload, rollback, partial terminal
+sequences, native slurp, tmux attachment, the Terminal bridge, and verified
+release installation. It requires a logged-in Mac desktop, Terminal Automation permission, and
+Accessibility permission for the Terminal bridge; it creates isolated test sessions and leaves existing sessions alone.
+
+The experimental **real Terminal job takeover** tests are included in that
+suite and can also be run with `make mac-takeover-test` (three repetitions),
+or `make mac-takeover-test TAKEOVER_REPEAT=1`. They require Xcode's LLDB and
+debugger attach permission in addition to Terminal Automation. Node REPL
+coverage is skipped if Node is not installed. A focused run is available as
+`python3 tests/test_mac_takeover.py --case python --repeat 3`.
+
+These tests launch their own Terminal tabs and Hardcore windows. They move a
+live job to a new controlling PTY, close the source Terminal tab, check that
+the PID and in-memory state survive, and reload the receiving Hardcore window.
+Coverage includes canonical/raw input, extra terminal descriptors and flags,
+Unicode, Ctrl-C, resize signals, Python and Node REPLs, and a curses application.
+They also verify refusal of child-process trees and session leaders, protected
+shell attach failure, and an unusable receiver leaving the source functional.
+
+This backend remains **test-only**; `hardcore slurp --terminal` still uses the
+bridge described in the [Mac guide](../README.md#slurp-on-macos). The tests configure their source zsh with `NO_HUP`;
+arbitrary source jobs still need safe disowning. The experimental Node fix
+restores ordinary kqueue terminal registrations using a private macOS ABI.
+Descriptor discovery must be synchronized with stopped threads before this
+can become a product backend. Shared descriptor relationships, other event
+mechanisms, rollback after `setsid`, and initial screen/emulator-mode recovery
+remain unresolved. The curses test redraws after resize and sends the known
+application-mode arrow sequence; it does not establish physical-key mode
+recovery. No existing user session is targeted by these tests.
+
+`make mac-host-test` tests a hosted process tree without model requests and is
+part of the integration suite. Optional installed-agent checks are separate:
+
+```sh
+python3 tests/test_mac_host.py --agent claude --agent codex --agent grok --agent agy --check-debugger
+# Uses existing logins and sends small model requests in new conversations:
+python3 tests/test_mac_host.py --agent codex --live --in-flight
+```
+
+The live check verifies remembered conversation state after closing Terminal
+and reloading Hardcore; `--in-flight` also attaches while a response is pending.
+It uses disposable workspaces, never resumes existing conversations, and asks
+the agents not to use tools. Active tool execution is covered by the local
+process-tree fixture, not by agent model requests.

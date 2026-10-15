@@ -1,0 +1,9 @@
+{
+  "name": "hardcore-slurp",
+  "owner": {"name": "Hardcore"},
+  "metadata": {"description": "Cooperative Claude Code handoff into Hardcore on macOS"},
+  "plugins": [
+    {"name": "hardcore-slurp", "source": "./hardcore-slurp", "description": "Guarded Claude handoff into Hardcore"},
+    {"name": "hardcore-slurp-driver", "source": "./hardcore-slurp-driver", "description": "Dispatcher for Hardcore's guarded handoff"}
+  ]
+}

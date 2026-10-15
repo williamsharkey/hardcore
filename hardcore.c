@@ -263,9 +263,11 @@ static uint32_t mix(uint32_t a, uint32_t b, float t) {
 
 static char g_start_dir[1024];   /* Windows or Linux path */
 static char g_last_dir[1024];    /* where the last window closed: the next one opens there */
+#ifdef _WIN32
 static int g_shell_ps;           /* shell=powershell in config.ini: tabs run PowerShell, not WSL */
 static int g_no_bash;            /* the distro has no bash: run its default shell, without rc.bash */
 static int g_have_distro = 1;    /* any WSL distro registered for this user (HKCU\...\Lxss) */
+#endif
 static char g_mnt_root[64] = "/mnt/";   /* where Windows drives appear in WSL (wsl.conf automount root) */
 static char g_cfg_dir_line[1100];   /* dir= as config.ini had it, written back unchanged */
 #ifdef _WIN32
@@ -494,9 +496,12 @@ typedef struct Tab {
     int fd;                      /* pty master, -1 = none */
     pid_t pid;
     void *rsrc;                  /* dispatch source: output ready */
+    void *psrc;                  /* dispatch source: shell exit */
     void *wq;                    /* serial queue for writes the pty can't take right away */
     int *wpending;               /* writes waiting on that queue (atomic; the queue frees it last) */
     int exited;
+    int claude_guard, claude_released, claude_cursor_sent;
+    DWORD claude_guard_at;       /* bounded input hold while the adapter restores its draft */
 #endif
     char *in;
     int in_n, in_cap;
@@ -585,6 +590,7 @@ static void tab_write(Tab *tb, const void *s, int n) {
 }
 #else
 static void tab_write(Tab *tb, const void *s, int n);
+static int mac_input_held(Tab *tb);
 #endif
 
 /* ── platform layer: Win32 in this file, macOS in hardcore_mac.m ───── */
@@ -933,7 +939,6 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
         {
             int len = acc_n, pos = 0;
             while (len > 0 && row_is_blank_default(&acc[len - 1])) len--;
-            if (cur_line == 1 && len < cur_off) len = len;   /* cursor may sit past the text */
             do {
                 int take = len - pos > cols ? cols : len - pos;
                 if (take == cols && acc[pos + take - 1].wflag == W_WIDE) take--;  /* don't split a wide char */
@@ -1984,6 +1989,7 @@ static void sgr_color(char *o, size_t cap, uint32_t spec, int bg) {
 
 static int utf8_encode(uint32_t cp, char *o);
 
+#ifdef _WIN32
 static void term_dump(Term *t, FILE *f, int max_rows) {
     static const int abit[8] = {1, 2, 3, 4, 5, 7, 8, 9};     /* A_BOLD.. A_STRIKE → SGR */
     int alt = t->alt, last, L, first, total;
@@ -2025,6 +2031,8 @@ static void term_dump(Term *t, FILE *f, int max_rows) {
     }
     t->alt = alt;
 }
+
+#endif
 
 /* ── a terminal's whole state as text ──────────────────────────────────
    For handing a tab to a newer hardcore without stopping what runs in it:
@@ -3072,6 +3080,9 @@ static void sel_copy(void) {
 static void send_to_active(const char *s, int n) {
     Tab *tb = active_tab();
     if (!tb) return;
+#ifndef _WIN32
+    if (mac_input_held(tb)) return;
+#endif
     if (tb->t.view) {
         tb->t.view = 0;
         plat_invalidate();
@@ -5264,6 +5275,9 @@ static int mouse_report(int button, int press, int motion, int mx, int my, int m
     char buf[64];
     int col, row, b = button, n;
     if (!tb || !tb->t.m_mouse || (mods & M_SHIFT)) return 0;
+#ifndef _WIN32
+    if (mac_input_held(tb)) return 1;
+#endif
     if (motion && tb->t.m_mouse != 1003 && !(tb->t.m_mouse == 1002 && button != 3)) return 1;
     if (motion && tb->t.m_mouse == 9) return 1;
     mouse_cell(mx, my, &col, &row);

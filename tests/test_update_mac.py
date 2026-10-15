@@ -30,13 +30,11 @@ def main():
     if sys.platform != "darwin":
         print("SKIP: macOS GUI required")
         return
-    # A reserved subcommand must fail promptly, even though the repository
-    # contains a real slurp directory. It must never launch a GUI window.
-    for args in [['slurp'], ['slurp', '--list']]:
-        result = subprocess.run([str(ROOT / 'hardcore.app/Contents/MacOS/hardcore'), *args],
-                                cwd=ROOT, capture_output=True, text=True, timeout=5)
-        assert result.returncode != 0 and 'not implemented on macOS' in result.stderr, result
-    print('PASS: macOS slurp reports unsupported instead of opening a directory')
+    # Command discovery must never invoke slurp against existing terminals.
+    result = subprocess.run([str(ROOT / 'hardcore.app/Contents/MacOS/hardcore'), '--help'],
+                            cwd=ROOT, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0 and 'hardcore slurp' in result.stdout, result
+    print('PASS: CLI help advertises slurp without opening or inspecting terminals')
     with tempfile.TemporaryDirectory(prefix="hardcore-update-test-") as tmp:
         root = Path(tmp)
         install = root / "installed" / "hardcore.app"
@@ -51,8 +49,12 @@ def main():
         cfg = root / "config"
         cfg.mkdir()
         (cfg / "config.ini").write_text("font=t\ntab_underlay=1\n")
+        home = root / "home"
+        (home / "Library/Application Support").mkdir(parents=True)
+        runtime = root / "runtime"
         fifo = root / "control"
         env = dict(os.environ, PATH="/usr/bin:/bin:/usr/sbin:/sbin",
+                   HOME=str(home), HARDCORE_RUNTIME_DIR=str(runtime),
                    HARDCORE_CTL=str(fifo), HARDCORE_NO_ACTIVATE="1",
                    HARDCORE_TEST_CONFIG=str(cfg), HARDCORE_SHELL="/bin/zsh")
         worker = root / "worker.py"
@@ -106,7 +108,7 @@ for line in sys.stdin:
                 wait_for(path.exists)
                 return json.loads(path.read_text())
 
-            wait_for(lambda: Path(f"/tmp/hardcore-{os.getuid()}/{proc.pid}.sock").exists())
+            wait_for(lambda: (runtime / f"{proc.pid}.sock").exists())
             send("cmd resize 901,503")
             send("type sleep 30\\n")
             wait_for(lambda: state()['tabs'][0]['program'] == 'sleep')
@@ -138,7 +140,8 @@ for line in sys.stdin:
             send("cmd view 5")
             before = state()
             children += [t['pid'] for t in before['tabs']]
-            result = subprocess.run([str(exe), "--reload"], capture_output=True, text=True, timeout=40)
+            result = subprocess.run([str(exe), "--reload"], env=env, stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=40)
             assert result.returncode == 0, result.stdout + result.stderr
             after = state()
             assert before == after, (before, after)
@@ -154,7 +157,8 @@ for line in sys.stdin:
             (invalid / "Contents/MacOS").mkdir(parents=True)
             (invalid / "Contents/MacOS/hardcore").write_text("not an executable")
             original = exe.read_bytes()
-            result = subprocess.run([str(exe), "update", "--from", str(invalid)], capture_output=True, text=True, timeout=30)
+            result = subprocess.run([str(exe), "update", "--from", str(invalid)], env=env,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
             assert result.returncode != 0
             assert exe.read_bytes() == original and proc.poll() is None
             after_invalid = state()
@@ -165,7 +169,7 @@ for line in sys.stdin:
             second = subprocess.Popen([str(exe), "--cd", str(root)],
                                       env=dict(env, HARDCORE_CTL=str(fifo2)), stdout=log, stderr=log)
             wait_for(fifo2.exists)
-            wait_for(lambda: Path(f"/tmp/hardcore-{os.getuid()}/{second.pid}.sock").exists())
+            wait_for(lambda: (runtime / f"{second.pid}.sock").exists())
             second_state = root / "second-before.json"
             with open(fifo2, "w") as f:
                 f.write(f"cmd state {second_state}\n")
@@ -198,7 +202,8 @@ for line in sys.stdin:
             print("PASS: update invoked inside foreground process replaces app bundle, reloads both windows, and returns to the same live process")
 
             # Repeat to ensure descriptors/watchers are correctly recreated.
-            result = subprocess.run([str(exe), "--reload"], capture_output=True, text=True, timeout=40)
+            result = subprocess.run([str(exe), "--reload"], env=env, stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=40)
             assert result.returncode == 0, result.stdout + result.stderr
             assert state()['pid'] == proc.pid
             print("PASS: repeated live reload")
@@ -214,7 +219,7 @@ for line in sys.stdin:
                 if second.poll() is None:
                     second.terminate()
                     second.wait(timeout=10)
-                Path(f"/tmp/hardcore-{os.getuid()}/{second.pid}.sock").unlink(missing_ok=True)
+                (runtime / f"{second.pid}.sock").unlink(missing_ok=True)
             if proc.poll() is None:
                 proc.terminate()
                 proc.wait(timeout=10)
@@ -223,7 +228,7 @@ for line in sys.stdin:
                     os.kill(pid, signal.SIGHUP)
                 except ProcessLookupError:
                     pass
-            Path(f"/tmp/hardcore-{os.getuid()}/{proc.pid}.sock").unlink(missing_ok=True)
+            (runtime / f"{proc.pid}.sock").unlink(missing_ok=True)
             log.close()
 
 

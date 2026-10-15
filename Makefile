@@ -10,7 +10,7 @@
 # macOS:
 #   make              → hardcore.app (and build/hardcore, the bare binary)
 #   make test         → unit tests + xterm.js fixtures + headless forkpty/shell selftest
-#   make install      → hardcore.app into ~/Applications
+#   make install      → ~/Applications/hardcore.app + ~/.local/bin/hardcore
 
 UNAME := $(shell uname -s)
 
@@ -26,8 +26,10 @@ endif
 MAC_CC    ?= clang
 MAC_FLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-deprecated-declarations \
              -mmacosx-version-min=11.0 -arch arm64 -arch x86_64
-MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -lutil
+MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -framework ApplicationServices -lutil
 APP        = hardcore.app
+APPDIR    ?= $(HOME)/Applications
+BINDIR    ?= $(HOME)/.local/bin
 
 .PHONY: all clean selftest install test mac-test slurp-test
 
@@ -35,7 +37,7 @@ ifeq ($(UNAME),Darwin)
 all: $(APP)
 test: mac-test
 install: $(APP)
-	python3 tools/install_mac.py "$(APP)" "$(HOME)/Applications/$(APP)" "$(HOME)/.local/bin"
+	@python3 tools/install_mac.py "$(APP)" "$(APPDIR)" "$(BINDIR)"
 else
 all: hardcore.exe
 test: win-test
@@ -129,7 +131,7 @@ build/hardcore.metallib: hardcore.metal
 	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
 	xcrun metallib build/hardcore.air -o $@
 
-build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
+build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
@@ -138,27 +140,89 @@ build/hardcore.icns: tools/gen_icon.py
 	python3 tools/gen_icon.py build/hardcore.iconset
 	iconutil -c icns -o $@ build/hardcore.iconset
 
-$(APP): build/hardcore build/hardcore.icns tools/Info.plist
+CLAUDE_PLUGINS = plugins/.claude-plugin/marketplace.json \
+                 $(wildcard plugins/*/.claude-plugin/*.json plugins/*/hooks/*.json plugins/*/hooks/*.js plugins/*/README.md)
+
+$(APP): build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py $(CLAUDE_PLUGINS)
 	rm -rf $@
 	mkdir -p $@/Contents/MacOS $@/Contents/Resources
 	cp build/hardcore $@/Contents/MacOS/hardcore
 	cp build/hardcore.icns $@/Contents/Resources/hardcore.icns
+	cp tools/update_mac.py $@/Contents/Resources/update_mac.py
+	cp tools/claude_slurp.py tools/claude_handoff.py $@/Contents/Resources/
+	mkdir -p $@/Contents/Resources/plugins
+	cp -R plugins/.claude-plugin plugins/hardcore-slurp plugins/hardcore-slurp-driver $@/Contents/Resources/plugins/
 	sed 's/@VERSION@/$(shell sed -n 's/^#define HARDCORE_VERSION "\(.*\)"/\1/p' hardcore.c)/' tools/Info.plist > $@/Contents/Info.plist
-	codesign --force --sign - $@ 2>/dev/null || true
+	codesign --force --sign - $@
 
 mac-test: build/hardcore reflow-test
 	build/hardcore --unit build/unit.txt; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
 	python3 tests/run_xtermjs.py
+	python3 tests/test_mac_install.py
+	python3 tests/test_mac_import_resize.py
+	python3 tests/test_mac_frame_order.py
+	python3 tests/test_mac_update_dispatch.py
 	build/hardcore --selftest build/selftest.txt; rc=$$?; cat build/selftest.txt; exit $$rc
 
 clean:
 	rm -rf build hardcore.exe selftest.txt $(APP)
 
-# Upload this signed universal bundle as hardcore-macos.zip on a GitHub release.
-.PHONY: release-mac
-release-mac: $(APP)
+# Release asset consumed by the macOS updater (GitHub supplies the SHA-256).
+.PHONY: mac-release
+mac-release: $(APP)
 	rm -f build/hardcore-macos.zip
-	ditto -c -k --keepParent $(APP) build/hardcore-macos.zip
+	ditto -c -k --keepParent --norsrc $(APP) build/hardcore-macos.zip
+
+# Build and deterministic regressions without live shell-clone or GUI probes.
+.PHONY: mac-offline-test
+mac-offline-test: mac-release reflow-test
+	build/hardcore --unit build/unit.txt; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
+	python3 tests/run_xtermjs.py
+	python3 tests/test_mac_install.py
+	python3 tests/test_mac_update.py
+	python3 tests/test_mac_update_dispatch.py
+	$(MAKE) claude-adapter-test
+	python3 tools/verify_mac_slurp.py --offline
+
+# GUI integration tests use isolated sockets/shells; Terminal test needs Automation
+# and Accessibility permission and creates/closes only its own test tab.
+.PHONY: mac-integration-test mac-takeover-test mac-host-test mac-exit-watch-test mac-pty-lifetime-test
+mac-pty-lifetime-test:
+	python3 tests/test_mac_pty_lifetime.py
+
+.PHONY: claude-adapter-test
+claude-adapter-test:
+	python3 tests/test_claude_slurp_cli.py
+	python3 tests/test_claude_handoff.py
+	python3 tests/test_mac_terminal_retire.py
+	node --test plugins/hardcore-slurp/tests/*.test.mjs
+
+.PHONY: claude-window-test
+claude-window-test: build/hardcore
+	python3 tests/test_claude_handoff_window.py
+
+mac-exit-watch-test:
+	python3 tests/test_mac_exit_watch.py
+
+mac-host-test: build/hardcore
+	python3 tests/test_mac_host.py
+
+TAKEOVER_REPEAT ?= 3
+mac-takeover-test: build/hardcore
+	python3 tests/test_mac_takeover.py --repeat $(TAKEOVER_REPEAT)
+
+mac-integration-test: mac-release
+	$(MAKE) mac-pty-lifetime-test
+	$(MAKE) mac-exit-watch-test
+	python3 tests/test_mac_update.py
+	python3 tests/test_mac_handoff.py
+	python3 tests/test_mac_terminal.py
+	$(MAKE) mac-host-test
+	$(MAKE) mac-takeover-test
+
+# Compatibility name for the same release archive.
+.PHONY: release-mac
+release-mac: mac-release
 
 # Requires a logged-in desktop. Uses disposable app bundles and isolated config.
 .PHONY: mac-update-test

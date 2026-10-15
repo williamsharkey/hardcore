@@ -143,6 +143,9 @@ shows that screen: **More info → Run anyway**. Or build it yourself (see
 
 ### Update
 
+The release download and ConPTY handoff described here apply to Windows.
+For Mac live updates and Terminal slurp, see [macOS](#macos).
+
 From any shell:
 
 ```
@@ -198,69 +201,11 @@ tabs come back through [sessions](#sessions). Copies left behind by earlier
 updates are deleted on the next update. `--force` reinstalls the latest
 release even if this one isn't older.
 
-### macOS live updates
-
-On a Mac, `hardcore update` downloads the latest release's
-`hardcore-macos.zip`, verifies GitHub's SHA-256 digest and the app's code
-signature, and replaces the app bundle. Each window running that installation
-then reloads in place. The shell and foreground programs keep their PIDs and
-PTYs; they are never restarted. The window, active tab, both terminal screens,
-scrollback, scroll position, and partial terminal escape sequences are carried
-over to the new executable. The Cocoa window may briefly disappear while it
-is rebuilt; jobs continue throughout.
-
-New macOS tabs export the app's executable directory on `PATH` and reassert
-it after shell startup. CLI programs launched in these tabs inherit it; no
-per-agent alias, plugin, or shell function is needed. In Claude Code, Codex,
-Grok, and Antigravity CLI (AGY), use `!hardcore --version` to check command
-access, then `!hardcore update`. The `!` is the CLI's shell-mode shortcut;
-at a regular shell prompt, omit it.
-
-`make install` also creates `~/.local/bin/hardcore`, pointing at the installed
-app, so shells outside Hardcore can find it when that directory is on their
-`PATH`. Merely copying the app does not install that external launcher.
-Existing app bundles are kept as backups, and supported running windows
-reload after installation. For an old session or a tool that resets `PATH`,
-use `~/Applications/hardcore.app/Contents/MacOS/hardcore update` (adjust the
-path for another install location). A remote shell or container needs its own
-installation; a CLI sandbox must allow the update's network and app-file access.
-
-The macOS live-update implementation is currently a development build feature;
-the public shell installer still directs Mac users to build from source.
-`hardcore update` follows published GitHub releases, not unpublished branch
-commits.
-
-For a locally built version, without waiting for a release:
-
-```sh
-make hardcore.app
-~/Applications/hardcore.app/Contents/MacOS/hardcore update --from "$PWD/hardcore.app"
-```
-
-`hardcore --reload` reloads windows from the executable already installed.
-`hardcore --version` reports the release and build. A bare development binary
-can use `update --from /path/to/new/binary`; release downloads require an app
-bundle. The checkbox, font, theme and shared grid work in either case.
-
-The replacement is checked for protocol compatibility and Metal startup before
-installation. A pending paste postpones a window's reload. If `exec` fails,
-that window keeps running. The previous installation is kept beside the app
-as `hardcore.app.previous`; an adoption or Metal initialization failure can
-fall back to that executable. The updater reports any window that did not
-acknowledge a successful reload.
-
-**Bootstrap:** older Mac builds have no live-update listener. Install this
-support and restart those windows once; subsequent supported updates can
-preserve running sessions. The automatic download path also needs a release
-containing `hardcore-macos.zip`. `make release-mac` prepares that universal app
-archive; building it does not publish a release. `make mac-update-test` runs
-GUI/PTY integration tests using disposable installations on a logged-in Mac.
-
 ### Slurp: attach running sessions
 
-**Windows/WSL only.** macOS does not yet support importing live sessions from
-other terminals. On macOS, `hardcore slurp` exits with an explanatory error;
-live updating preserves Hardcore’s own sessions but does not import others.
+**Windows and WSL:** the following attachment paths apply to Windows builds.
+For Hardcore windows, Terminal.app, tmux, and Claude handoff on a Mac, see
+[Slurp on macOS](#slurp-on-macos).
 
 `hardcore slurp` discovers sessions and adds them to an existing Hardcore
 window, or opens a new window. A **slurp** tab reports candidates and skipped
@@ -457,14 +402,302 @@ The same terminal runs natively on a Mac: same parser, tab column, Unifont
 and Claude Code integration, on Cocoa, `forkpty` and Metal instead of
 Win32, ConPTY and Direct3D. It's one universal (arm64 + x86_64) app.
 
+### Build and install on macOS
+
 ```bash
 make            # → hardcore.app (needs the Xcode command line tools and python3;
                 #   with full Xcode the shader is compiled ahead of time)
-make install    # → ~/Applications/hardcore.app
-make test       # unit tests, xterm.js fixtures, headless forkpty + shell selftest
+make install    # → ~/Applications/hardcore.app + ~/.local/bin/hardcore
+make test       # unit, xterm.js, PTY import-size regression, and shell selftest
 ```
 
-What's different on the Mac:
+After installing, run `hardcore` (or `hardcore DIR` to open a folder).
+The command is a symlink to the installed app's executable. If `~/.local/bin`
+isn't on your PATH, the installer prints the command to enable it in your
+current shell and instructions to make it persistent; shell dotfiles are never
+edited automatically. With the default install location, enable the command in
+the current zsh/bash shell with `export PATH="$HOME/.local/bin:$PATH"`; add that
+line to your shell startup file to keep it available in future shells. You can
+also launch with `open "$HOME/Applications/hardcore.app"`.
+Override the destinations with `make install APPDIR=/path/to/apps BINDIR=/path/to/bin`.
+An existing unrelated `hardcore` command at the destination is never overwritten.
+
+### Live updates on macOS
+
+On a Mac, `hardcore update` downloads the latest release's
+`hardcore-macos.zip`, verifies GitHub's SHA-256 digest and the app's code
+signature, and replaces the app bundle. Each window running that installation
+then reloads in place by executing the new binary in the same Hardcore process.
+The shell and foreground programs keep their PIDs and PTYs; they are never
+restarted. The window, active tab, both terminal screens,
+scrollback, scroll position, and partial terminal escape sequences are carried
+over to the new executable. The Cocoa window may briefly disappear while it
+is rebuilt; jobs continue throughout.
+
+New macOS tabs export the app's executable directory on `PATH` and reassert
+it after shell startup. CLI programs launched in these tabs inherit it; no
+per-agent alias, plugin, or shell function is needed. In Claude Code, Codex,
+Grok, and Antigravity CLI (AGY), use `!hardcore --version` to check command
+access, then `!hardcore update`. The `!` is the CLI's shell-mode shortcut;
+at a regular shell prompt, omit it.
+
+`make install` also creates `~/.local/bin/hardcore`, pointing at the installed
+app, so shells outside Hardcore can find it when that directory is on their
+`PATH`. Merely copying the app does not install that external launcher.
+Existing app bundles are kept as backups, and supported running windows
+reload after installation. For an old session or a tool that resets `PATH`,
+use `~/Applications/hardcore.app/Contents/MacOS/hardcore update` (adjust the
+path for another install location). A remote shell or container needs its own
+installation; a CLI sandbox must allow the update's network and app-file access.
+
+The macOS live-update implementation is currently a development build feature;
+the public shell installer still directs Mac users to build from source.
+`hardcore update` follows published GitHub releases, not unpublished branch
+commits.
+
+For a locally built version, without waiting for a release:
+
+```sh
+make hardcore.app
+~/Applications/hardcore.app/Contents/MacOS/hardcore update --from "$PWD/hardcore.app"
+```
+
+`hardcore reload`, `hardcore --reload`, and `hardcore update --local` reload
+windows from the executable already installed without downloading a release.
+`hardcore --version` reports the release and build. A bare development binary
+can use `update --from /path/to/new/binary`; release downloads require an app
+bundle. Font, theme, layout, and shared-grid settings work in either case.
+
+The replacement is checked for protocol compatibility and Metal startup before
+installation. A pending paste postpones a window's reload. If `exec` fails,
+that window keeps running. The previous installation is kept beside the app
+as `hardcore.app.previous`; an adoption or Metal initialization failure can
+fall back to that executable. The updater reports any window that did not
+acknowledge a successful reload.
+
+**Bootstrap:** older Mac builds have no live-update listener. Install this
+support and restart those windows once; subsequent supported updates can
+preserve running sessions. The automatic download path also needs a release
+containing `hardcore-macos.zip`. `make release-mac` (also `make mac-release`)
+prepares that universal app archive; building it does not publish a release. `make mac-update-test` runs
+GUI/PTY integration tests using disposable installations on a logged-in Mac.
+
+### Slurp on macOS
+
+Choose the route that matches how the source session was started:
+
+| Source | Current behavior | Can the source close? |
+| --- | --- | --- |
+| Hardcore window | Transfers its live PTYs and terminal state. | Donor closes after verified handoff. |
+| Ordinary Terminal.app tab | Bridges its live text and keyboard input. | Keep Terminal open. |
+| Claude already running in Terminal | Optional cooperative conversation handoff; see below. | Keep the original shell and Terminal open. |
+| `hardcore host` or tmux | Attaches another client to the existing tmux session. | The original client can detach after attachment. |
+| Plain iTerm2 or other terminal | Direct takeover is not implemented. | No automatic closure. |
+
+```sh
+hardcore slurp --list                 # preview sources
+hardcore slurp --terminal /dev/ttys003 # bridge one Terminal.app tab
+hardcore slurp --pid 12345            # transfer one Hardcore window
+hardcore slurp                        # gather eligible sources in a new window
+hardcore slurp --tmux session-name    # attach a live tmux session explicitly
+```
+
+**Terminal.app is a live bridge, not a process takeover.** Its original tab
+and programs remain running; keep Terminal open. Hardcore displays the tab's
+live plain text and forwards keyboard input to that specific tab. Closing the
+Hardcore tab detaches the bridge without terminating the original job. The
+bridge requires macOS Automation permission to read Terminal and Accessibility
+permission to forward input. If denied, the command explains the permission
+needed. It does not restart the session.
+
+Terminal's scripting interface does not expose cell colours or cursor
+position, so these are not preserved in the bridge. It polls screen text,
+resizes the source grid to match, and selects the source tab when forwarding
+input. This is less faithful than a native Hardcore PTY transfer, especially
+for full-screen applications. Avoid typing into the source tab concurrently.
+
+**Hardcore-to-Hardcore slurp transfers live PTYs** to a receiving window,
+including scrollback, both screens, cursor, modes, prompt marks and partial
+escape/UTF-8 sequences. The donor windows close only after the new
+window is ready. Windows without handoff support are not eligible.
+
+**tmux sessions stay alive in their tmux server.** Default slurp attaches only
+detached sessions. `--tmux NAME` can also attach an already attached session;
+other clients remain connected. `--tmux-socket PATH` selects a nondefault
+server. This also works for tmux sessions used in Terminal or iTerm2. Direct
+attachment to plain iTerm2 sessions is not implemented yet.
+
+### Portable sessions on macOS
+
+For portable Claude Code, Codex, Grok, or Antigravity sessions, start the
+conversation in Terminal with `hardcore host` (requires `tmux` on PATH):
+
+```sh
+hardcore host claude                 # also: codex, grok, agy
+# Later, from another terminal:
+hardcore slurp --list
+hardcore slurp --terminal /dev/ttys003
+```
+
+`host` runs the command in a private tmux server. Slurp recognizes that
+Terminal tab and attaches its live session in Hardcore, preserving the agent,
+child processes, PTY, screen and keyboard modes. After attachment, the original
+Terminal tab can close; the session also survives Hardcore reloads. This does
+not use debugger access or modify signed executables. `hardcore host` without
+a command starts a shell. These sessions appear as portable hosts in the slurp
+list; a detached host can be attached by its unique session name with
+`hardcore slurp --tmux hardcore-…`. Closing a client detaches it; exit the job
+inside the session to end it.
+
+`host` must be used **before starting the conversation**. It cannot retrofit
+an already-running plain Terminal job. The installed signed Claude Code,
+Codex, Grok and Antigravity binaries tested on this Mac deny debugger attach.
+
+### Claude conversation handoff on macOS
+
+An existing Claude conversation has a cooperative route that can be installed
+after it starts:
+
+```sh
+# From the project directory, using a build that includes the adapter:
+hardcore claude install
+hardcore claude status
+```
+
+In the existing Claude conversation, run `/reload-plugins`, then
+`/hardcore-slurp wait`. The adapter waits to observe a normally completed turn
+with no background work, scheduled tasks or active agents. It
+prepares a receiving Hardcore window, checks readiness again, and asks Claude
+to background the conversation. The destination restores its title and
+acknowledges readiness before Hardcore attaches that exact session.
+`/hardcore-slurp status` explains any wait; `/hardcore-slurp cancel`
+cancels it. A late-loaded idle conversation needs its next ordinary turn before
+readiness can be established; the adapter never sends a model prompt itself.
+
+Once the adapter is loaded, Hardcore can request the move without entering a
+command in Claude or replacing its unsent text:
+
+```sh
+claude agents --json --all --cwd "$PWD" # find the interactive source sessionId
+hardcore claude move SESSION_ID         # optional: --project /path/to/project
+```
+
+`move` verifies the exact live source, installs the project's adapter if needed,
+and queues a request for up to one hour. A newly installed adapter still needs
+`/reload-plugins` in the existing Claude session; installation alone does not
+load it. The queued request waits for the same readiness checks as the slash
+command. Text drafts transfer without being submitted, including multiline
+Unicode text and a cursor in the middle. The receiver temporarily holds input
+while restoring and checking the exact text and cursor. It also checks a SHA-256
+digest of Claude's available rich conversation blocks, including image,
+document, tool and thinking blocks, then emits a unique receipt over its
+attached PTY. Hardcore verifies the matching tab, PID and TTY and completes
+a rendered frame before recording attachment verification and releasing input.
+The guard has a deadline and releases on restoration failure. Collapsed paste
+and image placeholders refuse before moving because their hidden payloads
+cannot be captured through the draft API.
+
+Saved handoffs remain inspectable after a failed attachment:
+
+```sh
+hardcore claude moves
+hardcore claude inspect REQUEST_ID
+hardcore claude recover REQUEST_ID --export-draft saved-draft.json
+```
+
+The listing reports saved status; `inspect` separately checks whether the
+original source, destination, receiving client and window still exist.
+`recover` creates a private JSON file containing the saved draft and cursor,
+refusing existing files. These commands do not submit text or restart a job.
+
+This experimental adapter requires Claude Code 2.1.300 or newer. It installs two
+project-scoped plugins using the official CLI; both must remain enabled during
+handoff. It uses Claude's shared plugin cache but does not enable the plugins
+in other projects. Managed settings that suppress user-installed hooks can
+prevent readiness. See [adapter details](plugins/hardcore-slurp/README.md).
+
+The Claude route preserves the conversation by creating and attaching a new
+Claude session. It does not preserve the original Claude PID or transplant its
+PTY. Active work finishes before handoff; the adapter does not kill and replay
+commands or guess their exit status. It leaves the original Terminal window
+open, so it does not trigger Terminal's terminate-processes dialog. If the
+receiving client fails after backgrounding, `claude agents` lists the background
+session for recovery with `claude attach ID`.
+
+This is not yet automatic Terminal retirement. Claude's message API provides
+at most 4096 messages from normalized current context, excluding older compacted
+history and system configuration. The draft API does not expose all attachments
+or hidden stashes. Terminal's plain-text scrollback,
+styled screen/cursor state, shell variables, aliases, jobs and unflushed shell
+history are not transferred by this route. A verified Claude attachment is
+therefore insufficient to close the source window. The separate retirement
+verifier rejects closure under its default full-shell requirement and rejects
+remaining source TTY users, including detached jobs holding the slave open.
+
+### Verify macOS slurp
+
+From the repository, a single command runs without input prompts:
+
+```sh
+python3 tools/verify_mac_slurp.py
+```
+
+For a build and the full deterministic Mac test set without live shell-clone
+or GUI probes, run `make mac-offline-test`. It also prepares the signed app
+and release archive; it does not install or publish them.
+
+`verify_mac_slurp.py` runs archive and handoff regression tests, Unicode/RTF robustness cases,
+replays the latest valid saved Terminal fixture when available, and exercises
+shell cloning and a disposable Hardcore receiver window. Each live probe owns
+its test shells and PTYs. The native probe uses `build/hardcore`; build it first
+with `make` if the report identifies a missing executable.
+
+The native check compares the complete visible Unicode draft and cursor before
+the source test shell exits, then verifies an edit at the preserved cursor in
+Hardcore. It also requires the shell, kernel PTY, and Hardcore grid to agree on
+dimensions, and compares captured shell memory and unflushed history exactly.
+The companion shell tests cover editor state, undo/redo, and isolated Apple
+session-history paths. These checks passed in the
+[audited live run](bench/RESULTS-mac.md#verified-live-native-draft-cursor-and-geometry).
+
+Results go into a new private temporary directory with `report.json`,
+`SUMMARY.txt`, and individual logs. Failures, timeouts and skipped checks are
+reported separately. `--offline` selects the tests and saved-file replay that
+do not launch the shell/GUI probes; `--capture CAPTURE_DIRECTORY` selects a
+particular saved fixture. Replaying a prior Terminal copy is historical
+evidence, not a new capture of Terminal's current state. Full-state migration
+and automatic source-window closure remain outside this verification's proof.
+
+### Remaining Mac transfer research
+
+A separate owned-PTY experiment found that stock macOS `zsh/clone` can copy a
+running shell's memory and ZLE draft onto a new PTY after launch. Existing jobs
+remain in the original shell, and extra file descriptors need special handling,
+so this is not enabled as automatic Terminal slurp. See the
+[shell-preservation research](bench/RESEARCH-mac-zsh-clone.md).
+Further tests cover Apple session-history collisions, exit hooks and editor
+undo/redo in the [shell-state follow-up](bench/RESEARCH-mac-zsh-clone-state.md).
+The owned fixtures now also verify a working controlling terminal and native
+receiver. They do not account for every existing job, descriptor, shell plugin,
+or Terminal presentation state, so full-shell takeover remains experimental.
+
+There is a separate, promising route for **ordinary Codex sessions using its
+default shared daemon**: a new frontend can attach to the same live thread.
+An opt-in research probe (`python3 tests/probe_mac_agent_attach.py`) has kept
+an active tool running after terminating the original Terminal frontend, then
+accepted another prompt in Hardcore. This replaces the frontend, not the
+original PTY or shell. It is not yet wired into `hardcore slurp`; safe discovery
+of the exact source thread and a graceful detach handshake are still needed.
+It does not cover `codex --no-daemon`. See the
+[unprepared-session results](bench/RESULTS-mac.md#unprepared-agent-session-attachment-2026-10-14)
+for the other agents and limitations.
+
+Additional manual Terminal fixtures, hosted-agent checks, and the debugger-based
+experimental takeover suite are documented in
+[Mac slurp validation](slurp/README.md#macos-validation-and-research).
+
+### Mac behavior and keys
+
 - **Your login shell, not bash.**
   - zsh tabs get two hooks (prompt marks and the folder) through a
     `ZDOTDIR` that hands straight back to your own `.zshenv`, `.zprofile`,

@@ -1,0 +1,8 @@
+{
+  "name": "hardcore-slurp-driver",
+  "version": "0.3.0",
+  "description": "Dispatches guarded Hardcore handoffs through the separate hardcore-slurp safety checks",
+  "dependencies": ["hardcore-slurp"],
+  "author": {"name": "Hardcore"},
+  "license": "MIT"
+}
