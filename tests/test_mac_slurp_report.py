@@ -22,6 +22,14 @@ HARNESS = r'''
 typedef struct { char run[600]; } Tab;
 static Tab fixtures[8], *g_tabs[8];
 static int g_ntabs;
+static int g_mac_terminal_discovery_failed;
+static NSArray *mac_terminal_sessions(int report) {
+    (void)report;
+    return @[@{@"tty":@"/dev/ttys123"}, @{@"tty":@"/dev/ttys456"}];
+}
+static NSDictionary *mac_host_for_tty(NSString *tty) { return [tty isEqual:@"/dev/ttys123"] ? @{@"id":@"$0"} : nil; }
+static NSArray *mac_windows(void) { return @[]; }
+static NSArray *mac_attachable_tmux(NSString *socket) { (void)socket; return @[]; }
 
 /* FUNCTIONS */
 
@@ -77,6 +85,19 @@ int main(int argc, const char **argv) {
             require([mac_slurp_terminal_label(@{}) isEqual:@"unknown folder:shell"], "missing cwd silently presented as home folder");
             NSString *clean = mac_slurp_terminal_label(@{@"cwd":@"/work/ru\nffian", @"program":@"cl\033aude"});
             require([clean isEqual:@"ru ffian:claude"], "CLI labels retain terminal controls");
+        } else if (!strcmp(which, "discovery-schema")) {
+            for (int failed = 0; failed <= 1; failed++) {
+                g_mac_terminal_discovery_failed = failed;
+                NSDictionary *value = mac_slurp_sources();
+                require(CFGetTypeID((CFTypeRef)value[@"terminalDiscoveryFailed"]) == CFBooleanGetTypeID(), "discovery status serialized as a number instead of JSON boolean");
+                require([value[@"terminalDiscoveryFailed"] boolValue] == failed, "wrong discovery failure status");
+                NSArray *sources = value[@"terminal"];
+                for (NSDictionary *source in sources)
+                    require(CFGetTypeID((CFTypeRef)source[@"managed"]) == CFBooleanGetTypeID(), "managed flag serialized as a number instead of JSON boolean");
+                require([sources[0][@"managed"] boolValue] && ![sources[1][@"managed"] boolValue], "host discovery flags reversed");
+                NSData *data = [NSJSONSerialization dataWithJSONObject:value options:0 error:nil];
+                require(data != nil, "discovery payload is not JSON");
+            }
         } else require(NO, "unknown case");
         printf("passed %s\n", which);
     }
@@ -97,6 +118,7 @@ class SlurpReportTests(unittest.TestCase):
             production_function(ROOT/'hardcore_mac_transfer.m', 'static NSDictionary *mac_slurp_result(void)'),
             production_function(ROOT/'hardcore_mac_transfer.m', 'static NSString *mac_slurp_terminal_label(NSDictionary *source)'),
             production_function(ROOT/'hardcore_mac_transfer.m', 'static void mac_slurp_report(NSDictionary *reply, FILE *out)'),
+            production_function(ROOT/'hardcore_mac_transfer.m', 'static NSDictionary *mac_slurp_sources(void)'),
         ])
         source = directory/'report.m'
         source.write_text(HARNESS.replace('/* FUNCTIONS */', functions))
@@ -116,6 +138,7 @@ class SlurpReportTests(unittest.TestCase):
     def test_native_and_tmux_routes_keep_their_distinct_semantics(self): self.case('native-report')
     def test_legacy_receiver_does_not_imply_verified_transfer(self): self.case('legacy-report')
     def test_source_labels_use_metadata_and_escape_terminal_controls(self): self.case('labels')
+    def test_discovery_emits_real_json_booleans_for_coordinator(self): self.case('discovery-schema')
 
 
 if __name__ == '__main__':

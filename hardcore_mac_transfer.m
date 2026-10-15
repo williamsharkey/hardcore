@@ -794,6 +794,18 @@ static void mac_slurp_report(NSDictionary *reply, FILE *out) {
     fprintf(out, "hardcore: opened receiving window %d\n", [reply[@"pid"] intValue]);
 }
 
+static NSDictionary *mac_slurp_sources(void) {
+    NSMutableArray *terminal = [NSMutableArray array];
+    for (NSDictionary *source in mac_terminal_sessions(1)) {
+        NSMutableDictionary *entry = [[source mutableCopy] autorelease];
+        entry[@"managed"] = mac_host_for_tty(source[@"tty"]) ? @YES : @NO;
+        [terminal addObject:entry];
+    }
+    return @{@"terminal":terminal,
+        @"terminalDiscoveryFailed":g_mac_terminal_discovery_failed ? @YES : @NO,
+        @"hardcore":mac_windows(), @"tmux":mac_attachable_tmux(nil)};
+}
+
 static int mac_cli(int argc, char **argv) {
     uint32_t cap = sizeof(g_mac_exe_path);
     char path[MAX_PATH];
@@ -803,15 +815,7 @@ static int mac_cli(int argc, char **argv) {
     if (argc < 2) return -1;
     if (!strcmp(argv[1], "--slurp-sources")) {
         if (argc != 2) return 2;
-        NSMutableArray *terminal = [NSMutableArray array];
-        for (NSDictionary *source in mac_terminal_sessions(1)) {
-            NSMutableDictionary *entry = [[source mutableCopy] autorelease];
-            entry[@"managed"] = @(mac_host_for_tty(source[@"tty"]) != nil);
-            [terminal addObject:entry];
-        }
-        NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"terminal":terminal,
-            @"terminalDiscoveryFailed":@(g_mac_terminal_discovery_failed),
-            @"hardcore":mac_windows(), @"tmux":mac_attachable_tmux(nil)} options:0 error:nil];
+        NSData *data = [NSJSONSerialization dataWithJSONObject:mac_slurp_sources() options:0 error:nil];
         if (!data) return 1;
         fwrite(data.bytes, 1, data.length, stdout); putchar('\n'); return 0;
     }
