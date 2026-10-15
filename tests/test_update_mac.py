@@ -45,12 +45,19 @@ def main():
         cfg.mkdir()
         (cfg / "config.ini").write_text("font=t\ntab_underlay=1\n")
         fifo = root / "control"
-        env = dict(os.environ, HARDCORE_CTL=str(fifo), HARDCORE_NO_ACTIVATE="1",
+        env = dict(os.environ, PATH="/usr/bin:/bin:/usr/sbin:/sbin",
+                   HARDCORE_CTL=str(fifo), HARDCORE_NO_ACTIVATE="1",
                    HARDCORE_TEST_CONFIG=str(cfg), HARDCORE_SHELL="/bin/zsh")
         worker = root / "worker.py"
         worker.write_text('''import json, os, shutil, subprocess, sys, threading, time
 from pathlib import Path
 root, exe, candidate = map(Path, sys.argv[1:])
+shell_checks = []
+for shell in ['/bin/sh', '/bin/bash', '/bin/zsh']:
+    for mode in ['-c', '-lc']:
+        check = subprocess.run([shell, mode, 'hardcore --version && hardcore --help'], capture_output=True, text=True, timeout=15)
+        shell_checks.append({'shell':shell, 'mode':mode, 'code':check.returncode, 'stdout':check.stdout, 'stderr':check.stderr})
+(root/'shell-checks').write_text(json.dumps(shell_checks))
 (root/'identity').write_text(json.dumps({'worker':os.getpid(),'shell':os.getppid(),'command':shutil.which('hardcore')}))
 def beat():
     while True:
@@ -61,7 +68,7 @@ print('history line\\r\\n'*80, end='')
 print('\\x1b[?1049h\\x1b[?2004h\\x1b[?1000h\\x1b[?1006hLIVE FOREGROUND ─ 雪', flush=True)
 for line in sys.stdin:
     if line.strip() == 'update':
-        result=subprocess.run([str(exe),'update','--from',str(candidate)],capture_output=True,text=True,timeout=40)
+        result=subprocess.run(['/bin/sh','-c','hardcore update --from "$1"','hardcore-test',str(candidate)],capture_output=True,text=True,timeout=40)
         (root/'result').write_text(json.dumps({'returncode':result.returncode,'stdout':result.stdout,'stderr':result.stderr,'worker':os.getpid()}))
     elif line.strip() == 'alive':
         (root/'alive').write_text(str(os.getpid()))
@@ -110,6 +117,9 @@ for line in sys.stdin:
             command = shlex.join([sys.executable, str(worker), str(root), str(exe), str(candidate)])
             send("type " + command + "\\n")
             wait_for((root / "identity").exists)
+            checks = json.loads((root / 'shell-checks').read_text())
+            assert all(c['code'] == 0 and c['stdout'].startswith('hardcore ') for c in checks), checks
+            print('PASS: sh/bash/zsh noninteractive and login subprocesses find hardcore and its updater')
             identity = json.loads((root / "identity").read_text())
             children += [identity['worker'], identity['shell']]
             assert Path(identity['command']).resolve() == exe.resolve(), identity

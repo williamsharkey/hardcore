@@ -199,13 +199,26 @@ scrollback, scroll position, and partial terminal escape sequences are carried
 over to the new executable. The Cocoa window may briefly disappear while it
 is rebuilt; jobs continue throughout.
 
-New macOS tabs put the app's executable directory on `PATH`, so
-`!hardcore update` works from Claude Code. From an outside terminal, use the
-installed executable's full path if `hardcore` isn't on your `PATH`.
+New macOS tabs export the app's executable directory on `PATH` and reassert
+it after shell startup. CLI programs launched in these tabs inherit it; no
+per-agent alias, plugin, or shell function is needed. In Claude Code, Codex,
+Grok, and Antigravity CLI (AGY), use `!hardcore --version` to check command
+access, then `!hardcore update`. The `!` is the CLI's shell-mode shortcut;
+at a regular shell prompt, omit it.
+
 `make install` also creates `~/.local/bin/hardcore`, pointing at the installed
-app, so existing shells and tools such as Codex can find it when that directory
-is on their `PATH`. Existing app bundles are kept as backups, and supported
-running windows reload after installation.
+app, so shells outside Hardcore can find it when that directory is on their
+`PATH`. Merely copying the app does not install that external launcher.
+Existing app bundles are kept as backups, and supported running windows
+reload after installation. For an old session or a tool that resets `PATH`,
+use `~/Applications/hardcore.app/Contents/MacOS/hardcore update` (adjust the
+path for another install location). A remote shell or container needs its own
+installation; a CLI sandbox must allow the update's network and app-file access.
+
+The macOS live-update implementation is currently a development build feature;
+the public shell installer still directs Mac users to build from source.
+`hardcore update` follows published GitHub releases, not unpublished branch
+commits.
 
 For a locally built version, without waiting for a release:
 
