@@ -89,6 +89,10 @@ static NSDictionary *mac_pack_tab(Tab *tb) {
     Term *t = &tb->t; SBuf snap = {0};
     term_snapshot(t, &snap);
     NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"id": @(tb->id), @"kind": @(tb->kind), @"parent": @(tb->parent_id),
+        @"browser_url": [NSString stringWithUTF8String:tb->browser_url] ?: @"",
+        @"browser_site": [NSString stringWithUTF8String:tb->browser_site] ?: @"",
+        @"browser_native": @(tb->browser_native),
         @"fd": @(tb->fd), @"pid": @(tb->pid), @"cols": @(t->cols), @"rows": @(t->rows),
         @"view": @(t->view), @"activity": @(tb->activity), @"attention": @(tb->attention),
         @"exited": @(tb->exited), @"help": @(tb->help), @"born": @(tb->born),
@@ -130,7 +134,16 @@ static Tab *mac_unpack_tab(NSDictionary *d) {
     Tab *tb = calloc(1, sizeof(Tab));
     if (!tb || !term_init(&tb->t, cols, rows)) { free(tb); return NULL; }
     tb->fd = -1; /* snapshot replies must never go to the running shell */
-    tb->id = g_next_id++;
+    int saved_id=[d[@"id"] intValue];
+    tb->id=saved_id>0 && saved_id<INT_MAX-1 ? saved_id : g_next_id++;
+    if (g_next_id<=tb->id) g_next_id=tb->id+1;
+    if ([d[@"kind"] intValue]==TK_BROWSER) {
+        tb->kind=TK_BROWSER; tb->parent_id=[d[@"parent"] intValue];
+        tb->browser_native=[d[@"browser_native"] boolValue];
+        snprintf(tb->browser_url,sizeof(tb->browser_url),"%s",[browser_string(d[@"browser_url"]) UTF8String]);
+        snprintf(tb->browser_site,sizeof(tb->browser_site),"%s",[browser_string(d[@"browser_site"]) UTF8String]);
+        if (fd>=0 || [d[@"pid"] intValue]>0) { term_free(&tb->t); free(tb); return NULL; }
+    }
     Term *t = &tb->t;
     vt_feed(t, [snap bytes], (int)[snap length]);
 #define UNPACK_NUMBER(field) t->field = [d[@#field] longLongValue];
@@ -231,6 +244,7 @@ static int mac_adopt_read(void) {
     for (NSDictionary *d in state[@"tabs"]) {
         Tab *tb = mac_unpack_tab(d);
         if (!tb) return 0;
+        if (tab_by_id(tb->id)) { term_free(&tb->t); free(tb); return 0; }
         g_tabs[g_ntabs++] = tb;
     }
     g_active = [state[@"active"] intValue];
@@ -292,15 +306,22 @@ static void mac_update_listen(void) {
            accepting, bounded by SO_RCVTIMEO below. */
         fcntl(client, F_SETFL, fcntl(client, F_GETFL) & ~O_NONBLOCK);
         struct timeval timeout = {1, 0}; setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        char cmd[32] = {0}; size_t got = 0;
+        char cmd[32768] = {0}; size_t got = 0;
         if (mac_peer_ok(client)) while (got < sizeof(cmd)-1) {
             ssize_t n = read(client, cmd+got, 1);
             if (n < 0 && errno == EINTR) continue;
             if (n != 1 || cmd[got++] == '\n') break;
         }
         if (!strcmp(cmd, "info\n")) {
-            NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"exe":g_mac_exe, @"pid":@(getpid())} options:0 error:nil];
+            NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"exe":g_mac_exe, @"pid":@(getpid()), @"browser_protocol":@1} options:0 error:nil];
             mac_write_all(client, [json bytes], [json length]);
+        } else if (got>9 && cmd[got-1]=='\n' && !strncmp(cmd,"browser ",8)) {
+            NSData *data=[NSData dataWithBytes:cmd+8 length:got-9];
+            id request=[NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            NSDictionary *reply=[request isKindOfClass:NSDictionary.class] ? mac_browser_request(request) :
+                @{@"ok":@NO,@"error":@"Invalid browser request."};
+            NSData *json=[NSJSONSerialization dataWithJSONObject:reply options:0 error:nil];
+            mac_write_all(client,json.bytes,json.length);
         } else if (!strcmp(cmd, "reload\n")) {
             char why[256]; mac_reload(client, why, sizeof(why));
             dprintf(client, "error %s\n", why); /* only reached when exec failed */
@@ -319,7 +340,7 @@ static NSData *mac_request(NSString *socket_path, const char *command, int secon
     struct timeval tv = {seconds, 0}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) || !mac_peer_ok(fd) || !mac_write_all(fd, command, strlen(command))) { close(fd); return nil; }
     NSMutableData *data = [NSMutableData data]; char buf[4096]; ssize_t n;
-    while ([data length] < 65536) {
+    while ([data length] < 1024*1024) {
         n = read(fd, buf, sizeof(buf));
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) break;
@@ -442,7 +463,7 @@ static int mac_update_unit(FILE *f) {
     for (int k=0;k<3;k++) {
         Tab *a = calloc(1, sizeof(Tab));
         if (!a || !term_init(&a->t, 40, 6)) { free(a); return fails+1; }
-        a->fd = -1;
+        a->fd = -1; a->id = 100+k;
         for (int j=0;j<30;j++) vt_feed(&a->t, (const unsigned char *)"history\r\n", 9);
         const char *alt = "\x1b[?1049h\x1b[?2004h\x1b[?1006h\x1b[?1000hALT";
         vt_feed(&a->t, (const unsigned char *)alt, (int)strlen(alt));
@@ -454,7 +475,7 @@ static int mac_update_unit(FILE *f) {
         Tab *b = mac_unpack_tab(decoded);
         int ok = b != NULL;
         if (b) {
-            ok = b->t.view == a->t.view && b->t.hcount == a->t.hcount && b->t.st == a->t.st &&
+            ok = b->id == a->id && b->t.view == a->t.view && b->t.hcount == a->t.hcount && b->t.st == a->t.st &&
                  b->t.utf8_need == a->t.utf8_need && b->t.m_bracketed && b->t.m_mouse == 1000 &&
                  b->t.hpushed-b->t.marks[0] == a->t.hpushed-a->t.marks[0] && !strcmp(a->t.cwd,b->t.cwd);
             vt_feed(&a->t, (const unsigned char *)rest[k], (int)strlen(rest[k]));
@@ -467,5 +488,20 @@ static int mac_update_unit(FILE *f) {
         fprintf(f, "%s mac update snapshot/parser #%d\n", ok ? "ok  " : "FAIL", k);
         fails += !ok; term_free(&a->t); free(a);
     }
+    Tab *browser=calloc(1,sizeof(Tab));
+    if (!browser || !term_init(&browser->t,40,6)) { free(browser); return fails+1; }
+    browser->fd=-1; browser->id=200; browser->parent_id=100; browser->kind=TK_BROWSER; browser->browser_native=1;
+    snprintf(browser->browser_url,sizeof(browser->browser_url),"https://example.com/a?b=c");
+    snprintf(browser->browser_site,sizeof(browser->browser_site),"Example");
+    utf8_to_wide("Page title - Example",browser->t.title,256);
+    Tab *restored=mac_unpack_tab(mac_pack_tab(browser));
+    int ok=restored && restored->id==200 && restored->parent_id==100 && restored->kind==TK_BROWSER &&
+        restored->browser_native==1 && !restored->browser && restored->fd==-1 && restored->pid==0 &&
+        !strcmp(restored->browser_url,browser->browser_url) && !strcmp(restored->browser_site,browser->browser_site) &&
+        !wcscmp(restored->t.title,browser->t.title);
+    fprintf(f,"%s browser reload metadata, stable IDs and lazy engine restoration\n",ok ? "ok  " : "FAIL");
+    fails+=!ok;
+    if (restored) { term_free(&restored->t); free(restored); }
+    term_free(&browser->t); free(browser);
     return fails;
 }

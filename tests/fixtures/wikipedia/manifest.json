@@ -1,0 +1,82 @@
+{
+  "kind": "synthetic structural fixtures",
+  "created": "2026-10-15",
+  "provenance": "Wikipedia article content was inspected through the web tool. Direct HTML retrieval was blocked by sandbox DNS. These hand-authored documents model article patterns; they are NOT downloaded DOM captures, verbatim articles, or verification against current Wikipedia HTML. Text is shortened and paraphrased. Population, climate, and survey numbers are deliberately illustrative.",
+  "cases": [
+    {
+      "file": "ada-lovelace.html",
+      "url": "https://en.wikipedia.org/wiki/Ada_Lovelace",
+      "patterns": [
+        "biography infobox",
+        "multiline key/value cells",
+        "nested lists",
+        "references",
+        "modern section wrappers",
+        "hatnote",
+        "portrait"
+      ]
+    },
+    {
+      "file": "tokyo.html",
+      "url": "https://en.wikipedia.org/wiki/Tokyo",
+      "patterns": [
+        "settlement infobox",
+        "Japanese text",
+        "infobox group heading",
+        "wide climate table",
+        "figure caption",
+        "nested list"
+      ]
+    },
+    {
+      "file": "fourier-transform.html",
+      "url": "https://en.wikipedia.org/wiki/Fourier_transform",
+      "patterns": [
+        "MathML with TeX annotation and image fallback",
+        "equation definition list",
+        "properties table",
+        "code block"
+      ]
+    },
+    {
+      "file": "population-list.html",
+      "url": "https://en.wikipedia.org/wiki/List_of_countries_and_dependencies_by_population",
+      "patterns": [
+        "maintenance notice",
+        "six-column table",
+        "numeric values",
+        "multiline headers",
+        "long notes",
+        "empty cells",
+        "source links"
+      ]
+    },
+    {
+      "file": "printing-press.html",
+      "url": "https://en.wikipedia.org/wiki/Printing_press",
+      "patterns": [
+        "prose article",
+        "legacy section markup",
+        "legacy thumbnail",
+        "definition list",
+        "quotation",
+        "further reading",
+        "nested navigation boilerplate"
+      ]
+    },
+    {
+      "file": "complex-tables.html",
+      "url": "https://en.wikipedia.org/wiki/Help:Table",
+      "kind": "wholly invented edge-case specimen",
+      "patterns": [
+        "rowspan",
+        "colspan",
+        "group headers",
+        "row groups",
+        "nested table",
+        "long URL",
+        "wide characters"
+      ]
+    }
+  ]
+}

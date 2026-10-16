@@ -480,6 +480,13 @@ typedef struct {
 typedef struct Tab {
     Term t;
     int id;
+    int parent_id;               /* browser children retain their owning terminal */
+    int browser_native;          /* default 0: Hardcore grid; 1: live native view */
+    void *browser;               /* platform-owned live document, never a shell */
+    char browser_url[4096];
+    char browser_site[512];
+    wchar_t browser_label[256];  /* fitted browser caption cache, never a process label */
+    int browser_label_cols;
 #ifdef _WIN32
     HPCON_ hpc;
     HANDLE pin_w, pout_r, proc, reader, wait;
@@ -519,7 +526,7 @@ typedef struct Tab {
     char program[64];             /* macOS foreground app, refreshed independently of output */
 } Tab;
 
-enum { TK_WSL, TK_PS, TK_CMD };
+enum { TK_WSL, TK_PS, TK_CMD, TK_BROWSER };
 enum { HELP_NONE, HELP_NO_DISTRO, HELP_FAILED, HELP_SLURP };
 
 #ifdef _WIN32
@@ -585,6 +592,16 @@ static void tab_write(Tab *tb, const void *s, int n) {
 }
 #else
 static void tab_write(Tab *tb, const void *s, int n);
+static void mac_browser_sync(void);
+static void mac_browser_resize(Tab *tb);
+static void mac_browser_destroy(Tab *tb);
+static void mac_browser_prepare(Tab *tb);
+static void mac_browser_scroll(int lines);
+static void mac_browser_draw_overlay(void);
+static void mac_browser_draw_tile(Tab *tb,const Cell *cell,int x,int y);
+static int mac_browser_hover_link(void);
+static int mac_browser_page_rows(Tab *tb);
+static void mac_browser_tab_label(Tab *tb,wchar_t *out,int cap,int cols);
 #endif
 
 /* ── platform layer: Win32 in this file, macOS in hardcore_mac.m ───── */
@@ -2943,7 +2960,7 @@ static int sidebar_x(void) {
 static int in_sidebar(int x) { return x >= sidebar_x() && x < sidebar_x() + sidebar_w(); }
 /* (0,0) is the native drawable surface, inside any system-owned border.
    Rounded corners may obscure cells; they never shift the grid. */
-static int term_ox(void) { return g_tab_underlay ? 0 : sidebar_w(); }
+static int term_ox(void) { return g_tab_underlay || (active_tab() && active_tab()->kind == TK_BROWSER) ? 0 : sidebar_w(); }
 static int term_oy(void) { return 0; }
 
 static void compute_grid(int w, int h, int *cols, int *rows) {
@@ -3054,7 +3071,7 @@ static void sel_copy(void) {
         for (x = x0; x <= x1 && x < len; x++) {
             if (cells[x].wflag == W_CONT) continue;
             if (n + 8 >= cap) out = (char *)realloc(out, cap *= 2);
-            n += utf8_encode(cells[x].ch ? cells[x].ch : ' ', out + n);
+            n += utf8_encode((cells[x].wflag & 8) ? (cells[x].attr ? ' ' : 0xFFFC) : cells[x].ch ? cells[x].ch : ' ', out + n);
         }
         if (!(wrapped && r < r1) || x1 < len - 1) {
             while (n > line_start && out[n - 1] == ' ') n--;
@@ -3841,7 +3858,20 @@ static void command_program(const char *command, char *out, int cap) {
     }
 }
 
-static void tab_label(Tab *tb, wchar_t *out, int cap) {
+static void tab_label_fit(Tab *tb, wchar_t *out, int cap, int cols) {
+    if (cap<1) return;
+    out[0]=0;
+    if (tb->kind == TK_BROWSER) {
+#ifndef _WIN32
+        mac_browser_tab_label(tb,out,cap,cols);
+#else
+        wchar_t title[256];
+        utf8_to_wide(tb->browser_url, title, 256);
+        _snwprintf(out, cap, L"%ls%ls", tb->parent_id ? L"↳ " : L"", tb->t.title[0] ? tb->t.title : title);
+        out[cap-1] = 0;
+#endif
+        return;
+    }
     const char *dir = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, *b = NULL, *p;
     char app[64];
     for (p = dir; *p; p++) if ((*p == '/' || *p == '\\') && p[1]) b = p+1;
@@ -3858,7 +3888,9 @@ static void tab_label(Tab *tb, wchar_t *out, int cap) {
         out[n++] = ':';
         utf8_to_wide(app, out+n, cap-n);
     }
+    (void)cols;
 }
+static void tab_label(Tab *tb, wchar_t *out, int cap) { tab_label_fit(tb,out,cap,cap-1); }
 
 static int unit_tab_labels(FILE *f) {
     static const struct { const char *in, *want; } cases[] = {
@@ -4033,18 +4065,25 @@ static void grid_text(const wchar_t *s, int col, int row, uint32_t rgb) {
         if (cps[i] != ' ') draw_glyph(cps[i], (float)(col * CW), row_y(row), ws[i], g_scale);
 }
 
+#ifndef _WIN32
+static uint32_t plat_title_mix(uint32_t fg, uint32_t bg, float alpha);
+static uint32_t plat_title_background_color(uint32_t bg);
+static void plat_render_title_background(float x0, float y0, float x1, float y1, uint32_t bg, uint32_t base);
+static void plat_render_title_underlay(void);
+static void plat_render_title_overlay(void);
+#endif
 #include "hardcore_chrome_draw.h"
 
-/* Default whitespace reveals chrome; every meaningful terminal cell owns its
-   entire cell rectangle so chrome strokes cannot leak through glyph margins. */
+/* Foreground owns its complete cell so chrome cannot cross glyph margins.
+   Background color alone is not foreground: highlighted blank space still
+   exposes the dim menu, composited above that background. */
 static int cell_covers_chrome(const Cell *c) {
     uint32_t fg, bg;
     int space = c->ch <= ' ' || c->ch == 0xA0 || (c->ch >= 0x2000 && c->ch <= 0x200A) ||
                 c->ch == 0x202F || c->ch == 0x205F || c->ch == 0x3000;
     cell_colors(c, &fg, &bg);
-    if (bg != DEF_BG) return 1;
     if (fg == bg) return 0;
-    return !space || c->wflag == W_CONT || (c->attr & (A_UNDER | A_STRIKE)) || c->link;
+    return !space || (c->wflag & 8) || c->wflag == W_CONT || (c->attr & (A_UNDER | A_STRIKE)) || c->link;
 }
 
 static int unit_underlay(FILE *f) {
@@ -4059,7 +4098,9 @@ static int unit_underlay(FILE *f) {
     fails += cell_covers_chrome(&blank) != 0;
     blank.ch = 'X'; fails += !cell_covers_chrome(&blank);
     blank.ch = ' '; blank.wflag = W_CONT; fails += !cell_covers_chrome(&blank);
-    blank.wflag = 0; blank.bg = C_PAL(2); fails += !cell_covers_chrome(&blank);
+    blank.wflag = 0; blank.bg = C_PAL(2); fails += cell_covers_chrome(&blank);
+    blank.ch = 'X'; fails += !cell_covers_chrome(&blank);
+    blank.ch = ' ';
     blank.bg = 0; blank.attr = A_UNDER; fails += !cell_covers_chrome(&blank);
     blank.attr = 0; blank.link = 1; fails += !cell_covers_chrome(&blank);
     blank.link = 0;
@@ -4068,6 +4109,22 @@ static int unit_underlay(FILE *f) {
     fails += cell_covers_chrome(&blank);
     blank.ch = 'X'; blank.attr = A_HIDDEN; fails += cell_covers_chrome(&blank);
     blank.ch = 0xA0; blank.attr = A_DIM; fails += cell_covers_chrome(&blank);
+#ifndef _WIN32
+    /* There must be no invisible midpoint, nor an excessive shift, on any
+       gray background. Sample the RGB cube too, including saturated colors. */
+    for (int gray = 0; gray < 256; gray++) {
+        uint32_t color = plat_title_background_color((uint32_t)gray * 0x010101);
+        int delta = abs((int)(color & 255) - gray);
+        fails += delta < 16 || delta > 32;
+        fails += ((color >> 16) & 255) != (color & 255) || ((color >> 8) & 255) != (color & 255);
+    }
+    for (int r = 0; r <= 255; r += 17) for (int g = 0; g <= 255; g += 17) for (int b = 0; b <= 255; b += 17) {
+        uint32_t color = plat_title_background_color((uint32_t)(r << 16 | g << 8 | b));
+        int before = (77*r + 150*g + 29*b) / 256;
+        int after = (77*((color >> 16) & 255) + 150*((color >> 8) & 255) + 29*(color & 255)) / 256;
+        fails += abs(after - before) < 15 || abs(after - before) > 33;
+    }
+#endif
     const Font *saved_font = g_cf;
     int fi;
     for (fi = 0; fi < NFONTS; fi++) {
@@ -4121,79 +4178,110 @@ static int unit_underlay(FILE *f) {
 }
 
 static void r_begin(int w, int h);
-#ifndef _WIN32
-static int plat_title_height(void);
-static void plat_render_title_underlay(void);
-static void plat_render_title_overlay(void);
-#endif
 #include "hardcore_display.h"
+
+/* Terminal fills are below the quiet chrome, while terminal foreground cells
+   are above it. This lets the menu show through a highlighted row's blank
+   tail without washing out the highlight or drawing over its text. */
+static void render_terminal_backgrounds(const Term *t, int ox, int oy) {
+    for (int y = 0; y < t->rows; y++) {
+        const Cell *cells;
+        int n;
+        float y0 = (float)(oy + y*CH);
+        display_line(t, y, &cells, &n);
+        int end = g_sel_on ? t->cols : n;
+        for (int x = 0; x < end; x++) {
+            uint32_t fg, bg = DEF_BG;
+            if (x < n && !(cells[x].wflag & 8)) cell_colors(&cells[x], &fg, &bg);
+            if (display_selected(t, x, y)) bg = SEL_BG;
+            if (bg == DEF_BG) continue;
+            float x0 = (float)(ox + x*CW);
+            fill_rect(x0, y0, x0+CW, y0+CH, bg, 1);
+#ifndef _WIN32
+            plat_render_title_background(x0, y0, x0+CW, y0+CH, bg, bg);
+#endif
+        }
+    }
+}
 
 static void render(void) {
     struct { int right, bottom; } r;
     Tab *tb = active_tab();
     Term *t;
-    int y, x, ox = term_ox(), oy = term_oy();
+    int y, x, ox = term_ox(), oy = term_oy(), dock_col = sidebar_x()/CW;
+    int overlay = g_tab_underlay || (tb && tb->kind == TK_BROWSER);
     plat_client_size(&r.right, &r.bottom);
+#ifndef _WIN32
+    if (tb && tb->kind == TK_BROWSER) mac_browser_prepare(tb);
+    int browser_hover = tb && tb->kind==TK_BROWSER ? mac_browser_hover_link() : 0;
+#endif
     g_clip_w = r.right / CW * CW;
     g_clip_h = r.bottom / CH * CH;
     r_begin(r.right, r.bottom);
+#ifndef _WIN32
+    if (tb && tb->kind == TK_BROWSER && tb->browser_native) {
+        g_draw_alpha = chrome_hovered() ? 1 : .5f;
+        render_tabbar(r.right, r.bottom);
+        g_draw_alpha = 1;
+        mac_browser_draw_overlay();
+        plat_render_title_overlay();
+        return;
+    }
+#endif
+#ifndef _WIN32
+    plat_render_title_underlay();
+#endif
 #ifdef _WIN32
     if (!tb) { render_tabbar(r.right, r.bottom); render_caption_buttons(r.right); return; }
 #else
-    if (!tb) { render_tabbar(r.right, r.bottom); plat_render_title_underlay(); plat_render_title_overlay(); return; }
+    if (!tb) { render_tabbar(r.right, r.bottom); plat_render_title_overlay(); return; }
 #endif
     t = &tb->t;
     chrome_prepare_display(t);
-    if (g_tab_underlay) {
+    render_terminal_backgrounds(t, ox, oy);
+    if (overlay) {
         g_draw_alpha = .38f;
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
     } else render_tabbar(r.right, r.bottom);
-#ifndef _WIN32
-    plat_render_title_underlay();
-#endif
 
-    /* One pass per row: backgrounds, then glyphs, then underlines, so a bold
-       smear or underline is never painted over by the next cell's background.
-       Rows don't overlap, so this draws the same pixels as three full-screen
-       passes. Past a screen row's rlen everything is a default blank. */
+    /* Restore background only beneath foreground cells that overlap chrome,
+       then draw glyphs and decorations. All cell masks precede row glyphs so
+       a bold smear cannot be erased by the next cell's mask. */
     for (y = 0; y < t->rows; y++) {
         const Cell *cells;
-        int n, wrapped, L = t->hcount - t->view + y, end;
-        int underlay_cells = g_tab_underlay;
+        int n;
         float y0 = (float)(oy + y * CH);
-#ifndef _WIN32
-        underlay_cells |= y0 < plat_title_height();
-#endif
-        if (g_display_term == t && g_display.cells) {
-            cells = g_display.cells + y*t->cols;
-            n = t->cols;
-        } else {
-            term_line(t, L, &cells, &n, &wrapped);
-            if (L >= t->hcount && L - t->hcount < t->rows && t->rlen[t->alt][L - t->hcount] < n)
-                n = t->rlen[t->alt][L - t->hcount];
-            if (n > t->cols) n = t->cols;
-        }
-        end = g_sel_on ? t->cols : n;
-        for (x = 0; x < end; x++) {
+        display_line(t, y, &cells, &n);
+        int mask_end = overlay && y >= g_chrome.top && y < g_chrome.bottom ? n : 0;
+        int mask_begin = dock_col;
+        if (mask_end > mask_begin + SB_COLS) mask_end = mask_begin + SB_COLS;
+        for (x = mask_begin; x < mask_end; x++) {
             uint32_t fg, bg;
-            if (x < n) cell_colors(&cells[x], &fg, &bg);
-            else bg = DEF_BG;
+            if (!cell_covers_chrome(&cells[x])) continue;
+            if(cells[x].wflag & 8){fg=DEF_FG;bg=DEF_BG;}else cell_colors(&cells[x], &fg, &bg);
             if (display_selected(t, x, y)) bg = SEL_BG;
-            /* Opaque terminal cells mask the underlay, including glyph margins,
-               wide continuations, decorations and meaningful blank backgrounds. */
-            if (bg == DEF_BG && !(underlay_cells && x < n &&
-                cell_covers_chrome(&cells[x]))) continue;
             r_color(bg, 1);
             quad((float)(ox + x * CW), y0, (float)(ox + (x + 1) * CW), y0 + CH);
+#ifndef _WIN32
+            /* Quiet title circles tint the resolved background, including
+               selection, but never the glyphs/decorations drawn afterward. */
+            plat_render_title_background((float)(ox + x * CW), y0, (float)(ox + (x + 1) * CW), y0 + CH, bg, bg);
+#endif
         }
         for (x = 0; x < n; x++) {
             const Cell *c = &cells[x];
             uint32_t fg, bg;
             int w;
+#ifndef _WIN32
+            if(tb->kind==TK_BROWSER && (c->wflag & 8)){mac_browser_draw_tile(tb,c,x,y);continue;}
+#endif
             if (c->ch <= ' ' || c->wflag == W_CONT) continue;
             cell_colors(c, &fg, &bg);
             if (fg == bg) continue;
+#ifndef _WIN32
+            if(tb->kind==TK_BROWSER && c->link && c->link==browser_hover) fg=g_shown->pal[12];
+#endif
             w = (c->wflag == W_WIDE) ? 2 : 1;
             r_color(fg, 1);
             draw_glyph(c->ch, (float)(ox + x * CW), y0, w, g_scale);
@@ -4205,6 +4293,15 @@ static void render(void) {
             const Cell *c = &cells[x];
             uint32_t fg, bg;
             float x0 = (float)(ox + x * CW);
+#ifndef _WIN32
+            if(tb->kind==TK_BROWSER && (c->wflag & 8))continue;
+            if(tb->kind==TK_BROWSER && c->link) {
+                if(!(c->wflag & 8) && c->link!=browser_hover) {
+                    cell_colors(c,&fg,&bg);fill_rect(x0,y0+CH-1,x0+CW,y0+CH,fg,.18f);
+                }
+                continue;
+            }
+#endif
             if (!(c->attr & (A_UNDER | A_STRIKE)) && !c->link) continue;
             cell_colors(c, &fg, &bg);
             if (fg == bg) continue;
@@ -4257,12 +4354,13 @@ static void render(void) {
         fill_rect(bx, track_top + pos * (track_h - bar_h), bx + SCROLLBAR_W - 2 * g_scale,
                   track_top + pos * (track_h - bar_h) + bar_h, AMBER, t->view ? 0.8f : 0.3f);
     }
-    if (g_tab_underlay && chrome_hovered()) render_tabbar(r.right, r.bottom);
+    if (overlay && chrome_hovered()) render_tabbar(r.right, r.bottom);
 #ifdef _WIN32
     if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
         fill_rect(0, 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
     render_caption_buttons(r.right);   /* last: glass over whatever is under it */
 #else
+    mac_browser_draw_overlay();
     plat_render_title_overlay();
 #endif
 }
@@ -4437,7 +4535,7 @@ static void update_busy(int tick) {
     int i, any = 0, changed = 0;
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
-        int b = term_busy(&tb->t);
+        int b = tb->kind == TK_BROWSER ? tb->busy : term_busy(&tb->t);
         if (tb->t.ps_state != tb->ps_seen) {
             /* Claude stopped to ask you something: say so if you aren't looking */
             if ((tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR) && !g_focused) plat_flash();
@@ -4467,12 +4565,15 @@ static void activate(int i) {
     if (i < 0 || i >= g_ntabs) return;
     term_settle(&g_tabs[i]->t);  /* a tab not caught up since a resize: before it shows */
     g_active = i;
+    resize_all();
     tab_fit(g_tabs[i]);          /* still at an old size if the window changed while it was hidden */
     g_tabs[i]->activity = 0;
     g_tabs[i]->attention = 0;
     g_sel_on = 0;
 #ifdef _WIN32
     slurp_selection(g_tabs[i]);
+#else
+    mac_browser_sync();
 #endif
     update_title();
     plat_invalidate();
@@ -5020,7 +5121,7 @@ static void adopt_done(void) {
 /* The folder the window is closing in, for the next window to open in. */
 static void remember_dir(Tab *tb) {
     const char *d;
-    if (!tb || tb->help) return;
+    if (!tb || tb->help || tb->kind == TK_BROWSER) return;
 #ifdef _WIN32
     if (tb->slurp_hwnd) return;
 #endif
@@ -5055,6 +5156,9 @@ static void close_tab(int i) {
 
 static void scroll_view(int lines) {
     Tab *tb = active_tab();
+#ifndef _WIN32
+    if (tb && tb->kind == TK_BROWSER) { mac_browser_scroll(-lines); return; }
+#endif
     if (!tb || tb->t.alt) return;
     term_settle(&tb->t);         /* scrolling back: the old lines at today's width first */
     tb->t.view += lines;
@@ -5255,6 +5359,66 @@ static void mouse_cell(int mx, int my, int *col, int *row) {
     }
     *col = c;
     *row = r;
+}
+
+/* Run the real VT -> display adapter without AppKit/Win32 window creation.
+   This screenshot paragraph needs one following blank row at the dock width. */
+static int unit_chrome_display(FILE *f) {
+    static const char paragraph[] =
+        "\x1b[2;1H  Build and non-GUI tests pass. The disposable test app crashed during macOS registration, before rendering. Current sandbox restrictions prevent GUI"
+        "\x1b[3;1H  verification, committing, and live reload, so your running window still uses the previous build."
+        "\x1b[5;1H456\x1b[8;1H";
+    static const char diff[] =
+        "\x1b[2;1H\x1b[48;2;24;64;32m  5313 +    int result = snprintf(buffer, sizeof(buffer), \"/Users/example/Library/Support/hardcore/preferences/profile.json\", mouse_modes[mouse]);\x1b[K\x1b[0m"
+        "\x1b[3;1H  + Show details\x1b[5;1H456\x1b[8;1H";
+    static const char *const fixtures[] = {paragraph, diff};
+    Tab *tb = (Tab *)calloc(1, sizeof(*tb)), *saved_tab = g_tabs[0];
+    int saved_ntabs = g_ntabs, saved_active = g_active, saved_mode = g_tab_underlay, saved_reflow = g_chrome_reflow;
+    ChromeReflow saved_display = g_display;
+    const Term *saved_display_term = g_display_term;
+    int saved_view = g_display_view, saved_hcount = g_display_hcount, fails = 0;
+    if (!tb || !term_init(&tb->t, 152, 8)) { free(tb); return 1; }
+    memset(&g_display, 0, sizeof(g_display)); g_display_term = NULL;
+    g_tabs[0] = tb; g_ntabs = 1; g_active = 0; g_chrome_reflow = 1;
+    static const int mouse_modes[] = {0, 1000, 1002, 1003};
+    for (int fixture = 0; fixture < 2; fixture++)
+    for (int side = 1; side <= 2; side++) for (int mouse = 0; mouse < 4; mouse++) {
+        char modes[64];
+        int n = snprintf(modes, sizeof(modes), "\x1b" "c\x1b[?25l\x1b[?%dh\x1b[?1006h", mouse ? mouse_modes[mouse] : 1000);
+        vt_feed(&tb->t, (const unsigned char *)modes, n);
+        if (!mouse) vt_feed(&tb->t, (const unsigned char *)"\x1b[?1000l", 8);
+        vt_feed(&tb->t, (const unsigned char *)fixtures[fixture], (int)strlen(fixtures[fixture]));
+        g_tab_underlay = side;
+        int dock = side == 1 ? 124 : 0, mode = tb->t.m_mouse;
+        Cell before[152*8];
+        for (int y = 0; y < 8; y++) memcpy(before+y*152, tb->t.row[0][y], 152*sizeof(Cell));
+        chrome_prepare_display_at(&tb->t, dock, 1, 4);
+        fails += g_display_term != &tb->t || !g_display.changed;
+        fails += mode != mouse_modes[mouse] || tb->t.m_mouse != mode || !tb->t.m_mouse_sgr;
+        for (int y = 0; y < 8; y++) {
+            fails += memcmp(before+y*152, tb->t.row[0][y], 152*sizeof(Cell)) != 0;
+            if (!g_display.cells) continue;
+            for (int x = 0; x < 152; x++) {
+                const Cell *c = g_display.cells+y*152+x;
+                if (y >= 1 && y < 4 && x >= dock && x < dock+28) fails += !cr_space(c->ch);
+                if (!cr_space(c->ch)) {
+                    int col, row, source = g_display.source[y*152+x];
+                    mouse_cell(x*CW+CW/2, y*CH+CH/2, &col, &row);
+                    fails += row*152+col != source;
+                    fails += memcmp(c, before+source, sizeof(Cell)) != 0;
+                }
+            }
+        }
+        if (g_display.cells) fails += g_display.cells[4*152].ch != '4';
+    }
+    chrome_reflow_free(&g_display);
+    g_display = saved_display; g_display_term = saved_display_term;
+    g_display_view = saved_view; g_display_hcount = saved_hcount;
+    g_tabs[0] = saved_tab; g_ntabs = saved_ntabs; g_active = saved_active;
+    g_tab_underlay = saved_mode; g_chrome_reflow = saved_reflow;
+    term_free(&tb->t); free(tb);
+    fprintf(f, "%s chrome display: prose/styled diffs/paths, both docks, mouse reporting, source coordinates and terminal preserved\n", fails ? "FAIL" : "ok  ");
+    return fails;
 }
 
 /* reports to an app that asked for the mouse (vim, htop, tmux...);
@@ -6668,6 +6832,7 @@ static int unit_tests(const char *out_path) {
         fails += !ok;
     }
     fails += unit_underlay(f);
+    fails += unit_chrome_display(f);
     fails += unit_chrome(f);
     fails += unit_tab_labels(f);
     for (i = 0; i < (int)(sizeof(urls) / sizeof(urls[0])); i++) {
@@ -7029,6 +7194,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 char request[600];
                 if (!WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, request, sizeof(request), NULL, NULL) || !slurp_filter(request)) return 2;
             }
+        } else if (!strcmp(a, "browser")) {
+            cli("hardcore: browser tabs are available on macOS in this first pass; Windows WebView2 is not implemented yet.\n");
+            return 1;
         } else if (!strcmp(a, "update") || !strcmp(a, "--update")) {
             return update_cmd(i + 1 < argc && !wcscmp(argv[i + 1], L"--force"));
         } else if (!strcmp(a, "version") || !strcmp(a, "--version") || !strcmp(a, "-v")) {

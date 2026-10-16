@@ -1,0 +1,118 @@
+HARDCORE — LEFT / RIGHT UNDERLAYS AND INLINE PAGES (study 03)
+
+Open index.html directly in a browser. It is self-contained and requires no
+server or network. gallery.html / comparison.png contain the static review.
+The default is study 10: left menu in the middle of a paragraph.
+This is a prototype; Hardcore's production renderer and PTYs are unchanged.
+
+CHANGES IN THIS STUDY
+Hover anywhere in either underlay raises the ENTIRE menu, including its grip,
+all visible tabs and Settings. Leaving it restores the dim underlay. Terminal
+characters and their cell backgrounds remain above chrome until hover. No
+terminal column is reserved and the menu never automatically squeezes/moves.
+
+Left underlay docks at x=0. Eligible prose beside it is rewrapped to the narrower
+available width and shifted right by the menu width, preserving its original
+indentation. Before/after the menu's vertical span the paragraph gets the full
+width and original indentation again. Later content cannot move vertically.
+If a complete safe layout is unavailable, preserve original text coordinates
+and leave the menu underneath. Literal code, tables, prompts and boxes remain
+unchanged, even when that obscures the menu.
+
+Pages replace scrolling everywhere. The first real item on each visible page
+carries separate previous/next buttons and a page counter, for example:
+  [<-]● Terminus 8×16[->]1/3
+The middle remains an actual selectable item. The two arrows only page the
+list; the counter is informational. There are NO navigation-only rows. Tab and
+Font/Theme lists paginate independently. The final page uses the normal page
+capacity for Previous, even when it contains fewer items. Resizing aligns the
+current offset to a valid page boundary. Wheel input is not intercepted.
+
+CONTROLS
+Placement: opaque left sidebar / right underlay / left underlay.
+Dock row slider or drag grip: manually change the underlay's vertical position.
+Original / Reflowed: compare layouts without moving the menu.
+Local reflow and Debug markers: independently toggle transform and annotations.
+Grid width / Height: inspect narrower/shorter viewports and page capacities.
+Underlay opacity: control the dim layer while it is below terminal text.
+Settings: open/close; choose Font or Theme; click options to select them.
+Arrow buttons: move through that list; click the middle entry to select it.
+Inspect exact text: line numbers, changed lines and consumed blank lines.
+Try your own text: replace the local source with a prospective example.
+Save regression case: export original rows, grid and dock geometry, and observed
+result as JSON. expected is null until a reviewed desired result is supplied.
+Save PNG: export the current terminal mockup.
+
+STUDIES
+01 Sidebar, closed Settings: one-row tabs and inline page buttons.
+02 Sidebar, open Settings: page buttons on real font/theme choices.
+03 Sidebar pagination: independent terminal and settings pages.
+04 Right dock: first fox example, borrowing its following blank line.
+05 Right dock: redistribution into an existing short final line, no blank needed.
+06 Right dock: mixed prose/code, with literal content left untouched.
+07 Right dock: dense literal content and no safe fit; whole-menu hover.
+08 Right dock: second fox example, preserving the over/the word boundary.
+09 Left dock: shorter shifted prose and protected numeric headings.
+10 Left dock in the middle: full width above/below and an inset beside it.
+Additional exports show whole-menu hover on both sides, page two, compact sizing,
+and the original/reflowed fox paragraph.
+
+REFLOW API
+  HardcoreReflow.reflow(lines, {
+    columns: 128,
+    dock: {side:'left', x:0, y:5, width:28, height:8},
+    enabled: true, maxBlankRows: 3
+  })
+side defaults to right. Output includes lines, changes, blocks, markers, stats.
+changes include side, preserved indent, and rowOffsets aligned with after[].
+Original input is not mutated. Always render from original source when changing
+menu geometry; do not progressively reflow earlier display transforms.
+
+The algorithm groups likely same-indent prose without crossing blank rows or
+protected structure. It wraps whole words, tries the original row budget first
+(including slack on the final line), then adjacent blank rows up to the budget.
+Accept only a complete fit that reduces occupied menu cells. Otherwise leave the
+original paragraph exact. No subsequent nonblank rows are shifted. No words
+are broken, lost, duplicated, or concatenated.
+
+Debug arrows occupy the existing indentation cell just before changed text. On
+the left this is AFTER the menu inset; a marker may not steal a menu cell. A line
+with no original indentation has an unplaced marker and remains highlighted in
+the line-numbered comparison. No additional gutter is introduced.
+
+BORDERS AND FONT
+Every tab is one character row. Default outlines are manually drawn strokes at
+cell edges in GNU Unifont's spare top/bottom bitmap pixels. They do not strike
+through labels. Box-glyph ends are available as a comparison treatment. Other
+fonts need their own ink-margin checks; font choices in this prototype show
+selection state but keep Unifont rendering for consistent pixel comparisons.
+Grid origin is the drawable top-left. No terminal inset is added.
+GNU Unifont license: ../../font/unifont-license.txt
+
+FUTURE REAL-WORLD CASES
+This is deliberately conservative plain-text recognition. AI CLI frames, colored
+backgrounds, styled panels, syntax, lists and deliberate spacing may convey
+structure that text alone cannot recover. ANSI, wide/combining glyphs, likely
+code/tables/prompts/boxes and ambiguous headings stay literal. The current
+captures are text re-renderings, not a preserved styled terminal-cell model.
+
+Keep a screenshot or terminal-cell/ANSI capture with each reported example,
+along with the grid, menu geometry and desired result. Save regression case
+records the current behavior separately from the eventual expected layout. A
+specific reviewed example should become a regression test before expanding the
+recognizer. The JSON export does not claim to preserve colors or backgrounds.
+Production also requires cell-width/wrap metadata, cursor/selection/input
+mapping and copy behavior. Display-only reflow must never alter program input
+or silently resize the PTY.
+
+REBUILD / VALIDATE
+  node test_reflow.js
+  python3 build.py
+  python3 render.py       # Playwright + Chromium
+  python3 gallery.py      # Playwright + Chromium
+32 algorithm tests cover both dock sides, exact user examples, row boundaries,
+word preservation, idempotence, protected structures and imported captures.
+Browser checks cover ten studies, whole-menu hover bounded to either menu,
+full-width/inset/full-width paragraph behavior, fixed headings, actual page
+arrow/selection hit targets, final partial pages, compact page alignment and
+regression-case export. Generated views were visually inspected.

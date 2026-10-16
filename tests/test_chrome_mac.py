@@ -241,17 +241,18 @@ def test_reflow(app):
     protected[start + 2] = "  first   second   aligned"
     c = app.feed(protected)
     assert c["source"] == c["display"], c
-    # Meaningful terminal backgrounds, cursor rows, and mouse reporting must
-    # keep the application's native geometry intact.
+    # Meaningful terminal backgrounds and cursor rows protect prose. Mouse
+    # reporting still permits safe reflow and uses mapped source coordinates.
     styled = lines.copy()
     styled[start] = "\x1b[48;2;22;33;44m" + styled[start] + "\x1b[0m"
     c = app.feed(styled)
     assert c["source"] == c["display"], "styled background paragraph reflowed content"
     c = app.feed(lines, "\x1b[?1000h\x1b[?1006h")
-    assert c["source"] == c["display"], "mouse-reporting mode reflowed content"
+    assert c["reflow_changed"], "mouse-reporting mode disabled prose reflow"
+    assert_mapping(app, c)
     c = app.feed(lines, f"\x1b[{start + 1};3H\x1b[?25h")
     assert c["source"] == c["display"], "cursor paragraph reflowed content"
-    print("PASS: structured/styled output, mouse-reporting apps and cursor paragraphs keep source geometry")
+    print("PASS: structure/backgrounds/cursor rows stay fixed; mouse-reporting prose reflows with source mapping")
 
     # Natural VT autowrap may split a word at a physical row boundary. It is
     # not a word separator, so guessing a prose join must never insert a space.
@@ -464,7 +465,14 @@ def test_visible_whitespace_and_rules(app):
     lines[row] = "\x1b[48;2;60;70;80m" + " " * c["cols"] + "\x1b[0m"
     app.feed(lines)
     shaded = app.snap("codex-meaningful-background")
-    assert shaded.crop(*box) != dim.crop(*box), "meaningful terminal background stopped masking menu"
+    assert shaded.crop(*box) != dim.crop(*box), "highlighted background was lost"
+    interior = shaded.crop(box[0] + cell["width"], box[1] + 2, box[2] - 3*cell["width"], box[3] - 4)
+    assert len({interior[i:i+3] for i in range(0, len(interior), 4)}) > 1, "highlighted blank cells still hide the menu text"
+    # Terminal text owns its whole cell even over the colored background.
+    lines[row] = "\x1b[48;2;60;70;80m" + "X" * c["cols"] + "\x1b[0m"
+    app.feed(lines)
+    occupied = app.snap("codex-highlighted-text-over-menu")
+    assert occupied.crop((d["x"] + 8)*cell["width"], box[1], cell["width"], cell["height"]) == occupied.crop(40*cell["width"], box[1], cell["width"], cell["height"]), "underlay draws over highlighted terminal text"
 
     c = app.feed([""] * c["rows"])
     c = app.click(d["x"] + 6, c["pages"]["settings_row"])
@@ -494,20 +502,73 @@ def test_title_underlay(app):
     assert 0 < title["height"] < 5 * c["cell"]["height"], title
     assert not title["hovered"] and not title["buttons_visible"], title
     assert min(r for r in c["tab_rows"] if r >= 0) >= title["height"], "title hover obscures a clickable tab"
-    back = app.snap("title-dim-underlay")
-    b = title["button_rects"][0]
-    x, y = int(b["x"] + b["width"] / 2), int(b["y"] + b["height"] / 2)
-    p = pixel(back, x, y)
-    assert p[0] == p[1] == p[2] and p[0] > 12, ("quiet traffic light is not a visible gray circle", p)
-    # Fill the title rows with literal characters. Compare the cell containing
-    # the circle with a distant identical cell: circle pixels must be beneath it.
-    lines = [""] * c["rows"]
-    for row in range((title["height"] + c["cell"]["height"] - 1) // c["cell"]["height"]):
-        lines[row] = "X" * c["cols"]
-    app.feed(lines)
-    text = app.snap("title-text-over-circles")
     cw, ch = c["cell"]["width"], c["cell"]["height"]
-    assert text.crop(x // cw * cw, y // ch * ch, cw, ch) == text.crop(40*cw, y // ch * ch, cw, ch), "traffic circle drew above terminal text"
+    title_rows = (title["height"] + ch - 1) // ch
+
+    def fixture(background, character, foreground="", selected=False):
+        lines = [""] * c["rows"]
+        for row in range(title_rows):
+            if isinstance(background, tuple):
+                lines[row] = "".join(background[col % len(background)] + foreground + character
+                                     for col in range(c["cols"])) + "\x1b[0m"
+            else:
+                lines[row] = background + foreground + character * c["cols"] + "\x1b[0m"
+        app.feed(lines)
+        if selected:
+            app.send(f"cmd sel 0 0 {title_rows - 1} {c['cols'] - 1}")
+
+    def assert_background_only(blank, text, label, period=1):
+        # A distant identical cell provides the original foreground and the
+        # actual background after ANSI inverse/selection have been resolved.
+        # Only pixels belonging to the circle may change that background.
+        for button in title["button_rects"]:
+            center_x = int(button["x"] + button["width"] / 2)
+            center_y = int(button["y"] + button["height"] / 2)
+            center = pixel(blank, center_x, center_y)
+            background = pixel(blank, 40*cw + center_x % (period*cw), center_y)
+            contrast = max(abs(a - b) for a, b in zip(center[:3], background[:3]))
+            assert 8 <= contrast <= 64, (label, "circle contrast is absent or excessive", center, background)
+            foreground_count = margin_count = 0
+            for y in range(int(button["y"]), int(button["y"] + button["height"])):
+                for x in range(int(button["x"]), int(button["x"] + button["width"])):
+                    reference_x = 40*cw + x % (period*cw)
+                    reference_bg = pixel(blank, reference_x, y)
+                    reference_fg = pixel(text, reference_x, y)
+                    circle_bg = pixel(blank, x, y)
+                    actual = pixel(text, x, y)
+                    if reference_fg != reference_bg:
+                        assert actual == reference_fg, (label, "circle changed glyph or decoration", x, y, actual, reference_fg)
+                        foreground_count += circle_bg != reference_bg
+                    else:
+                        assert actual == circle_bg, (label, "glyph cell margin erased circle", x, y, actual, circle_bg)
+                        margin_count += circle_bg != reference_bg
+            assert foreground_count and margin_count, (label, "fixture did not overlap both glyphs and their margins", button)
+
+    # Midgray specifically catches a fixed gray blend's invisible fixed point.
+    # Colored ANSI backgrounds, inverse video and real terminal selection must
+    # participate just like the canvas color, rather than erase whole circles.
+    cases = (
+        ("default", "", "", False),
+        ("black", "\x1b[38;2;220;220;220;48;2;0;0;0m", "", False),
+        ("midgray", "\x1b[38;2;230;230;230;48;2;128;128;128m", "", False),
+        ("light", "\x1b[38;2;20;20;20;48;2;245;245;245m", "", False),
+        ("colored", "\x1b[38;2;230;230;230;48;2;55;125;205m", "", False),
+        ("inline-highlight", ("\x1b[38;2;230;230;230;48;2;45;55;75m",
+                              "\x1b[38;2;230;230;230;48;2;128;128;128m"), "", False),
+        ("inverse", "\x1b[38;2;180;150;70;48;2;15;20;25;7m", "", False),
+        ("decorated", "\x1b[38;2;230;220;210;48;2;60;70;80m", "\x1b[1;2;3;4;9m", False),
+        ("selected", "\x1b[38;2;230;220;210;48;2;60;70;80m", "", True),
+    )
+    for label, background, foreground, selected in cases:
+        fixture(background, " ", selected=selected)
+        blank = app.snap(f"title-{label}-background")
+        fixture(background, "X", foreground, selected)
+        text = app.snap(f"title-{label}-glyphs")
+        assert_background_only(blank, text, label, len(background) if isinstance(background, tuple) else 1)
+    print("PASS: traffic lights adapt subtly to default, ANSI, gray, inverse and selected backgrounds; glyphs and decorations remain exact")
+
+    fixture("", "X")
+    text = app.snap("title-text-over-circles")
     app.send(f"cmd hover {c['cols'] * cw // 2},{title['height'] // 2}")
     c = app.chrome()
     assert c["titlebar"]["hovered"] and c["titlebar"]["buttons_visible"], c["titlebar"]
@@ -528,7 +589,7 @@ def test_title_underlay(app):
     c = app.chrome()
     assert not c["titlebar"]["selection_drag"] and not c["titlebar"]["buttons_visible"], c["titlebar"]
     app.hover(-1, -1)
-    print("PASS: gray traffic lights sit beneath text; top hover smokes full width; upward selection keeps controls hidden and scrolls")
+    print("PASS: top hover smokes full width; upward selection keeps traffic lights beneath text, controls hidden and scrolling active")
 
 
 def main():

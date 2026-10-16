@@ -1,5 +1,102 @@
 # hardcore
 
+Experimental browser tabs are available on **macOS 11+**. Press **⇧⌘B** to
+open the built-in welcome page, **⌘L** to enter an address, and **⇧⌘M** to switch
+between Hardcore and native rendering. **⌘[ / ⌘]** navigate back/forward and
+**⌘R** reloads the page. Browser tabs appear below their owning terminal tab and
+use the page title and domain as their label. Labels fit the actual grid cells,
+including the smaller space beside pagination: repeated site branding is removed,
+familiar domains abbreviate when needed, and long titles retain beginning/end text.
+Missing titles fall back to a readable URL path and host; query strings and
+credentials stay out of labels. Titles update with the live page and survive
+app reloads. Hover the top window edge
+for grid-aligned back/forward buttons, address input, Go, close, new browser tab,
+and the Mono/Native switch. The narrow-window layout uses additional grid rows.
+
+Hardcore mode is the default: a live system WebKit page projects semantic text,
+headings, links, lists, code, tables and basic controls into the current bitmap
+font, theme and character grid. Blocks wrap around either menu dock and regain
+full width outside it. Links have a faint one-device-pixel hairline; hovering removes it, brightens
+the link and changes the cursor to a pointing hand. Click links/buttons/controls;
+inputs open a grid editor, selects use a grid picker, and text areas support
+multiple lines (Control-Return applies).
+Tab/Shift-Tab selects visible controls and Return activates them. Wheel, arrows,
+Page Up/Down, Home and End scroll; Shift/Option-drag selects grid text. Native
+mode displays the real page across the full canvas, with a half-opacity menu
+that comes forward on hover. Switching modes retains the same live document. Right-click opens a grid
+context menu for copying link locations, opening child browser tabs, copying
+selection, navigation, and inspecting elements. **Inspect element** splits off
+a lower grid pane with DOM attributes/child nodes, computed styles, and text;
+click child nodes or the parent button to navigate the tree. This is a compact
+DOM inspector, not a JavaScript console or a full browser developer-tools suite.
+
+Inline images snap to whole character rectangles, up to 12 columns by 4 rows.
+Text in the same block wraps beside them. Thumbnails are decoded at bounded
+size, nearest-neighbor sampled, ordered-dithered into the theme's 16 terminal
+colors plus its foreground/background, and cached between frames. Downloads
+are asynchronous, capped at 2 MB per image, with at most 32 cached sources per
+page. Embedded base64 PNG/JPEG images work too. Image requests use an isolated
+HTTP session; authenticated/blocked assets and unsupported image formats show
+a placeholder. Native mode uses WebKit's own complete image presentation.
+
+From a terminal or an agent running inside Hardcore:
+
+```sh
+hardcore browser open https://example.com
+hardcore browser list
+hardcore browser mode TAB_ID native
+hardcore browser close TAB_ID
+```
+
+Commands return JSON. New terminal shells inherit `HARDCORE_WINDOW_PID` and
+`HARDCORE_TAB_ID` so browser tabs attach beneath the invoking terminal. Use
+`--window PID --parent TAB_ID` explicitly from another shell; if older shells
+have no IDs, a single matching window is selected and its active tab supplies
+the parent. `hardcore browser --help` lists commands. After building locally,
+reload the existing window with `./hardcore.app/Contents/MacOS/hardcore --reload`
+before trying these commands in that window.
+
+This first pass uses its own WebKit cookies/profile, separate from Safari and
+Chrome. Grid mode covers the main document's first 100,000 characters and 2,000
+blocks; canvas, embedded frames, rich editors, combining marks and advanced
+controls need native mode. Browser URLs, mode and parent IDs survive an app
+reload, but pages reload and their in-memory JavaScript/form state is lost;
+terminal sessions keep the existing live-reload behavior. Windows WebView2,
+extensions (including Claude's Chrome extension), and an agent DOM/MCP API are
+not implemented. Browser layout, projection, command validation and reload
+metadata have headless tests; native rendering/input still need desktop review.
+
+Website-specific helpers live in `browser/adapters/*.js`. Each registers with
+`globalThis.hardcoreSiteAdapters.push({matches(host,path), root(document),
+skip(element), project(document, context)})`; specific matches precede the generic fallback. The optional
+`project` helper emits semantic blocks through `context.emit`, with live runs from
+`context.inline` and stable DOM identities from `context.id`. Tables supply an
+array of run arrays in `columns`, a shared `table` ID, optional `header` and
+`numeric` column bitmask. `gap`, `hang` and `rule` control document rhythm;
+widths and wrapping remain native grid decisions. Helpers preserve
+the live document. `tools/embed_browser.py` compiles these scripts and the welcome
+page into the executable, so users need no runtime script files or Node/Python.
+
+Wikipedia articles use a dedicated document adapter: a quiet masthead, title,
+lead paragraphs, compact facts, linked contents, and section headings with dim
+rules. Infobox values stay together; tables have shared column widths, numeric
+alignment, and one rule under their headers. Narrow tables turn into labeled
+records. Grouped headers and row spans retain their meaning, nested tables
+flatten into text, and captions, reference links and accessible equation text
+stay with the article. Site navigation/edit widgets and duplicate math images
+are omitted from the projection. Contents and citation links jump within the
+grid document. Lists keep hanging indents while article paragraphs wrap flush.
+All styles use the active theme and font; native rendering retains the original
+page. Unsupported complex spatial diagrams retain their text but may need native
+mode for their original visual relationships.
+
+`make browser-test` exercises six explicitly synthetic Wikipedia structural
+fixtures at four widths, on both docks and without a dock, and generates a
+readable review at `build/wikipedia-preview/index.html`. They cover biography,
+geography, mathematics, population data, prose history and complex spans; they
+are not live-page screenshots. `python3 tools/capture_wikipedia.py --representative`
+can capture original article HTML and provenance when network access is available.
+
 Settings → **Layout** chooses a fixed left **Sidebar**, **Right underlay**,
 or **Left underlay**. Both underlays give the terminal its full width. The dim
 menu sits beneath terminal cells; hovering anywhere in its bounds brings the
@@ -15,14 +112,23 @@ right and bottom remain background.
 
 The optional **Local reflow** checkbox rearranges recognizable prose around
 an underlay for display only. It first uses spare space in the paragraph's
-existing rows, then at most three following blank rows. Words stay whole and
+existing rows, then at most three following blank rows. Prose words stay whole and
 later text stays on its original row. A left dock shifts only the rows beside
 the menu; other rows retain the full width. Foreground colors, bold/dim/italic
 text, ordinary Unicode punctuation, and prose bullets retain their styling and
 hanging indentation. Codex “• Ran …” summaries may wrap at existing word spaces
-when local space permits, keeping paths and arguments intact. Structured output,
-boxes, wide/combining text, meaningful backgrounds, input rows, and applications
-requesting mouse reports keep their original layout. When there is no safe local
+when local space permits. Numbered source/diff rows, file paths, and tool-output
+trees also wrap as separate literal records. Numbers and diff signs stay on
+their own first row; continuations align with that record's code or output.
+Paths can break after `/`, and argument lists after unquoted commas or semicolons.
+Original glyphs, colors, diff backgrounds, and link identities are preserved.
+A local record block can borrow blank rows after its details footer; when only
+some records fit, the others retain their complete text beneath the menu.
+Boxes, tables, fenced code, wide/combining text, and input rows remain protected.
+Unrecognized prose backgrounds also keep their original layout.
+Mouse reporting does not disable prose reflow; reported mouse
+coordinates map back to the original cells. Highlighted blank space shows the
+dim menu above its background, while terminal glyphs cover it. When there is no safe local
 fit, terminal content continues to cover the underlay until hover. The original
 terminal data, scrollback, and PTY dimensions are unchanged; selection maps
 displayed characters back to their source cells.
@@ -478,8 +584,10 @@ What's different on the Mac:
   `dir=` in `~/Library/Application Support/hardcore/config.ini`, or with
   `hardcore.app/Contents/MacOS/hardcore DIR`. A folder dropped on the Dock
   icon opens a tab there.
-- **The window's traffic lights** rest as dim gray circles beneath terminal
-  text. Hovering the native title area reveals the real controls and smokes the
+- **The window's traffic lights** rest as subtle neutral circles beneath terminal
+  text. They lighten dark backgrounds and darken light ones, including colored
+  highlights and text selections, without changing glyph pixels. Middle gray
+  retains contrast too. Hovering the native title area reveals the real controls and smokes the
   full-width band; drag there to move the window or double-click to zoom. An
   upward text-selection drag keeps the controls and band hidden and continues
   scrolling. The terminal still starts at the drawable origin. The empty

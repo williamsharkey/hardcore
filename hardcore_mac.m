@@ -29,6 +29,7 @@
  */
 
 #import <Cocoa/Cocoa.h>
+#import <WebKit/WebKit.h>
 #include <util.h>
 #include <fcntl.h>
 #include <libproc.h>
@@ -54,7 +55,28 @@ static double uptime_ms(void);
 static NSTimer *g_timers[8];
 static int g_mac_title_hover;
 static int g_mac_title_drag;
+static int g_browser_native_drag;
 static id g_mac_title_monitor;
+static void mac_browser_address(void);
+static void mac_browser_open_welcome(void);
+static void mac_browser_command(int command);
+static void mac_browser_action(Tab *tb, int action);
+static void mac_browser_focus(int direction);
+static void mac_browser_enter(void);
+static void mac_browser_edit(SEL action, id sender);
+static int mac_browser_title_height(void);
+static int mac_browser_nav_editing(void);
+static int mac_browser_page_rows(Tab *tb);
+static void mac_browser_draw_nav(void);
+static int mac_browser_ui_mouse(int mx,int my);
+static int mac_browser_ui_contains(int mx,int my);
+static int mac_browser_ui_scroll(int mx,int my,int lines);
+static int mac_browser_ui_key(NSEvent *e);
+static int mac_browser_ui_move(int mx,int my);
+static int mac_browser_insert(NSString *text);
+static void mac_browser_context(int mx,int my);
+static int mac_browser_editing(void);
+static int mac_browser_copy_edit(void);
 
 static char g_mac_bin_dir[4096];
 static const char *g_shell;      /* your login shell */
@@ -185,7 +207,7 @@ static int mtl_init(void) {
     pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
     pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     g_pipe = [g_mtl newRenderPipelineStateWithDescriptor:pd error:&err];
     [pd release];
     [lib release];
@@ -206,6 +228,7 @@ static int mtl_init(void) {
 typedef struct Frame {
     Inst *v;                     /* the frame's quads */
     int n, cap, w, h;
+    int transparent;
     int snap;                    /* test channel: write this frame to snap_path */
     char snap_path[MAX_PATH];
     double lat_key, lat_out, lat_down, lat_written;   /* HARDCORE_LAT, for the key this frame answers */
@@ -248,6 +271,8 @@ static void r_begin(int w, int h) {
     g_build = (Frame *)calloc(1, sizeof(Frame));
     g_build->w = w;
     g_build->h = h;
+    Tab *tb = active_tab();
+    g_build->transparent = tb && tb->kind == TK_BROWSER && tb->browser_native;
 }
 
 static void write_bmp(const char *path, const void *px, int w, int h) {
@@ -281,7 +306,7 @@ static void draw_frame(Frame *f) {
     rp.colorAttachments[0].texture = d.texture;
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    rp.colorAttachments[0].clearColor = MTLClearColorMake(((DEF_BG >> 16) & 255) / 255.0, ((DEF_BG >> 8) & 255) / 255.0, (DEF_BG & 255) / 255.0, 1);
+    rp.colorAttachments[0].clearColor = f->transparent ? MTLClearColorMake(0,0,0,0) : MTLClearColorMake(((DEF_BG >> 16) & 255) / 255.0, ((DEF_BG >> 8) & 255) / 255.0, (DEF_BG & 255) / 255.0, 1);
     enc = [cb renderCommandEncoderWithDescriptor:rp];
     [enc setRenderPipelineState:g_pipe];
     [enc setFragmentTexture:g_atlas atIndex:0];
@@ -545,6 +570,7 @@ static void tab_write(Tab *tb, const void *s, int n) {
 }
 
 static void tab_set_size(Tab *tb, int cols, int rows) {
+    if (tb->kind == TK_BROWSER) { mac_browser_resize(tb); return; }
     struct winsize ws;
     if (!tb->wq || tb->fd < 0) return;
     memset(&ws, 0, sizeof(ws));
@@ -658,12 +684,16 @@ static int spare_ok(void) {
 }
 
 /* in the child, after forkpty: start the shell in dir (a spare waits to be told) */
-static void exec_shell(const char *dir, int spare) {
+static void exec_shell(const char *dir, int spare, int tab_id) {
     char cwd[MAX_PATH], zdir[MAX_PATH], argv0[256], rc[MAX_PATH];
     const char *base = shell_base();
     expand_home(dir, cwd, sizeof(cwd));
     if (chdir(cwd) != 0 && (!getenv("HOME") || chdir(getenv("HOME")) != 0)) chdir("/");
     child_env();
+    char window_id[32], tab_key[32];
+    snprintf(window_id,sizeof(window_id),"%d",getppid());
+    snprintf(tab_key,sizeof(tab_key),"%d",tab_id);
+    setenv("HARDCORE_WINDOW_PID",window_id,1); setenv("HARDCORE_TAB_ID",tab_key,1);
     if (spare) setenv("HARDCORE_SPARE", "1", 1);
     signal(SIGPIPE, SIG_DFL);
     snprintf(argv0, sizeof(argv0), "-%s", base);   /* a login shell, like Terminal starts */
@@ -732,7 +762,7 @@ static int tab_spawn(Tab *tb) {
         term_message(&tb->t, msg);
         return 0;
     }
-    if (pid == 0) exec_shell(tb->start_dir, tb->spare);
+    if (pid == 0) exec_shell(tb->start_dir, tb->spare, tb->id);
     fcntl(fd, F_SETFD, FD_CLOEXEC);    /* later tabs' shells mustn't hold this one open */
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     tb->fd = fd;
@@ -758,6 +788,7 @@ static Tab *tab_create(const char *dir, int spare) {
 }
 
 static void tab_destroy_async(Tab *tb) {
+    mac_browser_destroy(tb);
     if (tb->pid > 0 && !tb->exited) {
         kill(-tb->pid, SIGHUP);  /* its process group; closing the pty hangs up the foreground job too */
         kill(tb->pid, SIGHUP);
@@ -816,6 +847,7 @@ static void mac_foreground_name(Tab *tb, char *out, int cap) {
 static void mac_refresh_programs(void) {
     int changed = 0;
     for (int i=0;i<g_ntabs;i++) {
+        if (g_tabs[i]->kind==TK_BROWSER) continue;
         char name[64]; mac_foreground_name(g_tabs[i],name,sizeof(name));
         if (strcmp(name,g_tabs[i]->program)) {
             snprintf(g_tabs[i]->program,sizeof(g_tabs[i]->program),"%s",name);
@@ -998,7 +1030,7 @@ static const NSWindowButton mac_title_buttons[] = {
     NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton
 };
 
-static int mac_title_height(void) {
+static int mac_title_native_height(void) {
     NSRect layout;
     if (!g_win || !g_view || ([g_win styleMask] & NSWindowStyleMaskFullScreen)) return 0;
     layout = [(NSView *)g_view convertRect:[g_win contentLayoutRect] fromView:nil];
@@ -1007,6 +1039,8 @@ static int mac_title_height(void) {
     if (height < 1) height = 22;
     return (int)(height * [g_win backingScaleFactor] + .5);
 }
+
+static int mac_title_height(void) { return MAX(mac_title_native_height(),mac_browser_title_height()); }
 
 static int mac_title_contains(int x, int y) {
     int w, h;
@@ -1022,8 +1056,8 @@ static void mac_title_sync_buttons(void) {
 }
 
 static void mac_title_hover_at(int x, int y) {
-    int hover = !g_sel_drag && !g_sb_drag && mac_title_contains(x, y);
-    if (g_mac_title_drag) hover = 1;
+    int hover = !g_sel_drag && !g_sb_drag && !g_browser_native_drag && mac_title_contains(x, y);
+    if (g_mac_title_drag || mac_browser_nav_editing()) hover = 1;
     if (hover == g_mac_title_hover) return;
     g_mac_title_hover = hover;
     mac_title_sync_buttons();
@@ -1044,26 +1078,78 @@ static NSRect mac_title_button_rect(int i) {
 }
 
 static int plat_lights_bottom(void) { return mac_title_height(); }
-static int plat_title_height(void) { return mac_title_height(); }
 
-static void plat_render_title_underlay(void) {
-    if (!g_win || !g_view || g_mac_title_hover || !mac_title_height()) return;
-    for (int i = 0; i < 3; i++) {
-        NSRect r = mac_title_button_rect(i);
-        float cx = NSMidX(r), cy = NSMidY(r);
-        float radius = (NSWidth(r) / 2) - [g_win backingScaleFactor];
-        if (radius <= 0) continue;
-        /* Pixel coverage at the edge keeps circles round at either scale. */
-        for (int y = (int)floorf(cy-radius); y < (int)ceilf(cy+radius); y++) {
-            for (int x = (int)floorf(cx-radius); x < (int)ceilf(cx+radius); x++) {
-                float dx = x + .5f - cx, dy = y + .5f - cy;
-                float coverage = radius + .5f - sqrtf(dx*dx + dy*dy);
+typedef struct { float cx, cy, radius; int left, top, right, bottom; } MacTitleCircle;
+static MacTitleCircle g_mac_title_circles[3];
+static int g_mac_title_circle_count, g_mac_title_circle_right, g_mac_title_circle_bottom;
+
+static uint32_t plat_title_mix(uint32_t fg, uint32_t bg, float alpha) {
+    int a = (int)(alpha * 255 + .5f);
+    uint32_t out = 0;
+    for (int shift = 0; shift <= 16; shift += 8)
+        out |= (uint32_t)((((fg >> shift) & 255)*a + ((bg >> shift) & 255)*(255-a) + 127) / 255) << shift;
+    return out;
+}
+
+static uint32_t plat_title_background_color(uint32_t bg) {
+    int r = (bg >> 16) & 255, g = (bg >> 8) & 255, b = bg & 255;
+    /* A neutral 1/8 shift toward white on dark backgrounds, black on light
+       ones. Choosing the direction gives at least 16 levels on every gray,
+       including middle gray: exclusion or blending toward gray has a null
+       point there. Colored backgrounds keep their hue with less saturation. */
+    int light = 77*r + 150*g + 29*b < 128*256;
+    r += light ? (255-r+4)/8 : -(r+4)/8;
+    g += light ? (255-g+4)/8 : -(g+4)/8;
+    b += light ? (255-b+4)/8 : -(b+4)/8;
+    return (uint32_t)(r << 16 | g << 8 | b);
+}
+
+/* Called immediately after a background fill, before any foreground strokes.
+   Geometry is cached once per frame; most cells reject at the first check.
+   Resolve coverage against the background explicitly so a later cell/menu
+   fill replaces, rather than repeatedly blends, an existing circle edge. */
+static void plat_render_title_background(float x0, float y0, float x1, float y1, uint32_t bg, uint32_t base) {
+    int translation = g_chrome_x;
+    float alpha = g_draw_alpha;
+    x0 += translation; x1 += translation;
+    if (!g_mac_title_circle_count || x0 >= g_mac_title_circle_right || y0 >= g_mac_title_circle_bottom || x1 <= 0 || y1 <= 0) return;
+    bg = plat_title_mix(bg, base, alpha);
+    uint32_t color = plat_title_background_color(bg);
+    g_chrome_x = 0;
+    g_draw_alpha = 1;
+    for (int i = 0; i < g_mac_title_circle_count; i++) {
+        const MacTitleCircle *c = &g_mac_title_circles[i];
+        int left = (int)fmaxf(x0, c->left), right = (int)fminf(x1, c->right);
+        int top = (int)fmaxf(y0, c->top), bottom = (int)fminf(y1, c->bottom);
+        for (int y = top; y < bottom; y++) {
+            for (int x = left; x < right; x++) {
+                float dx = x + .5f - c->cx, dy = y + .5f - c->cy;
+                float coverage = c->radius + .5f - sqrtf(dx*dx + dy*dy);
                 if (coverage <= 0) continue;
                 if (coverage > 1) coverage = 1;
-                fill_rect(x, y, x+1, y+1, 0x808080, coverage * .42f);
+                fill_rect(x, y, x+1, y+1, plat_title_mix(color, bg, coverage), 1);
             }
         }
     }
+    g_chrome_x = translation;
+    g_draw_alpha = alpha;
+}
+
+static void plat_render_title_underlay(void) {
+    g_mac_title_circle_count = g_mac_title_circle_right = g_mac_title_circle_bottom = 0;
+    if (!g_win || !g_view || g_mac_title_hover || !mac_title_height()) return;
+    for (int i = 0; i < 3; i++) {
+        NSRect r = mac_title_button_rect(i);
+        float radius = (NSWidth(r) / 2) - [g_win backingScaleFactor];
+        if (radius <= 0) continue;
+        MacTitleCircle *c = &g_mac_title_circles[g_mac_title_circle_count++];
+        c->cx = NSMidX(r); c->cy = NSMidY(r); c->radius = radius;
+        c->left = (int)floorf(c->cx-radius); c->right = (int)ceilf(c->cx+radius);
+        c->top = (int)floorf(c->cy-radius); c->bottom = (int)ceilf(c->cy+radius);
+        if (c->right > g_mac_title_circle_right) g_mac_title_circle_right = c->right;
+        if (c->bottom > g_mac_title_circle_bottom) g_mac_title_circle_bottom = c->bottom;
+    }
+    plat_render_title_background(0, 0, g_clip_w, g_clip_h, DEF_BG, DEF_BG);
 }
 
 static void plat_render_title_overlay(void) {
@@ -1073,6 +1159,7 @@ static void plat_render_title_overlay(void) {
     g_clip_w = w; /* The native title band covers even a partial rightmost cell. */
     fill_rect(0, 0, w, mac_title_height(), BAR_BG, .91f);
     g_clip_w = clip;
+    mac_browser_draw_nav();
 }
 
 /* ── clipboard, drops, links ───────────────────────────────────────── */
@@ -1279,12 +1366,35 @@ static void mac_title_track_events(void) {
     if (g_mac_title_monitor) return;
     g_mac_title_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:
         NSEventMaskMouseMoved | NSEventMaskMouseEntered | NSEventMaskMouseExited |
-        NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp
+        NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp | NSEventMaskKeyDown
         handler:^NSEvent *(NSEvent *e) {
             if ([e window] == g_win) {
                 int x, y;
                 view_px(e, &x, &y);
+                Tab *tb=active_tab();
+                if ([e type]==NSEventTypeKeyDown) {
+                    if (tb && tb->kind==TK_BROWSER && tb->browser_native) {
+                        NSString *key=[e charactersIgnoringModifiers];
+                        if (([e modifierFlags]&NSEventModifierFlagCommand) && key.length==1) {
+                            unichar ch=[key characterAtIndex:0];
+                            if (ch>='1' && ch<='9') { activate(ch=='9' ? g_ntabs-1 : ch-'1'); return nil; }
+                        }
+                        if ([e keyCode]==48 && ([e modifierFlags]&NSEventModifierFlagControl)) {
+                            activate((g_active+(([e modifierFlags]&NSEventModifierFlagShift) ? g_ntabs-1 : 1))%g_ntabs); return nil;
+                        }
+                    }
+                    return e;
+                }
+                if ([e type]==NSEventTypeLeftMouseDown && tb && tb->kind==TK_BROWSER && tb->browser_native)
+                    g_browser_native_drag=!over_chrome(x,y) && !mac_title_contains(x,y);
+                if ([e type]==NSEventTypeLeftMouseUp) g_browser_native_drag=0;
+                if([e type]==NSEventTypeLeftMouseDown && mac_browser_nav_editing() && !mac_title_contains(x,y))mac_browser_ui_mouse(x,y);
                 mac_title_hover_at(x, y);
+                if (tb && tb->kind==TK_BROWSER && tb->browser_native && !g_sel_drag) {
+                    int before=chrome_hovered();
+                    g_mouse_x=x; g_mouse_y=y;
+                    if (before!=chrome_hovered() || over_chrome(x,y)) plat_invalidate();
+                }
             } else if ([e type] == NSEventTypeMouseMoved || [e type] == NSEventTypeLeftMouseDown) {
                 mac_title_hover_at(-1, -1);
             }
@@ -1321,7 +1431,17 @@ static int plain_layout(void) {
 @implementation HCView
 
 - (BOOL)isFlipped { return YES; }
-- (BOOL)isOpaque { return YES; }
+- (BOOL)isOpaque { Tab *tb=active_tab(); return !(tb && tb->kind==TK_BROWSER && tb->browser_native); }
+- (NSView *)hitTest:(NSPoint)point {
+    Tab *tb=active_tab();
+    if (tb && tb->kind==TK_BROWSER && tb->browser_native) {
+        NSPoint p=[self convertPoint:point fromView:self.superview];
+        CGFloat scale=[g_win backingScaleFactor];
+        int x=(int)(p.x*scale), y=(int)(p.y*scale);
+        if (!over_chrome(x,y) && !mac_title_contains(x,y) && !mac_browser_ui_contains(x,y)) return nil;
+    }
+    return [super hitTest:point];
+}
 - (BOOL)acceptsFirstResponder { return YES; }
 - (BOOL)acceptsFirstMouse:(NSEvent *)e { (void)e; return YES; }
 - (BOOL)mouseDownCanMoveWindow { return NO; }
@@ -1501,6 +1621,8 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     NSEventModifierFlags f = [e modifierFlags];
     Tab *tb = active_tab();
     if (!tb) return;
+    if(mac_browser_ui_key(e))return;
+    if(mac_browser_editing() && !(f&NSEventModifierFlagCommand)){[self interpretKeyEvents:@[e]];return;}
     if (g_lat && !g_lat_key) {
         g_lat_key = [e timestamp] * 1000.0;
         g_lat_down = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
@@ -1522,6 +1644,23 @@ static int key_mods(NSEventModifierFlags f, int meta) {
             return;
         }
         [self specialKey:e];     /* Cmd+←/→/Backspace; other Cmd keys belong to the menus or nobody */
+        return;
+    }
+    if (tb->kind==TK_BROWSER) {
+        switch ([e keyCode]) {
+        case 126: mac_browser_scroll(-1); break;
+        case 125: mac_browser_scroll(1); break;
+        case 116: mac_browser_scroll(1-tb->t.rows); break;
+        case 121: case 49: mac_browser_scroll(tb->t.rows-1); break;
+        case 115: mac_browser_scroll(-20000); break;
+        case 119: mac_browser_scroll(20000); break;
+        case 48:
+            if ([e modifierFlags]&NSEventModifierFlagControl) [self specialKey:e];
+            else mac_browser_focus(([e modifierFlags]&NSEventModifierFlagShift) ? -1 : 1);
+            break;
+        case 36: case 76: mac_browser_enter(); break;
+        default: break;
+        }
         return;
     }
     if ([self specialKey:e] || [self controlKey:e]) return;
@@ -1563,6 +1702,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     char url[2048];
     if (!NSPointInRect(p, [self bounds]) || over_chrome((int)(p.x * s), (int)(p.y * s))) return;
     mouse_cell((int)(p.x * s), (int)(p.y * s), &col, &row);
+    if(mac_browser_hover_link()){[[NSCursor pointingHandCursor] set];return;}
     if (([e modifierFlags] & NSEventModifierFlagCommand) && link_at(col, row, url, sizeof(url))) [[NSCursor pointingHandCursor] set];
     else [[NSCursor IBeamCursor] set];
 }
@@ -1573,7 +1713,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     (void)r;
     [marked release];
     marked = nil;
-    if ([str length]) send_str([str UTF8String]);
+    if ([str length] && !mac_browser_insert(str)) send_str([str UTF8String]);
 }
 - (void)doCommandBySelector:(SEL)sel { (void)sel; }
 - (void)setMarkedText:(id)s selectedRange:(NSRange)a replacementRange:(NSRange)b {
@@ -1609,7 +1749,8 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     Tab *tb = active_tab();
     view_px(e, &mx, &my);
     mac_title_hover_at(mx, my);
-    if (g_mac_title_hover) {
+    if(mac_browser_ui_mouse(mx,my))return;
+    if (g_mac_title_hover && mac_title_contains(mx,my)) {
         if ([e clickCount] == 2) [g_win performZoom:nil];
         else {
             g_mac_title_drag = 1;
@@ -1639,6 +1780,10 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     }
     if (!tb) return;
     mouse_cell(mx, my, &col, &row);
+    if (tb->kind==TK_BROWSER && !(mods&M_SHIFT) && col>=0 && col<tb->t.cols && row>=0 && row<tb->t.rows) {
+        int action=tb->t.row[0][row][col].link;
+        if (action) { mac_browser_action(tb,action); return; }
+    }
     if ([e modifierFlags] & NSEventModifierFlagCommand) {   /* Cmd+click opens a link, even inside mouse-aware apps */
         char url[2048];
         if (link_at(col, row, url, sizeof(url))) { open_url(url); return; }
@@ -1692,6 +1837,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     NSMenu *m;
     view_px(e, &mx, &my);
     if (over_chrome(mx, my)) return;
+    if(active_tab() && active_tab()->kind==TK_BROWSER){mac_browser_context(mx,my);return;}
     if (mouse_report(2, 1, 0, mx, my, ev_mods(e))) return;
     m = [[[NSMenu alloc] init] autorelease];
     [m setAutoenablesItems:NO];
@@ -1736,9 +1882,13 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     on_bar = over_chrome(mx, my);
     g_mouse_x = mx;
     g_mouse_y = my;
-    if (was_bar || on_bar) plat_invalidate();
-    if (was_bar || on_bar) settings_point();
-    if (g_mac_title_hover) { [[NSCursor openHandCursor] set]; return; }
+    if(mac_browser_ui_move(mx,my))return;
+    if (was_bar || on_bar) plat_invalidate();    if (was_bar || on_bar) settings_point();
+    if(tb && tb->kind==TK_BROWSER) {
+        plat_invalidate();
+        if(mac_browser_hover_link()){[[NSCursor pointingHandCursor] set];return;}
+    }
+    if (g_mac_title_hover) { [[NSCursor arrowCursor] set]; return; }
     if (on_bar) {                /* a hand on what clicks, an open hand where the window drags, as on a web page */
         int idx = -1, hit = hit_tabbar(mx, my, &idx);
         [(tabbar_action(mx, my) ? [NSCursor pointingHandCursor] : hit == HIT_BAR ? [NSCursor openHandCursor] : [NSCursor arrowCursor]) set];
@@ -1769,6 +1919,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     scroll_acc += [e hasPreciseScrollingDeltas] ? (float)(dy * [g_win backingScaleFactor] / CH) : (float)(dy * 3);
     lines = (int)scroll_acc;
     if (!lines) return;
+    if(mac_browser_ui_scroll(mx,my,-lines)){scroll_acc-=lines;return;}
     scroll_acc -= lines;
     if (tb->t.m_mouse && !(ev_mods(e) & M_SHIFT)) {
         for (i = 0; i < abs(lines); i++) mouse_report(lines > 0 ? 64 : 65, 1, 0, mx, my, ev_mods(e));
@@ -1796,8 +1947,8 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 
 /* ── menu actions ── */
 
-- (void)copy:(id)sender { (void)sender; sel_copy(); g_sel_on = 0; plat_invalidate(); }
-- (void)paste:(id)sender { (void)sender; paste(); }
+- (void)copy:(id)sender { if(mac_browser_copy_edit())return; if (active_tab() && active_tab()->kind==TK_BROWSER && active_tab()->browser_native) { mac_browser_edit(@selector(copy:),sender); return; } (void)sender; sel_copy(); g_sel_on = 0; plat_invalidate(); }
+- (void)paste:(id)sender { NSString *text=[[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString];if(text && mac_browser_insert(text))return; if (active_tab() && active_tab()->kind==TK_BROWSER && active_tab()->browser_native) { mac_browser_edit(@selector(paste:),sender); return; } (void)sender; paste(); }
 - (void)newTab:(id)sender {
     (void)sender;
     if (g_tracing) {
@@ -1810,6 +1961,12 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     new_tab_mac();
     trace("new tab made");
 }
+- (void)newBrowser:(id)sender { (void)sender; mac_browser_open_welcome(); }
+- (void)browserAddress:(id)sender { (void)sender; mac_browser_address(); }
+- (void)browserMode:(id)sender { (void)sender; mac_browser_command(0); }
+- (void)browserBack:(id)sender { (void)sender; mac_browser_command(1); }
+- (void)browserForward:(id)sender { (void)sender; mac_browser_command(2); }
+- (void)browserReload:(id)sender { (void)sender; mac_browser_command(3); }
 - (void)closeTab:(id)sender { (void)sender; user_close_tab(g_active); }
 - (void)nextTab:(id)sender { (void)sender; if (g_ntabs) activate((g_active + 1) % g_ntabs); }
 - (void)prevTab:(id)sender { (void)sender; if (g_ntabs) activate((g_active + g_ntabs - 1) % g_ntabs); }
@@ -1818,11 +1975,16 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (void)nextMark:(id)sender { (void)sender; jump_mark(1); }
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
-    if ([item action] == @selector(copy:)) return g_sel_on;
+    if ([item action] == @selector(copy:)) return g_sel_on || mac_browser_editing() || (active_tab() && active_tab()->kind==TK_BROWSER && active_tab()->browser_native);
+    if ([item action] == @selector(browserMode:) || [item action] == @selector(browserBack:) ||
+        [item action] == @selector(browserForward:) || [item action] == @selector(browserReload:))
+        return active_tab() && active_tab()->kind==TK_BROWSER;
     return YES;
 }
 
 @end
+
+#include "hardcore_browser_mac.m"
 
 /* ── window and app ────────────────────────────────────────────────── */
 
@@ -1916,6 +2078,7 @@ static void build_menus(void) {
     NSMenu *bar = [[NSMenu alloc] init], *app = [[NSMenu alloc] initWithTitle:@"hardcore"];
     NSMenu *shell = [[NSMenu alloc] initWithTitle:@"Shell"], *edit = [[NSMenu alloc] initWithTitle:@"Edit"];
     NSMenu *win = [[NSMenu alloc] initWithTitle:@"Window"];
+    NSMenu *browser = [[NSMenu alloc] initWithTitle:@"Browser"];
     NSEventModifierFlags C = NSEventModifierFlagCommand, CS = C | NSEventModifierFlagShift;
     NSString *up = [NSString stringWithFormat:@"%C", (unichar)NSUpArrowFunctionKey];
     NSString *down = [NSString stringWithFormat:@"%C", (unichar)NSDownArrowFunctionKey];
@@ -1944,6 +2107,14 @@ static void build_menus(void) {
     menu_item(win, @"Minimize", @selector(performMiniaturize:), @"m", C);
     menu_item(win, @"Zoom", @selector(performZoom:), @"", 0);
     menu_item(win, @"Enter Full Screen", @selector(toggleFullScreen:), @"f", C | NSEventModifierFlagControl);
+    [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:browser];
+    menu_item(browser,@"New Browser Tab",@selector(newBrowser:),@"b",CS);
+    menu_item(browser,@"Open Address…",@selector(browserAddress:),@"l",C);
+    menu_item(browser,@"Switch Hardcore / Native",@selector(browserMode:),@"m",CS);
+    [browser addItem:[NSMenuItem separatorItem]];
+    menu_item(browser,@"Back",@selector(browserBack:),@"[",C);
+    menu_item(browser,@"Forward",@selector(browserForward:),@"]",C);
+    menu_item(browser,@"Reload Page",@selector(browserReload:),@"r",C);
     [NSApp setMainMenu:bar];
     [NSApp setWindowsMenu:win];
 }
@@ -2264,8 +2435,10 @@ static int unit_tests(const char *out_path) {
     }
     fails += unit_scrollback(f);
     fails += unit_underlay(f);
+    fails += unit_chrome_display(f);
     fails += unit_chrome(f);
     fails += unit_tab_labels(f);
+    fails += browser_unit(f);
     fails += mac_update_unit(f);
     {
         int e, ok = reflow_check(5000, &e) && !e, rt = reflow_roundtrip();
@@ -2293,6 +2466,7 @@ static int replay(const char *out_path, int cols, int rows, char **files, int nf
 }
 
 #include "hardcore_mac_update.h"
+#include "hardcore_browser_cli.h"
 
 /* ── startup ───────────────────────────────────────────────────────── */
 
@@ -2349,6 +2523,8 @@ int main(int argc, char **argv) {
         puts("hardcore [DIR]                         open a terminal\n"
              "hardcore update                        install latest macOS release and reload live tabs\n"
              "hardcore update --from PATH             install a local app bundle (or bare binary)\n"
+             "hardcore browser open [URL]            new live browser tab (Hardcore grid by default)\n"
+             "hardcore browser --help                 browser commands and tab targeting\n"
              "hardcore slurp                         unsupported on macOS (Windows/WSL only)\n"
              "hardcore --reload                      reload windows using the installed executable\n"
              "hardcore --version                     print version and build");
@@ -2360,6 +2536,7 @@ int main(int argc, char **argv) {
                         "To open a directory named slurp, use hardcore ./slurp.\n");
         return 1;
     }
+    if (argc > 1 && !strcmp(argv[1], "browser")) return mac_browser_cli(argc-2,argv+2);
     if (argc > 1 && !strcmp(argv[1], "update")) return mac_update_cmd(argc - 2, argv + 2);
     if (argc == 2 && !strcmp(argv[1], "--reload")) return mac_reload_windows();
     if (argc == 4 && !strcmp(argv[1], "--mac-adopt")) {
@@ -2496,6 +2673,7 @@ int main(int argc, char **argv) {
     render_thread_start();
     layer_fit();
     resize_all();
+    mac_browser_sync();
     first_prompt_now(40);
     trace("first prompt read");
     [g_win makeKeyAndOrderFront:nil];

@@ -16,8 +16,13 @@ static void chrome_frame(int row, uint32_t color) {
     chrome_rule(row, color);
 }
 static void chrome_row_fill(int row, int selected, int hovered) {
-    if (hovered || selected)
+    if (hovered || selected) {
         fill_rect(0, row_y(row), (float)chrome_draw_width(), row_y(row + 1), hovered ? TAB_HOVER : DEF_BG, 1);
+#ifndef _WIN32
+        plat_render_title_background(0, row_y(row), (float)chrome_draw_width(), row_y(row + 1),
+                                     hovered ? TAB_HOVER : DEF_BG, plat_title_mix(BAR_BG, DEF_BG, g_draw_alpha));
+#endif
+    }
 }
 static void chrome_label(const wchar_t *s, int left, int right, int row, uint32_t color) {
     if (right > left) draw_label(s, (float)(left * CW), row_y(row), (float)((right - left) * CW), color);
@@ -100,13 +105,18 @@ static void render_settings(int hover, int hidx) {
 
 static void render_tabbar(int win_w, int win_h) {
     int i, idx = -1, hover = HIT_NONE;
+    int overlay = g_tab_underlay || (active_tab() && active_tab()->kind == TK_BROWSER);
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
     UI_FONT;
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
     g_chrome_x = sidebar_x();
-    fill_rect(0, g_tab_underlay ? row_y(g_chrome.top) : 0, (float)chrome_draw_width(),
-              g_tab_underlay ? row_y(g_chrome.bottom) : (float)win_h, BAR_BG, 1);
+    fill_rect(0, overlay ? row_y(g_chrome.top) : 0, (float)chrome_draw_width(),
+              overlay ? row_y(g_chrome.bottom) : (float)win_h, BAR_BG, 1);
+#ifndef _WIN32
+    plat_render_title_background(0, overlay ? row_y(g_chrome.top) : 0, (float)chrome_draw_width(),
+                                 overlay ? row_y(g_chrome.bottom) : (float)win_h, BAR_BG, DEF_BG);
+#endif
     for (i = g_chrome.top; i < g_chrome.top + g_chrome.grip_rows; i++) {
         int hovered = hover == HIT_BAR && g_mouse_y >= i * CH && g_mouse_y < (i + 1) * CH;
         chrome_row_fill(i, 0, hovered);
@@ -127,7 +137,7 @@ static void render_tabbar(int win_w, int win_h) {
         chrome_row_fill(row, active, hovered);
         if (!i) chrome_pager_draw(row, g_tab_offset, g_chrome.tab_capacity, g_ntabs, 1,
                                   hover == HIT_TABPAGE, idx, &left, &right);
-        tab_label(tb, label, 256);
+        tab_label_fit(tb, label, 256, right-left-1);
         chrome_label(label, left + 1, right, row, hovered ? g_look.text : fg);
         r_color(tb->t.ps_state == PS_ERROR ? g_look.red : tb->attention || tb->t.ps_state == PS_BLOCKED || tb->busy ? AMBER : fg, 1);
         draw_glyph(tb->busy ? drip : tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR || tb->attention ? '!' : active ? 0x25CF : tb->activity ? 0x00B7 : ' ',

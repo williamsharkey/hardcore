@@ -5,13 +5,14 @@ static int chrome_background_safe(const Cell *c) {
     cell_colors(c, &fg, &bg);
     return bg == DEF_BG;
 }
-static void chrome_prepare_display(Term *t) {
+static void chrome_prepare_display_at(Term *t, int dock_x, int dock_y, int dock_height) {
     Cell *input;
     unsigned char *protected_rows;
     int x, y;
     chrome_reflow_free(&g_display);
     g_display_term = NULL;
-    if (!g_tab_underlay || !g_chrome_reflow || t->m_mouse || t->cols <= SB_COLS + 4) return;
+    if (!g_tab_underlay || !g_chrome_reflow || t->cols <= SB_COLS + 4 ||
+        (active_tab() && &active_tab()->t == t && active_tab()->kind == TK_BROWSER)) return;
     input = (Cell *)calloc((size_t)t->cols * t->rows, sizeof(Cell));
     protected_rows = (unsigned char *)calloc((size_t)t->rows, 1);
     if (!input || !protected_rows) { free(input); free(protected_rows); return; }
@@ -44,15 +45,32 @@ static void chrome_prepare_display(Term *t) {
     /* Never move an input/cursor row, even when the application hides it. */
     if (t->cy + t->view >= 0 && t->cy + t->view < t->rows)
         protected_rows[t->cy + t->view] = 1;
-    tab_layout();
     if (chrome_reflow_build_checked(&g_display, input, t->cols, t->rows, protected_rows,
-                            g_tab_underlay, sidebar_x()/CW, chrome_top_row(), SB_COLS,
-                            chrome_bottom_row()-chrome_top_row(), 3, chrome_background_safe)) {
+                            g_tab_underlay, dock_x, dock_y, SB_COLS,
+                            dock_height, 3, chrome_background_safe)) {
         g_display_term = t;
         g_display_view = t->view;
         g_display_hcount = t->hcount;
     }
     free(input); free(protected_rows);
+}
+
+static void chrome_prepare_display(Term *t) {
+    tab_layout();
+    chrome_prepare_display_at(t, sidebar_x()/CW, g_chrome.top, g_chrome.bottom-g_chrome.top);
+}
+
+static void display_line(const Term *t, int row, const Cell **cells, int *n) {
+    if (g_display_term == t && g_display.cells) {
+        *cells = g_display.cells + row*t->cols;
+        *n = t->cols;
+    } else {
+        int wrapped, line = t->hcount - t->view + row;
+        term_line(t, line, cells, n, &wrapped);
+        if (line >= t->hcount && line - t->hcount < t->rows && t->rlen[t->alt][line-t->hcount] < *n)
+            *n = t->rlen[t->alt][line-t->hcount];
+        if (*n > t->cols) *n = t->cols;
+    }
 }
 
 static int display_selected(const Term *t, int col, int row) {

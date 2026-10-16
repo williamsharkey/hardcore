@@ -26,7 +26,7 @@ endif
 MAC_CC    ?= clang
 MAC_FLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-deprecated-declarations \
              -mmacosx-version-min=11.0 -arch arm64 -arch x86_64
-MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -lutil
+MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -framework WebKit -framework ImageIO -lutil
 APP        = hardcore.app
 
 .PHONY: all clean selftest install test mac-test slurp-test
@@ -90,7 +90,7 @@ build/slurp-version.h: build/slurp-linux
 # which commit a build is (hardcore --version); the release number is HARDCORE_VERSION in hardcore.c
 BUILD := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
-hardcore.exe: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
+hardcore.exe: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c build/res.o $(LIBS)
 
@@ -129,7 +129,10 @@ build/hardcore.metallib: hardcore.metal
 	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
 	xcrun metallib build/hardcore.air -o $@
 
-build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
+build/browser.inc: tools/embed_browser.py browser/project.js browser/welcome.html $(wildcard browser/adapters/*.js)
+	python3 tools/embed_browser.py
+
+build/hardcore: build/browser.inc hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
@@ -146,7 +149,8 @@ $(APP): build/hardcore build/hardcore.icns tools/Info.plist
 	sed 's/@VERSION@/$(shell sed -n 's/^#define HARDCORE_VERSION "\(.*\)"/\1/p' hardcore.c)/' tools/Info.plist > $@/Contents/Info.plist
 	codesign --force --sign - $@ 2>/dev/null || true
 
-mac-test: build/hardcore reflow-test
+mac-test: build/hardcore reflow-test browser-test
+	python3 tests/test_browser_cli.py
 	build/hardcore --unit build/unit.txt; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
 	python3 tests/run_xtermjs.py
 	build/hardcore --selftest build/selftest.txt; rc=$$?; cat build/selftest.txt; exit $$rc
@@ -166,7 +170,7 @@ mac-update-test: $(APP)
 	python3 tests/test_update_mac.py
 
 # Opt-in desktop integration: disposable real application sessions in Windows Terminal.
-build/slurp-driver.exe: tests/slurp_driver.c hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
+build/slurp-driver.exe: tests/slurp_driver.c hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-o $@ tests/slurp_driver.c build/res.o $(filter-out -mwindows,$(LIBS))
 
@@ -183,3 +187,12 @@ reflow-test:
 
 chrome-test: $(APP)
 	python3 tests/test_chrome_mac.py
+
+.PHONY: browser-test
+browser-test: build/browser.inc
+	cc -std=c99 -O2 -Wall -Wextra tests/test_browser_grid.c -o build/test-browser-grid
+	build/test-browser-grid
+	node --check browser/project.js
+	node tests/test_browser_dom.js
+	cc -std=c99 -O2 -Wall -Wextra -Wno-unused-function tests/browser_document_dump.c -o build/browser-document-dump
+	node tests/test_wikipedia.js --preview

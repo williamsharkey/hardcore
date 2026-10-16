@@ -1,0 +1,182 @@
+Browser tabs investigation — 2026-10-15
+Status: macOS first pass built on 2026-10-15. Live WKWebView tabs, default
+Hardcore grid/native switching, link/basic-control activation, bounded DOM
+projection, embedded helpers, CLI open/list/mode/back/forward/reload/close,
+parent IDs, and URL/mode restoration are implemented. Headless tests cover
+the grid, projection, validation and restoration; GUI integration remains
+unverified in the current sandbox. Windows, extensions, MCP and full DOM
+agent control remain proposals below. See README for implemented commands.
+
+Recommended direction
+
+Use a small platform browser host plus Hardcore's own grid presentation. On
+macOS use system WKWebView; on Windows use the shared Evergreen WebView2
+Runtime. This reuses installed browser-engine code without shipping Chromium.
+It does not import Safari/Chrome/Edge's existing tab objects, profiles, or UI.
+Keep a browser-backend boundary so a real-Chrome companion can be explored for
+extensions that require Chrome-specific behavior.
+
+Confirmed platform facts
+
+Apple provides WKWebView and script messaging through WKUserContentController.
+WebKit added WKWebExtension/WKWebExtensionContext/WKWebExtensionController in
+macOS 15.4. The installed Xcode SDK confirms availability macos(15.4), and
+WKWebViewConfiguration.webExtensionController. Native messaging callbacks are
+in WKWebExtensionControllerDelegate. This is a WebKit extension host, not a
+guarantee that an arbitrary Chrome extension works unchanged. [1,2,3]
+
+Microsoft documents a shared, automatically updated WebView2 Runtime and a
+statically linked loader for single-EXE applications. Engine processes still
+exist and consume browser-scale memory. The runtime remains a system/runtime
+dependency even when Hardcore ships as one EXE. Verify the loader and COM SDK
+with Hardcore's current MinGW toolchain before choosing a linking approach. [4]
+
+WebView2 exposes AddBrowserExtension for unpacked extension folders, with
+extensions enabled in environment options. Its API reference explicitly notes
+missing browser UI entry points for extension icons, badges and popups. A
+general browser-features page still lists extensions as unavailable, so that
+table alone is insufficient; test the specific runtime/API/extension. [5,6]
+
+Anthropic's current Claude Code documentation describes Chrome and Edge plus
+other detected Chromium browsers, native-messaging host registration, and
+session-related tab groups. It excludes WSL. This does not document support
+for WKWebView or WebView2. Extension sign-in, native messaging, debugger APIs,
+tab groups and side panels need an explicit compatibility test. [7]
+
+CEF provides embedding and offscreen rendering, but requires its own engine
+library, resources, and on macOS helper app bundles. It does not meet the
+lightweight, single-shipped-executable objective. Using an installed Chrome
+framework as an undocumented shared CEF replacement is not a supported plan. [8]
+
+Chrome 136+ requires a non-default data directory for remote-debugging switches.
+A CDP companion therefore cannot be assumed to attach to the user's ordinary
+Chrome profile. A user-installed extension is a separate integration route. [9]
+
+Authentication is another compatibility gate. Embedded profiles do not inherit
+the user's Safari/Chrome/Edge logins or profile sync. Microsoft's browser-features
+documentation states that Google blocks its authentication in embedded webviews.
+An external OAuth login may help an application-owned login flow but does not
+generally copy a website's cookies into the embedded profile. Test actual target
+sites; some will need the real-browser companion rather than a webview. [6]
+
+Presentation and tab ownership (proposed)
+
+Extend the tab model with a terminal/browser kind, stable tab ID, parent tab ID,
+profile ID, URL, title, engine handle and presentation mode. Browser children
+appear directly below their owning terminal, with existing pagination. Closing
+or reordering a terminal should have explicit, predictable child-tab behavior.
+Keep browser tab lifetime independent of a CLI process exiting accidentally.
+
+Both browser presentations use the complete drawable bounds. Native rendering
+shows the live engine view, with the Hardcore menu above it at 0.5 opacity and
+1.0 while hovered. The web page itself remains opaque. macOS needs a separate
+transparent chrome overlay above WKWebView; putting the page above the current
+Metal view would hide its menu. Windows should use visual/composition hosting
+instead of assuming parent D3D drawing can cover an HWND child webview. [10]
+Overlay hit-testing consumes menu targets and otherwise passes events through.
+
+Hardcore mode is the default. Retain the real live engine document and project
+its semantic content into a separate grid view. Use the actual bitmap font,
+theme and drawable origin, not CSS monospace alone. CSS cannot guarantee that
+arbitrary flex layouts, canvas content and native controls fit the bitmap grid.
+Switching presentation should retain the same document, history and JS state.
+
+The generic projection reads visible DOM/computed styles and semantic roles:
+headings, paragraphs, lists, links, forms, code, tables and navigation. Maintain
+stable node identities and text offsets alongside cells. Feed typed blocks to
+the shared layout/reflow machinery; browser content need not rediscover its
+structure from terminal glyphs. Route clicks, selection, input, IME and focus
+back to their live DOM targets. Validate native input semantics: synthetic JS
+events alone will not preserve every site's trusted-event behavior.
+
+Keep updates incremental with mutation/resize observations and bounded work per
+frame. Layout width varies around the underlay; structured blocks keep gutters,
+just as the new terminal record reflow does. Preserve a mapping from displayed
+cells to DOM text/control identities. Window backing scale, browser zoom and
+CSS pixels must be translated explicitly; grid cells stay in drawable pixels.
+
+Canvas/WebGL, video, closed shadow roots, cross-origin frames and complex editors
+need tested adapters, native-rendered islands, or a clearly available native
+presentation. A universal full-fidelity text conversion cannot be promised.
+Also test timer/visibility throttling while the engine view is not foreground.
+
+Website helper repository (proposed)
+
+Keep editable, versioned sources under browser/adapters/<site>/ in the repo.
+Compile built-in JS/CSS/metadata into C byte arrays/resources, like the fonts;
+no Node or Python process is required at runtime. Domain/route matching, semantic
+selectors, table/code hints and control mappings refine the generic projection.
+Adapters should preserve the live document rather than replace a site with
+static scraped text. Use deterministic HTML fixtures for layout and interaction
+regressions, with a generic fallback when a site's structure changes.
+
+LLMs can propose changes against those fixtures. Ship reviewed adapter versions
+in normal application updates rather than silently downloading executable code.
+
+CLI and agent control (proposed, not existing commands)
+
+  hardcore browser open URL --parent current --mode hardcore --json
+  hardcore browser list --json
+  hardcore browser mode TAB_ID native
+  hardcore browser close TAB_ID
+  hardcore mcp
+
+Use the same executable for CLI/MCP and platform hosting. A local authenticated
+IPC service resolves the terminal's stable ID and parent ownership; inherited
+session metadata makes child placement automatic. Agents use stable tab/node
+IDs for navigation, observations and actions. An existing Claude Chrome tab
+group can only be associated through an actual tested bridge; matching URLs or
+window titles is not sufficient to establish session ownership.
+
+Extension hosting is an additional capability, not the foundation of generic
+agent control. A WebKit native-messaging adapter would have to translate its
+host callbacks; Chromium APIs and Chrome-specific extension UI may still differ.
+For exact Claude-extension behavior, keep a real-Chrome/Edge companion option
+separate from the system-webview backend until proven compatible. A companion's
+pixel streaming is not equivalent to embedding the original browser view.
+
+Packaging and state constraints
+
+One shipped Windows EXE and the existing macOS app bundle are realistic with
+system webviews and embedded adapters. Cookies, caches, browser profiles and
+extension storage still need writable application data. WebView2's extension
+API specifically expects external unpacked files; the inspected WebKit API
+loads a bundle, directory or ZIP. Runtime extraction/installation is therefore
+different from shipping extra dependency files and must be acknowledged.
+
+Keep WebKit/runtime initialization lazy so terminal-only startup stays fast.
+Share profiles/process infrastructure where supported, while allowing explicit
+isolated profiles for agents. OS browser updates provide engine security fixes;
+shipping a Chromium fork would make Hardcore responsible for those updates.
+
+The current exec-based live updater preserves PTYs, not WKWebView objects or
+WebView2 controllers. Persisting URL/history/profile can restore pages but does
+not preserve arbitrary live JS/form state. A persistent backend would need a
+separate, verified lifecycle/compositor design. Browser tabs must not weaken the
+already-working terminal reload or claim identical browser continuity for free.
+
+Proofs needed before implementation commitments
+
+1. Host one WKWebView in full-window bounds and switch live between native and
+   grid presentation; verify forms, navigation, selection, IME and theme changes.
+2. Overlay the menu with correct opacity, hit-testing and window/title behavior.
+3. Exercise dynamic/virtualized pages, frames, canvas and editor fallback.
+4. Build the WebView2 equivalent with the existing Windows compiler and static
+   loader; verify composition hosting and runtime-missing behavior.
+5. Load a minimal extension, then test the actual Claude extension end to end.
+   Probe capabilities rather than equating successful installation with support.
+6. Create child browser tabs from two CLI sessions and verify ownership, limits,
+   profiles, agent disconnects, tab closing and window reload behavior.
+
+Sources checked
+
+[1] https://developer.apple.com/documentation/webkit/wkusercontentcontroller
+[2] https://developer.apple.com/documentation/macos-release-notes/macos-15_4-release-notes
+[3] https://developer.apple.com/documentation/webkit/wkwebextension
+[4] https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution
+[5] https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2profile7?view=webview2-1.0.4022.49
+[6] https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/browser-features
+[7] https://code.claude.com/docs/en/chrome
+[8] https://chromiumembedded.github.io/cef/general_usage.html
+[9] https://developer.chrome.com/blog/remote-debugging-port
+[10] https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2compositioncontroller?view=webview2-1.0.2849.39

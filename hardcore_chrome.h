@@ -96,6 +96,9 @@ static void tab_layout(void) {
     int i, win_w, win_h, items = chrome_item_total();
     UI_FONT;
     plat_client_size(&win_w, &win_h);
+#ifndef _WIN32
+    if(active_tab() && active_tab()->kind==TK_BROWSER)win_h=mac_browser_page_rows(active_tab())*CH;
+#endif
     g_chrome = chrome_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
                               g_tab_underlay, g_dock_row, items);
     if (g_tab_underlay) g_dock_row = g_chrome.top;
@@ -156,7 +159,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
     if (mx < 0 || mx >= sidebar_w() || my < 0) { UI_DONE; return HIT_NONE; }
     tab_layout();
     col = mx / CW; row = my / CH;
-    if (g_tab_underlay && (row < g_chrome.top || row >= g_chrome.bottom)) { UI_DONE; return HIT_NONE; }
+    if ((g_tab_underlay || (active_tab() && active_tab()->kind == TK_BROWSER)) && (row < g_chrome.top || row >= g_chrome.bottom)) { UI_DONE; return HIT_NONE; }
     for (i = 0; i < g_chrome.tab_count; i++) {
         if (row != g_chrome.tab_row + i) continue;
         if (col == SB_COLS - 2) { *idx = g_tab_offset + i; UI_DONE; return HIT_CLOSE; }

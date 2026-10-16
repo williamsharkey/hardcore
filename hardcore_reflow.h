@@ -30,10 +30,11 @@ typedef struct ChromeReflow {
     int cols, rows, changed;
 } ChromeReflow;
 
-enum { CR_BLANK, CR_PROSE, CR_PROTECTED };
+enum { CR_BLANK, CR_PROSE, CR_PROTECTED, CR_RECORD };
+enum { CR_RECORD_NONE, CR_RECORD_CODE, CR_RECORD_PATH, CR_RECORD_TREE, CR_RECORD_COMMAND, CR_RECORD_FOOTER };
 enum { CR_REASON_OTHER, CR_REASON_LIST, CR_REASON_UNSAFE };
 typedef struct {
-    int type, reason, indent, body, end, words, bullet, command;
+    int type, reason, indent, body, end, words, bullet, command, record;
 } ChromeReflowRow;
 typedef struct { int source, length; } ChromeReflowWord;
 typedef struct { int first, count, offset, indent; } ChromeReflowPlacement;
@@ -84,12 +85,69 @@ static int cr_fence(const Cell *line, int begin, int end) {
     return cr_starts(line, begin, end, "```") || cr_starts(line, begin, end, "~~~");
 }
 
+/* Explicit line identities permit literal wrapping without treating code as
+ * prose. A numbered diff keeps its number/sign on its own first row; a tool
+ * tree keeps its prefix there. Tables and complete box frames stay protected. */
+static int cr_record_shape(const Cell *line, ChromeReflowRow *r) {
+    int x = r->indent, digits = x, gap, dot = 0;
+    while (digits < r->end && line[digits].ch >= '0' && line[digits].ch <= '9') digits++;
+    gap = digits;
+    while (gap < r->end && cr_space(line[gap].ch)) gap++;
+    if (digits > x && gap > digits && gap + 1 < r->end &&
+        (line[gap].ch == '+' || line[gap].ch == '-') && cr_space(line[gap+1].ch)) {
+        r->body = gap+2;
+        while (r->body < r->end && cr_space(line[r->body].ch)) r->body++;
+        return CR_RECORD_CODE;
+    }
+    if (digits > x && gap-digits >= 2 && gap < r->end) {
+        for (int k = gap; k < r->end; k++) if (line[k].ch < 128 && strchr("();{}=", (int)line[k].ch)) {
+            r->body = gap;
+            return CR_RECORD_CODE;
+        }
+    }
+    if (x+1 < r->end && line[x].ch == 0x2514 && cr_space(line[x+1].ch)) {
+        r->body = x+2;
+        while (r->body < r->end && cr_space(line[r->body].ch)) r->body++;
+        return CR_RECORD_TREE;
+    }
+    if (r->bullet && (cr_starts(line, r->body, r->end, "Ran ") ||
+        cr_starts(line, r->body, r->end, "You ran ") || cr_starts(line, r->body, r->end, "Failed (exit ")))
+        return CR_RECORD_COMMAND;
+    if (x < r->end && (line[x].ch == '/' || cr_starts(line, x, r->end, "~/") ||
+        cr_starts(line, x, r->end, "./") || cr_starts(line, x, r->end, "../") ||
+        cr_starts(line, x, r->end, "https://") || cr_starts(line, x, r->end, "http://"))) {
+        r->body = x+2;
+        return CR_RECORD_PATH;
+    }
+    /* rg's filename:line: result is one record, including any following code. */
+    for (int k = x; k < r->end && !cr_space(line[k].ch); k++) {
+        if (line[k].ch == '.' || line[k].ch == '/') dot = 1;
+        if (dot && line[k].ch == ':') {
+            int n = k+1;
+            while (n < r->end && line[n].ch >= '0' && line[n].ch <= '9') n++;
+            if (n > k+1 && n < r->end && line[n].ch == ':') {
+                r->body = r->indent+2; /* Avoid a very wide filename gutter. */
+                return CR_RECORD_PATH;
+            }
+        }
+    }
+    if (x+2 < r->end && line[x].ch == '+' && cr_space(line[x+1].ch)) {
+        int n = x+2;
+        if (cr_starts(line, n, r->end, "Show details")) return CR_RECORD_FOOTER;
+        int begin = n;
+        while (n < r->end && line[n].ch >= '0' && line[n].ch <= '9') n++;
+        if (n > begin && (cr_starts(line, n, r->end, " line (") || cr_starts(line, n, r->end, " lines (")))
+            return CR_RECORD_FOOTER;
+    }
+    return CR_RECORD_NONE;
+}
+
 /* Foreground colors and bold/dim/italic attributes travel with each cell.
  * Meaningful backgrounds, other effects, links and uncertain widths can
  * convey structure; protect them even in trailing spaces. Native callers may
  * recognize explicitly encoded background colors that equal the canvas. */
 static ChromeReflowRow cr_classify(const Cell *line, int cols, int protected_row, int fenced,
-                                   ChromeReflowBackgroundSafe background_safe) {
+                                   ChromeReflowBackgroundSafe background_safe, int tree_indent) {
     static const char *const code_words[] = {
         "const", "let", "var", "function", "class", "def", "import", "from",
         "return", "export", "if", "else", "for", "while", "switch", "case",
@@ -117,6 +175,24 @@ static ChromeReflowRow cr_classify(const Cell *line, int cols, int protected_row
     }
     if (protected_row) { r.reason = CR_REASON_UNSAFE; return r; }
     if (fenced || cr_fence(line, r.indent, r.end)) return r;
+    r.record = cr_record_shape(line, &r);
+    if (!r.record && tree_indent >= 0 && r.indent >= tree_indent && r.end > r.indent && !r.bullet) {
+        r.record = CR_RECORD_TREE;
+        r.body = r.indent+2;
+    }
+    if (r.record) {
+        for (x = 0; x < cols; x++) {
+            const Cell *c = line+x;
+            if ((c->attr & (16u | 64u)) || c->wflag || (r.record == CR_RECORD_TREE && c->ch == '|') ||
+                (!cr_space(c->ch) && !cr_prose_character(c->ch) && !(x == r.indent && c->ch == 0x2514))) {
+                r.reason = CR_REASON_UNSAFE;
+                return r;
+            }
+        }
+        r.type = CR_RECORD;
+        r.reason = CR_REASON_LIST;
+        return r;
+    }
     for (x = 0; x < cols; x++) {
         const Cell *c = line + x;
         if ((c->bg && (!background_safe || !background_safe(c))) ||
@@ -221,6 +297,8 @@ static int cr_source_after(const ChromeReflowWord *word, int cols) {
     return last % cols + 1 < cols ? last + 1 : last;
 }
 
+#include "hardcore_structured_reflow.h"
+
 static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
                                int cols, int rows, const unsigned char *protected_rows,
                                int side, int dock_x, int dock_y, int dock_width,
@@ -251,9 +329,14 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
     info = (ChromeReflowRow *)malloc((size_t)rows * sizeof(*info));
     placement = (ChromeReflowPlacement *)malloc((size_t)rows * sizeof(*placement));
     if (!info || !placement) goto fail;
+    int tree_indent = -1;
     for (row = 0; row < rows; row++) {
         const Cell *line = input + row * cols;
-        info[row] = cr_classify(line, cols, protected_rows && protected_rows[row], fenced, background_safe);
+        info[row] = cr_classify(line, cols, protected_rows && protected_rows[row], fenced, background_safe, tree_indent);
+        if (info[row].type == CR_RECORD && info[row].record == CR_RECORD_TREE) {
+            if (tree_indent < 0) tree_indent = info[row].body;
+        } else if (!(info[row].type == CR_RECORD && info[row].record != CR_RECORD_FOOTER &&
+                     tree_indent >= 0 && info[row].indent >= tree_indent)) tree_indent = -1;
         if (cr_fence(line, info[row].indent, info[row].end)) fenced = !fenced;
         if (info[row].type == CR_PROSE) total_words += (size_t)info[row].words;
     }
@@ -269,6 +352,11 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
     for (row = 0; row < rows;) {
         int start, end, indent, hanging, bullet, source_rows, blank_rows, word_count = 0;
         int y, x, word, used_rows, fit, affected;
+        if (info[row].type == CR_RECORD && info[row].record != CR_RECORD_FOOTER) {
+            row = cr_reflow_records(out, input, info, row, cols, rows, side,
+                                    dock_x, dock_y, dock_width, dock_height, max_blank);
+            continue;
+        }
         if (info[row].type != CR_PROSE || info[row].words < 2) { row++; continue; }
         start = row;
         indent = info[row].indent;
