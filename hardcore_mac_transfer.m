@@ -377,6 +377,8 @@ static NSDictionary *mac_claude_receipt(NSDictionary *req) {
              @"error": @"The matching attached tab has not rendered its verification marker."};
 }
 
+#include "hardcore_mac_bridge_refresh.m"
+
 static void mac_server(void) {
     NSString *dir = mac_runtime();
     if (!dir) { fprintf(stderr, "hardcore: live updates unavailable: unsafe runtime directory\n"); return; }
@@ -424,7 +426,9 @@ static void mac_server(void) {
                     return;
                 }
                 NSDictionary *req = peek == 1 ? mac_recv(peer) : nil;
-                if (req) dispatch_sync(dispatch_get_main_queue(), ^{
+                if ([req[@"op"] isEqual:@"refresh-terminal-bridge"]) {
+                    mac_send(peer, mac_bridge_refresh(req));
+                } else if (req) dispatch_sync(dispatch_get_main_queue(), ^{
                     @try {
                         NSString *op = req[@"op"];
                         if ([op isEqual:@"list"]) mac_send(peer, mac_info());
@@ -879,6 +883,26 @@ static int mac_cli(int argc, char **argv) {
         close(pair[0]);
         if (![reply[@"ok"] boolValue]) { puts("{\"ok\":false,\"error\":\"Receiving window did not become ready\"}"); return 1; }
         printf("{\"ok\":true,\"pid\":%d,\"inputGuarded\":%s}\n", [reply[@"pid"] intValue], argc == 4 ? "true" : "false"); return 0;
+    }
+    /* Maintenance for one explicitly identified legacy mirror helper. */
+    if (!strcmp(argv[1], "--refresh-terminal-bridge")) {
+        if (argc != 4) return 2;
+        char *end = NULL;
+        long window = strtol(argv[2], &end, 10);
+        if (!end || *end || window <= 1 || window > INT_MAX) return 2;
+        long helper = strtol(argv[3], &end, 10);
+        if (!end || *end || helper <= 1 || helper > INT_MAX) return 2;
+        NSString *endpoint = [mac_runtime() stringByAppendingPathComponent:[NSString stringWithFormat:@"%ld.sock", window]];
+        int fd = mac_connect(endpoint);
+        NSDictionary *reply = nil;
+        if (fd >= 0) {
+            if (mac_send(fd, @{@"op": @"refresh-terminal-bridge", @"helperPid": @(helper)})) reply = mac_recv(fd);
+            close(fd);
+        }
+        if (!reply) reply = @{@"ok": @NO, @"error": @"Hardcore window is unavailable."};
+        NSData *json = [NSJSONSerialization dataWithJSONObject:reply options:0 error:nil];
+        fwrite(json.bytes, 1, json.length, stdout); putchar('\n');
+        return [reply[@"ok"] boolValue] ? 0 : 1;
     }
     if (!strcmp(argv[1], "host")) return mac_host(argc, argv);
     if (!strcmp(argv[1], "--terminal-bridge")) return argc == 4 ? mac_terminal_bridge(argv[2], argv[3]) : 2;

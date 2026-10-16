@@ -146,7 +146,7 @@ build/hardcore.metallib: hardcore.metal
 	xcrun metal -O2 -mmacosx-version-min=11.0 -c $< -o build/hardcore.air
 	xcrun metallib build/hardcore.air -o $@
 
-build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_font_menu.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_dock.m hardcore_mac_update.h hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_tmux_metadata.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
+build/hardcore: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_font_menu.h hardcore_display.h hardcore_reflow.h hardcore_mac.m hardcore_mac_dock.m hardcore_mac_update.h hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB)
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
@@ -176,6 +176,8 @@ mac-test: build/hardcore reflow-test
 	python3 tests/test_mac_import_resize.py
 	python3 tests/test_mac_frame_order.py
 	python3 tests/test_mac_dock.py
+	python3 tests/test_mac_bridge_activation.py
+	python3 tests/test_mac_bridge_refresh.py
 	python3 tests/test_mac_terminal.py
 	python3 tests/test_mac_tmux_metadata.py
 	python3 tests/test_mac_slurp_report.py
@@ -212,6 +214,8 @@ mac-offline-test: mac-release reflow-test
 	python3 tests/test_default_theme.py
 	$(MAKE) claude-adapter-test
 	python3 tests/test_mac_dock.py
+	python3 tests/test_mac_bridge_activation.py
+	python3 tests/test_mac_bridge_refresh.py
 	python3 tests/test_mac_terminal.py
 	python3 tests/test_mac_tmux_metadata.py
 	python3 tests/test_mac_slurp_report.py
