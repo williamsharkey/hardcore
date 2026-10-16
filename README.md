@@ -463,6 +463,14 @@ Grok, and Antigravity CLI (AGY), use `!hardcore --version` to check command
 access, then `!hardcore update`. The `!` is the CLI's shell-mode shortcut;
 at a regular shell prompt, omit it.
 
+New tabs advertise `TERM=xterm-256color` and `COLORTERM=truecolor`. They clear
+inherited `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` so an
+automation tool's plain-output settings do not disable an interactive TUI's
+colors. Shell startup files can still set an intentional color preference.
+Live updates preserve existing processes and their environment: a program
+already started with color disabled needs to be restarted with those overrides
+unset (resume its saved session where supported).
+
 `make install` also creates `~/.local/bin/hardcore`, pointing at the installed
 app, so shells outside Hardcore can find it when that directory is on their
 `PATH`. Merely copying the app does not install that external launcher.

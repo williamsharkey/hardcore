@@ -738,6 +738,11 @@ static int tab_drain(Tab *tb) {
 static void child_env(void) {
     static const char *drop[] = {"TERM_SESSION_ID", "ITERM_SESSION_ID", "ITERM_PROFILE", "LC_TERMINAL", "LC_TERMINAL_VERSION",
                                  "WT_SESSION", "VTE_VERSION", "TMUX", "TMUX_PANE", "STY",
+                                 /* A launcher/agent's output policy is not this new terminal's
+                                    capability. In particular NO_COLOR=1 hides TUI colors even
+                                    with COLORTERM=truecolor. Shell startup files run afterward
+                                    and may still set an intentional per-shell color preference. */
+                                 "NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE",
                                  /* started from inside Claude Code: its session markers would make every
                                     claude in our tabs a "child session" (no transcripts, wrong session id) */
                                  "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT", "CLAUDE_CODE_ENTRYPOINT",

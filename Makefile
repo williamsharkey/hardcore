@@ -172,6 +172,7 @@ mac-test: build/hardcore reflow-test
 	build/hardcore --unit build/unit.txt; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
 	python3 tests/run_xtermjs.py
 	python3 tests/test_mac_install.py
+	python3 tests/test_mac_child_env.py
 	python3 tests/test_mac_import_resize.py
 	python3 tests/test_mac_frame_order.py
 	python3 tests/test_mac_dock.py
@@ -202,6 +203,7 @@ mac-offline-test: mac-release reflow-test
 	build/hardcore --unit build/unit.txt; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
 	python3 tests/run_xtermjs.py
 	python3 tests/test_mac_install.py
+	python3 tests/test_mac_child_env.py
 	python3 tests/test_mac_update.py
 	python3 tests/test_mac_update_dispatch.py
 	python3 tests/test_courier_fonts.py
