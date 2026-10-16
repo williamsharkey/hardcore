@@ -5,6 +5,74 @@ static NSString *record_root(void) {return @"/tmp/hardcore-fixture-recordings";}
 static NSString *record_resource(NSString *name) {return name;}
 static void record_status(NSString *message) {(void)message;}
 #include "../../hardcore_recording_library.m"
+
+/* Offscreen/inactive AppKit lifecycle probe: never activates or creates a
+ * browser/capture view. It checks ownership and ordering, not active OS clicks. */
+static void pump(double seconds) {
+    NSDate *until=[NSDate dateWithTimeIntervalSinceNow:seconds];
+    while(until.timeIntervalSinceNow>0) {
+        NSEvent *event=[NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate dateWithTimeIntervalSinceNow:.005] inMode:NSDefaultRunLoopMode dequeue:YES];
+        if(event)[NSApp sendEvent:event];
+        [NSApp updateWindows];
+    }
+}
+static NSWindow *frontVisibleWindow(void) {
+    for(NSWindow *window in NSApp.orderedWindows)if(window.visible)return window;
+    return nil;
+}
+static BOOL postMouse(NSWindow *window,NSEventType type) {
+    NSEvent *event=[NSEvent mouseEventWithType:type location:NSMakePoint(100,100) modifierFlags:0 timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil eventNumber:1 clickCount:1 pressure:type==NSEventTypeLeftMouseDown?1:0];
+    if(!event)return NO;
+    [NSApp postEvent:event atStart:NO];pump(.03);return YES;
+}
+static int library_window_check(void) {
+    @autoreleasepool {
+        [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];[NSApp finishLaunching];
+        NSWindow *main=[[NSWindow alloc] initWithContentRect:NSMakeRect(-10000,-10000,1000,800) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
+        main.title=@"Library test main window";main.alphaValue=0;main.releasedWhenClosed=NO;
+        /* Prepare the production singleton before opening so it never flashes
+           onscreen. An inner pool catches accidental autorelease ownership. */
+        @autoreleasepool {
+            g_record_library=[[HCRecordingLibrary alloc] init];
+            g_record_library.window.alphaValue=0;
+            [g_record_library.window setFrameOrigin:NSMakePoint(-10000,-10000)];
+        }
+        NSWindow *library=g_record_library.window;
+        if(!library || library.releasedWhenClosed || library.windowController!=g_record_library)return 1;
+        [main makeKeyAndOrderFront:nil];pump(.03);
+        __block NSUInteger down=0,up=0,closes=0;
+        __block BOOL openOnRelease=NO,armed=NO;
+        id observer=[NSNotificationCenter.defaultCenter addObserverForName:NSWindowWillCloseNotification object:library queue:nil usingBlock:^(NSNotification *note){(void)note;closes++;}];
+        id monitor=[NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown|NSEventMaskLeftMouseUp handler:^NSEvent *(NSEvent *event){
+            if(event.window!=main)return event;
+            if(event.type==NSEventTypeLeftMouseDown){down++;armed=YES;if(!openOnRelease)mac_record_library();}
+            else {up++;if(openOnRelease && armed)mac_record_library();armed=NO;}
+            return nil;
+        }];
+        for(int cycle=0;cycle<4;cycle++) {
+            openOnRelease=cycle%2;
+            NSUInteger closedBefore=closes;
+            @autoreleasepool {
+                if(!postMouse(main,NSEventTypeLeftMouseDown))return 2;
+                if(!openOnRelease && (!library.visible || frontVisibleWindow()!=library))return 3;
+                if(openOnRelease && library.visible)return 4;
+                if(!postMouse(main,NSEventTypeLeftMouseUp))return 5;
+            }
+            pump(.03);
+            if(!library.visible || frontVisibleWindow()!=library || closes!=closedBefore)return 6;
+            if(g_record_library.window!=library || library.windowController!=g_record_library)return 7;
+            [library close];pump(.03);
+            if(library.visible || closes!=closedBefore+1)return 8;
+        }
+        [NSEvent removeMonitor:monitor];[NSNotificationCenter.defaultCenter removeObserver:observer];
+        BOOL remainedInactive=!NSApp.active;
+        [main orderOut:nil];[main close];[main release];[g_record_library release];g_record_library=nil;
+        if(down!=4 || up!=4 || closes!=4 || !remainedInactive)return 9;
+        puts("recording library window: retained across autorelease pools, consumed press/release, front ordering, and four close/reopen cycles passed (inactive app; no devices)");
+    }
+    return 0;
+}
+
 int main(void) { @autoreleasepool {
     NSString *why=nil;
     NSDictionary *edits=record_library_edits(@{@"startMs":@100,@"endMs":@200,@"crop":@[@0,@0,@100,@100],@"captionItems":@[@{@"start":@0,@"end":@1000,@"text":@"Hello\n\nWorld"}]},&why);
@@ -36,5 +104,7 @@ int main(void) { @autoreleasepool {
         [job release];
     }
     [fm removeItemAtPath:root error:nil];
+    int windowResult=library_window_check();
+    if(windowResult){fprintf(stderr,"library window check failed: %d\n",windowResult);return 20+windowResult;}
     puts("recording library: edit validation, local bridge boundaries and atomic export jobs passed");return 0;
 } }

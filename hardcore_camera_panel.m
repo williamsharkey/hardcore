@@ -1,6 +1,7 @@
 /* Camera TV: grid-drawn controls around a native AVFoundation preview. The
  * capture object and recording callbacks are owned by hardcore_recording.m. */
 static int g_camera_visible, g_camera_placed, g_camera_manual, g_camera_drag, g_camera_down;
+static int g_camera_pending_action;
 static HcTvRect g_camera_rect, g_camera_requested, g_camera_drag_origin;
 static int g_camera_drag_x, g_camera_drag_y;
 static HcTvPlacement g_camera_placement;
@@ -76,11 +77,16 @@ static void mac_camera_library_refresh(void) {
         if([name hasSuffix:@".hcrec"] && ![name hasSuffix:@".partial.hcrec"])count++;
     g_camera_library_count=count;
 }
+static void mac_camera_cancel_press(void) {
+    /* Keep ownership of the release, but never open a window from a press
+     * interrupted by Escape, minimization or a change of key window. */
+    g_camera_pending_action=g_camera_drag=0;
+}
 static void mac_camera_tick_start(void) {
     if(g_camera_timer)return;
     g_camera_timer=[NSTimer scheduledTimerWithTimeInterval:.2 repeats:YES block:^(NSTimer *timer) {
         int active=mac_record_active();
-        if(g_camera_drag && !g_view.window.isKeyWindow)g_camera_drag=g_camera_down=0;
+        if(!g_view.window.isKeyWindow)mac_camera_cancel_press();
         if(g_camera_was_recording && !active)mac_camera_library_refresh();
         g_camera_was_recording=active;
         if(!g_camera_visible && !active) {
@@ -92,7 +98,7 @@ static void mac_camera_tick_start(void) {
 }
 static void mac_camera_toggle(void) {
     g_camera_visible=!g_camera_visible;
-    g_camera_drag=g_camera_down=0;
+    g_camera_drag=g_camera_down=g_camera_pending_action=0;
     if(g_camera_visible) {
         mac_camera_library_refresh();mac_camera_tick_start();
         if(!g_camera_capture) {
@@ -238,7 +244,7 @@ static void mac_camera_drag_move(int x,int y) {
 static int mac_camera_mouse(NSEvent *event,int x,int y) {
     NSEventType type=event.type;
     if(type==NSEventTypeKeyDown) {
-        if(g_camera_drag && event.keyCode==53){g_camera_drag=0;plat_invalidate();return 1;}
+        if((g_camera_drag || g_camera_pending_action) && event.keyCode==53){mac_camera_cancel_press();plat_invalidate();return 1;}
         return 0;
     }
     if(g_camera_drag && (type==NSEventTypeLeftMouseDragged || type==NSEventTypeLeftMouseUp)) {
@@ -247,7 +253,16 @@ static int mac_camera_mouse(NSEvent *event,int x,int y) {
         return 1;
     }
     if(g_camera_down && (type==NSEventTypeLeftMouseDragged || type==NSEventTypeLeftMouseUp)) {
-        if(type==NSEventTypeLeftMouseUp)g_camera_down=0;
+        if(type==NSEventTypeLeftMouseUp) {
+            int action=g_camera_pending_action;
+            g_camera_down=g_camera_pending_action=0;
+            /* Finish the source-window click before showing another window.
+             * Opening during mouse-down can let the original click bring
+             * the terminal back in front when the button is released. */
+            if(action==MAC_CAMERA_LIBRARY && mac_camera_hit(x,y)==action) {
+                mac_camera_library_refresh();mac_record_library();
+            }
+        }
         return 1;
     }
     int hit=mac_camera_hit(x,y);
@@ -258,7 +273,7 @@ static int mac_camera_mouse(NSEvent *event,int x,int y) {
     if(type!=NSEventTypeLeftMouseDown)
         return type==NSEventTypeScrollWheel || type==NSEventTypeRightMouseDown || type==NSEventTypeRightMouseUp ||
             type==NSEventTypeOtherMouseDown || type==NSEventTypeOtherMouseUp;
-    g_mouse_x=x;g_mouse_y=y;g_camera_down=1;
+    g_mouse_x=x;g_mouse_y=y;g_camera_down=1;g_camera_pending_action=0;
     HCCameraCaptureState state=g_camera_capture.state;
     BOOL busy=mac_record_active();
     if(hit==MAC_CAMERA_MOVE || hit==MAC_CAMERA_RESIZE) {
@@ -273,7 +288,7 @@ static int mac_camera_mouse(NSEvent *event,int x,int y) {
     else if(hit==MAC_CAMERA_CAPTIONS && !busy) {
         g_camera_capture.captionsEnabled=!g_camera_capture.captionsEnabled;
         [[NSUserDefaults standardUserDefaults] setBool:g_camera_capture.captionsEnabled forKey:@"HCCameraCaptions"];
-    } else if(hit==MAC_CAMERA_LIBRARY){mac_camera_library_refresh();mac_record_library();}
+    } else if(hit==MAC_CAMERA_LIBRARY)g_camera_pending_action=hit;
     plat_invalidate();return 1;
 }
 static int mac_camera_cursor(int x,int y) {

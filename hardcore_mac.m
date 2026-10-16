@@ -2554,7 +2554,7 @@ static void focus_changed(int focused) {
     Tab *tb = input_tab();
     int cutie_reports_out=g_cutie_focus_id && tb!=active_tab();
     g_focused = focused;
-    if(!focused){mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
+    if(!focused){mac_camera_cancel_press();mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
     if (g_focused && tb) tb->attention = 0;
     if (tb && tb->t.m_focus && (g_focused || !cutie_reports_out)) tab_write(tb, g_focused ? "\x1b[I" : "\x1b[O", 3);
     mac_dock_update(0);
@@ -2567,7 +2567,7 @@ static void focus_changed(int focused) {
 @implementation HCDelegate
 - (void)applicationWillFinishLaunching:(NSNotification *)n { (void)n; trace("applicationWillFinishLaunching"); }
 - (void)applicationDidFinishLaunching:(NSNotification *)n { (void)n; trace("applicationDidFinishLaunching"); }
-- (void)windowWillMiniaturize:(NSNotification *)n {(void)n;mac_record_hide_pointer();mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
+- (void)windowWillMiniaturize:(NSNotification *)n {(void)n;mac_camera_cancel_press();mac_record_hide_pointer();mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
 - (void)windowDidBecomeKey:(NSNotification *)n { (void)n; trace("window key"); focus_changed(1); }
 - (void)windowDidResignKey:(NSNotification *)n { (void)n;mac_record_hide_pointer(); if (g_chrome_drag) chrome_drag_end(); focus_changed(0); }
 - (void)windowDidEnterFullScreen:(NSNotification *)n {

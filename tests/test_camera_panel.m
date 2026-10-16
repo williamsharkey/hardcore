@@ -31,7 +31,7 @@ static NSView *g_view;
 static int g_chrome_x,g_chrome_surface_cols,g_chrome_capture,g_mouse_x=-1,g_mouse_y=-1,g_sel_drag,g_sb_drag;
 static float g_draw_alpha;
 static struct { uint32_t dim,text,red,detail,text_lo; } g_look;
-static int test_reflow_count;
+static int test_reflow_count,test_library_opens;
 static HcTvRect test_reflow_rect;
 static int chrome_min(int a,int b){return a<b?a:b;}
 static int chrome_max(int a,int b){return a>b?a:b;}
@@ -47,7 +47,7 @@ static void mac_record_start(void){}
 static void mac_record_pause(void){}
 static void mac_record_stop(void){}
 static void mac_record_discard(void){}
-static void mac_record_library(void){}
+static void mac_record_library(void){test_library_opens++;}
 static void chrome_label(const wchar_t *text,int a,int b,int y,uint32_t color){}
 static void fill_rect(float a,float b,float c,float d,uint32_t color,float alpha){}
 static void utf8_to_wide(const char *s,wchar_t *out,int capacity){if(capacity)out[0]=0;}
@@ -66,6 +66,59 @@ static void chrome_tv_reflow_apply(Term *t,HcTvRect rect,const HcTvRect *prior,i
 
 static int at(int col,int row) {
     return mac_camera_hit((g_camera_rect.x+col)*CW+CW/2,(g_camera_rect.y+row)*CH+CH/2);
+}
+static int pointer(NSEventType type,int col,int row) {
+    NSEvent *event=[NSEvent mouseEventWithType:type location:NSZeroPoint modifierFlags:0
+        timestamp:0 windowNumber:0 context:nil eventNumber:0 clickCount:1 pressure:0];
+    return mac_camera_mouse(event,(g_camera_rect.x+col)*CW+CW/2,(g_camera_rect.y+row)*CH+CH/2);
+}
+static void clips_clicks(void) {
+    int row=g_camera_rect.h-3;
+    assert(pointer(NSEventTypeLeftMouseDown,20,row));
+    assert(test_library_opens==0); /* a held press must not order a new window */
+    assert(pointer(NSEventTypeLeftMouseDragged,21,row));
+    assert(test_library_opens==0);
+    assert(pointer(NSEventTypeLeftMouseUp,21,row));
+    assert(test_library_opens==1 && !g_camera_down && !g_camera_pending_action);
+    pointer(NSEventTypeLeftMouseUp,21,row);
+    assert(test_library_opens==1); /* exactly one action per click */
+
+    pointer(NSEventTypeLeftMouseDown,20,row);
+    assert(pointer(NSEventTypeLeftMouseDragged,-1,row));
+    assert(pointer(NSEventTypeLeftMouseUp,-1,row));
+    assert(test_library_opens==1); /* releasing outside cancels */
+
+    pointer(NSEventTypeLeftMouseDown,20,row);
+    pointer(NSEventTypeLeftMouseDragged,-1,row);
+    pointer(NSEventTypeLeftMouseDragged,20,row);
+    pointer(NSEventTypeLeftMouseUp,20,row);
+    assert(test_library_opens==2); /* returning to the button still works */
+
+    pointer(NSEventTypeLeftMouseDown,20,row);
+    mac_camera_cancel_press(); /* key window loss/minimization */
+    assert(pointer(NSEventTypeLeftMouseUp,20,row));
+    assert(test_library_opens==2 && !g_camera_down);
+
+    pointer(NSEventTypeLeftMouseDown,20,row);
+    NSEvent *escape=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0
+        timestamp:0 windowNumber:0 context:nil characters:@"\033" charactersIgnoringModifiers:@"\033"
+        isARepeat:NO keyCode:53];
+    assert(mac_camera_mouse(escape,0,0));
+    assert(pointer(NSEventTypeLeftMouseUp,20,row));
+    assert(test_library_opens==2 && !g_camera_down);
+
+    pointer(NSEventTypeLeftMouseDown,2,2);
+    pointer(NSEventTypeLeftMouseUp,20,row);
+    assert(test_library_opens==2); /* dragging in from elsewhere isn't a click */
+
+    pointer(NSEventTypeLeftMouseDown,20,row);
+    g_camera_placed=0;
+    assert(pointer(NSEventTypeLeftMouseUp,20,row));
+    assert(test_library_opens==2); /* no stale target after viewport shrinks */
+    g_camera_placed=1;
+    pointer(NSEventTypeLeftMouseDown,20,row);
+    pointer(NSEventTypeLeftMouseUp,20,row);
+    assert(test_library_opens==3); /* cancellation never leaves a stuck press */
 }
 int main(void) {
     @autoreleasepool {
@@ -91,6 +144,7 @@ int main(void) {
         assert(at(20,initial.h-3)==MAC_CAMERA_LIBRARY);
         assert(at(initial.w-2,initial.h-1)==MAC_CAMERA_RESIZE);
         assert(at(initial.w,2)==MAC_CAMERA_NONE);
+        clips_clicks();
         NSDictionary *metadata=mac_camera_metadata();
         NSArray *rect=metadata[@"rect"];
         assert([metadata[@"visible"] boolValue] && [metadata[@"mirrored"] boolValue]);
@@ -111,7 +165,7 @@ int main(void) {
         assert(at(2,2)==MAC_CAMERA_NONE);
         test_tab.t.cols=120;g_camera_visible=0;mac_camera_layout(&test_tab.t);
         assert(!g_camera_placed && !mac_camera_hit(10,10));
-        puts("camera panel: collision-free placement, manual geometry, reflow, control hit targets and replay metadata passed (no devices opened)");
+        puts("camera panel: placement, reflow, metadata and Clips click/release/cancellation passed (no devices opened)");
     }
     return 0;
 }

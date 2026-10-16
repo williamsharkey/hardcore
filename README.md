@@ -1272,8 +1272,8 @@ comparison.
 - `tests/test_camera_capture.m` synthesizes video and audio without opening
   devices. It checks H.264/AAC encoding and decoding, pause removal, continuous
   media timestamps, save ownership, and safe discard. `tests/test_camera_panel.m`
-  checks placement, reflow, controls and replay geometry without a camera,
-  microphone, permission prompt or window.
+  checks placement, reflow, replay geometry and Clips click/release cancellation
+  without a camera, microphone, permission prompt or window.
 - `tests/test_camera_compositing.m` draws a synthetic preview through the real
   panel code and a Metal-backed view, checking Retina coordinates, different
   terminal/UI fonts, resizing and visibility without opening a camera.
