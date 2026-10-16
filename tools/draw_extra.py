@@ -4,6 +4,8 @@ same 8x16 / 16x16 one-bit style. Edit the pictures below, then:
     python3 tools/draw_extra.py > font/hardcore-extra.hex
 Later .hex files override earlier ones in tools/gen_font.py, so these win."""
 
+from gen_fonts import cog_glyph
+
 GLYPHS = {
     # UI: the tab bell (private use, never printed by programs we know of)
     0xF8F0: """
@@ -101,6 +103,7 @@ GLYPHS[0xE0B0] = triangle(True, True)    #
 GLYPHS[0xE0B1] = triangle(True, False)   # 
 GLYPHS[0xE0B2] = triangle(False, True)   # 
 GLYPHS[0xE0B3] = triangle(False, False)  # 
+GLYPHS[0x2699] = cog_glyph(8, 16)       # settings: full one-cell gear, not a squeezed wide glyph
 
 for cp in sorted(GLYPHS):
     print(to_hex(cp, GLYPHS[cp]))

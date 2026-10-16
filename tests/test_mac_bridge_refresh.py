@@ -30,7 +30,7 @@ HARNESS = r'''
 #define CH 26
 typedef unsigned DWORD;
 enum { TK_TERMINAL, TK_BROWSER };
-typedef struct { int cols, rows, marker; } Term;
+typedef struct { int cols, rows, marker, nmarks, had_activity; } Term;
 typedef struct {
     Term t; int id, kind, parent_id, fd, exited, born; pid_t pid;
     void *rsrc, *psrc, *wq; int *wpending;

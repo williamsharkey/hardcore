@@ -185,6 +185,10 @@ class SmallProductionFontTests(unittest.TestCase):
             _, _, native, omitted = self.native[name]
             self.assertFalse(omitted, name)
             for cp, expected in native.items():
+                if cp == 0x2699:
+                    # The config control deliberately uses a full-cell UI cog.
+                    # Its extent and open hub are checked in test_config_glyph.
+                    continue
                 self.assertEqual(unpack_record(blob, cp, spec[4]), (expected['width'], expected['rows']), (name, cp))
 
     def test_actual_renderer_matches_every_approved_demo_pixel(self):

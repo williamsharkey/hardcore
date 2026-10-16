@@ -4,7 +4,7 @@ enum {
     HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT,
     HIT_SCHEME, HIT_STAB, HIT_SCLOSE, HIT_UNDERLAY, HIT_TABPAGE, HIT_SETPAGE,
     HIT_REFLOW, HIT_REFLOW_DEBUG, HIT_DOCK_ROW, HIT_CHROME_INERT, HIT_GRIP,
-    HIT_WEB, HIT_FILES, HIT_CAF, HIT_TV, HIT_TV_CLOSE, HIT_CUTIE, HIT_TV_GRIP, HIT_TV_RESIZE
+    HIT_WEB, HIT_FILES, HIT_CAF, HIT_CAMERA, HIT_TV, HIT_TV_CLOSE, HIT_CUTIE, HIT_TV_GRIP, HIT_TV_RESIZE
 };
 static int plat_lights_bottom(void);
 static void plat_settings_shown(void);
@@ -47,8 +47,9 @@ typedef struct {
 } ChromeHeaderControl;
 static const ChromeHeaderControl CHROME_HEADER_CONTROLS[] = {
     {"move", L"↕ move", 0, 1, 7, HIT_GRIP},
-    {"settings", L"⚙", 0, 11, 3, HIT_SETTINGS},
-    {"caf", L"CAF", 0, 21, 4, HIT_CAF},
+    {"settings", L"⚙config", 0, 9, 8, HIT_SETTINGS},
+    {"camera", L"cam", 0, 18, 4, HIT_CAMERA},
+    {"caf", L"CAF", 0, 24, 3, HIT_CAF},
     {"term", L"+term", 1, 1, 7, HIT_PLUS},
     {"web", L"+www", 1, 10, 6, HIT_WEB},
     {"files", L"files", 1, 19, 7, HIT_FILES},
@@ -313,7 +314,7 @@ static int chrome_setting_hit(int hit) {
 static int tabbar_action(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
     return (chrome_setting_hit(hit) && hit != HIT_CHROME_INERT) || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_CUTIE ||
-        hit == HIT_WEB || hit == HIT_FILES || hit == HIT_CAF || hit == HIT_TAB;
+        hit == HIT_WEB || hit == HIT_FILES || hit == HIT_CAF || hit == HIT_CAMERA || hit == HIT_TAB;
 }
 static void resize_all(void);
 static void settings_point(void) {

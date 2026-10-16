@@ -354,6 +354,7 @@ static void chrome_render_header(int hover) {
             uint32_t color = highlighted ? g_look.text : c->hit == HIT_CAF ?
                 (mac_caf_active() ? AMBER : g_look.dim) : g_look.detail;
             const wchar_t *label = c->hit == HIT_CAF && !mac_caf_active() ? L"caf" : c->label;
+            if(c->hit==HIT_CAMERA && mac_record_active()){label=L"REC";color=g_look.red;}
             grid_text(label, c->col, y, color);
         }
         if (!row) chrome_frame(y, g_look.dim);

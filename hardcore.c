@@ -470,6 +470,7 @@ typedef struct {
     /* OSC 133 ; A marks: absolute line numbers of prompts / turn starts, oldest first */
     long long marks[512];
     int nmarks;
+    int had_activity;           /* sticky: first prompt becomes a used terminal after input/commands */
     int dirty;
     int side;                    /* something the tab column shows changed: folder, program status */
     char claude[40];             /* Claude Code session running here (rc.bash's wrapper says), "?" = unknown */
@@ -593,6 +594,7 @@ static void slurp_selection(Tab *tb);
 
 static void tab_write(Tab *tb, const void *s, int n) {
     DWORD w;
+    if (n > 0 && tb->t.nmarks && (memchr(s, '\r', (size_t)n) || memchr(s, '\n', (size_t)n))) tb->t.had_activity = 1;
     if (tb->slurp_hwnd) { slurp_write(tb, s, n); return; }
     if (tb->pin_w && n > 0) WriteFile(tb->pin_w, s, (DWORD)n, &w, NULL);
 }
@@ -1689,6 +1691,7 @@ static void add_mark(Term *t) {
         t->marks[t->nmarks - 1] = at;
         return;
     }
+    if (t->nmarks) t->had_activity = 1;
     if (t->nmarks == 512) { memmove(t->marks, t->marks + 1, sizeof(t->marks[0]) * 511); t->nmarks--; }
     t->marks[t->nmarks++] = at;
 }
@@ -1759,6 +1762,7 @@ static void osc_dispatch(Term *t) {
             if (!t->claude[0]) t->claude_args[0] = 0;
         } else if (!strncmp(rest, "cmd=", 4)) {
             snprintf(t->cmd, sizeof(t->cmd), "%s", rest + 4);
+            if (t->cmd[0]) t->had_activity = 1;
             t->side = 1;
         } else if (!strncmp(rest, "claude-args=", 12)) {
             snprintf(t->claude_args, sizeof(t->claude_args), "%s", rest + 12);
@@ -3961,6 +3965,7 @@ static void tab_label_fit(Tab *tb, wchar_t *out, int cap, int cols) {
     if (!dir[0]) dir = "~";
     snprintf(app, sizeof(app), "%s", tb->program);
 #endif
+    if (!app[0]) snprintf(app, sizeof(app), "%s", tb->t.had_activity || tb->t.nmarks > 1 || tb->t.hcount || tb->run[0] || tb->hist[0] ? "term" : "<new>");
     utf8_to_wide(b ? b : dir, out, cap);
     int n = (int)wcslen(out);
     if (app[0] && n + 2 < cap) {
@@ -3997,7 +4002,12 @@ static int unit_tab_labels(FILE *f) {
     wchar_t label[256]; tab_label(tb,label,256);
     fails += wcscmp(label,L"hardcore:codex") != 0;
     tb->program[0] = tb->t.cmd[0] = 0; tab_label(tb,label,256);
-    fails += wcscmp(label,L"hardcore") != 0;
+    fails += wcscmp(label,L"hardcore:<new>") != 0;
+    tb->t.had_activity = 1; tab_label(tb,label,256);
+    fails += wcscmp(label,L"hardcore:term") != 0;
+    tb->t.had_activity = 0; tb->t.nmarks = 2; tab_label(tb,label,256);
+    fails += wcscmp(label,L"hardcore:term") != 0;
+    tb->t.nmarks = 1;
 #ifndef _WIN32
     snprintf(tb->run, sizeof(tb->run), "terminal:/dev/ttys123");
     snprintf(tb->t.cwd, sizeof(tb->t.cwd), "/work/ruffian");
@@ -4044,6 +4054,7 @@ static int caption_btn_w(void) { return 46 * g_scale; }
 
 #ifndef _WIN32
 static int mac_caf_active(void);
+static int mac_record_active(void);
 static int mac_caf_toggle(void);
 static double mac_caf_elapsed(void);
 static const char *mac_caf_power(void);
@@ -4181,6 +4192,8 @@ static uint32_t plat_title_background_color(uint32_t bg);
 static void plat_render_title_background(float x0, float y0, float x1, float y1, uint32_t bg, uint32_t base);
 static void plat_render_title_underlay(void);
 static void plat_render_title_overlay(void);
+static void mac_camera_draw(void);
+static void mac_camera_layout(Term *t);
 #endif
 static int chrome_intrusion_span(int row, int *left, int *right);
 static int chrome_intrusion_span_at(int row,int dock,int top,int bottom,int *left,int *right);
@@ -4382,11 +4395,12 @@ static void render(void) {
     }
 #ifndef _WIN32
     if (tb && tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active()) {
-        chrome_tv_clock();tab_layout();chrome_tv_prepare(&tb->t);
+        chrome_tv_clock();tab_layout();chrome_tv_prepare(&tb->t);mac_camera_layout(&tb->t);
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
         mac_browser_draw_overlay();
         render_cuties(r.right);
+        mac_camera_draw();
         plat_render_title_overlay();
         return;
     }
@@ -4526,6 +4540,7 @@ static void render(void) {
     if (overlay && (chrome_hovered() || chrome_any_tv_hovered())) render_tabbar(r.right, r.bottom);
     mac_browser_draw_overlay();
     render_cuties(r.right);
+    mac_camera_draw();
     plat_render_title_overlay();
 #endif
 }

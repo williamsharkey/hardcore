@@ -52,7 +52,7 @@ static int g_ntabs=4, source_col=-2;
 typedef struct { int kind; } TestTab;
 static TestTab tab;
 static struct { int light, dark; } FAMILIES[10];
-static struct { uint32_t text, detail, dim; } g_look={3,4,5};
+static struct { uint32_t text, detail, dim, red; } g_look={3,4,5,6};
 static int chrome_min(int a,int b) { return a<b?a:b; }
 static int chrome_max(int a,int b) { return a>b?a:b; }
 static int sidebar_x(void) { return 72*CW; }
@@ -73,6 +73,7 @@ static int scheme_index(int key) { return key; }
 static float row_y(int r) { return (float)(r*CH); }
 static int caf_active;
 static int mac_caf_active(void) { return caf_active; }
+static int mac_record_active(void) { return 0; }
 static int fills, glyphs, frames, sides, row_fills;
 static struct { int col,row; wchar_t text[32]; uint32_t color; } labels[8];
 static float fx,fy,fr,fb;
@@ -120,8 +121,8 @@ static void targets(void) {
     assert(hit_tabbar(sidebar_x()+4*CW,8*CH,&idx)==HIT_BAR);
 #else
     unsigned char occupied[2][SB_COLS]={{0}};
-    const wchar_t *expected[]={L"↕ move",L"⚙",L"CAF",L"+term",L"+www",L"files"};
-    assert(CHROME_HEADER_CONTROL_COUNT==6);
+    const wchar_t *expected[]={L"↕ move",L"⚙config",L"cam",L"CAF",L"+term",L"+www",L"files"};
+    assert(CHROME_HEADER_CONTROL_COUNT==7);
     for(int i=0;i<CHROME_HEADER_CONTROL_COUNT;i++) {
         const ChromeHeaderControl *c=CHROME_HEADER_CONTROLS+i;
         assert(!wcscmp(c->label,expected[i]) && c->col>0 && c->width>=(int)wcslen(c->label));
@@ -138,7 +139,7 @@ static void targets(void) {
     /* A relocated label keeps its action; an occluded gap never becomes a window drag. */
     g_chrome_menu_count=6; source_col=11;
     assert(hit_tabbar(sidebar_x()+3*CW,g_chrome.top*CH,&idx)==HIT_SETTINGS);
-    source_col=9;
+    source_col=8;
     assert(hit_tabbar(sidebar_x()+3*CW,g_chrome.top*CH,&idx)==HIT_CHROME_INERT);
     source_col=-1;
     assert(hit_tabbar(sidebar_x()+3*CW,g_chrome.top*CH,&idx)==HIT_NONE);
@@ -158,7 +159,7 @@ static void paint(void) {
     reset_paint();chrome_render_header(HIT_GRIP);
     assert(fills==1 && fx==CW && fr==2*CW);
 #else
-    assert(glyphs==6 && frames==1 && sides==1 && row_fills==2 && !fills);
+    assert(glyphs==7 && frames==1 && sides==1 && row_fills==2 && !fills);
     for(int i=0;i<CHROME_HEADER_CONTROL_COUNT;i++) {
         const ChromeHeaderControl *c=CHROME_HEADER_CONTROLS+i;
         assert(labels[i].col==c->col && labels[i].row==g_chrome.top+c->row);
@@ -169,10 +170,10 @@ static void paint(void) {
         assert(labels[i].color==g_look.text);
     }
     caf_active=1;reset_paint();chrome_render_header(HIT_NONE);
-    assert(labels[2].color==AMBER && !wcscmp(labels[2].text,L"CAF"));
+    assert(labels[3].color==AMBER && !wcscmp(labels[3].text,L"CAF"));
     g_chrome=chrome_primary_measure(1,1,g_ntabs,0,1,8,0);
     reset_paint();chrome_render_header(HIT_NONE);
-    assert(glyphs==3 && row_fills==1 && frames==1 && !sides);
+    assert(glyphs==4 && row_fills==1 && frames==1 && !sides);
 #endif
 }
 int main(int argc,char **argv) {

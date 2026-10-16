@@ -26,10 +26,12 @@
 	<string>Hardcore reads your selected Terminal tabs to provide a live bridge while their programs keep running.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Create optional on-device captions for videos you record in Hardcore.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Programs you run in hardcore may use the camera for video calls and webcam previews.</string>
+	<string>Show your camera in a mini TV and record videos you choose to make in Hardcore.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Programs you run in hardcore may use the microphone for calls and audio recording.</string>
+	<string>Record your voice alongside camera videos you choose to make in Hardcore.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>MIT license. GNU Unifont: GPLv2+ with the font embedding exception, or OFL 1.1. Terminus: OFL 1.1. Tamzen, misc-fixed, Sony and ETL fonts: their own free licenses (see the README).</string>
 	<key>CFBundleDocumentTypes</key>

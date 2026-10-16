@@ -135,7 +135,7 @@ static NSDictionary *mac_tab_snapshot(Tab *tb) {
 #define NUM(field) d[@#field] = @(t->field)
     NUM(cols); NUM(rows); NUM(view); NUM(st); NUM(esc_which); NUM(np); NUM(priv); NUM(inter);
     NUM(utf8_need); NUM(utf8_acc); NUM(last_ch); NUM(m_sync); NUM(sync_since);
-    NUM(ps_state); NUM(ps_pct); NUM(ps_tasks); NUM(progress); NUM(spin_ch); NUM(spin_at); NUM(spin_n);
+    NUM(ps_state); NUM(ps_pct); NUM(ps_tasks); NUM(progress); NUM(spin_ch); NUM(spin_at); NUM(spin_n); NUM(had_activity);
 #undef NUM
 #define TEXT(field) d[@#field] = [NSData dataWithBytes:t->field length:sizeof(t->field)]
     TEXT(cwd); TEXT(claude); TEXT(claude_args); TEXT(cmd); TEXT(title); TEXT(ps_kind); TEXT(ps_msg);
@@ -172,7 +172,7 @@ static Tab *mac_tab_restore(NSDictionary *d, int fd) {
 #define NUM(field) t->field = [d[@#field] longLongValue]
     NUM(view); NUM(st); NUM(esc_which); NUM(np); NUM(priv); NUM(inter);
     NUM(utf8_need); NUM(utf8_acc); NUM(last_ch); NUM(m_sync); NUM(sync_since);
-    NUM(ps_state); NUM(ps_pct); NUM(ps_tasks); NUM(progress); NUM(spin_ch); NUM(spin_at); NUM(spin_n);
+    NUM(ps_state); NUM(ps_pct); NUM(ps_tasks); NUM(progress); NUM(spin_ch); NUM(spin_at); NUM(spin_n); NUM(had_activity);
 #undef NUM
 #define TEXT(field) do { NSData *v = d[@#field]; if ([v isKindOfClass:[NSData class]] && v.length == sizeof(t->field)) memcpy(t->field, v.bytes, v.length); } while (0)
     TEXT(cwd); TEXT(claude); TEXT(claude_args); TEXT(cmd); TEXT(title); TEXT(ps_kind); TEXT(ps_msg);

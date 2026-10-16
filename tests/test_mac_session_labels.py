@@ -22,7 +22,7 @@ HARNESS = r'''
 #include <wchar.h>
 
 enum { TK_TERMINAL, TK_BROWSER };
-typedef struct { char cwd[1024]; int dirty, side; } Term;
+typedef struct { char cwd[1024]; int dirty, side, had_activity, nmarks, hcount, cy; long long marks[512]; } Term;
 typedef struct {
     Term t;
     char run[1024], hist[1024], start_dir[1024], program[64];
@@ -48,6 +48,7 @@ static void mac_browser_tab_label(Tab *tab, wchar_t *out, int capacity, int colu
 }
 static void update_title(void) { title_updates++; }
 static void plat_invalidate(void) { invalidations++; }
+static long long term_abs_line(const Term *term, int y) { (void)term; return y; }
 
 /* FUNCTIONS */
 
@@ -76,7 +77,20 @@ int main(int argc, const char **argv) {
     @autoreleasepool {
         require(argc == 2, "case required");
         const char *which = argv[1];
-        if (!strcmp(which, "terminal-source")) {
+        if (!strcmp(which, "new-and-used")) {
+            Tab *tab = add_tab(""); tab->program[0] = 0;
+            equal(label(tab), @"receiver:<new>", "fresh shell is not marked new");
+            add_mark(&tab->t);
+            equal(label(tab), @"receiver:<new>", "first prompt should stay new");
+            add_mark(&tab->t);
+            require(!tab->t.had_activity, "redrawing the first prompt counts as command activity");
+            tab->t.cy = 3; add_mark(&tab->t);
+            equal(label(tab), @"receiver:term", "next prompt did not mark used terminal");
+            tab->t.nmarks = 0;
+            equal(label(tab), @"receiver:term", "clearing prompt marks forgot terminal activity");
+            tab->t.had_activity = 0; tab->t.hcount = 2;
+            equal(label(tab), @"receiver:term", "restored scrollback was labeled new");
+        } else if (!strcmp(which, "terminal-source")) {
             Tab *tab = add_tab("terminal:/dev/ttys123");
             terminal_metadata = @{@"cwd":@"/projects/ruffian", @"program":@"claude", @"title":@"misleading title"};
             mac_refresh_programs();
@@ -103,7 +117,7 @@ int main(int argc, const char **argv) {
             terminal_metadata = @{@"cwd":@"/projects/ruffian", @"program":@"", @"shell":@"zsh"};
             mac_refresh_programs();
             equal(@(tab->program), @"", "finished foreground job retained stale name");
-            equal(label(tab), @"ruffian [bridge]", "idle source shell shows helper or stale app");
+            equal(label(tab), @"ruffian:term [bridge]", "idle source shell shows helper or stale app");
             require(title_updates == 2 && !local_calls, "idle transition was ignored or consulted helper");
         } else if (!strcmp(which, "unavailable-source")) {
             Tab *tab = add_tab("terminal:/dev/ttys123");
@@ -162,6 +176,7 @@ class SourceSessionLabelTests(unittest.TestCase):
             production_function(ROOT/'hardcore.c', 'static void tab_label(Tab *tb, wchar_t *out, int cap)'),
             production_function(ROOT/'hardcore_mac.m', 'static int mac_apply_session_metadata(Tab *tb, NSDictionary *metadata)'),
             production_function(ROOT/'hardcore_mac.m', 'static void mac_refresh_programs(void)'),
+            production_function(ROOT/'hardcore.c', 'static void add_mark(Term *t)'),
         ])
         harness = directory/'labels.m'
         harness.write_text(HARNESS.replace('/* FUNCTIONS */', functions))
@@ -177,6 +192,9 @@ class SourceSessionLabelTests(unittest.TestCase):
 
     def test_terminal_uses_original_source_metadata(self):
         self.run_case('terminal-source')
+
+    def test_fresh_and_used_terminal_labels_survive_prompt_redraw_and_clear(self):
+        self.run_case('new-and-used')
 
     def test_quiet_changes_update_without_redundant_redraws(self):
         self.run_case('quiet-refresh')

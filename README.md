@@ -134,13 +134,14 @@ The macOS header uses two rows of controls in the selected bitmap font:
 | Control | Action |
 |---|---|
 | **↕ move** | Drag the tab menu |
-| **⚙** | Toggle Settings |
+| **⚙ config** | Toggle Settings |
+| **cam** | Open the camera and recording TV |
 | **caf / CAF** | Toggle display and system sleep prevention; uppercase and amber when active |
 | **+term** | New terminal in the current folder |
 | **+www** | Open a new website tab |
 | **files** | Open the current folder in the bundled file browser |
 
-The move handle, settings, and CAF occupy the first row; new-tab actions occupy
+The move handle, config, cam, and CAF occupy the first row; new-tab actions occupy
 the second. Gaps between controls are inert. Drag the normal window title band
 to move the app window; its pointer stays an arrow.
 
@@ -342,6 +343,49 @@ shared by every window.
   ConPTY and the WSL attachment helper built in. Nothing to install, no
   runtime dependencies to download. It draws with Direct3D 11 on a flip-model
   swap chain.
+
+Fresh terminal tabs show `folder:<new>`. After command activity they show
+`folder:term`, or the foreground program name when one is running. The state
+survives a live update.
+
+## Camera recordings on macOS
+
+Click **cam** to open a camera TV. It prefers the front-facing or built-in
+camera and requests camera and microphone access on first use. Drag its header
+to move it, or the bottom-right grip to resize it; terminal text reflows around
+the panel. The preview uses a mirrored, aspect-fit view. **−** hides the panel;
+an active recording continues while hidden. Hiding an idle preview releases
+the camera and microphone.
+
+Click **Rec**, then **Pause** / **Resume**, **Save**, or **Discard**. Paused time
+is removed from both the movie and the interface replay. The microphone is
+included when available; the panel reports when a recording will be silent.
+**Captions** opts into on-device speech recognition after saving. If the local
+speech model or permission is unavailable, the movie still saves and the panel
+reports that captions could not be completed. Captions can also be edited later.
+
+**Clips N** opens the saved-recording library. Recordings live in
+`~/Movies/Hardcore/` as `.hcrec` directories containing a compressed H.264/AAC
+camera movie, replay data, captions, and a portable HTML player. The replay
+stores the application's bitmap glyphs, layout, colors, and pointer activity;
+only the camera and microphone are recorded as media. Native browser tabs
+switch to Hardcore's grid view during recording and return to their previous
+mode afterward.
+
+Open a saved clip to scrub, trim, crop, change captions or pointer visibility,
+and export a composed video. Editing preserves the original take. The native
+exporter combines the interface replay, camera and audio into an MP4;
+its progress appears in the editor. **Share ZIP** creates a portable compressed
+bundle; unzip it before opening its player. The bundled `index.html` can also be opened
+in a browser for playback. Interrupted saves remain `.partial.hcrec` drafts.
+The header shows red **REC** while a recording is active or saving. Save or
+discard a recording before quitting or running a live update.
+
+`make recording-test` runs synthetic capture, player, exporter and library checks
+without opening any devices. `make recording-native-test` also compares the
+real Metal renderer with a replay export in an isolated test window. Long
+recordings retain their source JSON for seeking; ZIP sharing compresses the
+repeated drawing data.
 
 ## Run inside another terminal
 
@@ -1224,6 +1268,11 @@ comparison.
 
 ## Testing
 
+- `tests/test_camera_capture.m` synthesizes video and audio without opening
+  devices. It checks H.264/AAC encoding and decoding, pause removal, continuous
+  media timestamps, save ownership, and safe discard. `tests/test_camera_panel.m`
+  checks placement, reflow, controls and replay geometry without a camera,
+  microphone, permission prompt or window.
 - `make reflow-test` exercises local word wrapping, both dock directions,
   source-cell mapping, paragraph boundaries, protected terminal content, menu
   word packing, horizontal status shifts, shaded panels, literal continuation chains, secondary-TV

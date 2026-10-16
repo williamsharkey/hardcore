@@ -225,6 +225,25 @@ def box_glyph(cp, W, H, cx, cy, orig):
             if d == 'u': vline(cx + k, 0, cy - 2 if hdouble else cy + hhalf)
     return img
 
+def cog_glyph(width, height):
+    """A cell-sized UI gear: eight teeth and an open hub, without wide fallback.
+
+    Unifont's two-cell gear was squeezed to one cell by the renderer, shrinking
+    its height along with its width. Draw at each font's actual pixel measure.
+    """
+    rows = []
+    rx, ry = width / 2, min(height * .36, width * .72)
+    for y in range(height):
+        row = 0
+        for x in range(width):
+            dx, dy = (x - (width - 1) / 2) / rx, (y - (height - 1) / 2) / ry
+            radius = math.hypot(dx, dy)
+            edge = 1 if math.cos(math.atan2(dy, dx) * 8) > .25 else .77
+            if .38 <= radius <= edge:
+                row |= 1 << (width - 1 - x)
+        rows.append(row)
+    return rows
+
 def table(glyphs):
     NP = 0x1100
     pages = sorted({cp >> 8 for cp in glyphs}); off = [0] * NP
@@ -250,6 +269,7 @@ def main():
             rows.append((key, name, w, h, dev, thin, fb, -1, 0)); continue
         omitted = []
         g = read_bdf(bdf, w, h, omit_overhang=key in NO_CLIP_FONTS, omitted=omitted)
+        g[0x2699] = (w, cog_glyph(w, h))
         if omitted:
             print('%s: %d overhanging glyphs use Unifont fallback (original bitmaps were not clipped)' % (bdf, len(omitted)))
         if centre:

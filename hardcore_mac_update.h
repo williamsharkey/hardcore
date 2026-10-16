@@ -177,6 +177,7 @@ static Tab *mac_unpack_tab(NSDictionary *d) {
 }
 
 static int mac_reload(int ack, char *why, size_t cap) {
+    if(mac_record_active()){snprintf(why,cap,"save or discard the camera recording before updating");return 0;}
     if (!mac_probe(g_mac_exe)) { snprintf(why, cap, "replacement is missing or does not support live updates"); return 0; }
     /* A blocked paste may wait indefinitely. Do not discard it or freeze UI. */
     for (int i = 0; i < g_ntabs; i++) {

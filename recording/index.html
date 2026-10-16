@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Hardcore recordings</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="toolbar">
+    <a class="wordmark" href="#" id="library-link">Hardcore <span>recordings</span></a>
+    <div class="toolbar-actions"><button id="open-button">Open recording</button><button id="export-button" disabled>Export video</button></div>
+  </header>
+  <main>
+    <section id="welcome" class="welcome">
+      <div class="empty-frame" aria-hidden="true"><span>▍</span></div>
+      <h1>Your terminal, in motion.</h1>
+      <p>Open a recording folder to replay, trim, and crop it.</p>
+      <button id="welcome-open">Choose recording folder</button>
+      <p class="quiet">You can also drop the folder here.</p>
+    </section>
+    <section id="editor" hidden aria-label="Recording editor">
+      <div class="recording-heading"><div><h1 id="recording-title"></h1><p id="recording-detail" class="quiet"></p></div><label class="zoom-control">View <select id="zoom"><option value="fit">Fit</option><option value="1">100%</option><option value="2">200%</option></select></label></div>
+      <div id="viewport" class="viewport"><div id="stage" class="stage"><canvas id="screen" aria-label="Recorded terminal"></canvas><div id="crop-box" hidden aria-label="Crop selection"></div></div></div>
+      <div class="transport">
+        <button id="play" class="play" aria-label="Play recording">▶</button>
+        <output id="position">0:00</output>
+        <input id="seek" type="range" min="0" max="1" step="1" value="0" aria-label="Recording position">
+        <output id="duration">0:00</output>
+        <select id="speed" aria-label="Playback speed"><option value="0.5">½×</option><option value="1" selected>1×</option><option value="1.5">1½×</option><option value="2">2×</option></select>
+      </div>
+      <div class="editbar">
+        <div class="edit-group"><span class="group-label">Trim</span><label>In <input id="trim-start" type="number" min="0" step="0.001" value="0" aria-label="Trim start in seconds"></label><button id="mark-start" title="Set start to playhead">Set in</button><label>Out <input id="trim-end" type="number" min="0" step="0.001" value="0" aria-label="Trim end in seconds"></label><button id="mark-end" title="Set end to playhead">Set out</button></div>
+        <div class="edit-group"><button id="crop-toggle" aria-pressed="false">Crop</button><button id="crop-reset" disabled>Reset crop</button><span id="crop-size" class="quiet"></span></div>
+        <div class="edit-group toggles"><label><input id="pointer-toggle" type="checkbox" checked> Pointer</label><label><input id="captions-toggle" type="checkbox" checked> Captions</label><button id="captions-import">Add captions</button></div>
+      </div>
+      <div class="footer"><p id="edit-summary" class="quiet"></p><button id="save-edits">Save edit settings</button></div>
+    </section>
+    <p id="status" role="status" aria-live="polite"></p>
+  </main>
+  <dialog id="export-dialog"><form method="dialog"><h2>Export video</h2><p id="export-note"></p><pre id="export-command"></pre><div class="dialog-actions"><button id="download-edits" type="button">Download edit settings</button><button value="close">Done</button></div></form></dialog>
+  <input id="folder-picker" type="file" webkitdirectory multiple hidden>
+  <input id="caption-picker" type="file" accept=".srt,.vtt,text/vtt" hidden>
+  <video id="camera" playsinline preload="auto" hidden></video>
+  <script src="recording.js"></script>
+  <script src="edits.js"></script>
+  <script src="core.js"></script>
+  <script src="player.js"></script>
+</body>
+</html>

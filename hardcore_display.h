@@ -342,6 +342,7 @@ static void chrome_prepare_display(Term *t) {
     chrome_prepare_display_internal(t, sidebar_x()/CW, g_chrome.top, g_chrome.bottom-g_chrome.top, 1);
 #ifndef _WIN32
     chrome_tv_prepare(t);
+    mac_camera_layout(t);
 #endif
 }
 

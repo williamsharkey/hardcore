@@ -26,7 +26,7 @@ endif
 MAC_CC    ?= clang
 MAC_FLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-deprecated-declarations \
              -mmacosx-version-min=11.0 -arch arm64 -arch x86_64
-MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -framework ApplicationServices -framework WebKit -framework ImageIO -lutil
+MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -framework ApplicationServices -framework WebKit -framework ImageIO -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework AudioToolbox -framework Speech -lutil
 APP        = hardcore.app
 APPDIR    ?= $(HOME)/Applications
 BINDIR    ?= $(HOME)/.local/bin
@@ -73,7 +73,7 @@ build/width.inc: font/ucd/EastAsianWidth.txt font/ucd/DerivedGeneralCategory.txt
 	@mkdir -p build
 	python3 tools/gen_width.py font/ucd > $@
 
-font/hardcore-extra.hex: tools/draw_extra.py
+font/hardcore-extra.hex: tools/draw_extra.py tools/gen_fonts.py
 	python3 $< > $@
 
 build/hardcore.ico: tools/gen_icon.py
@@ -150,7 +150,7 @@ build/hardcore.metallib: hardcore.metal
 build/browser.inc: tools/embed_browser.py browser/project.js browser/welcome.html $(wildcard browser/adapters/*.js)
 	python3 tools/embed_browser.py
 
-build/hardcore: build/browser.inc hardcore_browser_image_geometry.h hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
+build/hardcore: hardcore_camera_capture.h hardcore_camera_capture.m hardcore_camera_panel.m hardcore_recording.m hardcore_recording_library.m build/browser.inc hardcore_browser_image_geometry.h hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
@@ -160,11 +160,19 @@ build/hardcore.icns: tools/gen_icon.py
 CLAUDE_PLUGINS = plugins/.claude-plugin/marketplace.json \
                  $(wildcard plugins/*/.claude-plugin/*.json plugins/*/hooks/*.json plugins/*/hooks/*.js plugins/*/README.md)
 
-$(APP): tools/here.py tools/files.py build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
+build/recording-export: tools/recording_export.m
+	@mkdir -p build
+	clang -O2 -fobjc-arc -mmacosx-version-min=11.0 -arch arm64 -arch x86_64 -framework Foundation -framework AppKit -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework ImageIO $< -o $@
+
+$(APP): build/recording-export $(wildcard recording/*.html recording/*.js recording/*.css) tools/here.py tools/files.py build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
 	rm -rf $@
 	mkdir -p $@/Contents/MacOS $@/Contents/Resources
 	cp build/hardcore $@/Contents/MacOS/hardcore
 	cp build/hardcore.icns $@/Contents/Resources/hardcore.icns
+	cp build/recording-export $@/Contents/Resources/
+	codesign --force --sign - $@/Contents/Resources/recording-export
+	mkdir -p $@/Contents/Resources/recording
+	cp recording/*.html recording/*.js recording/*.css $@/Contents/Resources/recording/
 	cp tools/update_mac.py $@/Contents/Resources/update_mac.py
 	cp tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py tools/files.py tools/here.py $@/Contents/Resources/
 	mkdir -p $@/Contents/Resources/plugins
@@ -210,7 +218,7 @@ mac-release: $(APP)
 
 # Build and deterministic regressions without live shell-clone or GUI probes.
 .PHONY: mac-offline-test
-mac-offline-test: mac-release reflow-test browser-test here-test
+mac-offline-test: mac-release reflow-test browser-test here-test recording-test
 	python3 tests/test_cutie_browser.py
 	python3 tests/test_mac_caf.py
 	python3 tests/test_files.py
@@ -360,3 +368,17 @@ mac-here-test: $(APP)
 .PHONY: mac-browser-images-test
 mac-browser-images-test: $(APP)
 	python3 tests/test_browser_images_mac.py
+
+.PHONY: recording-test recording-native-test
+recording-test: build/recording-export
+	node tests/test_recording.js
+	python3 tests/test_recording_export.py
+	clang -O1 -Wno-deprecated-declarations tests/test_camera_capture.m -o build/test-camera-capture -framework Cocoa -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework AudioToolbox -framework Speech -framework QuartzCore
+	build/test-camera-capture
+	clang -O1 -Wno-deprecated-declarations -Wno-unused-function tests/test_camera_panel.m -o build/test-camera-panel -framework Cocoa -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework AudioToolbox -framework Speech -framework QuartzCore
+	build/test-camera-panel
+	clang -O1 -Wno-deprecated-declarations -fno-objc-arc tests/fixtures/recording_library_check.m -o build/test-recording-library -framework Cocoa -framework WebKit
+	build/test-recording-library
+
+recording-native-test: $(APP) recording-test
+	python3 tests/test_recording_native.py

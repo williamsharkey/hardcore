@@ -490,7 +490,7 @@ static Tab *mac_browser_new(NSString *address, int parent, int native) {
     if (owner && owner->kind==TK_BROWSER) owner=tab_by_id(owner->parent_id);
     Tab *tb=calloc(1,sizeof(Tab));
     if (!tb || !term_init(&tb->t,g_cols,g_rows)) { free(tb); return NULL; }
-    tb->id=g_next_id++; tb->fd=-1; tb->kind=TK_BROWSER; tb->browser_native=!!native;
+    tb->id=g_next_id++; tb->fd=-1; tb->kind=TK_BROWSER; tb->browser_native=!!native && !mac_record_active();
     tb->parent_id=owner ? owner->id : 0; tb->t.m_cursor_vis=0;
     mac_browser_metadata(tb,nil,nil,url);
     int at=g_ntabs;
@@ -506,7 +506,7 @@ static void mac_browser_address(void) { mac_browser_address_grid(); }
 static void mac_browser_command(int command) {
     Tab *tb=active_tab(); HCBrowser *b=browser_for(tb);
     if (!b) return;
-    if (command==0) { tb->browser_native=!tb->browser_native; mac_browser_sync(); }
+    if (command==0) { if(mac_record_active()){NSBeep();return;} tb->browser_native=!tb->browser_native; mac_browser_sync(); }
     else if (command==1) [b->web goBack];
     else if (command==2) [b->web goForward];
     else if (command==3) {
@@ -608,6 +608,7 @@ static NSDictionary *mac_browser_request(NSDictionary *request) {
     int at=0; while (at<g_ntabs && g_tabs[at]!=tb) at++;
     if ([op isEqualToString:@"mode"]) {
         if (![@[@"hardcore",@"native"] containsObject:request[@"mode"] ?: @""]) return @{@"ok":@NO,@"error":@"Mode must be hardcore or native."};
+        if(mac_record_active() && [request[@"mode"] isEqual:@"native"])return @{@"ok":@NO,@"error":@"Recording captures browser grid view. Save or discard before switching to native view."};
         tb->browser_native=[request[@"mode"] isEqual:@"native"]; activate(at);
     } else if ([op isEqualToString:@"close"]) {
         /* Defer the close so closing the last tab cannot end the process before

@@ -50,6 +50,7 @@ static void require(int ok, const char *message) {
     if (!ok) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
 }
 static void r_flush(void) {}
+static void mac_record_frame(Frame *frame) { require(frame->serial>0, "recording frame lacks submission serial"); }
 static Tab *active_tab(void) { return &dummy_tab; }
 static void trace(const char *s) { (void)s; }
 static void frame_free(Frame *frame) { free(frame); }

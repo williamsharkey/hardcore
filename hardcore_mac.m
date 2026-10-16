@@ -30,6 +30,22 @@
 
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
+#include "hardcore_camera_capture.m"
+static HCCameraCapture *g_camera_capture;
+static NSString *g_record_status;
+static void mac_camera_toggle(void);
+static int mac_camera_mouse(NSEvent *,int,int);
+static int mac_camera_cursor(int,int);
+static NSDictionary *mac_camera_metadata(void);
+static int mac_record_active(void);
+static void mac_record_start(void);
+static void mac_record_pause(void);
+static void mac_record_stop(void);
+static void mac_record_discard(void);
+static void mac_record_library(void);
+static void mac_record_upload(int,int,const unsigned char *);
+static void mac_record_event(NSEvent *,int,int);
+static void mac_record_hide_pointer(void);
 #include <util.h>
 #include <fcntl.h>
 #include <libproc.h>
@@ -340,6 +356,8 @@ typedef struct Frame {
     int trace_tab;               /* HARDCORE_TRACE: the new tab's first frame */
 } Frame;
 
+static void mac_record_frame(Frame *f);
+
 static Frame *g_build;           /* being built by render() */
 static Frame *g_pending;         /* built, waiting for the render thread */
 static pthread_mutex_t g_fmx = PTHREAD_MUTEX_INITIALIZER;
@@ -369,6 +387,7 @@ static void r_flush(void) {      /* the whole frame goes in one draw, so this on
    handed over, so the shared texture needs no fence. (After a full-atlas
    reset, the frame being built at that moment can show stale glyphs once.) */
 static void r_upload(int x, int y, const unsigned char *bmp) {
+    mac_record_upload(x,y,bmp);
     [g_atlas replaceRegion:MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, SLOT, SLOT) mipmapLevel:0 withBytes:bmp bytesPerRow:SLOT];
 }
 
@@ -492,6 +511,7 @@ static void r_present(void) {
     if (!(f = g_build)) return;
     g_build = NULL;
     f->serial = ++g_frame_serial;
+    mac_record_frame(f);
     f->handoff = g_handoff_paint;
     if (g_lat && g_lat_key && g_lat_out) {
         f->lat_key = g_lat_key;
@@ -663,6 +683,7 @@ static void tab_write(Tab *tb, const void *s, int n) {
     char *copy;
     int fd = tb->fd, off = 0;
     if (!tb->wq || fd < 0 || n <= 0) return;   /* no shell (a --replay terminal, or it's gone) */
+    if (tb->t.nmarks && (memchr(s, '\r', (size_t)n) || memchr(s, '\n', (size_t)n))) tb->t.had_activity = 1;
     tb->write_seq++;
     if (!__atomic_load_n(tb->wpending, __ATOMIC_ACQUIRE)) {
         while (off < n) {
@@ -1038,6 +1059,7 @@ static int mac_apply_session_metadata(Tab *tb, NSDictionary *metadata) {
         size_t length = MIN(strlen(utf8), sizeof(name) - 1);
         while (length && ((unsigned char)utf8[length] & 0xc0) == 0x80) length--;
         memcpy(name, utf8, length); name[length] = 0;
+        if (name[0]) tb->t.had_activity = 1;
         if (strcmp(name, tb->program)) {
             snprintf(tb->program, sizeof(tb->program), "%s", name);
             changed = 1;
@@ -1063,6 +1085,7 @@ static void mac_refresh_programs(void) {
             continue;
         }
         char name[64]; mac_foreground_name(tb,name,sizeof(name));
+        if (name[0]) tb->t.had_activity = 1;
         if (strcmp(name,tb->program)) {
             snprintf(tb->program,sizeof(tb->program),"%s",name);
             changed = 1;
@@ -1541,6 +1564,7 @@ static int mac_header_action(int hit) {
     if(hit==HIT_PLUS)new_tab_mac();
     else if(hit==HIT_WEB)mac_browser_open_welcome();
     else if(hit==HIT_FILES)mac_files_new();
+    else if(hit==HIT_CAMERA)mac_camera_toggle();
     else if(hit==HIT_CAF) {
         int on=mac_caf_toggle();
         if(on>0)hc_tv_open(&g_tvs[HC_TV_CAF].state,GetTickCount());
@@ -1749,6 +1773,7 @@ static void view_px(NSEvent *e, int *x, int *y) {
    mouseMoved's arrow. All cursor-update, motion and modifier paths now agree
    on the same geometry. Native WebKit retains ownership of its page body. */
 static void mac_pointer_cursor_at(int x,int y,NSEventModifierFlags flags) {
+    if(mac_camera_cursor(x,y))return;
     if(g_tv_drag_slot>=0){[(g_tv_drag_mode?mac_tv_resize_cursor():[NSCursor closedHandCursor]) set];return;}
     if(g_chrome_drag){[[NSCursor closedHandCursor] set];return;}
     int w,h;plat_client_size(&w,&h);
@@ -1789,6 +1814,8 @@ static NSEvent *mac_title_event(NSEvent *e) {
             if ([e window] == g_win) {
                 int x, y;
                 view_px(e, &x, &y);
+                mac_record_event(e,x,y);
+                if(mac_camera_mouse(e,x,y))return nil;
                 Tab *tb=active_tab();
                 if([e type]==NSEventTypeLeftMouseDown && cutie_at(x,y)<0)mac_cutie_blur();
                 if ([e type]==NSEventTypeScrollWheel) return g_tv_drag_slot>=0?nil:e;
@@ -2406,6 +2433,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (void)mouseEntered:(NSEvent *)e { [self mouseMoved:e]; }
 
 - (void)mouseExited:(NSEvent *)e {
+    mac_record_hide_pointer();
     mac_cutie_blur();
     chrome_preview_cancel();
     int x, y;
@@ -2515,6 +2543,9 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 @end
 
 #include "hardcore_browser_mac.m"
+#include "hardcore_recording.m"
+#include "hardcore_recording_library.m"
+#include "hardcore_camera_panel.m"
 
 /* ── window and app ────────────────────────────────────────────────── */
 
@@ -2535,9 +2566,9 @@ static void focus_changed(int focused) {
 @implementation HCDelegate
 - (void)applicationWillFinishLaunching:(NSNotification *)n { (void)n; trace("applicationWillFinishLaunching"); }
 - (void)applicationDidFinishLaunching:(NSNotification *)n { (void)n; trace("applicationDidFinishLaunching"); }
-- (void)windowWillMiniaturize:(NSNotification *)n {(void)n;mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
+- (void)windowWillMiniaturize:(NSNotification *)n {(void)n;mac_record_hide_pointer();mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
 - (void)windowDidBecomeKey:(NSNotification *)n { (void)n; trace("window key"); focus_changed(1); }
-- (void)windowDidResignKey:(NSNotification *)n { (void)n; if (g_chrome_drag) chrome_drag_end(); focus_changed(0); }
+- (void)windowDidResignKey:(NSNotification *)n { (void)n;mac_record_hide_pointer(); if (g_chrome_drag) chrome_drag_end(); focus_changed(0); }
 - (void)windowDidEnterFullScreen:(NSNotification *)n {
     (void)n; g_mac_title_hover = 0; mac_title_sync_buttons(); plat_invalidate();
 }
@@ -2558,6 +2589,11 @@ static void focus_changed(int focused) {
         char m[96];
         snprintf(m, sizeof(m), "applicationShouldTerminate: event %.2f ms ago", uptime_ms() - [[NSApp currentEvent] timestamp] * 1000.0);
         trace(m);
+    }
+    if (mac_record_active()) {
+        NSAlert *alert=[[[NSAlert alloc] init] autorelease];
+        alert.messageText=@"Save or discard the camera recording before quitting.";
+        [alert runModal];return NSTerminateCancel;
     }
     if (!g_quitting && !confirm_close(-1)) return NSTerminateCancel;
     trace("confirmed");
@@ -2850,7 +2886,8 @@ static void ctl_line(char *s) {
         else if (!mac_input_held(tb)) tab_write(tb, s, (int)(o - s));
     } else if (!strncmp(s, "cmd ", 4)) {
         const char *c = s + 4;
-        if(!strncmp(c,"focus ",6))focus_changed(atoi(c+6));
+        if(!strncmp(c,"record-fixture ",15))mac_record_fixture([NSString stringWithUTF8String:c+15]);
+        else if(!strncmp(c,"focus ",6))focus_changed(atoi(c+6));
         else if(!strcmp(c,"preview-cancel"))chrome_preview_cancel();
         else if(!strncmp(c,"preview-event ",14)) {
             const char *event=c+14;
