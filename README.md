@@ -151,8 +151,28 @@ The file browser supports navigation, filtering, sorting, previews, Quick Look,
 opening files, new folders, rename, copy, move and Trash; press **?** for keys.
 It confirms changes and refuses overwrites. Cross-volume move and Trash are
 currently refused while preserving the source; copy can cross volumes.
-These TVs provide a base for further panels; compact live previews of other
-agents inside their own TVs are not implemented yet.
+On macOS, hover a tab and click **□**, two character columns left of **×**, to
+pin a **Cutie TV**: a small live view of that same session. Up to four can stay
+open alongside Settings and CAF. They use the current font and theme, preserve
+terminal colors, wrap text into their compact viewport, and collapse repeated
+empty rows. The source process, terminal dimensions, scroll position, selected
+tab and unread indicator stay unchanged when a TV opens. Scroll inside a TV to
+browse its bounded recent history independently.
+
+Click inside a terminal TV to type into that session; its footer turns amber
+and says **Typing · Esc returns**. **Escape** or a click elsewhere returns input
+to the main tab. **Option–Escape** sends Escape to the TV's program. Paste and
+arrow keys work, and mouse-aware programs receive clicks mapped back to current
+source cells. Focus also clears on window exit, focus loss, minimize, resize or
+tab selection. **↗** expands the source tab; **×** closes only the TV. Cuties do
+not expire after ten seconds. Their placement stays fixed during interaction;
+if the window cannot fit a panel, it waits for room.
+
+Browser Cuties show a compact text projection with clickable links and buttons;
+images appear as small markers. Detailed form controls expand their source tab
+for editing. Terminal Cuties preserve the application's output rather than
+inventing abbreviated controls, so dense full-screen apps may need scrolling
+or **↗** for extended work.
 
 Settings options use highlights without horizontal row borders;
 the right dock extends offscreen with no outside border. Lists use all available
@@ -1154,6 +1174,11 @@ comparison.
   cover separate controls, corner/edge pixels, countdown, and CAF placement;
   hover-preview tests use real owned PTYs and local browser pages to verify
   source/unread preservation, no resize or input leaks, and focus-loss cleanup.
+  Cutie tests use independent real PTYs to check live colors, keyboard and
+  mapped mouse input, source lifetime, four-panel capacity and persistence.
+  `tests/test_cutie_project.py`, `tests/test_cutie_cache.py` and
+  `tests/test_cutie_browser.py` cover source mapping, Unicode, stale frames and
+  browser projection without changing the authoritative source.
 - `tests/test_mac_caf.py` checks assertion ownership, independent windows,
   exec updates, process exit, and bounded power queries. `tests/test_files.py`
   checks file operations and drives the curses browser through an owned PTY.

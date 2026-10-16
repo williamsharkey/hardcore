@@ -103,7 +103,7 @@ build/slurp-version.h: build/slurp-linux
 # which commit a build is (hardcore --version); the release number is HARDCORE_VERSION in hardcore.c
 BUILD := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
-hardcore.exe: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
+hardcore.exe: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c build/res.o $(LIBS)
 
@@ -149,7 +149,7 @@ build/hardcore.metallib: hardcore.metal
 build/browser.inc: tools/embed_browser.py browser/project.js browser/welcome.html $(wildcard browser/adapters/*.js)
 	python3 tools/embed_browser.py
 
-build/hardcore: build/browser.inc hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
+build/hardcore: build/browser.inc hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
@@ -172,6 +172,7 @@ $(APP): tools/files.py build/hardcore build/hardcore.icns tools/Info.plist tools
 	codesign --force --sign - $@
 
 mac-test: build/hardcore reflow-test browser-test
+	python3 tests/test_cutie_browser.py
 	python3 tests/test_browser_cli.py
 	build/hardcore --unit build/unit.txt; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
 	python3 tests/run_xtermjs.py
@@ -209,6 +210,7 @@ mac-release: $(APP)
 # Build and deterministic regressions without live shell-clone or GUI probes.
 .PHONY: mac-offline-test
 mac-offline-test: mac-release reflow-test browser-test
+	python3 tests/test_cutie_browser.py
 	python3 tests/test_mac_caf.py
 	python3 tests/test_files.py
 	python3 tests/test_tab_preview.py
@@ -282,7 +284,7 @@ mac-update-test: $(APP)
 	python3 tests/test_update_mac.py
 
 # Opt-in desktop integration: disposable real application sessions in Windows Terminal.
-build/slurp-driver.exe: tests/slurp_driver.c hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
+build/slurp-driver.exe: tests/slurp_driver.c hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-o $@ tests/slurp_driver.c build/res.o $(filter-out -mwindows,$(LIBS))
 
@@ -313,6 +315,8 @@ reflow-test:
 	python3 tests/test_tv_layout.py
 	python3 tests/test_tv_hit.py
 	python3 tests/test_tv_reflow.py
+	python3 tests/test_cutie_project.py
+	python3 tests/test_cutie_cache.py
 	cc -std=c99 -O2 -Wall -Wextra tests/test_tab_preview.c -o build/test-tab-preview
 	build/test-tab-preview
 
@@ -321,6 +325,7 @@ chrome-test: $(APP)
 	python3 tests/test_chrome_adaptive_mac.py
 	python3 tests/test_chrome_complex_mac.py
 	python3 tests/test_tv_mac.py
+	python3 tests/test_cutie_mac.py
 	python3 tests/test_tab_preview_mac.py
 
 .PHONY: browser-test

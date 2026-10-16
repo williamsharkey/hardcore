@@ -25,8 +25,12 @@ HARNESS=r'''
 #include <stdlib.h>
 #define CW 12
 #define CH 26
-enum{HIT_NONE,HIT_TAB,HIT_CLOSE,HIT_TABPAGE,HIT_CHROME_INERT,HIT_TV,HIT_FONT,HIT_SCHEME};
-static struct{int top,bottom;}g_chrome;
+#include "hardcore_tv.h"
+enum{HIT_NONE,HIT_TAB,HIT_CLOSE,HIT_CUTIE,HIT_TABPAGE,HIT_CHROME_INERT,HIT_TV,HIT_FONT,HIT_SCHEME};
+typedef struct{int top,bottom;}ChromeLayout;
+typedef struct{HcTvState state;HcTvMotion motion;}ChromeTv;
+static ChromeLayout g_chrome;
+static ChromeTv g_tvs[HC_TV_COUNT];
 static int g_chrome_join_top,g_chrome_join_bottom,g_chrome_x,g_mouse_x,g_mouse_y;
 static int lines;static float drawn_y,drawn_bottom;
 static int chrome_min(int a,int b){return a<b?a:b;}
@@ -65,23 +69,37 @@ static void seam(void){
 static void hover(void){
     g_chrome_x=72*CW;g_mouse_y=5*CH+1;g_mouse_x=g_chrome_x+5*CW;
     assert(chrome_tab_hover(HIT_TAB,5)&&chrome_tab_hover(HIT_CLOSE,5));
+    assert(chrome_tab_hover(HIT_CUTIE,5));
     assert(chrome_tab_hover(HIT_TABPAGE,5)&&chrome_tab_hover(HIT_CHROME_INERT,5));
     assert(!chrome_tab_hover(HIT_TV,5)&&!chrome_tab_hover(HIT_FONT,5)&&!chrome_tab_hover(HIT_SCHEME,5));
     g_mouse_x=5*CW;assert(!chrome_tab_hover(HIT_TV,5)&&!chrome_tab_hover(HIT_CHROME_INERT,5));
     g_mouse_x=g_chrome_x+5*CW;assert(!chrome_tab_hover(HIT_TAB,4));
 }
-int main(int argc,char **argv){int n=argc>1?atoi(argv[1]):0;if(!n)joins();else if(n==1)corners();else if(n==2)seam();else hover();puts("ok");return 0;}
+static void all_surfaces(void){
+    g_chrome=(ChromeLayout){10,20};g_chrome_x=72*CW;
+    ChromeTv *tv=g_tvs+HC_TV_COUNT-1;tv->state.open=tv->state.placed=1;
+    tv->state.alpha=tv->motion.alpha=1;tv->state.rect=(HcTvRect){72,20,28,9};
+    chrome_prepare_edges((ChromeLayout){3,10},72*CW,1);
+    assert(g_chrome_join_top&&g_chrome_join_bottom);
+    tv->motion.alpha=0;chrome_prepare_edges((ChromeLayout){3,10},72*CW,1);
+    assert(g_chrome_join_top&&!g_chrome_join_bottom);
+    tv->motion.alpha=1;tv->state.placed=0;chrome_prepare_edges((ChromeLayout){3,10},72*CW,0);
+    assert(!g_chrome_join_top&&!g_chrome_join_bottom);
+    tv->state.placed=1;tv->state.rect.x=0;chrome_prepare_edges((ChromeLayout){3,10},72*CW,0);
+    assert(!g_chrome_join_top&&!g_chrome_join_bottom);
+}
+int main(int argc,char **argv){int n=argc>1?atoi(argv[1]):0;if(!n)joins();else if(n==1)corners();else if(n==2)seam();else if(n==3)hover();else all_surfaces();puts("ok");return 0;}
 '''
 
 class Edges(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         renderer=(ROOT/'hardcore_chrome_draw.h').read_text()
-        helpers='\n'.join(function(renderer,n) for n in ('chrome_join_mask','chrome_corner_inset','chrome_rule','chrome_tab_hover'))
+        helpers='\n'.join(function(renderer,n) for n in ('chrome_join_mask','chrome_prepare_edges','chrome_corner_inset','chrome_rule','chrome_tab_hover'))
         cls.tmp=tempfile.TemporaryDirectory(prefix='hc-chrome-edges-');source=Path(cls.tmp.name)/'edges.c'
         source.write_text(HARNESS.replace('HELPERS',helpers));cls.binary=Path(cls.tmp.name)/'edges'
         subprocess.run([os.environ.get('CC','cc'),'-std=c99','-Wall','-Wextra','-Werror',
-            *shlex.split(os.environ.get('HC_TEST_CFLAGS','')),str(source),'-o',str(cls.binary)],check=True)
+            *shlex.split(os.environ.get('HC_TEST_CFLAGS','')),'-I',str(ROOT),str(source),'-o',str(cls.binary)],check=True)
     @classmethod
     def tearDownClass(cls):cls.tmp.cleanup()
     def check_case(self,n):subprocess.run([str(self.binary),str(n)],check=True,capture_output=True)
@@ -89,5 +107,6 @@ class Edges(unittest.TestCase):
     def test_touching_corners_square_and_exposed_corners_round(self):self.check_case(1)
     def test_lower_panel_omits_shared_seam_but_keeps_inner_rules(self):self.check_case(2)
     def test_opposite_tv_cannot_highlight_a_primary_tab(self):self.check_case(3)
+    def test_last_cutie_joins_only_while_visible_on_the_same_edge(self):self.check_case(4)
 
 if __name__=='__main__':unittest.main()

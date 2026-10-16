@@ -71,8 +71,8 @@ static void ordinary(int mode){
 }
 static void bounds(void){
     ChromeReflow display={0};fixture(&display);Context ctx={0,0,&display};HcTvRect next={40,5,20,6};
-    HcTvRect prior[5]={{0,0,20,3},{0,3,20,1},{0,4,20,1},{0,5,20,1},{0,6,20,1}};
-    assert(!hc_tv_reflow_compose(&display,next,prior,5,K,build,ink,&ctx)&&!ctx.calls);
+    HcTvRect prior[HC_TV_MAX_SLOTS+1]={{0,0,20,3},{0,3,20,1},{0,4,20,1},{0,5,20,1},{0,6,20,1}};
+    assert(!hc_tv_reflow_compose(&display,next,prior,HC_TV_MAX_SLOTS+1,K,build,ink,&ctx)&&!ctx.calls);
     assert(!hc_tv_reflow_compose(&display,prior[0],prior,1,K,build,ink,&ctx)&&!ctx.calls);
     display.rows=HC_TV_REFLOW_MAX_CELLS;
     assert(!hc_tv_reflow_compose(&display,next,prior,1,K,build,ink,&ctx)&&!ctx.calls);
@@ -87,7 +87,15 @@ static void production(void){
     assert(display.changed>before_changed&&display.source[A]==C+2&&display.markers[1]==24);
     chrome_reflow_free(&display);
 }
-int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):0;if(n<=9)ordinary(n);else if(n==10)bounds();else production();puts("ok");return 0;}
+static void maximum_prior(void){
+    ChromeReflow display={0};fixture(&display);Context ctx={0,0,&display};
+    HcTvRect prior[HC_TV_MAX_SLOTS];
+    for(int i=0;i<HC_TV_MAX_SLOTS;i++)prior[i]=(HcTvRect){0,i,2,1};
+    assert(hc_tv_reflow_compose(&display,(HcTvRect){40,5,20,6},prior,HC_TV_MAX_SLOTS,K,build,ink,&ctx));
+    assert(ctx.calls==1&&display.source[D]==B&&display.cursor==D+1);
+    chrome_reflow_free(&display);
+}
+int main(int argc,char**argv){int n=argc>1?atoi(argv[1]):0;if(n<=9)ordinary(n);else if(n==10)bounds();else if(n==11)production();else maximum_prior();puts("ok");return 0;}
 '''
 class Compose(unittest.TestCase):
     @classmethod
@@ -108,5 +116,6 @@ class Compose(unittest.TestCase):
             with self.subTest(case=n):self.run_case(n)
     def test_existing_prior_intrusion_cannot_be_moved(self):self.run_case(9)
     def test_budget_and_overlap_fail_before_builder(self):self.run_case(10)
+    def test_final_cutie_accepts_primary_and_five_prior_tvs(self):self.run_case(12)
     def test_actual_reflow_engine_composes(self):self.run_case(11)
 if __name__=="__main__":unittest.main()

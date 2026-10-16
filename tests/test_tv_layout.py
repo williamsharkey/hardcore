@@ -28,16 +28,16 @@ typedef struct {int browser_native;} Tab;
 typedef struct {int top,bottom,section_row,list_row,list_capacity,list_count,settings_row;} ChromeLayout;
 typedef struct {
     HcTvState state;HcTvMotion motion;HcTvPlacement placement,planned;
-    ChromeLayout layout;int motion_blocked;
+    ChromeLayout layout;int motion_blocked,tab_id,scroll;
 } ChromeTv;
-static ChromeTv g_tvs[2];
+static ChromeTv g_tvs[HC_TV_COUNT];
 static ChromeLayout g_chrome;
 static ChromeReflow g_display;
 static Term *g_display_term;
 static int g_display_view,g_display_hcount,g_chrome_reflow;
 static int g_settings_tab=1,g_setting_offset[3],g_font_menu_count=8;
 static int g_chrome_drag,g_sel_on,g_sel_drag,g_sb_drag,g_tab_underlay=1;
-static int g_hover,g_preview,g_hover_slot=-1,g_sidebar,g_scheduled,g_font_calls;
+static int g_hover,g_preview,g_hover_slot=-1,g_sidebar,g_scheduled,g_font_calls,g_cutie_focus_id;
 static uint32_t g_chrome_input_at,now;
 static void *g_font,*g_scheme;
 static Cell grid[100*60];
@@ -45,7 +45,7 @@ static int chrome_min(int a,int b){return a<b?a:b;}
 static int chrome_max(int a,int b){return a>b?a:b;}
 static uint32_t GetTickCount(void){return now;}
 static int chrome_hovered(void){return g_hover;}
-static int chrome_tv_hovered(int slot){return g_hover_slot==slot;}
+static int chrome_any_tv_hovered(void){return g_hover_slot>=0;}
 static int chrome_preview_active(void){return g_preview;}
 static void chrome_tv_schedule(void){g_scheduled++;}
 static Tab *display_tab(void){return NULL;}
@@ -79,7 +79,7 @@ static void init(Term *t,int cols,int rows){
     *t=(Term){.cols=cols,.rows=rows};g_sidebar=cols-SB_COLS;
     g_chrome=(ChromeLayout){.top=3,.bottom=11};
     g_settings_tab=1;memset(g_setting_offset,0,sizeof(g_setting_offset));
-    g_hover=g_preview=g_sel_on=g_sel_drag=g_chrome_drag=g_sb_drag=0;g_hover_slot=-1;
+    g_hover=g_preview=g_sel_on=g_sel_drag=g_chrome_drag=g_sb_drag=g_cutie_focus_id=0;g_hover_slot=-1;
     now=1000;g_chrome_input_at=0;g_scheduled=g_font_calls=0;
     hc_tv_open(&g_tvs[0].state,now);
 }
@@ -131,9 +131,47 @@ static void masked_anchor(void){
     assert(g_tvs[0].state.placed&&g_tvs[1].state.placed);
     assert(!hc_tv_rect_overlap(g_tvs[0].state.rect,g_tvs[1].state.rect));
 }
+static void cuties(void){
+    Term t;init(&t,100,60);hc_tv_open(&g_tvs[1].state,now);chrome_tv_prepare(&t);
+    HcTvRect settings=g_tvs[0].state.rect,caf=g_tvs[1].state.rect;
+    for(int i=HC_TV_CUTIE_FIRST;i<HC_TV_COUNT;i++)hc_tv_open(&g_tvs[i].state,now);
+    chrome_tv_prepare(&t);
+    HcTvRect rects[HC_TV_COUNT+1]={{72,3,28,8}};
+    assert(hc_tv_rect_equal(settings,g_tvs[0].state.rect));assert(hc_tv_rect_equal(caf,g_tvs[1].state.rect));
+    for(int i=0;i<HC_TV_COUNT;i++){
+        assert(g_tvs[i].state.placed);rects[i+1]=g_tvs[i].state.rect;
+        assert(g_tvs[i].placement.candidates<=HC_TV_MAX_CANDIDATES);
+        assert(hc_tv_rect_fits(rects[i+1],t.cols,t.rows));
+        if(i>=HC_TV_CUTIE_FIRST)assert(rects[i+1].h==HC_TV_CUTIE_ROWS&&g_tvs[i].layout.list_count==0);
+        for(int j=0;j<=i;j++)assert(!hc_tv_rect_overlap(rects[i+1],rects[j]));
+    }
+    for(int n=0;n<100;n++){now+=10;chrome_tv_prepare(&t);
+        for(int i=0;i<HC_TV_COUNT;i++)assert(hc_tv_rect_equal(rects[i+1],g_tvs[i].state.rect));}
+    /* A focused Cutie and the last slot's hover both freeze every placement. */
+    intrude(&t);g_cutie_focus_id=101;
+    for(int n=0;n<10;n++){now+=100;chrome_tv_prepare(&t);
+        for(int i=0;i<HC_TV_COUNT;i++)assert(g_tvs[i].motion.phase==HC_TV_MOTION_IDLE);}
+    g_cutie_focus_id=0;g_hover_slot=HC_TV_COUNT-1;
+    for(int n=0;n<10;n++){now+=100;chrome_tv_prepare(&t);
+        for(int i=0;i<HC_TV_COUNT;i++)assert(hc_tv_rect_equal(rects[i+1],g_tvs[i].state.rect));}
+}
+static void cutie_no_fit(void){
+    Term t;init(&t,28,60);
+    for(int i=1;i<HC_TV_COUNT;i++)hc_tv_open(&g_tvs[i].state,now);
+    chrome_tv_prepare(&t);int placed=0;
+    for(int i=0;i<HC_TV_COUNT;i++){
+        assert(g_tvs[i].state.open);placed+=g_tvs[i].state.placed;
+        if(g_tvs[i].state.placed)for(int j=0;j<i;j++)if(g_tvs[j].state.placed)
+            assert(!hc_tv_rect_overlap(g_tvs[i].state.rect,g_tvs[j].state.rect));
+    }
+    assert(placed<HC_TV_COUNT&&g_tvs[0].state.placed&&g_tvs[1].state.placed);
+    t.cols=100;g_sidebar=72;now+=100;chrome_tv_prepare(&t);
+    for(int i=0;i<HC_TV_COUNT;i++)assert(g_tvs[i].state.placed);
+}
 int main(int argc,char **argv){
     int n=argc>1?atoi(argv[1]):0;
-    if(n==0)stacked();else if(n==1)motion();else if(n==2)frozen();else if(n==3)compact();else masked_anchor();
+    if(n==0)stacked();else if(n==1)motion();else if(n==2)frozen();else if(n==3)compact();
+    else if(n==4)masked_anchor();else if(n==5)cuties();else cutie_no_fit();
     puts("ok");return 0;
 }
 '''
@@ -155,5 +193,7 @@ class Layout(unittest.TestCase):
     def test_hover_and_preview_cancel_motion(self):self.check_case(2)
     def test_compact_pages_resize_and_no_fit(self):self.check_case(3)
     def test_settings_anchor_never_overlaps_primary(self):self.check_case(4)
+    def test_four_cuties_keep_priority_bounds_and_freeze_for_focus(self):self.check_case(5)
+    def test_cuties_survive_no_fit_and_appear_when_room_returns(self):self.check_case(6)
 
 if __name__=="__main__":unittest.main()

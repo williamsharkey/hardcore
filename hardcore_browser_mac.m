@@ -65,6 +65,8 @@ static NSString *browser_url(NSString *input) {
 @interface HCBrowser : NSObject <WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler> {
 @public
     int tabID, generation, epoch, scroll, total, dirty, requesting, changedAgain, focusedAction;
+    int cutieGeneration, cutiePopupEpoch;
+    NSTimeInterval cutiePopupUntil;
     int lastCols, lastRows, lastX, lastY, lastHeight, lastSide, lastPreview;
     WKWebView *web;
     BrowserBlock *blocks;
@@ -102,6 +104,11 @@ static void mac_browser_edit(SEL action, id sender) {
 }
 static Tab *mac_browser_new(NSString *url, int parent, int native);
 static HCBrowser *browser_for(Tab *tb) { return tb && tb->kind == TK_BROWSER ? (HCBrowser *)tb->browser : nil; }
+static void browser_cutie_changed(HCBrowser *b) {
+    /* JS generations restart after navigation. This token also invalidates
+       maps during loading and when two accepted snapshots share a revision. */
+    b->cutieGeneration=b->cutieGeneration==0x7fffffff ? 1 : b->cutieGeneration+1;
+}
 static void browser_free_blocks(HCBrowser *b) {
     for (int i=0;i<b->blockCount;i++) { free(b->blocks[i].cells);free(b->blocks[i].nodes);free(b->blocks[i].ends); }
     free(b->blocks); b->blocks=NULL; b->blockCount=0;
@@ -250,6 +257,7 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
 - (void)dealloc { browser_free_blocks(self);free(nodeGrid);[imageCache release];[anchorBlocks release];[images release];[editText release];
     [menuItems release];[menuURL release];[inspection release];[inspectLines release];[web release];[super dealloc]; }
 - (void)load:(NSString *)url {
+    browser_cutie_changed(self);
     scroll=0; generation=0; browser_free_blocks(self); dirty=1; editKind=0;[editText release];editText=nil;
     Tab *tb=tab_by_id(tabID);
     if (tb) {
@@ -276,7 +284,7 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
 }
 - (void)accept:(NSDictionary *)snapshot {
     Tab *tb=tab_by_id(tabID); if (!tb || tb->browser!=self) return;
-    browser_decode(self,snapshot);
+    browser_decode(self,snapshot);browser_cutie_changed(self);
     generation=[snapshot[@"generation"] intValue]; focusedAction=0; dirty=1;
 
     NSString *rawURL=browser_string(snapshot[@"url"]);
@@ -297,7 +305,7 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
 }
 - (void)webView:(WKWebView *)view didStartProvisionalNavigation:(WKNavigation *)navigation {
     (void)view; (void)navigation;
-    browser_ui_reset(self);epoch++; generation=0; scroll=0; browser_free_blocks(self); dirty=1;hoverLink=0;
+    browser_ui_reset(self);epoch++;browser_cutie_changed(self); generation=0; scroll=0; browser_free_blocks(self); dirty=1;hoverLink=0;
     for(HCBrowserImage *image in imageCache.allValues)[image cancel];[imageCache removeAllObjects];[images removeAllObjects];
     Tab *tb=tab_by_id(tabID); if (tb) tb->busy=1;
     update_busy(0); plat_invalidate();
@@ -349,7 +357,12 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
     BOOL allowed=browser_url(url)!=nil || [scheme isEqualToString:@"blob"] || [scheme isEqualToString:@"data"];
     if (allowed && !action.targetFrame && url.length) {
         Tab *tb=tab_by_id(tabID);
-        if (browser_url(url)) mac_browser_new(url,tb ? tb->parent_id : 0,tb ? tb->browser_native : 0);
+        /* A miniature click must not give a popup the user's selected tab.
+           Scope this redirect to the document and recent explicit Cutie
+           activation; ordinary browser popup behavior stays unchanged. */
+        BOOL cutie=cutiePopupEpoch==epoch && cutiePopupUntil>=NSProcessInfo.processInfo.systemUptime;
+        if(cutie){cutiePopupUntil=0;[web loadRequest:action.request];}
+        else if (browser_url(url)) mac_browser_new(url,tb ? tb->parent_id : 0,tb ? tb->browser_native : 0);
         else [web loadRequest:action.request];
         handler(WKNavigationActionPolicyCancel); return;
     }
@@ -440,6 +453,29 @@ static void mac_browser_prepare(Tab *tb) {
     tb->t.m_cursor_vis=0; tb->t.view=0;
     free(cells); b->dirty=0; b->lastCols=cols; b->lastRows=rows; b->lastX=x; b->lastY=y; b->lastHeight=height; b->lastSide=side; b->lastPreview=preview;
 }
+static int mac_browser_cutie_generation(Tab *tb) {
+    HCBrowser *b=browser_for(tb);return b ? b->cutieGeneration : 0;
+}
+static int mac_browser_cutie_project(Tab *tb,Cell *output,int cols,int rows,int scroll) {
+    if(!output || cols<4 || cols>256 || rows<1 || rows>128)return 0;
+    HCBrowser *b=browser_for(tb);
+    /* This layout owns no source state: no Term writes, source scroll changes,
+       geometry cache changes, DOM evaluation, image resizing, or focus sync. */
+    int offset=MAX(0,MIN(BROWSER_DOCUMENT_ROWS,scroll));
+    int total=browser_grid_layout_nodes(b ? b->blocks : NULL,b ? b->blockCount : 0,
+        output,NULL,cols,rows,offset,0,0,0,0,0);
+    int limit=MAX(0,total-rows);
+    if(offset>limit)browser_grid_layout_nodes(b ? b->blocks : NULL,b ? b->blockCount : 0,
+        output,NULL,cols,rows,limit,0,0,0,0,0);
+    /* The little grid cannot use the full browser's image atlas coordinates.
+       Retain each image's action as a quiet marker, leaving styled text exact. */
+    for(int i=0;i<cols*rows;i++)if(output[i].wflag&BROWSER_IMAGE) {
+        int first=!output[i].attr;
+        output[i].ch=first ? 0x25a7 : ' ';output[i].wflag=0;output[i].attr=0;
+        output[i].fg=output[i].bg=0;
+    }
+    return total;
+}
 static void mac_browser_scroll(int lines) {
     HCBrowser *b=browser_for(active_tab()); if (!b) return;
     b->scroll=MAX(0,MIN(MAX(0,b->total-mac_browser_page_rows(active_tab())),b->scroll+lines));
@@ -515,6 +551,30 @@ static void mac_browser_action(Tab *tb, int action) {
         if (error || !live || live->browser!=b || b->generation!=revision || b->epoch!=documentEpoch || ![info isKindOfClass:NSDictionary.class]) return;
         if (!browser_follow_anchor(live,b,browser_integer(info[@"target"])))
             mac_browser_begin_control(live,action,revision,documentEpoch,info);
+    }];
+}
+static void mac_browser_cutie_action(Tab *tb,int action) {
+    HCBrowser *b=browser_for(tb);if(!b || action<1 || action>4000)return;
+    int revision=b->generation,identity=tb->id,documentEpoch=b->epoch,stamp=b->cutieGeneration;
+    NSString *js=[NSString stringWithFormat:@"globalThis.hardcoreBrowser?.info(%d,%d)",action,revision];
+    [b->web evaluateJavaScript:js inFrame:nil inContentWorld:browser_world() completionHandler:^(id info,NSError *error) {
+        Tab *live=tab_by_id(identity);
+        if(error || !live || live->browser!=b || b->generation!=revision || b->epoch!=documentEpoch ||
+            b->cutieGeneration!=stamp || ![info isKindOfClass:NSDictionary.class])return;
+        NSString *tag=browser_string(info[@"tag"]),*type=browser_string(info[@"type"]);
+        BOOL editor=[tag isEqual:@"SELECT"] || [tag isEqual:@"TEXTAREA"] ||
+            ([tag isEqual:@"INPUT"] && ![@[@"checkbox",@"radio",@"button",@"submit",@"reset",@"image",@"hidden"] containsObject:type]);
+        if(editor) {
+            /* Editing controls need the normal browser workspace. Activation
+               is explicit here; simple links/buttons keep keyboard ownership. */
+            for(int i=0;i<g_ntabs;i++)if(g_tabs[i]==live){activate(i);break;}
+            if(tab_by_id(identity)==live && live->browser==b && b->epoch==documentEpoch && b->generation==revision)
+                mac_browser_begin_control(live,action,revision,documentEpoch,info);
+            return;
+        }
+        b->cutiePopupEpoch=documentEpoch;b->cutiePopupUntil=NSProcessInfo.processInfo.systemUptime+2.0;
+        NSString *code=[NSString stringWithFormat:@"globalThis.hardcoreBrowser?.activate(%d,%d)",action,revision];
+        [b->web evaluateJavaScript:code inFrame:nil inContentWorld:browser_world() completionHandler:nil];
     }];
 }
 

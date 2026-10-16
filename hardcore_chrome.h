@@ -4,7 +4,7 @@ enum {
     HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT,
     HIT_SCHEME, HIT_STAB, HIT_SCLOSE, HIT_UNDERLAY, HIT_TABPAGE, HIT_SETPAGE,
     HIT_REFLOW, HIT_REFLOW_DEBUG, HIT_DOCK_ROW, HIT_CHROME_INERT, HIT_GRIP,
-    HIT_WEB, HIT_FILES, HIT_CAF, HIT_TV, HIT_TV_CLOSE
+    HIT_WEB, HIT_FILES, HIT_CAF, HIT_TV, HIT_TV_CLOSE, HIT_CUTIE
 };
 static int plat_lights_bottom(void);
 static void plat_settings_shown(void);
@@ -72,7 +72,7 @@ static int chrome_pager_geometry(int offset, int capacity, int total, int tab,
     if (capacity <= 0 || total <= capacity) return 0;
     _snwprintf(counter, 24, L"%d/%d", offset / capacity + 1, (total + capacity - 1) / capacity);
     counter[23] = 0;
-    *counter_col = SB_COLS - (tab ? 3 : 1) - (int)wcslen(counter);
+    *counter_col = SB_COLS - (tab ? 5 : 1) - (int)wcslen(counter);
     *next_col = *counter_col - 4;
     return 1;
 }
@@ -81,7 +81,7 @@ static int chrome_page_hit(int col, int offset, int capacity, int total, int tab
     if (!chrome_pager_geometry(offset, capacity, total, tab, &next_col, &counter_col)) return 0;
     if (col >= 1 && col < 5) { *direction = -1; return 1; }
     if (col >= next_col && col < counter_col) { *direction = 1; return 1; }
-    return col >= counter_col && col < SB_COLS - (tab ? 3 : 1) ? 2 : 0;
+    return col >= counter_col && col < SB_COLS - (tab ? 5 : 1) ? 2 : 0;
 }
 
 #include "hardcore_font_menu.h"
@@ -237,6 +237,9 @@ static int hit_tabbar(int mx, int my, int *idx) {
 #endif
     for (i = 0; i < g_chrome.tab_count; i++) {
         if (row != g_chrome.tab_row + i) continue;
+        #ifndef _WIN32
+        if (col == SB_COLS - 4) { *idx = g_tab_offset + i; UI_DONE; return HIT_CUTIE; }
+        #endif
         if (col == SB_COLS - 2) { *idx = g_tab_offset + i; UI_DONE; return HIT_CLOSE; }
         if (!i && (page_hit = chrome_page_hit(col, g_tab_offset, g_chrome.tab_capacity, g_ntabs, 1, idx))) {
             UI_DONE; return page_hit == 1 ? HIT_TABPAGE : HIT_CHROME_INERT;
@@ -276,7 +279,7 @@ static int chrome_setting_hit(int hit) {
 }
 static int tabbar_action(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
-    return (chrome_setting_hit(hit) && hit != HIT_CHROME_INERT) || hit == HIT_PLUS || hit == HIT_CLOSE ||
+    return (chrome_setting_hit(hit) && hit != HIT_CHROME_INERT) || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_CUTIE ||
         hit == HIT_WEB || hit == HIT_FILES || hit == HIT_CAF || hit == HIT_TAB;
 }
 static void resize_all(void);

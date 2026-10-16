@@ -1,5 +1,5 @@
 /* Place secondary TVs against the primary display result. Twelve anchors per
- * surface, two surfaces today, and one bounded reflow per accepted surface. */
+ * surface, at most six surfaces, and one bounded reflow per accepted surface. */
 #ifndef _WIN32
 #include "hardcore_tv_reflow.h"
 static int chrome_tv_build(ChromeReflow *out,const Cell *input,int cols,int rows,
@@ -24,7 +24,7 @@ static int chrome_tv_cost(HcTvRect r,HcTvCost *cost,void *context) {
     ChromeTvCostContext *ctx=context;Term *t=ctx->term;
     if(r.x!=0 && r.x+r.w!=t->cols)return 0; /* edge lanes preserve reading order */
     if(hc_tv_rect_overlap(r,ctx->primary))return 0;
-    for(int i=0;i<2;i++) if(g_tvs[i].state.placed && hc_tv_rect_overlap(r,g_tvs[i].state.rect))return 0;
+    for(int i=0;i<HC_TV_COUNT;i++) if(g_tvs[i].state.placed && hc_tv_rect_overlap(r,g_tvs[i].state.rect))return 0;
     if((size_t)t->cols*t->rows>HC_TV_REFLOW_MAX_CELLS)return 1;
     int cx,cy;display_cursor_position(t,&cx,&cy);
     for(int y=r.y;y<r.y+r.h;y++) {
@@ -60,28 +60,29 @@ static uint64_t chrome_tv_signature(Term *t) {
 static int chrome_tv_placement_valid(HcTvPlacement p,HcTvRect primary,Term *t,int height) {
     if(!p.valid || p.rect.w!=SB_COLS || p.rect.h!=height ||
        !hc_tv_rect_fits(p.rect,t->cols,t->rows) || hc_tv_rect_overlap(p.rect,primary))return 0;
-    for(int i=0;i<2;i++)if(g_tvs[i].state.placed && hc_tv_rect_overlap(p.rect,g_tvs[i].state.rect))return 0;
+    for(int i=0;i<HC_TV_COUNT;i++)if(g_tvs[i].state.placed && hc_tv_rect_overlap(p.rect,g_tvs[i].state.rect))return 0;
     return 1;
 }
 static void chrome_tv_prepare(Term *t) {
     uint32_t now=GetTickCount();
-    int blocked=chrome_hovered() || chrome_tv_hovered(0) || chrome_tv_hovered(1) || chrome_preview_active() ||
+    int blocked=chrome_hovered() || chrome_any_tv_hovered() || chrome_preview_active() || g_cutie_focus_id>0 ||
         g_chrome_drag || g_sel_on || g_sel_drag || g_sb_drag ||
         (uint32_t)(now-g_chrome_input_at)<700;
-    for(int i=0;i<2;i++) {g_tvs[i].state.placed=0;g_tvs[i].motion_blocked=blocked;}
+    int open=0;
+    for(int i=0;i<HC_TV_COUNT;i++) {g_tvs[i].state.placed=0;g_tvs[i].motion_blocked=blocked;open+=g_tvs[i].state.open;}
     if(t->cols<SB_COLS || t->rows<3) {
-        for(int i=0;i<2;i++)hc_tv_motion_reset(&g_tvs[i].motion);
+        for(int i=0;i<HC_TV_COUNT;i++)hc_tv_motion_reset(&g_tvs[i].motion);
         chrome_tv_schedule();return;
     }
-    if(!g_tvs[0].state.open && !g_tvs[1].state.open){chrome_tv_schedule();return;}
+    if(!open){chrome_tv_schedule();return;}
     HcTvRect primary={sidebar_x()/CW,g_chrome.top,SB_COLS,g_chrome.bottom-g_chrome.top};
     ChromeTvCostContext cost_context={t,primary};
-    HcTvRect obstacles[3]={primary}; int count=1;
+    HcTvRect obstacles[HC_TV_COUNT+1]={primary}; int count=1;
     uint64_t signature=chrome_tv_signature(t);
-    for(int i=0;i<2;i++) {
+    for(int i=0;i<HC_TV_COUNT;i++) {
         ChromeTv *tv=g_tvs+i;
         if(!tv->state.open){hc_tv_motion_reset(&tv->motion);continue;}
-        int items=0,height=6,capacity=0;
+        int items=0,height=i>=HC_TV_CUTIE_FIRST?HC_TV_CUTIE_ROWS:6,capacity=0;
         int room=t->rows;
         if(t->cols<2*SB_COLS)room=chrome_max(primary.y,t->rows-primary.y-primary.h);
         if(i==HC_TV_SETTINGS) {
@@ -107,14 +108,13 @@ static void chrome_tv_prepare(Term *t) {
         int first=!tv->motion.initialized,context_changed=tv->motion.context!=context;
         int valid=chrome_tv_placement_valid(tv->placement,primary,t,height);
         int action=hc_tv_motion_observe(&tv->motion,now,signature,context,blocked);
-        if(height<(i==HC_TV_SETTINGS?3:2)) {tv->motion.searched=1;continue;}
+        if(height<(i==HC_TV_CAF?2:3)) {tv->motion.searched=1;continue;}
         /* New surfaces and invalid geometry need a fitting location now.
          * Content-only improvements wait for the quiet interval and fade. */
         if(first || (!valid && context_changed) || action==HC_TV_MOTION_SEARCH) {
             /* Later TVs extend the visible stack before trying other edges.
              * The callback still vetoes the authoritative primary rectangle. */
-            HcTvRect anchor=i==HC_TV_CAF && g_tvs[HC_TV_SETTINGS].state.placed?
-                g_tvs[HC_TV_SETTINGS].state.rect:primary;
+            HcTvRect anchor=obstacles[count-1];
             HcTvPlacement choice=hc_tv_place(t->cols,t->rows,anchor,SB_COLS,height,
                                              &tv->placement,chrome_tv_cost,&cost_context);
             tv->motion.searched=1;
@@ -135,7 +135,7 @@ static void chrome_tv_prepare(Term *t) {
         tv->layout.settings_row=-1;tv->layout.section_row=i==HC_TV_SETTINGS?r.y+1:-1;
         tv->layout.list_row=i==HC_TV_SETTINGS?r.y+2:-1;
         tv->layout.list_capacity=capacity;
-        tv->layout.list_count=chrome_min(capacity,items-g_setting_offset[g_settings_tab]);
+        tv->layout.list_count=i==HC_TV_SETTINGS?chrome_min(capacity,items-g_setting_offset[g_settings_tab]):0;
         /* The following composer is intentionally conservative around every
            earlier surface. It cannot trade away primary-menu clearance. */
         chrome_tv_reflow_apply(t,r,obstacles,count);

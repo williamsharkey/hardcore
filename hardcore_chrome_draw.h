@@ -65,7 +65,7 @@ static void chrome_prepare_edges(ChromeLayout primary,int primary_x,float primar
     if(primary_alpha>0)
         mask|=chrome_join_mask(g_chrome_x,g_chrome.top,g_chrome.bottom,
                                primary_x,primary.top,primary.bottom);
-    for(int i=0;i<2;i++) {
+    for(int i=0;i<HC_TV_COUNT;i++) {
         const ChromeTv *tv=g_tvs+i;HcTvRect r=tv->state.rect;
         if(tv->state.open && tv->state.placed && tv->state.alpha*tv->motion.alpha>0)
             mask|=chrome_join_mask(g_chrome_x,g_chrome.top,g_chrome.bottom,r.x*CW,r.y,r.y+r.h);
@@ -293,7 +293,7 @@ static void render_settings(int hover, int hidx) {
 #include "hardcore_tv_draw.h"
 
 static int chrome_tab_hover(int hit,int row) {
-    return (hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_TABPAGE || hit==HIT_CHROME_INERT) &&
+    return (hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_CUTIE || hit==HIT_TABPAGE || hit==HIT_CHROME_INERT) &&
         g_mouse_x>=g_chrome_x && g_mouse_x<g_chrome_x+sidebar_w() && g_mouse_y/CH==row;
 }
 static void render_tabbar(int win_w, int win_h) {
@@ -335,7 +335,7 @@ static void render_tabbar(int win_w, int win_h) {
         chrome_frame(g_chrome.top, g_look.dim);
     }
     for (i = 0; i < g_chrome.tab_count; i++) {
-        int tab = g_tab_offset + i, row = g_chrome.tab_row + i, left = 1, right = SB_COLS - 3;
+        int tab = g_tab_offset + i, row = g_chrome.tab_row + i, left = 1, right = SB_COLS - 5;
         int active = tab == g_active, hovered = chrome_tab_hover(hover,row);
         Tab *tb = g_tabs[tab];
         wchar_t label[256];
@@ -348,6 +348,9 @@ static void render_tabbar(int win_w, int win_h) {
         r_color(tb->t.ps_state == PS_ERROR ? g_look.red : tb->attention || tb->t.ps_state == PS_BLOCKED || tb->busy ? AMBER : fg, 1);
         draw_glyph(tb->busy ? drip : tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR || tb->attention ? '!' : active ? 0x25CF : tb->activity ? 0x00B7 : ' ',
                    (float)(left * CW), row_y(row), 1, g_scale);
+        #ifndef _WIN32
+        if (hovered) grid_text(L"□", SB_COLS - 4, row, hover == HIT_CUTIE && idx == tab ? AMBER : g_look.text_lo);
+        #endif
         if (hovered) grid_text(L"×", SB_COLS - 2, row, hover == HIT_CLOSE && idx == tab ? g_look.red : g_look.dim);
         chrome_sides(row, g_look.dim);
         if (!i) chrome_rule(row, g_look.dim);

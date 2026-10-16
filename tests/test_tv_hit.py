@@ -26,10 +26,15 @@ static int g_chrome_menu_count,g_chrome_menu_capacity,g_chrome_menu_top,g_chrome
 static float g_chrome_menu_alpha;
 static int g_settings_tab=1,g_setting_offset[3],g_font_menu_count=8,g_sel_drag,g_mouse_x=-1,g_mouse_y=-1,g_settings_open;
 static const struct{int light,dark;}FAMILIES[NFAMILIES]={{0,1}};
-static uint32_t GetTickCount(void){return 1000;}
-static void plat_invalidate(void){}
-static void plat_timer(int id,int ms){(void)id;(void)ms;}
-static void plat_kill_timer(int id){(void)id;}
+typedef struct {int id,browser_native;} Tab;
+static Tab tabs[8];
+static int g_cutie_focus_id,g_timer,g_invalidations;
+static uint32_t now=1000;
+static Tab *tab_by_id(int id){for(int i=0;i<8;i++)if(id>0&&tabs[i].id==id)return tabs+i;return NULL;}
+static uint32_t GetTickCount(void){return now;}
+static void plat_invalidate(void){g_invalidations++;}
+static void plat_timer(int id,int ms){(void)id;g_timer=ms;}
+static void plat_kill_timer(int id){(void)id;g_timer=0;}
 static int chrome_item_total(void){return NFAMILIES;}
 static int font_menu_hit(int item,int col){return item+col;}
 static int scheme_index(int key){return key;}
@@ -39,6 +44,8 @@ static int chrome_pager_geometry(int a,int b,int c,int d,int *e,int *f){(void)a;
 static ChromePackRow rows[12];
 static void init(void){
     memset(g_tvs,0,sizeof(g_tvs));memset(rows,0,sizeof(rows));g_settings_tab=1;g_setting_offset[1]=0;
+    memset(tabs,0,sizeof(tabs));g_cutie_focus_id=g_timer=g_invalidations=g_settings_open=0;now=1000;
+    for(int i=0;i<8;i++)tabs[i].id=100+i;
     for(int y=0;y<12;y++)for(int x=0;x<SB_COLS;x++){rows[y].src[x]=x;rows[y].dst[x]=x;rows[y].actionable[x]=1;}
     g_chrome_menu_rows=rows;g_chrome_menu_count=g_chrome_menu_capacity=12;
     g_chrome_menu_top=10;g_chrome_menu_x=720;g_chrome_menu_cw=CW;g_chrome_menu_ch=CH;g_chrome_menu_alpha=1;
@@ -72,7 +79,48 @@ static void caf(void){
     assert(hit(3,13,&idx)==HIT_TV&&idx==1);
     assert(hit(26,10,&idx)==HIT_TV_CLOSE&&idx==1);
 }
-int main(int argc,char **argv){int n=argc>1?atoi(argv[1]):0;if(!n)packed();else if(n==1)stale();else caf();puts("ok");return 0;}
+static void lifecycle(void){
+    init();assert(chrome_tv_open_tab(0)==-1&&chrome_tv_open_tab(999)==-1);
+    tabs[0].browser_native=1;int first=chrome_tv_open_tab(100);
+    assert(first==HC_TV_CUTIE_FIRST&&g_tvs[first].tab_id==100);
+    chrome_tv_scroll(first,7);assert(chrome_tv_open_tab(100)==first&&g_tvs[first].scroll==7);
+    /* Tab reordering never changes the source identity. */
+    Tab tmp=tabs[0];tabs[0]=tabs[1];tabs[1]=tmp;
+    assert(chrome_tv_open_tab(100)==first);
+    for(int i=1;i<HC_TV_CUTIE_COUNT;i++)assert(chrome_tv_open_tab(100+i)==first+i);
+    assert(chrome_tv_open_tab(104)==-1);
+    for(int i=0;i<HC_TV_CUTIE_COUNT;i++)assert(g_tvs[first+i].tab_id==100+i);
+    chrome_tv_scroll(first,INT_MAX);assert(g_tvs[first].scroll==INT_MAX);
+    chrome_tv_scroll(first,INT_MIN);assert(g_tvs[first].scroll==0);
+    g_cutie_focus_id=100;chrome_tv_close_slot(first);assert(!g_cutie_focus_id&&!g_tvs[first].state.open);
+    assert(chrome_tv_open_tab(104)==first&&g_tvs[first].scroll==0&&g_tvs[first].frame.count==0);
+    tabs[4].id=0;g_cutie_focus_id=104;chrome_tv_prune();
+    assert(!g_tvs[first].state.open&&!g_cutie_focus_id);
+    for(int i=first+1;i<HC_TV_COUNT;i++)assert(g_tvs[i].state.open);
+    chrome_tv_close_slot(-1);chrome_tv_close_slot(HC_TV_COUNT);
+    assert(!chrome_tv_contains(-1,0,0)&&!chrome_tv_contains(HC_TV_COUNT,0,0));
+}
+static void persistent(void){
+    init();int slot=chrome_tv_open_tab(100);now+=600000;chrome_tv_clock();
+    assert(g_tvs[slot].state.open&&g_tvs[slot].state.alpha==1);
+    assert(!g_tvs[0].state.open&&!g_timer);
+    chrome_tv_interaction(slot);now+=600000;chrome_tv_clock();assert(g_tvs[slot].state.open);
+}
+static void cutie_hit(void){
+    int idx=-1;init();g_tvs[HC_TV_COUNT-1]=g_tvs[0];g_tvs[0].state.open=0;
+    g_tvs[HC_TV_COUNT-1].tab_id=100;
+    rows[3].actionable[5]=0; /* terminal body uses projection, not word packing */
+    assert(hit(5,13,&idx)==HIT_TV&&idx==HC_TV_COUNT-1);
+    rows[0].src[24]=26;rows[0].actionable[26]=0;
+    assert(hit(24,10,&idx)==HIT_TV_CLOSE&&idx==HC_TV_COUNT-1);
+    assert(hit(26,10,&idx)==HIT_NONE);
+    assert(chrome_any_tv_contains(721,201));g_mouse_x=721;g_mouse_y=201;
+    assert(chrome_any_tv_hovered());g_sel_drag=1;assert(!chrome_any_tv_hovered());g_sel_drag=0;
+    tabs[0].id=0;assert(hit(24,10,&idx)==HIT_NONE&&!chrome_any_tv_hovered());
+}
+int main(int argc,char **argv){int n=argc>1?atoi(argv[1]):0;
+    if(!n)packed();else if(n==1)stale();else if(n==2)caf();else if(n==3)lifecycle();
+    else if(n==4)persistent();else cutie_hit();puts("ok");return 0;}
 '''
 class Hit(unittest.TestCase):
     @classmethod
@@ -87,4 +135,7 @@ class Hit(unittest.TestCase):
     def test_packed_word_controls_use_source_columns(self):self.check_case(0)
     def test_stale_geometry_content_and_invisible_frames_are_inert(self):self.check_case(1)
     def test_caf_returns_its_own_slot(self):self.check_case(2)
+    def test_cuties_bind_stable_ids_deduplicate_and_prune(self):self.check_case(3)
+    def test_cuties_do_not_idle_expire_or_schedule_idle_ticks(self):self.check_case(4)
+    def test_last_cutie_slot_header_and_body_are_interactive(self):self.check_case(5)
 if __name__=="__main__":unittest.main()

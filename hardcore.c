@@ -481,6 +481,7 @@ typedef struct {
 typedef struct Tab {
     Term t;
     int id;
+    uint64_t output_generation;  /* invalidate miniature input maps after each parsed batch */
     int parent_id;               /* browser children retain their owning terminal */
     int browser_native;          /* default 0: Hardcore grid; 1: live native view */
     void *browser;               /* platform-owned live document, never a shell */
@@ -601,6 +602,10 @@ static void mac_browser_sync(void);
 static void mac_browser_resize(Tab *tb);
 static void mac_browser_destroy(Tab *tb);
 static void mac_browser_prepare(Tab *tb);
+static int mac_browser_cutie_project(Tab*,Cell*,int,int,int);
+static int mac_browser_cutie_generation(Tab*);
+static void mac_browser_cutie_action(Tab*,int);
+static void mac_cutie_blur(void);
 static void mac_browser_scroll(int lines);
 static void mac_browser_draw_overlay(void);
 static void mac_browser_draw_tile(Tab *tb,const Cell *cell,int x,int y);
@@ -2949,6 +2954,18 @@ static DWORD g_last_paint;
 #endif
 
 static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
+#ifndef _WIN32
+static int g_cutie_focus_id;
+static int cutie_focus_valid(void);
+static void cutie_input_follow(void);
+#endif
+static Tab *input_tab(void) {
+#ifndef _WIN32
+    if(g_cutie_focus_id && cutie_focus_valid())return tab_by_id(g_cutie_focus_id);
+    if(g_cutie_focus_id)mac_cutie_blur();
+#endif
+    return active_tab();
+}
 
 #include "hardcore_tab_preview.h"
 static TabPreview g_tab_preview;
@@ -3043,6 +3060,9 @@ static void resize_all(void) {
     compute_grid(w, h, &cols, &rows);
     if (cols == g_cols && rows == g_rows) return;
     chrome_preview_cancel();
+#ifndef _WIN32
+    mac_cutie_blur();
+#endif
     g_cols = cols;
     g_rows = rows;
     g_sel_on = 0;
@@ -3119,12 +3139,17 @@ static void sel_copy(void) {
 }
 
 static void send_to_active(const char *s, int n) {
-    Tab *tb = active_tab();
+    Tab *tb = input_tab();
     if (!tb) return;
 #ifndef _WIN32
     if (mac_input_held(tb)) return;
+    cutie_input_follow();
 #endif
-    if (tb->t.view) {
+    if (tb->t.view
+#ifndef _WIN32
+        && !g_cutie_focus_id
+#endif
+    ) {
         tb->t.view = 0;
         plat_invalidate();
     }
@@ -3134,7 +3159,7 @@ static void send_to_active(const char *s, int n) {
 /* Sends text the way a paste arrives: CRLF/LF become CR like a typed Enter,
    ESC is stripped so a paste can't end bracketed-paste mode early. */
 static void paste_utf8(const char *in) {
-    Tab *tb = active_tab();
+    Tab *tb = input_tab();
     size_t n = strlen(in);
     char *s, *o;
     const char *p;
@@ -4022,10 +4047,11 @@ static double mac_caf_elapsed(void);
 static const char *mac_caf_power(void);
 #endif
 #include "hardcore_chrome.h"
+#include "hardcore_cutie.h"
 static void chrome_preview_pointer(int mx,int my) {
     int index=-1,hit=hit_tabbar(mx,my,&index);
     Tab *selected=active_tab();
-    int target=(hit==HIT_TAB || hit==HIT_CLOSE) && index>=0 && index<g_ntabs?g_tabs[index]->id:0;
+    int target=(hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_CUTIE) && index>=0 && index<g_ntabs?g_tabs[index]->id:0;
     int eligible=g_focused && !g_sel_drag && !g_chrome_drag && !g_sb_drag;
     if(tab_preview_point(&g_tab_preview,selected?selected->id:0,target,eligible))plat_invalidate();
 }
@@ -4355,6 +4381,7 @@ static void render(void) {
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
         mac_browser_draw_overlay();
+        render_cuties(r.right);
         plat_render_title_overlay();
         return;
     }
@@ -4491,8 +4518,9 @@ static void render(void) {
     render_caption_buttons(r.right);
     if (overlay && (chrome_hovered() || chrome_preview_active())) render_tabbar(r.right, r.bottom);
 #else
-    if (overlay && (chrome_hovered() || chrome_tv_hovered(0) || chrome_tv_hovered(1))) render_tabbar(r.right, r.bottom);
+    if (overlay && (chrome_hovered() || chrome_any_tv_hovered())) render_tabbar(r.right, r.bottom);
     mac_browser_draw_overlay();
+    render_cuties(r.right);
     plat_render_title_overlay();
 #endif
 }
@@ -4694,6 +4722,9 @@ static void update_busy(int tick) {
 /* ── tab management ───────────────────────────────────────────────── */
 
 static void activate(int i) {
+#ifndef _WIN32
+    mac_cutie_blur();
+#endif
     if (i < 0 || i >= g_ntabs) return;
     chrome_preview_cancel();
     term_settle(&g_tabs[i]->t);  /* a tab not caught up since a resize: before it shows */
@@ -5267,6 +5298,9 @@ static void close_tab(int i) {
     Tab *tb;
     if (i < 0 || i >= g_ntabs) return;
     tb = g_tabs[i];
+#ifndef _WIN32
+    if(tb->id==g_cutie_focus_id)mac_cutie_blur();
+#endif
     memmove(&g_tabs[i], &g_tabs[i + 1], sizeof(Tab *) * (g_ntabs - i - 1));
     g_ntabs--;
     if (!g_ntabs) {             /* the last tab: its folder is where the next window opens */
