@@ -85,6 +85,41 @@ static int cr_fence(const Cell *line, int begin, int end) {
     return cr_starts(line, begin, end, "```") || cr_starts(line, begin, end, "~~~");
 }
 
+/* Codex's compact diff gutter is "3 +text", including for non-code text.
+ * The colored row supplies the missing separator's provenance; ordinary
+ * arithmetic such as "3 +14" must not become a numbered diff. */
+static int cr_diff_background(const Cell *line, int begin, int end) {
+    uint32_t bg = line[begin].bg;
+    if (!bg) return 0;
+    for (int x = begin+1; x < end; x++) if (line[x].bg != bg) return 0;
+    return 1;
+}
+
+static int cr_url_start(const Cell *line, int begin, int end) {
+    return cr_starts(line, begin, end, "https://") ||
+           cr_starts(line, begin, end, "http://") ||
+           cr_starts(line, begin, end, "file://");
+}
+
+/* A tool tree can contain literal search expressions and boolean operators.
+ * Do not grant the same treatment to arbitrary pipe-separated output: the
+ * inherited tree indentation alone is not evidence that a table may wrap. */
+static int cr_tree_literal_pipes(const Cell *line, const ChromeReflowRow *r) {
+    if (cr_starts(line, r->body, r->end, "Search ") ||
+        cr_starts(line, r->body, r->end, "Ran ")) return 1;
+    int syntax = 0, pipe = 0;
+    for (int x = r->body; x < r->end; x++) {
+        uint32_t c = line[x].ch;
+        if (c && c < 128 && strchr("();{}=", (int)c)) syntax = 1;
+        if (c == '|') {
+            pipe = 1;
+            if (!(x > r->body && line[x-1].ch == '|') &&
+                !(x+1 < r->end && line[x+1].ch == '|')) return 0;
+        }
+    }
+    return syntax && pipe;
+}
+
 /* Explicit line identities permit literal wrapping without treating code as
  * prose. A numbered diff keeps its number/sign on its own first row; a tool
  * tree keeps its prefix there. Tables and complete box frames stay protected. */
@@ -94,8 +129,9 @@ static int cr_record_shape(const Cell *line, ChromeReflowRow *r) {
     gap = digits;
     while (gap < r->end && cr_space(line[gap].ch)) gap++;
     if (digits > x && gap > digits && gap + 1 < r->end &&
-        (line[gap].ch == '+' || line[gap].ch == '-') && cr_space(line[gap+1].ch)) {
-        r->body = gap+2;
+        (line[gap].ch == '+' || line[gap].ch == '-') &&
+        (cr_space(line[gap+1].ch) || cr_diff_background(line, x, r->end))) {
+        r->body = gap+1;
         while (r->body < r->end && cr_space(line[r->body].ch)) r->body++;
         return CR_RECORD_CODE;
     }
@@ -113,9 +149,13 @@ static int cr_record_shape(const Cell *line, ChromeReflowRow *r) {
     if (r->bullet && (cr_starts(line, r->body, r->end, "Ran ") ||
         cr_starts(line, r->body, r->end, "You ran ") || cr_starts(line, r->body, r->end, "Failed (exit ")))
         return CR_RECORD_COMMAND;
+    if ((r->bullet && cr_starts(line, r->body, r->end, "Opened ") &&
+         cr_url_start(line, r->body+7, r->end)) ||
+        (cr_starts(line, r->body, r->end, "Saved to: ") &&
+         cr_url_start(line, r->body+10, r->end))) return CR_RECORD_PATH;
     if (x < r->end && (line[x].ch == '/' || cr_starts(line, x, r->end, "~/") ||
         cr_starts(line, x, r->end, "./") || cr_starts(line, x, r->end, "../") ||
-        cr_starts(line, x, r->end, "https://") || cr_starts(line, x, r->end, "http://"))) {
+        cr_url_start(line, x, r->end))) {
         r->body = x+2;
         return CR_RECORD_PATH;
     }
@@ -181,9 +221,10 @@ static ChromeReflowRow cr_classify(const Cell *line, int cols, int protected_row
         r.body = r.indent;
     }
     if (r.record) {
+        int literal_pipes = r.record != CR_RECORD_TREE || cr_tree_literal_pipes(line, &r);
         for (x = 0; x < cols; x++) {
             const Cell *c = line+x;
-            if ((c->attr & (16u | 64u)) || c->wflag || (r.record == CR_RECORD_TREE && c->ch == '|') ||
+            if ((c->attr & (16u | 64u)) || c->wflag || (!literal_pipes && c->ch == '|') ||
                 (!cr_space(c->ch) && !cr_prose_character(c->ch) && !(x == r.indent && c->ch == 0x2514) &&
                  !(r.record == CR_RECORD_FOOTER && c->ch == 0x2303))) {
                 r.reason = CR_REASON_UNSAFE;

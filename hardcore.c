@@ -622,6 +622,8 @@ static void plat_timer(int id, int ms);          /* one-shot (or, for TIMER_THRO
 #define TIMER_THROB 3
 #define TIMER_DISK 4              /* Win32: the low-disk check, every minute */
 #define TIMER_SETTLE 5            /* resizing stopped: rewrap the rest of every tab's scrollback */
+#define TIMER_CHROME 6            /* adaptive menu search and its brief fade transition */
+static DWORD g_chrome_input_at;   /* pause automatic menu motion while typing */
 static void plat_kill_timer(int id);
 static void plat_set_title(const wchar_t *title);
 static void plat_close_window(void);
@@ -3313,13 +3315,17 @@ typedef struct {
     uint32_t rgba;
 } Inst;
 
-static float g_draw_alpha = 1; /* dim the complete underlay before drawing terminal cells */
+static float g_draw_alpha = 1; /* shared draw opacity, including menu transitions */
 static uint32_t g_rgba = 0xFFFFFFFF;
 #define VB_INST 65536            /* per draw; a frame that needs more draws in pieces */
 static Inst g_inst[VB_INST];
 static int g_ninst;
 static int g_clip_w = 32767, g_clip_h = 32767;
 static int g_chrome_x; /* translation for the right-side overlay only */
+/* Menu quads are staged so a whole row can borrow whitespace before any of
+   its glyphs reach the renderer. Capture cannot flush the terminal's batch. */
+static Inst *g_chrome_quads;
+static int g_chrome_quad_count, g_chrome_quad_capacity, g_chrome_capture, g_chrome_capture_failed;
 
 static void r_flush(void);
 static void r_upload(int x, int y, const unsigned char *bmp);
@@ -3349,8 +3355,19 @@ static void r_quad_uv(float x0, float y0, float x1, float y1, int u0, int v0, in
     if (y0 < 0) y0 = 0;
     if (x1 > g_clip_w) x1 = (float)g_clip_w;
     if (y1 > g_clip_h) y1 = (float)g_clip_h;
-    if (g_ninst == VB_INST) r_flush();
-    q = &g_inst[g_ninst++];
+    if (g_chrome_capture) {
+        if (g_chrome_capture_failed) return;
+        if (g_chrome_quad_count == g_chrome_quad_capacity) {
+            int capacity = g_chrome_quad_capacity ? g_chrome_quad_capacity * 2 : 1024;
+            Inst *more = (Inst *)realloc(g_chrome_quads, (size_t)capacity * sizeof(*more));
+            if (!more) { g_chrome_capture_failed = 1; return; }
+            g_chrome_quads = more; g_chrome_quad_capacity = capacity;
+        }
+        q = &g_chrome_quads[g_chrome_quad_count++];
+    } else {
+        if (g_ninst == VB_INST) r_flush();
+        q = &g_inst[g_ninst++];
+    }
     q->x0 = px(x0); q->y0 = px(y0); q->x1 = px(x1); q->y1 = px(y1);
     q->u0 = (uint16_t)u0; q->v0 = (uint16_t)v0; q->u1 = (uint16_t)u1; q->v1 = (uint16_t)v1;
     q->rgba = g_rgba;
@@ -3751,6 +3768,7 @@ static void fill_rect(float x0, float y0, float x1, float y1, uint32_t rgb, floa
    measure. A wide glyph in a 1-cell slot is shrunk to fit, square and
    centred, the way dumbterm did it; a narrow one in two cells is centred. */
 static void draw_glyph(uint32_t cp, float x, float y, int w_cells, int scale) {
+    if (g_chrome_capture && cp == ' ') return;
     int aw, ah, wide, slot = glyph_slot(cp, &aw, &ah, &wide);
     float cw = (float)CW, chh = (float)CH;
     int u0 = (slot % SLOTS_PER_ROW) * SLOT, v0 = (slot / SLOTS_PER_ROW) * SLOT, u1 = u0 + aw, v1 = v0 + ah;
@@ -4101,12 +4119,12 @@ static void plat_render_title_background(float x0, float y0, float x1, float y1,
 static void plat_render_title_underlay(void);
 static void plat_render_title_overlay(void);
 #endif
-static float chrome_row_alpha(int row);
+static int chrome_intrusion_span(int row, int *left, int *right);
 #include "hardcore_chrome_draw.h"
 
-/* Foreground owns its complete cell so chrome cannot cross glyph margins.
-   Background color alone is not foreground: highlighted blank space still
-   exposes the dim menu, composited above that background. */
+/* Foreground determines the continuous terminal span cut from chrome.
+   Background color alone is not foreground: a highlighted blank tail still
+   exposes the opaque menu, composited above that background. */
 static int cell_covers_chrome(const Cell *c) {
     uint32_t fg, bg;
     int space = c->ch <= ' ' || c->ch == 0xA0 || (c->ch >= 0x2000 && c->ch <= 0x200A) ||
@@ -4116,12 +4134,13 @@ static int cell_covers_chrome(const Cell *c) {
     return !space || (c->wflag & 8) || c->wflag == W_CONT || (c->attr & (A_UNDER | A_STRIKE)) || c->link;
 }
 
-static float chrome_overlap_alpha(const Cell *cells, int n, int left, int right, int raised) {
-    if (raised) return 1;
-    if (left < 0) left = 0;
-    if (right > n) right = n;
-    for (int x = left; x < right; x++) if (cell_covers_chrome(&cells[x])) return .38f;
-    return 1;
+static int chrome_terminal_span(const Cell *cells, int n, int *left, int *right) {
+    *left = n; *right = 0;
+    for (int x = 0; x < n; x++) if (cell_covers_chrome(&cells[x])) {
+        if (x < *left) *left = x;
+        *right = x + 1;
+    }
+    return *right > *left;
 }
 
 static int unit_underlay(FILE *f) {
@@ -4148,12 +4167,11 @@ static int unit_underlay(FILE *f) {
     blank.ch = 'X'; blank.attr = A_HIDDEN; fails += cell_covers_chrome(&blank);
     blank.ch = 0xA0; blank.attr = A_DIM; fails += cell_covers_chrome(&blank);
     {
-        Cell row[4] = {{' ', 0, C_PAL(2)}, {' ', 0, C_PAL(2)}, {'X'}, {' '}};
-        fails += chrome_overlap_alpha(row, 4, 0, 2, 0) != 1;
-        fails += chrome_overlap_alpha(row, 4, 2, 4, 0) != .38f;
-        fails += chrome_overlap_alpha(row, 4, 2, 4, 1) != 1;
-        row[2].attr = A_HIDDEN;
-        fails += chrome_overlap_alpha(row, 4, 2, 4, 0) != 1;
+        Cell row[4] = {{'X'}, {' ', 0, C_PAL(2)}, {'X'}, {' '}};
+        int left, right;
+        fails += !chrome_terminal_span(row, 4, &left, &right) || left != 0 || right != 3;
+        row[0].attr = row[2].attr = A_HIDDEN;
+        fails += chrome_terminal_span(row, 4, &left, &right) != 0;
     }
 #ifndef _WIN32
     /* There must be no invisible midpoint, nor an excessive shift, on any
@@ -4228,18 +4246,26 @@ static int unit_underlay(FILE *f) {
 static void r_begin(int w, int h);
 #include "hardcore_display.h"
 
-/* Clear rows use the theme's full contrast. Only a row whose foreground still
-   occupies the dock lane recedes; hovering or dragging brings all rows forward. */
-static float chrome_row_alpha(int row) {
+/* Include spaces between terminal words so no menu glyph can leak into them.
+   Return the interval in terminal columns, clipped to the current dock. */
+static int chrome_intrusion_span(int row, int *left, int *right) {
     Tab *tb = active_tab();
     const Cell *cells;
-    int n, left = sidebar_x()/CW;
-    int raised = g_chrome_drag || (!g_sel_drag && g_mouse_x >= left*CW &&
-        g_mouse_x < (left+SB_COLS)*CW && g_mouse_y >= g_chrome.top*CH &&
-        g_mouse_y < g_chrome.bottom*CH);
-    if (!tb || tb->browser_native || row < 0 || row >= tb->t.rows || raised) return 1;
+    int n, occupied, dock = sidebar_x()/CW;
+    *left = *right = 0;
+    if (!tb || tb->browser_native || row < 0 || row >= tb->t.rows ||
+        row < g_chrome.top || row >= g_chrome.bottom) return 0;
     display_line(&tb->t, row, &cells, &n);
-    return chrome_overlap_alpha(cells, n, left, left + SB_COLS, 0);
+    occupied = chrome_terminal_span(cells, n, left, right);
+    if (tb->t.view == 0 && tb->t.m_cursor_vis && tb->t.cy == row && tb->t.cx < tb->t.cols) {
+        int end = tb->t.cx + (CELL(&tb->t, tb->t.cx, row)->wflag == W_WIDE ? 2 : 1);
+        if (!occupied || tb->t.cx < *left) *left = tb->t.cx;
+        if (end > *right) *right = end;
+    }
+    if (*left < dock) *left = dock;
+    if (*right > dock + SB_COLS) *right = dock + SB_COLS;
+    if (*right <= *left) { *left = *right = 0; return 0; }
+    return 1;
 }
 
 /* Terminal fills are below the quiet chrome, while terminal foreground cells
@@ -4280,6 +4306,12 @@ static void render(void) {
     g_clip_w = r.right / CW * CW;
     g_clip_h = r.bottom / CH * CH;
     r_begin(r.right, r.bottom);
+    /* Browser/native and empty-window paths do not prepare a terminal grid.
+       They must still end an old tab's fade and discard its pending target. */
+    if (!tb || (tb->kind == TK_BROWSER && tb->browser_native)) {
+        cm_reset(&g_chrome_motion); g_chrome_motion_alpha = 1;
+        plat_kill_timer(TIMER_CHROME);
+    }
 #ifndef _WIN32
     if (tb && tb->kind == TK_BROWSER && tb->browser_native) {
         render_tabbar(r.right, r.bottom);
@@ -4299,27 +4331,26 @@ static void render(void) {
 #endif
     t = &tb->t;
     chrome_prepare_display(t);
+    dock_col = sidebar_x()/CW;
     render_terminal_backgrounds(t, ox, oy);
     if (overlay) {
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
     } else render_tabbar(r.right, r.bottom);
 
-    /* Restore background only beneath foreground cells that overlap chrome,
-       then draw glyphs and decorations. All cell masks precede row glyphs so
-       a bold smear cannot be erased by the next cell's mask. */
+    /* Restore the complete terminal intrusion, including spaces between its
+       words, before drawing any glyphs. All masks precede row glyphs so a bold
+       smear cannot be erased by the following cell's background. */
     for (y = 0; y < t->rows; y++) {
         const Cell *cells;
         int n;
         float y0 = (float)(oy + y * CH);
         display_line(t, y, &cells, &n);
-        int mask_end = overlay && y >= g_chrome.top && y < g_chrome.bottom ? n : 0;
-        int mask_begin = dock_col;
-        if (mask_end > mask_begin + SB_COLS) mask_end = mask_begin + SB_COLS;
+        int mask_begin = dock_col, mask_end = dock_col;
+        if (overlay) chrome_intrusion_span(y, &mask_begin, &mask_end);
         for (x = mask_begin; x < mask_end; x++) {
             uint32_t fg, bg;
-            if (!cell_covers_chrome(&cells[x])) continue;
-            if(cells[x].wflag & 8){fg=DEF_FG;bg=DEF_BG;}else cell_colors(&cells[x], &fg, &bg);
+            if (x >= n || (cells[x].wflag & 8)) {fg=DEF_FG;bg=DEF_BG;} else cell_colors(&cells[x], &fg, &bg);
             if (display_selected(t, x, y)) bg = SEL_BG;
             r_color(bg, 1);
             quad((float)(ox + x * CW), y0, (float)(ox + (x + 1) * CW), y0 + CH);
@@ -6667,6 +6698,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        g_chrome_input_at = GetTickCount();
         if (g_lat && !g_lat_key.QuadPart) {
             lat_finish();
             QueryPerformanceCounter(&g_lat_key);

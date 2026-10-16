@@ -3,7 +3,127 @@
    past the drawable edge, with no outside vertical rule. Its controls remain
    on the original grid and retain their full visible width. */
 static float g_chrome_base_alpha;
-static void chrome_begin_row(int row) { g_draw_alpha = g_chrome_base_alpha * chrome_row_alpha(row); }
+static void chrome_begin_row(int row) { g_draw_alpha = g_chrome_base_alpha * g_chrome_motion_alpha; (void)row; }
+
+/* Stage ordinary chrome geometry, then move complete glyph groups into the
+   unobstructed part of each row. Backgrounds remain opaque; the terminal's
+   complete occupied span, including its spaces, is cut out as one notch. */
+static void chrome_capture_begin(void) {
+    g_chrome_quad_count = 0; g_chrome_capture_failed = 0; g_chrome_capture = 1;
+}
+static int chrome_capture_plan(int raised) {
+    int rows = g_chrome.bottom - g_chrome.top, i, x;
+    unsigned char *ink;
+    /* Failure is fail-closed for hit testing: no invisible menu targets. */
+    g_chrome_menu_count = -1; g_chrome_menu_raised = 0;
+    if (g_chrome_capture_failed || rows <= 0) return 0;
+    if (rows > g_chrome_menu_capacity) {
+        ChromePackRow *more = (ChromePackRow *)realloc(g_chrome_menu_rows, (size_t)rows * sizeof(*more));
+        if (!more) return 0;
+        g_chrome_menu_rows = more; g_chrome_menu_capacity = rows;
+    }
+    ink = (unsigned char *)calloc((size_t)rows * SB_COLS, 1);
+    if (!ink) return 0;
+    for (i = 0; i < g_chrome_quad_count; i++) {
+        const Inst *q = &g_chrome_quads[i];
+        int row = q->y0 / CH - g_chrome.top;
+        if (q->u0 == 0xffff || row < 0 || row >= rows) continue;
+        int left = (q->x0 - g_chrome_x) / CW;
+        int right = (q->x1 - g_chrome_x + CW - 1) / CW;
+        for (x = chrome_max(left, 0); x < chrome_min(right, SB_COLS); x++) ink[row * SB_COLS + x] = 1;
+    }
+    for (i = 0; i < rows; i++) {
+        int left = 0, right = 0;
+        if (!raised && g_tab_underlay && chrome_intrusion_span(g_chrome.top + i, &left, &right)) {
+            left -= g_chrome_x / CW; right -= g_chrome_x / CW;
+        } else left = right = 0;
+        chrome_pack_row(&g_chrome_menu_rows[i], ink + i * SB_COLS, SB_COLS, left, right);
+    }
+    free(ink);
+    g_chrome_menu_top = g_chrome.top; g_chrome_menu_count = rows;
+    g_chrome_menu_x = g_chrome_x; g_chrome_menu_cw = CW; g_chrome_menu_ch = CH;
+    g_chrome_menu_raised = raised;
+    g_chrome_menu_alpha = g_chrome_motion_alpha;
+    return 1;
+}
+static void chrome_emit_inst(const Inst *q, int x0, int x1, int y0, int y1) {
+    if (x0 >= x1 || y0 >= y1) return;
+    g_rgba = q->rgba;
+    r_quad_uv((float)x0, (float)y0, (float)x1, (float)y1, q->u0, q->v0, q->u1, q->v1);
+}
+static int chrome_pack_translation(const ChromePackRow *p, int left, int right, int *shift) {
+    int x, d;
+    if (left < 0 || right > SB_COLS || left >= right || p->dst[left] < 0) return 0;
+    d = p->dst[left] - left;
+    for (x = left + 1; x < right; x++) if (p->dst[x] != x + d) return 0;
+    *shift = d * CW;
+    return 1;
+}
+static void chrome_capture_end(int raised) {
+    int i, x, origin = g_chrome_x;
+    g_chrome_capture = 0;
+    if (!chrome_capture_plan(raised)) return;
+    g_chrome_x = 0;
+    for (i = 0; i < g_chrome_quad_count; i++) {
+        const Inst *q = &g_chrome_quads[i];
+        int row = q->y0 / CH - g_chrome.top;
+        if (row < 0 || row >= g_chrome_menu_count) continue;
+        const ChromePackRow *p = &g_chrome_menu_rows[row];
+        int left = (q->x0 - origin) / CW, right = (q->x1 - origin + CW - 1) / CW;
+        int shift = 0, x0 = q->x0, x1 = q->x1;
+        if (q->u0 != 0xffff) {
+            /* A wide glyph stays whole and carries its original atlas and
+               foreground color. Partial clipping never creates half glyphs. */
+            if (chrome_pack_translation(p, left, right, &shift))
+                chrome_emit_inst(q, x0 + shift, x1 + shift, q->y0, q->y1);
+            continue;
+        }
+        /* Move selected font-size/theme-key backgrounds with their glyphs.
+           Full-row fills and section rules instead keep their original span. */
+        if (p->blocked_left != p->blocked_right && x1-x0 >= CW && x1-x0 <= 8*CW &&
+            q->y1-q->y0 == CH && (x0-origin)%CW == 0 && (x1-origin)%CW == 0) {
+            if (!chrome_pack_translation(p, left, right, &shift)) continue;
+            x0 += shift; x1 += shift;
+        }
+        if (p->blocked_left == p->blocked_right) chrome_emit_inst(q, x0, x1, q->y0, q->y1);
+        else {
+            int cut0 = origin + p->blocked_left*CW, cut1 = origin + p->blocked_right*CW;
+            chrome_emit_inst(q, x0, chrome_min(x1, cut0), q->y0, q->y1);
+            chrome_emit_inst(q, chrome_max(x0, cut1), x1, q->y0, q->y1);
+        }
+    }
+    /* Outline the actual remaining shape, not individual terminal letters.
+       Each edge occupies exactly one physical pixel, independent of scale.
+       Horizontal steps lie on the menu side of the boundary, so terminal
+       text and its background can be drawn afterward without erasing them. */
+    r_color(g_look.dim, 1);
+    for (i = 0; i < g_chrome_menu_count; i++) {
+        const ChromePackRow *p = &g_chrome_menu_rows[i];
+        int y = (g_chrome.top + i) * CH;
+        if (p->blocked_left == p->blocked_right) continue;
+        if (p->blocked_left > 0) {
+            int edge = origin + p->blocked_left * CW;
+            quad((float)(edge-1), (float)y, (float)edge, (float)(y+CH));
+        }
+        if (p->blocked_right < SB_COLS) {
+            int edge = origin + p->blocked_right * CW;
+            quad((float)edge, (float)y, (float)(edge+1), (float)(y+CH));
+        }
+    }
+    for (i = 1; i < g_chrome_menu_count; i++) {
+        const ChromePackRow *a = &g_chrome_menu_rows[i-1], *b = &g_chrome_menu_rows[i];
+        int y = (g_chrome.top + i) * CH;
+        for (x = 0; x < SB_COLS; x++) {
+            int above = x >= a->blocked_left && x < a->blocked_right;
+            int below = x >= b->blocked_left && x < b->blocked_right;
+            if (above != below) {
+                int yy = y - below;
+                quad((float)(origin+x*CW), (float)yy, (float)(origin+(x+1)*CW), (float)(yy+1));
+            }
+        }
+    }
+    g_chrome_x = origin;
+}
 static int chrome_draw_width(void) { return sidebar_w() + (g_tab_underlay == 1 ? CW : 0); }
 static void chrome_sides(int row, uint32_t color) {
     float y = row_y(row), w = (float)chrome_draw_width();
@@ -118,6 +238,7 @@ static void render_tabbar(int win_w, int win_h) {
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
     g_chrome_x = sidebar_x();
+    chrome_capture_begin();
     for (i = g_chrome.top; i < g_chrome.bottom; i++) {
         chrome_begin_row(i);
         fill_rect(0, row_y(i), (float)chrome_draw_width(), row_y(i + 1), BAR_BG, 1);
@@ -165,6 +286,7 @@ static void render_tabbar(int win_w, int win_h) {
         chrome_begin_row(g_chrome.bottom - 1);
         fill_rect(0, row_y(g_chrome.bottom) - 1, (float)chrome_draw_width(), row_y(g_chrome.bottom), g_look.dim, 1);
     }
+    chrome_capture_end(chrome_hovered() || !g_tab_underlay);
     g_draw_alpha = saved_alpha;
 #ifdef _WIN32
     render_disk_warning(win_h);

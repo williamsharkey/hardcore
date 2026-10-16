@@ -591,6 +591,135 @@ static void expect_dock_gap(const ChromeReflow *out, int side, int dock, int wid
             assert(cr_space(out->cells[y*out->cols+x].ch));
 }
 
+static void test_compact_diff_gutters(void) {
+    const char *lines[] = {
+        "  3 +RSVP and siblings update prompt",
+        "  4 +Use case: precise object-edit",
+        "  5 +Edit the attached finished birthday invitation. Preserve its black line art on white.",
+        "  + Show details", "", "", "", "NEXT SECTION"
+    };
+    Cell *grid = make_grid(lines, 8, 100);
+    for (int y = 0; y < 3; y++) for (int x = 0; x < 100; x++) {
+        Cell *cell = grid+y*100+x;
+        cell->bg = 0x02243b24;
+        cell->fg = 0x02112233+x;
+        cell->attr = (uint8_t)(1+x%8);
+        cell->link = (uint16_t)(x/10);
+    }
+    for (int side = 1; side <= 2; side++) {
+        int dock = side == 1 ? 60 : 0;
+        ChromeReflow out = run(grid, 100, 8, NULL, side, dock, 0, 40, 7, 3);
+        assert(out.changed > 0);
+        expect_dock_gap(&out, side, dock, 40, 0, 7, 2);
+        /* All three numbers/signs remain independent first-row prefixes. */
+        for (int y = 0; y < 3; y++) {
+            int n = displayed_source(&out, y*100+2);
+            assert(n >= 0 && out.cells[n+2].ch == '+');
+            assert(out.source[n+3] == y*100+5);
+        }
+        expect_row(&out, 7, "NEXT SECTION");
+        chrome_reflow_free(&out);
+    }
+    /* Without the diff background, compact plus/minus remains literal. */
+    const char *plain[] = {"  3 +14 = ordinary arithmetic text", "", "", "NEXT SECTION"};
+    unchanged(plain, 4, 60);
+    free(grid);
+    checks++;
+}
+
+static void test_tree_inline_literal_pipes(void) {
+    const char *lines[] = {
+        "  └ Read hardcore_mac.m",
+        "    Search g_mac_frozen|mac_input_held|mac_input_guard|mac_.*freeze|transfer_active in hardcore_mac_transfer.m",
+        "  + Show details", "", "", "", "NEXT SECTION"
+    };
+    Cell *grid = make_grid(lines, 7, 120);
+    for (int x = 0; x < 120; x++) {
+        grid[120+x].fg = 0x02112233+(uint32_t)x;
+        grid[120+x].attr = (uint8_t)(x%8);
+        grid[120+x].link = (uint16_t)(x/10);
+    }
+    ChromeReflow out = run(grid, 120, 7, NULL, 1, 90, 0, 30, 6, 3);
+    assert(out.changed > 0);
+    expect_dock_gap(&out, 1, 90, 30, 0, 6, 2);
+    expect_row(&out, 6, "NEXT SECTION");
+    chrome_reflow_free(&out); free(grid);
+    const char *code[] = {
+        "  └ if (!strcmp(argv[1], \"--version\") || !strcmp(argv[1], \"version\")) {",
+        "    if (ready || error) return 1; /* a literal boolean expression */",
+        "  + Show details", "", "", "", "NEXT SECTION"
+    };
+    grid = make_grid(code, 7, 100);
+    for (int side = 1; side <= 2; side++) {
+        int dock = side == 1 ? 60 : 0;
+        out = run(grid, 100, 7, NULL, side, dock, 0, 40, 6, 3);
+        assert(out.changed > 0);
+        expect_dock_gap(&out, side, dock, 40, 0, 6, 2);
+        expect_row(&out, 6, "NEXT SECTION");
+        chrome_reflow_free(&out);
+    }
+    free(grid);
+    /* A tree prefix is not permission to wrap columnar tables or shell
+       output with an unexplained single pipe, even with code-like labels. */
+    const char *tables[] = {"  └ name | value | type", "    if | value=1 | type", "", "", "NEXT SECTION"};
+    unchanged(tables, 5, 80);
+    checks++;
+}
+
+static void test_opened_and_saved_urls(void) {
+    const char *examples[] = {
+        "• Opened https://developer.apple.com/documentation/appkit/nsapplication/activationpolicy-swift.enum",
+        "  Saved to: file:///Users/example/generated_images/session/exec-0000-1111-2222-3333/image.png",
+        "  file:///Users/example/generated_images/session/exec-0000-1111-2222-3333/image.png"
+    };
+    for (int kind = 0; kind < 3; kind++) {
+        const char *lines[] = {examples[kind], "", "", "", "NEXT SECTION"};
+        Cell *grid = make_grid(lines, 5, 120);
+        for (int x = 2; x < 120; x++) {
+            grid[x].fg = 0x02445566+(uint32_t)x;
+            grid[x].link = 42;
+            grid[x].attr = 8;
+        }
+        for (int side = 1; side <= 2; side++) {
+            int dock = side == 1 ? 70 : 0;
+            ChromeReflow out = run(grid, 120, 5, NULL, side, dock, 0, 50, 4, 3);
+            assert(out.changed > 0);
+            expect_dock_gap(&out, side, dock, 50, 0, 4, 2);
+            expect_row(&out, 4, "NEXT SECTION");
+            chrome_reflow_free(&out);
+        }
+        unsigned char protected_rows[] = {1, 0, 0, 0, 0};
+        ChromeReflow out = run(grid, 120, 5, protected_rows, 1, 70, 0, 50, 4, 3);
+        assert(!out.changed);
+        assert(!memcmp(out.cells, grid, 5*120*sizeof(Cell)));
+        chrome_reflow_free(&out);
+        free(grid);
+    }
+    checks++;
+}
+
+static void test_uncertain_diff_continuations(void) {
+    const char *lines[] = {
+        "  125 +    if (!strcmp(argv[1], \"changed\") || !strcmp(argv[1], \"new-input\") || !strcmp(argv[1], \"resized",
+        "           \")) { /* physical wrap with no reliable continuation metadata */",
+        "  + Show details", "", "", "", "NEXT SECTION"
+    };
+    Cell *grid = make_grid(lines, 7, 120);
+    for (int y = 0; y < 2; y++) for (int x = 0; x < 120; x++) grid[y*120+x].bg = 0x02243b24;
+    ChromeReflow out = run(grid, 120, 7, NULL, 1, 70, 0, 50, 6, 3);
+    /* A painted row alone cannot prove how wrapped code rejoins. Do not
+       invent a join, detach a half, or borrow across it from a later blank. */
+    assert(!out.changed);
+    assert(!memcmp(out.cells, grid, 7*120*sizeof(Cell)));
+    chrome_reflow_free(&out);
+    unsigned char protect[] = {1, 1, 0, 0, 0, 0, 0};
+    out = run(grid, 120, 7, protect, 2, 0, 0, 50, 6, 3);
+    assert(!out.changed);
+    assert(!memcmp(out.cells, grid, 7*120*sizeof(Cell)));
+    chrome_reflow_free(&out); free(grid);
+    checks++;
+}
+
 static void test_codex_unicode_footer_records(void) {
     const char *commands[] = {
         "• Ran hardcore --version && codesign --verify --deep --strict /Users/wm/Applications/hardcore.app && git status --sho…",
@@ -935,7 +1064,7 @@ static void test_randomized_records(void) {
         for (int i = 0; i < cols*rows; i++) grid[i].ch = ' ';
         for (int row = 0; row < records; row++) {
             char line[200];
-            int used = snprintf(line, sizeof(line), "  %d %c    ", 100+row, row%2 ? '-' : '+');
+            int used = snprintf(line, sizeof(line), "  %d %c%s", 100+row, row%2 ? '-' : '+', rnd(2) ? "    " : "");
             for (int word = 0; word < 10; word++) {
                 const char *token = tokens[rnd(6)];
                 int length = (int)strlen(token);
@@ -960,6 +1089,46 @@ static void test_randomized_records(void) {
     checks++;
 }
 
+static void test_randomized_literal_trees(void) {
+    static const char *const tokens[] = {"alpha|beta", "active.*|ready", "guard()", "||", "source.m", "value[index]);", "/Users/example/project/record.txt"};
+    for (int iteration = 0; iteration < 200; iteration++) {
+        int cols = 40+(int)rnd(81), rows = 8, records = 1+(int)rnd(3);
+        int side = 1+(int)rnd(2), width = 5+(int)rnd((unsigned)(cols-10));
+        Cell *grid = (Cell *)calloc((size_t)cols*rows, sizeof(Cell));
+        unsigned char protected_rows[8] = {0};
+        assert(grid);
+        for (int i = 0; i < cols*rows; i++) grid[i].ch = ' ';
+        for (int y = 0; y < records; y++) {
+            char line[200];
+            int used = snprintf(line, sizeof(line), "%s", y ? "    Search " : "  # Search ");
+            for (int word = 0; word < 10; word++) {
+                const char *token = tokens[rnd(7)];
+                int length = (int)strlen(token);
+                if (used+length+1 > cols) break;
+                memcpy(line+used, token, (size_t)length); used += length;
+                line[used++] = ' ';
+            }
+            for (int x = 0; x < cols; x++) {
+                Cell *c = grid+y*cols+x;
+                c->ch = x < used ? (unsigned char)line[x] : ' ';
+                c->fg = 0x01000000u | rnd(16);
+                c->attr = (uint8_t)rnd(16);
+                c->link = (uint16_t)rnd(8);
+            }
+            if (!y) grid[2].ch = 0x2514;
+            if (!rnd(5)) protected_rows[y] = 1;
+        }
+        grid[7*cols].ch = '9';
+        ChromeReflow out = run(grid, cols, rows, protected_rows, side, side == 1 ? cols-width : 0,
+                              (int)rnd(3), width, 1+(int)rnd(6), (int)rnd(4));
+        for (int y = 0; y < records; y++) if (protected_rows[y])
+            assert(!memcmp(out.cells+y*cols, grid+y*cols, (size_t)cols*sizeof(Cell)));
+        assert(out.cells[7*cols].ch == '9');
+        chrome_reflow_free(&out); free(grid);
+    }
+    checks++;
+}
+
 int main(void) {
     test_fox_examples();
     test_slack_no_blank();
@@ -970,6 +1139,10 @@ int main(void) {
     test_bullet_commands_and_boundaries();
     test_structured_diff_records();
     test_literal_paths_and_tool_output();
+    test_compact_diff_gutters();
+    test_tree_inline_literal_pipes();
+    test_opened_and_saved_urls();
+    test_uncertain_diff_continuations();
     test_codex_unicode_footer_records();
     test_preceding_blank_fallback();
     test_preceding_blank_not_reused();
@@ -981,6 +1154,7 @@ int main(void) {
     test_fixed_following_rows();
     test_randomized_invariants();
     test_randomized_records();
-    printf("PASS native reflow: %d groups, including 800 randomized grids\n", checks);
+    test_randomized_literal_trees();
+    printf("PASS native reflow: %d groups, including 1000 randomized grids\n", checks);
     return 0;
 }

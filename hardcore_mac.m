@@ -1852,6 +1852,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 }
 
 - (void)keyDown:(NSEvent *)e {
+    g_chrome_input_at = GetTickCount();
     NSEventModifierFlags f = [e modifierFlags];
     Tab *tb = active_tab();
     if (!tb) return;
@@ -2446,6 +2447,19 @@ static void ctl_chrome(const char *path) {
         @"button_rects":button_rects, @"selection_drag":@(g_sel_drag), @"selection_on":@(g_sel_on)};
     state[@"fontkey"] = [NSString stringWithFormat:@"%c", g_font->key];
     state[@"schemekey"] = [NSString stringWithFormat:@"%c", g_scheme->key];
+    state[@"motion"] = @{@"phase":@(g_chrome_motion.phase), @"alpha":@(g_chrome_motion_alpha),
+        @"side":@(g_chrome_motion.side), @"row":@(g_chrome_motion.row),
+        @"target_side":@(g_chrome_motion.target_side), @"target_row":@(g_chrome_motion.target_row),
+        @"searches":@(g_chrome_motion.searches), @"commits":@(g_chrome_motion.commits)};
+    NSMutableArray *menu_rows = [NSMutableArray array];
+    for (int y = g_chrome.top; y < g_chrome.bottom; y++) {
+        int left = 0, right = 0;
+        chrome_intrusion_span(y, &left, &right);
+        NSMutableArray *mapping = [NSMutableArray array];
+        for (int x = 0; x < SB_COLS; x++) [mapping addObject:@(chrome_menu_source_col(y, x))];
+        [menu_rows addObject:@{@"row":@(y), @"left":@(left), @"right":@(right), @"map":mapping}];
+    }
+    state[@"menu_rows"] = menu_rows;
     state[@"pages"] = @{
         @"tabs":@{@"offset":@(g_tab_offset), @"capacity":@(g_chrome.tab_capacity), @"total":@(g_ntabs), @"row":@(g_chrome.tab_row)},
         @"settings":@{@"offset":@(g_setting_offset[g_settings_tab]), @"capacity":@(g_chrome.list_capacity), @"total":@(chrome_item_total()), @"row":@(g_chrome.list_row)},

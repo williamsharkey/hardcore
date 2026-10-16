@@ -67,7 +67,7 @@ class Bitmap:
 
 
 class NativeApp:
-    def __init__(self, root, mode, artifacts):
+    def __init__(self, root, mode, artifacts, adaptive=False):
         self.root = root
         self.mode = 2 if mode == 0 else mode
         self.artifacts = artifacts
@@ -82,6 +82,7 @@ class NativeApp:
         install = root / "hardcore.app"
         shutil.copytree(ROOT / "hardcore.app", install)
         env = dict(os.environ, HARDCORE_CTL=str(self.fifo), HARDCORE_NO_ACTIVATE="1",
+                   HARDCORE_TEST_CHROME_MOTION="1" if adaptive else "0",
                    HARDCORE_TEST_CONFIG=str(cfg), HARDCORE_SHELL="/bin/zsh")
         self.proc = subprocess.Popen([str(install / "Contents/MacOS/hardcore"), "--cd", str(root)],
                                      env=env, stdout=self.log, stderr=self.log)

@@ -105,7 +105,11 @@ can capture original article HTML and provenance when network access is availabl
 Drag the single **↕** handle beside **hardcore** to position the menu. It snaps
 to the nearer left or right edge and follows the pointer vertically, keeping
 the terminal's full width. The menu uses full opacity wherever content fits
-around it; rows covered by unreflowable text recede beneath that text. Hovering
+around it. Unreflowable terminal text cuts a continuous notch into the menu,
+including the spaces between its words, with a one-device-pixel outline.
+Remaining menu words keep their normal colors and opacity. They can shift into
+spare space or shorten redundant gaps, retaining at least one space between
+words. Incomplete controls are not clickable. Hovering
 anywhere in its bounds brings the entire menu forward. Tabs occupy one row each
 without horizontal separators; their close button appears only on hover.
 Settings options use highlights without horizontal row borders;
@@ -131,7 +135,9 @@ hanging indentation. Codex “• Ran …” summaries may wrap at existing word
 when local space permits. Numbered source/diff rows, file paths, and tool-output
 trees also wrap as separate literal records. Numbers and diff signs stay on
 their own first row; continuations align with that record's code or output.
-Paths can break after `/`, and argument lists after unquoted commas or semicolons.
+Compact colored diff gutters, tool-tree search expressions, opened URLs, and
+saved-file records are recognized too. Paths can break after `/`, and argument
+lists after unquoted commas or semicolons.
 Original glyphs, colors, diff backgrounds, and link identities are preserved.
 A local record block moves its output and details footer together, including
 Codex's `+ 1 line (⌃t to expand)` and `+ N lines (⌃t to expand)` footers, so blank
@@ -140,9 +146,17 @@ some records fit, the others retain their complete text beneath the menu.
 Boxes, tables, fenced code, wide/combining text, and input rows remain protected.
 Unrecognized prose backgrounds also keep their original layout.
 Mouse reporting does not disable prose reflow; reported mouse
-coordinates map back to the original cells. Highlighted blank space shows the
-dim menu above its background, while terminal glyphs cover it. When there is no safe local
-fit, terminal content continues to cover the underlay until hover. The original
+coordinates map back to the original cells. Ambiguous physical continuations
+retain their original layout rather than acquiring guessed word boundaries.
+
+If a notch remains, the menu waits for the screen to settle before looking for a
+better position. It prefers a clear position on the same side, then less reflow
+and more padding, without shrinking the menu or hiding options. A substantial
+improvement fades the menu out for 0.3 seconds, changes the layout once at zero
+opacity, and fades it in for 0.3 seconds. Typing, selecting, hovering, dragging,
+and ongoing output defer the move; a cooldown prevents repeated repositioning.
+When no better fit exists, terminal text keeps priority and the menu stays put.
+The original
 terminal data, scrollback, and PTY dimensions are unchanged; selection maps
 displayed characters back to their source cells.
 
@@ -1050,9 +1064,10 @@ independent page positions. Menu lists do not scroll.
 Pointing at a scheme previews it on the whole window. Fonts apply on click,
 keeping the terminal and tab controls on the same grid at all times.
 Clicking picks it for every hardcore window at once. Drag the header's **↕**
-handle to choose the dock's side and vertical position. The dock stays at the chosen
-row, clamped to fit the window; it does not chase terminal output. Complex text
-that cannot safely reflow continues to cover the dim menu until hover.
+handle to choose the dock's side and vertical position. It starts at the chosen
+row, clamped to fit the window. After output settles, persistent text intrusions
+can trigger a gentle move to a substantially clearer location, preferably on
+the same side. Complex text keeps priority in outlined menu cutouts until hover.
 
 `%LOCALAPPDATA%\hardcore\config.ini` (on a Mac,
 `~/Library/Application Support/hardcore/config.ini`) holds them, along with
@@ -1077,9 +1092,11 @@ comparison.
 ## Testing
 
 - `make reflow-test` exercises local word wrapping, both dock directions,
-  source-cell mapping, paragraph boundaries, and protected terminal content.
+  source-cell mapping, paragraph boundaries, protected terminal content, menu
+  word packing, and the placement/fade state machine.
 - `make chrome-test` (macOS desktop) checks native menu layout, pagination,
-  both underlays, whole-menu hover, and reflow using isolated terminal windows.
+  both underlays, whole-menu hover, reflow, opaque cutouts, and timed atomic
+  relocation using isolated terminal windows.
 
 - `tests/run_xtermjs.py` replays xterm.js's escape-sequence fixtures through the
   parser (`hardcore.exe --replay`) and diffs against screens captured from real

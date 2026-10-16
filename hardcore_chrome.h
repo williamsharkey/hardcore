@@ -37,6 +37,24 @@ typedef struct {
     int settings_row, section_row, list_row, list_capacity, list_count, bottom;
 } ChromeLayout;
 static ChromeLayout g_chrome;
+static float g_chrome_motion_alpha = 1;
+#include "hardcore_chrome_pack.h"
+static ChromePackRow *g_chrome_menu_rows;
+static int g_chrome_menu_count, g_chrome_menu_capacity, g_chrome_menu_top;
+static int g_chrome_menu_x, g_chrome_menu_cw, g_chrome_menu_ch, g_chrome_menu_raised;
+static float g_chrome_menu_alpha = 1;
+/* This map describes the last painted frame, not a speculative hover frame.
+   A click before the hover repaint therefore cannot activate hidden controls. */
+static int chrome_menu_source_col(int row, int col) {
+    int at = row - g_chrome_menu_top;
+    if (col < 0 || col >= SB_COLS) return -1;
+    if (g_chrome_menu_alpha <= 0) return -1;
+    if (g_chrome_menu_raised || !g_chrome_menu_count) return col;
+    if (g_chrome_menu_x != sidebar_x() || g_chrome_menu_cw != cell_w(g_font) ||
+        g_chrome_menu_ch != cell_h(g_font) || at < 0 || at >= g_chrome_menu_count ||
+        g_chrome_menu_top != g_chrome.top || g_chrome_menu_top + g_chrome_menu_count != g_chrome.bottom) return -1;
+    return g_chrome_menu_rows[at].actionable[col] ? g_chrome_menu_rows[at].src[col] : -1;
+}
 
 static int chrome_min(int a, int b) { return a < b ? a : b; }
 static int chrome_max(int a, int b) { return a > b ? a : b; }
@@ -181,6 +199,11 @@ static int hit_tabbar(int mx, int my, int *idx) {
     tab_layout();
     col = mx / CW; row = my / CH;
     if ((g_tab_underlay || (active_tab() && active_tab()->kind == TK_BROWSER)) && (row < g_chrome.top || row >= g_chrome.bottom)) { UI_DONE; return HIT_NONE; }
+    if (g_tab_underlay && !g_chrome_menu_raised && g_chrome_menu_count) {
+        int original = chrome_menu_source_col(row, col);
+        if (original < 0) { UI_DONE; return HIT_NONE; }
+        col = original;
+    }
     if (row == g_chrome.top && col == 1) { UI_DONE; return HIT_GRIP; }
     for (i = 0; i < g_chrome.tab_count; i++) {
         if (row != g_chrome.tab_row + i) continue;
