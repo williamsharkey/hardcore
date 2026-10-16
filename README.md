@@ -351,7 +351,8 @@ survives a live update.
 ## Camera recordings on macOS
 
 Click **cam** to open a camera TV. It prefers the front-facing or built-in
-camera and requests camera and microphone access on first use. Drag its header
+camera and requests camera access on first use. The preview starts without
+waiting for microphone permission; **Rec** requests microphone access if needed. Drag its header
 to move it, or the bottom-right grip to resize it; terminal text reflows around
 the panel. The preview uses a mirrored, aspect-fit view. **−** hides the panel;
 an active recording continues while hidden. Hiding an idle preview releases
@@ -1273,6 +1274,9 @@ comparison.
   media timestamps, save ownership, and safe discard. `tests/test_camera_panel.m`
   checks placement, reflow, controls and replay geometry without a camera,
   microphone, permission prompt or window.
+- `tests/test_camera_compositing.m` draws a synthetic preview through the real
+  panel code and a Metal-backed view, checking Retina coordinates, different
+  terminal/UI fonts, resizing and visibility without opening a camera.
 - `make reflow-test` exercises local word wrapping, both dock directions,
   source-cell mapping, paragraph boundaries, protected terminal content, menu
   word packing, horizontal status shifts, shaded panels, literal continuation chains, secondary-TV

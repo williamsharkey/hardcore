@@ -21,10 +21,14 @@ typedef NS_ENUM(NSInteger, HCCameraCaptureState) {
 @property(nonatomic, readonly, copy) NSString *warning;
 @property(nonatomic, readonly, retain) NSError *lastError;
 @property(nonatomic, readonly) BOOL hasMicrophone;
+/* Observability for distinguishing a streaming camera from preview layout. */
+@property(nonatomic, readonly) NSUInteger receivedVideoFrames;
 /* Set before start. Only on-device recognition is permitted; unavailable
  * recognition leaves a valid movie and empty captions with a warning. */
 @property(nonatomic) BOOL captionsEnabled;
 @property(nonatomic, copy) void (^stateChanged)(void);
+/* Camera preview starts after camera permission alone. Microphone permission,
+ * when not yet decided, is requested on the first recording attempt. */
 - (void)prepareWithCompletion:(void (^)(NSError *error))completion;
 - (void)startRecordingToDirectory:(NSURL *)directory completion:(void (^)(NSError *error))completion;
 /* These transitions take effect before returning. elapsedSeconds shares the

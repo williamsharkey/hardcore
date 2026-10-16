@@ -57,6 +57,7 @@ static int mac_spawn(NSString *exe, NSArray *args, int fd, int detached, pid_t *
     (void)exe; (void)args; (void)fd; (void)detached; (void)pid; spawned++; return 0;
 }
 static NSDictionary *mac_info(void) { return @{@"protocol": @1, @"tabs": @[]}; }
+static NSDictionary *mac_camera_status(void) { return @{@"state": @"Camera closed", @"video_frames": @0}; }
 static NSDictionary *mac_claude_receipt(NSDictionary *request) { return @{@"fixture": request[@"op"]}; }
 static NSDictionary *mac_bridge_refresh(NSDictionary *request) { return @{@"fixture": request[@"op"]}; }
 static NSDictionary *mac_browser_request(NSDictionary *request) {
@@ -169,6 +170,13 @@ class BrowserSharedServerTests(unittest.TestCase):
             self.assertEqual(reply['request'], request)
         self.assertEqual(self.plist(path, {'op': 'list'})['protocol'], 1)
         self.assertEqual(self.plist(path, {'op': 'claude-guard'})['fixture'], 'claude-guard')
+
+    def test_camera_diagnostics_do_not_touch_tabs_or_launch_processes(self):
+        path = self.start_server()
+        self.assertEqual(self.plist(path, {'op': 'camera-status'}),
+                         {'state': 'Camera closed', 'video_frames': 0})
+        reply = json.loads(self.exchange(path, b'browser {"op":"list"}\n'))
+        self.assertEqual((reply['touched'], reply['spawned']), (0, 0))
 
     def test_malformed_browser_requests_do_not_kill_server(self):
         path = self.start_server()

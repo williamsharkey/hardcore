@@ -10,6 +10,8 @@
 #include <math.h>
 
 static NSString *const HCCameraErrorDomain = @"HardcoreCameraCapture";
+static NSString *const HCCameraMicrophonePendingWarning = @"Microphone access will be requested when recording starts.";
+static NSString *const HCCameraMicrophoneSilentWarning = @"Microphone unavailable or permission denied; this recording will be silent.";
 static void *HCCameraQueueKey = &HCCameraQueueKey;
 
 typedef struct {
@@ -71,10 +73,11 @@ static void hc_camera_main(void (^block)(void)) {
     NSString *_cameraName, *_warning;
     NSError *_lastError;
     BOOL _hasMicrophone, _captionsEnabled, _closed, _ownsMovie, _ownsCaptions;
-    BOOL _speechAuthorized, _testMode, _interrupted;
-    NSUInteger _generation, _videoFrames, _audioBuffers;
+    BOOL _speechAuthorized, _testMode, _interrupted, _startPending;
+    NSUInteger _generation, _videoFrames, _audioBuffers, _receivedVideoFrames, _startGeneration;
     CMTime _lastVideoPTS, _lastAudioPTS;
     void (^_stateChanged)(void);
+    void (^_pendingStartCompletion)(NSError *);
     void (^_stopCompletion)(NSURL *, NSArray *, NSError *);
     SFSpeechRecognizer *_recognizer;
     SFSpeechRecognitionTask *_speechTask;
@@ -83,6 +86,12 @@ static void hc_camera_main(void (^block)(void)) {
 }
 - (void)setCaptureState:(HCCameraCaptureState)state error:(NSError *)error;
 - (void)configureWithMicrophone:(BOOL)microphone completion:(void (^)(NSError *))completion;
+- (BOOL)configureMicrophoneInput;
+- (AVAuthorizationStatus)cameraAuthorizationStatusForMediaType:(AVMediaType)mediaType;
+- (void)requestCameraAccessForMediaType:(AVMediaType)mediaType completion:(void (^)(BOOL))completion;
+- (void)startPreparedSession:(AVCaptureSession *)session completion:(void (^)(NSError *))completion;
+- (NSError *)connectPreviewToSession:(AVCaptureSession *)session;
+- (NSError *)runPreparedSession:(AVCaptureSession *)session;
 - (NSError *)beginWriterToDirectory:(NSURL *)directory hostTime:(double)host;
 - (void)appendSampleBuffer:(CMSampleBufferRef)sample video:(BOOL)video hostTime:(double)host;
 - (void)finishCaptionsForGeneration:(NSUInteger)generation;
@@ -122,6 +131,22 @@ static void hc_camera_main(void (^block)(void)) {
 - (NSString *)warning { @synchronized(self) { return [[_warning copy] autorelease]; } }
 - (NSError *)lastError { @synchronized(self) { return [[_lastError retain] autorelease]; } }
 - (BOOL)hasMicrophone { @synchronized(self) { return _hasMicrophone; } }
+- (NSUInteger)receivedVideoFrames { @synchronized(self) { return _receivedVideoFrames; } }
+- (AVAuthorizationStatus)cameraAuthorizationStatusForMediaType:(AVMediaType)mediaType {
+    return [AVCaptureDevice authorizationStatusForMediaType:mediaType];
+}
+- (void)requestCameraAccessForMediaType:(AVMediaType)mediaType completion:(void (^)(BOOL))completion {
+    [AVCaptureDevice requestAccessForMediaType:mediaType completionHandler:completion];
+}
+- (void)clearMicrophoneWarning {
+    @synchronized(self) {
+        NSString *next = [[_warning stringByReplacingOccurrencesOfString:HCCameraMicrophonePendingWarning withString:@""]
+            stringByReplacingOccurrencesOfString:HCCameraMicrophoneSilentWarning withString:@""];
+        next = [next stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSString *copy = [next copy];
+        [_warning release]; _warning = copy;
+    }
+}
 - (void)setCaptureState:(HCCameraCaptureState)state error:(NSError *)error {
     @synchronized(self) {
         _state = state;
@@ -156,23 +181,20 @@ static void hc_camera_main(void (^block)(void)) {
             hc_camera_main(^{ if (completion) completion(error); });
             return;
         }
-        void (^microphoneAllowed)(BOOL) = ^(BOOL microphone) {
-            dispatch_async(self->_captureQueue, ^{
-                if (self->_closed) {
-                    hc_camera_main(^{ if (completion) completion(hc_camera_error(3, @"The camera was closed.")); });
-                    return;
-                }
-                [self configureWithMicrophone:microphone completion:completion];
-            });
-        };
-        AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
-        if (status == AVAuthorizationStatusNotDetermined)
-            [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:microphoneAllowed];
-        else microphoneAllowed(status == AVAuthorizationStatusAuthorized);
+        /* Permission for an optional microphone must never gate the preview.
+         * Already-authorized audio can join now; otherwise ask only on Rec. */
+        BOOL microphone = [self cameraAuthorizationStatusForMediaType:AVMediaTypeAudio] == AVAuthorizationStatusAuthorized;
+        dispatch_async(self->_captureQueue, ^{
+            if (self->_closed) {
+                hc_camera_main(^{ if (completion) completion(hc_camera_error(3, @"The camera was closed.")); });
+                return;
+            }
+            [self configureWithMicrophone:microphone completion:completion];
+        });
     };
-    AVAuthorizationStatus status = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeVideo];
+    AVAuthorizationStatus status = [self cameraAuthorizationStatusForMediaType:AVMediaTypeVideo];
     if (status == AVAuthorizationStatusNotDetermined)
-        [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:cameraAllowed];
+        [self requestCameraAccessForMediaType:AVMediaTypeVideo completion:cameraAllowed];
     else cameraAllowed(status == AVAuthorizationStatusAuthorized);
 }
 - (void)configureWithMicrophone:(BOOL)microphone completion:(void (^)(NSError *))completion {
@@ -223,19 +245,10 @@ static void hc_camera_main(void (^block)(void)) {
             videoConnection.automaticallyAdjustsVideoMirroring = NO;
             videoConnection.videoMirrored = NO;
         }
-        BOOL audioReady = NO;
-        if (microphone) {
-            AVCaptureDevice *mic = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-            NSError *micError = nil;
-            AVCaptureDeviceInput *input = mic ? [AVCaptureDeviceInput deviceInputWithDevice:mic error:&micError] : nil;
-            if (input && [_session canAddInput:input]) {
-                [_session addInput:input];
-                _audioOutput = [[AVCaptureAudioDataOutput alloc] init];
-                [_audioOutput setSampleBufferDelegate:self queue:_captureQueue];
-                if ([_session canAddOutput:_audioOutput]) { [_session addOutput:_audioOutput]; audioReady = YES; }
-            }
-        }
-        if (!audioReady) [self addWarning:@"Microphone unavailable or permission denied; this recording will be silent."];
+        @synchronized(self) { _hasMicrophone = NO; _receivedVideoFrames = 0; }
+        BOOL audioReady = microphone && [self configureMicrophoneInput];
+        if (!audioReady) [self addWarning:[self cameraAuthorizationStatusForMediaType:AVMediaTypeAudio] == AVAuthorizationStatusNotDetermined ?
+            HCCameraMicrophonePendingWarning : HCCameraMicrophoneSilentWarning];
         [_session commitConfiguration];
         if (error) {
             [self setCaptureState:HCCameraCaptureFailed error:error];
@@ -264,21 +277,69 @@ static void hc_camera_main(void (^block)(void)) {
             name:AVCaptureSessionWasInterruptedNotification object:_session];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(sessionInterruptionEnded:)
             name:AVCaptureSessionInterruptionEndedNotification object:_session];
-        [_session startRunning];
-        if (!_session.isRunning) error = hc_camera_error(7, @"The camera could not start. It may be in use by another application.");
-        [self setCaptureState:error ? HCCameraCaptureFailed : HCCameraCaptureReady error:error];
-        hc_camera_main(^{
-            if (!self->_closed && !error) {
-                self->_previewLayer.session = self->_session;
-                AVCaptureConnection *connection = self->_previewLayer.connection;
-                if (connection.isVideoMirroringSupported) {
-                    connection.automaticallyAdjustsVideoMirroring = NO;
-                    connection.videoMirrored = YES;
-                }
-            }
-            if (completion) completion(error);
-        });
+        [self startPreparedSession:_session completion:completion];
     }
+}
+/* The preview connection is part of the session before capture starts. Layer
+ * mutations stay on main; startRunning remains on the serial capture queue.
+ * Neither queue synchronously waits for the other. */
+- (NSError *)connectPreviewToSession:(AVCaptureSession *)session {
+    _previewLayer.session = session;
+    AVCaptureConnection *connection = _previewLayer.connection;
+    if (!connection) return hc_camera_error(20, @"The camera could not connect to its preview. Close cam and open it again.");
+    connection.enabled = YES;
+    if (connection.isVideoMirroringSupported) {
+        connection.automaticallyAdjustsVideoMirroring = NO;
+        connection.videoMirrored = YES;
+    }
+    return nil;
+}
+- (NSError *)runPreparedSession:(AVCaptureSession *)session {
+    [session startRunning];
+    return session.isRunning ? nil : hc_camera_error(7, @"The camera could not start. It may be in use by another application.");
+}
+- (void)startPreparedSession:(AVCaptureSession *)session completion:(void (^)(NSError *))completion {
+    hc_camera_main(^{
+        if (self->_closed || self->_session != session) {
+            if (completion) completion(hc_camera_error(3, @"The camera was closed."));
+            return;
+        }
+        NSError *connectionError = [self connectPreviewToSession:session];
+        if (connectionError) {
+            [self setCaptureState:HCCameraCaptureFailed error:connectionError];
+            if (completion) completion(connectionError);
+            return;
+        }
+        dispatch_async(self->_captureQueue, ^{
+            if (self->_closed || self->_session != session) {
+                hc_camera_main(^{ if (completion) completion(hc_camera_error(3, @"The camera was closed.")); });
+                return;
+            }
+            NSError *error = [self runPreparedSession:session];
+            [self setCaptureState:error ? HCCameraCaptureFailed : HCCameraCaptureReady error:error];
+            hc_camera_main(^{ if (completion) completion(error); });
+        });
+    });
+}
+/* Called inside begin/commitConfiguration, only after microphone permission. */
+- (BOOL)configureMicrophoneInput {
+    if (_hasMicrophone) return YES;
+    AVCaptureDevice *microphone = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+    AVCaptureDeviceInput *input = microphone ? [AVCaptureDeviceInput deviceInputWithDevice:microphone error:NULL] : nil;
+    if (!input || ![_session canAddInput:input]) return NO;
+    AVCaptureAudioDataOutput *output = [[[AVCaptureAudioDataOutput alloc] init] autorelease];
+    [output setSampleBufferDelegate:self queue:_captureQueue];
+    [_session addInput:input];
+    if (![_session canAddOutput:output]) {
+        [output setSampleBufferDelegate:nil queue:NULL];
+        [_session removeInput:input];
+        return NO;
+    }
+    [_session addOutput:output];
+    [_audioOutput release]; _audioOutput = [output retain];
+    @synchronized(self) { _hasMicrophone = YES; }
+    [self clearMicrophoneWarning];
+    return YES;
 }
 - (void)sessionError:(NSNotification *)notification {
     NSError *error = notification.userInfo[AVCaptureSessionErrorKey] ?: hc_camera_error(8, @"The camera stopped unexpectedly.");
@@ -300,16 +361,43 @@ static void hc_camera_main(void (^block)(void)) {
 - (void)sessionInterruptionEnded:(NSNotification *)notification {
     dispatch_async(_captureQueue, ^{ self->_interrupted = NO; });
 }
+- (BOOL)pendingStartMatches:(NSUInteger)generation {
+    @synchronized(self) { return _startPending && !_closed && generation == _startGeneration; }
+}
+- (void)cancelPendingStart {
+    @synchronized(self) { _startGeneration++; }
+    if (_pendingStartCompletion) _pendingStartCompletion(hc_camera_error(19, @"The recording start was cancelled."));
+}
+- (SFSpeechRecognizerAuthorizationStatus)speechAuthorizationStatus {
+    return [SFSpeechRecognizer authorizationStatus];
+}
+- (void)requestSpeechAccess:(void (^)(SFSpeechRecognizerAuthorizationStatus))completion {
+    [SFSpeechRecognizer requestAuthorization:completion];
+}
 - (void)startRecordingToDirectory:(NSURL *)directory completion:(void (^)(NSError *))completion {
-    if (self.state != HCCameraCaptureReady) {
-        hc_camera_main(^{ if (completion) completion(hc_camera_error(9, @"Open the camera before recording.")); });
+    if (self.state != HCCameraCaptureReady || _startPending) {
+        hc_camera_main(^{ if (completion) completion(hc_camera_error(9, @"Open the camera and wait for it to be ready before recording.")); });
         return;
     }
+    NSUInteger generation;
+    @synchronized(self) { _startPending = YES; generation = ++_startGeneration; }
+    __block BOOL completed = NO;
+    void (^finish)(NSError *) = ^(NSError *error) {
+        hc_camera_main(^{
+            if (completed) return;
+            completed = YES;
+            @synchronized(self) { self->_startPending = NO; }
+            [self->_pendingStartCompletion release]; self->_pendingStartCompletion = nil;
+            if (completion) completion(error);
+        });
+    };
+    _pendingStartCompletion = [finish copy];
     void (^begin)(BOOL) = ^(BOOL authorized) {
         dispatch_async(self->_captureQueue, ^{
+            if (![self pendingStartMatches:generation]) return;
             self->_speechAuthorized = authorized;
             if (self->_closed || self.state != HCCameraCaptureReady) {
-                hc_camera_main(^{ if (completion) completion(hc_camera_error(10, @"The camera is no longer ready.")); });
+                finish(hc_camera_error(10, @"The camera is no longer ready."));
                 return;
             }
             if (self->_captionsEnabled && !authorized)
@@ -317,12 +405,35 @@ static void hc_camera_main(void (^block)(void)) {
             NSError *error = [self beginWriterToDirectory:directory hostTime:hc_camera_host_seconds()];
             if (error) { [self discardOnCaptureQueue]; [self setCaptureState:HCCameraCaptureReady error:error]; }
             else [self setCaptureState:HCCameraCaptureRecording error:nil];
-            hc_camera_main(^{ if (completion) completion(error); });
+            finish(error);
         });
     };
-    if (_captionsEnabled && _hasMicrophone && [SFSpeechRecognizer authorizationStatus] == SFSpeechRecognizerAuthorizationStatusNotDetermined)
-        [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus status) { begin(status == SFSpeechRecognizerAuthorizationStatusAuthorized); }];
-    else begin(_captionsEnabled && _hasMicrophone && [SFSpeechRecognizer authorizationStatus] == SFSpeechRecognizerAuthorizationStatusAuthorized);
+    void (^microphoneAllowed)(BOOL) = ^(BOOL allowed) {
+        dispatch_async(self->_captureQueue, ^{
+            if (![self pendingStartMatches:generation]) return;
+            if (self->_closed || self.state != HCCameraCaptureReady) {
+                finish(hc_camera_error(10, @"The camera is no longer ready."));
+                return;
+            }
+            if (allowed && !self->_hasMicrophone) {
+                [self->_session beginConfiguration];
+                [self configureMicrophoneInput];
+                [self->_session commitConfiguration];
+            }
+            [self clearMicrophoneWarning];
+            if (!self->_hasMicrophone) [self addWarning:HCCameraMicrophoneSilentWarning];
+            hc_camera_main(^{
+                if (![self pendingStartMatches:generation]) return;
+                if (self->_captionsEnabled && self->_hasMicrophone && [self speechAuthorizationStatus] == SFSpeechRecognizerAuthorizationStatusNotDetermined)
+                    [self requestSpeechAccess:^(SFSpeechRecognizerAuthorizationStatus status) { begin(status == SFSpeechRecognizerAuthorizationStatusAuthorized); }];
+                else begin(self->_captionsEnabled && self->_hasMicrophone && [self speechAuthorizationStatus] == SFSpeechRecognizerAuthorizationStatusAuthorized);
+            });
+        });
+    };
+    AVAuthorizationStatus microphone = [self cameraAuthorizationStatusForMediaType:AVMediaTypeAudio];
+    if (microphone == AVAuthorizationStatusNotDetermined)
+        [self requestCameraAccessForMediaType:AVMediaTypeAudio completion:microphoneAllowed];
+    else microphoneAllowed(microphone == AVAuthorizationStatusAuthorized);
 }
 - (NSError *)beginWriterToDirectory:(NSURL *)directory hostTime:(double)host {
     if (!directory.isFileURL) return hc_camera_error(11, @"Choose a local recording directory.");
@@ -387,6 +498,11 @@ static void hc_camera_main(void (^block)(void)) {
 }
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sample fromConnection:(AVCaptureConnection *)connection {
     @autoreleasepool {
+        if (output == _videoOutput) {
+            BOOL first;
+            @synchronized(self) { first = ++_receivedVideoFrames == 1; }
+            if (first) hc_camera_main(^{ if (self->_stateChanged) self->_stateChanged(); });
+        }
         if (self.state != HCCameraCaptureRecording) return;
         CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
         CMClockRef sourceClock = _session.masterClock;
@@ -551,6 +667,7 @@ static void hc_camera_main(void (^block)(void)) {
     }
 }
 - (void)discardWithCompletion:(void (^)(void))completion {
+    [self cancelPendingStart];
     dispatch_async(_captureQueue, ^{
         [self discardOnCaptureQueue];
         [self setCaptureState:self->_session.isRunning || self->_testMode ? HCCameraCaptureReady : HCCameraCaptureIdle error:nil];
@@ -558,7 +675,8 @@ static void hc_camera_main(void (^block)(void)) {
     });
 }
 - (void)shutdown {
-    _closed = YES;
+    @synchronized(self) { _closed = YES; }
+    [self cancelPendingStart];
     self.stateChanged = nil;
     _previewLayer.session = nil;
     dispatch_async(_captureQueue, ^{
@@ -575,7 +693,7 @@ static void hc_camera_main(void (^block)(void)) {
     [_audioOutput setSampleBufferDelegate:nil queue:NULL];
     [_session stopRunning];
     [_speechTask cancel]; [_speechTask release]; [_recognizer release];
-    [_stateChanged release]; [_stopCompletion release];
+    [_stateChanged release]; [_stopCompletion release]; [_pendingStartCompletion release];
     [_session release]; [_previewLayer release]; [_videoOutput release]; [_audioOutput release];
     [_writer release]; [_videoInput release]; [_audioInput release];
     [_directory release]; [_movieURL release]; [_cameraName release]; [_warning release]; [_lastError release]; [_captions release];

@@ -15,6 +15,8 @@
 - (void)testFreeze:(double)host;
 - (void)testAppend:(CMSampleBufferRef)sample video:(BOOL)video host:(double)host;
 - (NSUInteger)testVideoFrames;
+- (AVCaptureSession *)testEmptySessionWithMicrophone:(BOOL)microphone;
+- (void)testSetMicrophone:(BOOL)microphone;
 @end
 @implementation HCCameraCapture (SyntheticTest)
 - (NSError *)testBegin:(NSURL *)directory {
@@ -51,6 +53,14 @@
     __block NSUInteger result = 0;
     [self syncCapture:^{ result = self->_videoFrames; }];
     return result;
+}
+- (AVCaptureSession *)testEmptySessionWithMicrophone:(BOOL)microphone {
+    @synchronized(self) { _hasMicrophone = microphone; }
+    if (!_session) _session = [[AVCaptureSession alloc] init];
+    return _session;
+}
+- (void)testSetMicrophone:(BOOL)microphone {
+    @synchronized(self) { _hasMicrophone = microphone; }
 }
 @end
 
@@ -167,9 +177,163 @@ static void inspect_movie(NSURL *url) {
     }
     assert(reader.status == AVAssetReaderStatusCompleted && count > 10 && previous > 1.9);
 }
+/* Control-flow regression fixture: every permission/device operation is
+ * replaced, while the real prepare/start sequencing and queue hops execute. */
+@interface HCCameraPermissionFixture : HCCameraCapture {
+@public
+    AVAuthorizationStatus videoAuthorization, audioAuthorization;
+    NSUInteger videoRequests, audioRequests, configurations, microphoneConfigurations, writerStarts;
+    BOOL configuredWithAudio, previewConnected, sessionStarted;
+    NSError *previewFailure;
+    void (^pendingAudio)(BOOL);
+    void (^pendingVideo)(BOOL);
+    void (^pendingSpeech)(SFSpeechRecognizerAuthorizationStatus);
+}
+@end
+@implementation HCCameraPermissionFixture
+- (instancetype)init {
+    if ((self = [super init])) {
+        videoAuthorization = AVAuthorizationStatusAuthorized;
+        audioAuthorization = AVAuthorizationStatusNotDetermined;
+    }
+    return self;
+}
+- (AVAuthorizationStatus)cameraAuthorizationStatusForMediaType:(AVMediaType)type {
+    return [type isEqualToString:AVMediaTypeVideo] ? videoAuthorization : audioAuthorization;
+}
+- (void)requestCameraAccessForMediaType:(AVMediaType)type completion:(void (^)(BOOL))completion {
+    if ([type isEqualToString:AVMediaTypeVideo]) { videoRequests++; [pendingVideo release]; pendingVideo = [completion copy]; }
+    else { audioRequests++; [pendingAudio release]; pendingAudio = [completion copy]; }
+}
+- (void)configureWithMicrophone:(BOOL)microphone completion:(void (^)(NSError *))completion {
+    configurations++; configuredWithAudio = microphone;
+    if (!microphone) [self addWarning:HCCameraMicrophonePendingWarning];
+    AVCaptureSession *session = [self testEmptySessionWithMicrophone:microphone];
+    [self startPreparedSession:session completion:completion];
+}
+- (NSError *)connectPreviewToSession:(AVCaptureSession *)session {
+    assert([NSThread isMainThread]); assert(!sessionStarted);
+    previewConnected = YES;
+    return previewFailure;
+}
+- (NSError *)runPreparedSession:(AVCaptureSession *)session {
+    assert(![NSThread isMainThread]); assert(previewConnected);
+    sessionStarted = YES; /* deliberately never calls AVFoundation startRunning */
+    return nil;
+}
+- (BOOL)configureMicrophoneInput {
+    microphoneConfigurations++;
+    [self testSetMicrophone:YES];
+    return YES;
+}
+- (NSError *)beginWriterToDirectory:(NSURL *)directory hostTime:(double)host {
+    writerStarts++; return nil; /* no files or real recording */
+}
+- (SFSpeechRecognizerAuthorizationStatus)speechAuthorizationStatus { return SFSpeechRecognizerAuthorizationStatusNotDetermined; }
+- (void)requestSpeechAccess:(void (^)(SFSpeechRecognizerAuthorizationStatus))completion { pendingSpeech = [completion copy]; }
+- (void)dealloc { [previewFailure release]; [pendingAudio release]; [pendingVideo release]; [pendingSpeech release]; [super dealloc]; }
+@end
+
+static void test_preview_authorization(void) {
+    HCCameraPermissionFixture *capture = [[HCCameraPermissionFixture alloc] init];
+    capture->videoAuthorization = AVAuthorizationStatusNotDetermined;
+    __block BOOL ready = NO;
+    [capture prepareWithCompletion:^(NSError *error) {
+        assert([NSThread isMainThread] && !error); ready = YES;
+    }];
+    assert(capture->videoRequests == 1 && capture->configurations == 0 && capture->audioRequests == 0);
+    capture->videoAuthorization = AVAuthorizationStatusAuthorized;
+    capture->pendingVideo(YES);
+    [capture->pendingVideo release]; capture->pendingVideo = nil;
+    wait_for(&ready);
+    assert(capture.state == HCCameraCaptureReady && capture->sessionStarted);
+    assert(capture->configurations == 1 && !capture->configuredWithAudio);
+    assert(capture->audioRequests == 0 && capture->videoRequests == 1);
+    assert(capture->previewConnected && !capture.hasMicrophone);
+    __block BOOL started = NO;
+    [capture startRecordingToDirectory:[NSURL fileURLWithPath:@"/unused-permission-fixture"] completion:^(NSError *error) {
+        assert(!error); started = YES;
+    }];
+    assert(capture->audioRequests == 1 && capture->writerStarts == 0);
+    assert(capture.state == HCCameraCaptureReady && capture->sessionStarted);
+    __block BOOL duplicateRejected = NO;
+    [capture startRecordingToDirectory:[NSURL fileURLWithPath:@"/unused-permission-fixture"] completion:^(NSError *error) {
+        assert(error); duplicateRejected = YES;
+    }];
+    wait_for(&duplicateRejected);
+    assert(capture->audioRequests == 1);
+    capture->audioAuthorization = AVAuthorizationStatusAuthorized;
+    capture->pendingAudio(YES);
+    [capture->pendingAudio release]; capture->pendingAudio = nil;
+    wait_for(&started);
+    assert(capture->writerStarts == 1 && capture->microphoneConfigurations == 1 && capture.hasMicrophone);
+    assert([capture.warning rangeOfString:HCCameraMicrophonePendingWarning].location == NSNotFound);
+    [capture shutdown]; [capture syncCapture:^{}]; [capture release];
+
+    /* A rejected preview connection cannot claim Ready or start the session. */
+    capture = [[HCCameraPermissionFixture alloc] init];
+    capture->previewFailure = [hc_camera_error(100, @"fixture preview failure") retain];
+    ready = NO;
+    [capture prepareWithCompletion:^(NSError *error) { assert(error.code == 100); ready = YES; }];
+    wait_for(&ready);
+    assert(capture.state == HCCameraCaptureFailed && !capture->sessionStarted);
+    assert(capture->audioRequests == 0);
+    [capture shutdown]; [capture syncCapture:^{}]; [capture release];
+
+    /* Denied microphone access still leaves a usable camera-only recording. */
+    capture = [[HCCameraPermissionFixture alloc] init];
+    capture->audioAuthorization = AVAuthorizationStatusDenied;
+    ready = NO;
+    [capture prepareWithCompletion:^(NSError *error) { assert(!error); ready = YES; }];
+    wait_for(&ready);
+    started = NO;
+    [capture startRecordingToDirectory:[NSURL fileURLWithPath:@"/unused-permission-fixture"] completion:^(NSError *error) { assert(!error); started = YES; }];
+    wait_for(&started);
+    assert(capture->writerStarts == 1 && !capture.hasMicrophone && capture->audioRequests == 0);
+    assert([capture.warning containsString:@"silent"]);
+    [capture shutdown]; [capture syncCapture:^{}]; [capture release];
+}
+
+static void test_pending_start_cancellation(void) {
+    /* Cover deferred microphone and speech prompts, and both explicit discard
+     * and closing the camera. All authorization providers remain fake. */
+    for (int speech = 0; speech < 2; speech++) for (int close = 0; close < 2; close++) {
+        HCCameraPermissionFixture *capture = [[HCCameraPermissionFixture alloc] init];
+        capture.captionsEnabled = speech;
+        if (speech) capture->audioAuthorization = AVAuthorizationStatusAuthorized;
+        __block BOOL ready = NO, cancelled = NO, discarded = NO;
+        __block NSUInteger callbacks = 0;
+        [capture prepareWithCompletion:^(NSError *error) { assert(!error); ready = YES; }];
+        wait_for(&ready);
+        [capture startRecordingToDirectory:[NSURL fileURLWithPath:@"/unused-cancel-fixture"] completion:^(NSError *error) {
+            assert(error && [NSThread isMainThread]); callbacks++; cancelled = YES;
+        }];
+        if (speech) {
+            double deadline = hc_camera_host_seconds()+5;
+            while (!capture->pendingSpeech && hc_camera_host_seconds() < deadline)
+                [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.001]];
+            assert(capture->pendingSpeech);
+        } else assert(capture->pendingAudio);
+        if (close) { [capture shutdown]; [capture syncCapture:^{}]; }
+        else { [capture discardWithCompletion:^{ discarded = YES; }]; wait_for(&discarded); }
+        wait_for(&cancelled);
+        assert(callbacks == 1 && capture->writerStarts == 0);
+        if (speech) { capture->pendingSpeech(SFSpeechRecognizerAuthorizationStatusAuthorized); [capture->pendingSpeech release]; capture->pendingSpeech = nil; }
+        else { capture->pendingAudio(YES); [capture->pendingAudio release]; capture->pendingAudio = nil; }
+        [capture syncCapture:^{}];
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.01]];
+        [capture syncCapture:^{}];
+        assert(callbacks == 1 && capture->writerStarts == 0);
+        if (!close) [capture shutdown];
+        [capture syncCapture:^{}]; [capture release];
+    }
+}
+
 int main(void) {
     @autoreleasepool {
         test_clock();
+        test_preview_authorization();
+        test_pending_start_cancellation();
         NSURL *root = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:
             [@"hardcore-camera-test-" stringByAppendingString:[NSUUID UUID].UUIDString]] isDirectory:YES];
         NSURL *take = [root URLByAppendingPathComponent:@"take" isDirectory:YES];
@@ -219,7 +383,7 @@ int main(void) {
         assert([[NSFileManager defaultManager] fileExistsAtPath:sentinel.path]);
         [capture shutdown]; [capture syncCapture:^{}]; [capture release];
         [[NSFileManager defaultManager] removeItemAtURL:root error:NULL];
-        puts("camera capture: pause clock, H.264/AAC encoding/decoding, timestamp continuity, save and discard passed (no devices opened)");
+        puts("camera capture: independent preview permission, connection-before-start ordering, pause clock, H.264/AAC encoding/decoding, timestamp continuity, save and discard passed (no devices opened)");
     }
     return 0;
 }

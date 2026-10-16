@@ -377,6 +377,8 @@ recording-test: build/recording-export
 	build/test-camera-capture
 	clang -O1 -Wno-deprecated-declarations -Wno-unused-function tests/test_camera_panel.m -o build/test-camera-panel -framework Cocoa -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework AudioToolbox -framework Speech -framework QuartzCore
 	build/test-camera-panel
+	clang -O1 -Wno-deprecated-declarations -Wno-unused-function tests/test_camera_compositing.m -o build/test-camera-compositing -framework Cocoa -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework AudioToolbox -framework Speech -framework QuartzCore -framework Metal
+	build/test-camera-compositing
 	clang -O1 -Wno-deprecated-declarations -fno-objc-arc tests/fixtures/recording_library_check.m -o build/test-recording-library -framework Cocoa -framework WebKit
 	build/test-recording-library
 

@@ -47,7 +47,14 @@ static void mac_camera_preview_sync(void) {
     }
     [g_camera_preview_view setHidden:!show];
     if(!show)return;
-    NSRect frame=[g_view convertRectFromBacking:mac_camera_body_pixels()];
+    /* Timer/permission callbacks also enter here, outside UI_FONT. */
+    UI_FONT;NSRect pixels=mac_camera_body_pixels();UI_DONE;
+    /* These are renderer pixels with a top-left origin, not AppKit backing
+     * coordinates. Rect conversion flips Y again on HCView and puts the
+     * preview above the window. Convert the units, preserving the origin. */
+    NSSize unit=[g_view convertSizeFromBacking:NSMakeSize(1,1)];
+    NSRect frame=NSMakeRect(pixels.origin.x*unit.width,pixels.origin.y*unit.height,
+        pixels.size.width*unit.width,pixels.size.height*unit.height);
     [CATransaction begin];[CATransaction setDisableActions:YES];
     g_camera_preview_view.frame=frame;
     AVCaptureVideoPreviewLayer *preview=g_camera_capture.previewLayer;
@@ -190,7 +197,7 @@ static void mac_camera_draw(void) {
     mac_camera_label(L"● Rec",1,7,row,!busy && state==HCCameraCaptureReady?g_look.red:g_look.dim,MAC_CAMERA_RECORD);
     mac_camera_label(paused?L"Resume":L"Pause",9,7,row,recording||paused?g_look.text:g_look.dim,MAC_CAMERA_PAUSE);
     mac_camera_label(L"Save",17,5,row,recording||paused||state==HCCameraCaptureFailed?AMBER:g_look.dim,MAC_CAMERA_SAVE);
-    mac_camera_label(L"Discard",23,7,row,busy && state!=HCCameraCaptureFinishing?g_look.text_lo:g_look.dim,MAC_CAMERA_DISCARD);
+    mac_camera_label(L"Discard",23,7,row,busy && (recording||paused||state==HCCameraCaptureFailed)?g_look.text_lo:g_look.dim,MAC_CAMERA_DISCARD);
     row++;
     mac_camera_label(g_camera_capture.captionsEnabled?L"[x] Captions":L"[ ] Captions",1,16,row,busy?g_look.dim:g_look.text_lo,MAC_CAMERA_CAPTIONS);
     wchar_t library[32];
@@ -261,8 +268,8 @@ static int mac_camera_mouse(NSEvent *event,int x,int y) {
     } else if(hit==MAC_CAMERA_MINIMIZE) {mac_camera_toggle();g_camera_down=1;}
     else if(hit==MAC_CAMERA_RECORD && !busy && state==HCCameraCaptureReady)mac_record_start();
     else if(hit==MAC_CAMERA_PAUSE && (state==HCCameraCaptureRecording || state==HCCameraCapturePaused))mac_record_pause();
-    else if(hit==MAC_CAMERA_SAVE && busy && state!=HCCameraCaptureFinishing)mac_record_stop();
-    else if(hit==MAC_CAMERA_DISCARD && busy && state!=HCCameraCaptureFinishing)mac_record_discard();
+    else if(hit==MAC_CAMERA_SAVE && busy && (state==HCCameraCaptureRecording || state==HCCameraCapturePaused || state==HCCameraCaptureFailed))mac_record_stop();
+    else if(hit==MAC_CAMERA_DISCARD && busy && (state==HCCameraCaptureRecording || state==HCCameraCapturePaused || state==HCCameraCaptureFailed))mac_record_discard();
     else if(hit==MAC_CAMERA_CAPTIONS && !busy) {
         g_camera_capture.captionsEnabled=!g_camera_capture.captionsEnabled;
         [[NSUserDefaults standardUserDefaults] setBool:g_camera_capture.captionsEnabled forKey:@"HCCameraCaptions"];
@@ -280,4 +287,21 @@ static NSDictionary *mac_camera_metadata(void) {
     UI_FONT;NSRect rect=mac_camera_body_pixels();UI_DONE;
     return @{@"visible":@(g_camera_visible && g_camera_placed),@"mirrored":@YES,
         @"rect":@[@(rect.origin.x),@(rect.origin.y),@(rect.size.width),@(rect.size.height)]};
+}
+
+/* Read-only diagnostics: counters/geometry only, never camera images or audio. */
+static NSDictionary *mac_camera_status(void) {
+    HCCameraCapture *camera=g_camera_capture;
+    AVCaptureVideoPreviewLayer *preview=camera.previewLayer;
+    NSView *view=g_camera_preview_view;
+    return @{@"visible":@(g_camera_visible),@"placed":@(g_camera_placed),
+        @"recording":@(mac_record_active()),@"state":camera.stateDescription ?: @"Camera closed",
+        @"camera":camera.cameraName ?: @"",
+        @"error":camera.lastError.localizedDescription ?: @"",@"warning":camera.warning ?: @"",
+        @"video_frames":@(camera.receivedVideoFrames),
+        @"session_running":@(preview.session.isRunning),@"connection_active":@(preview.connection.active),
+        @"connection_enabled":@(preview.connection.enabled),
+        @"hidden":@(!view || view.isHiddenOrHasHiddenAncestor),@"attached":@(view && preview.superlayer==view.layer),
+        @"view_frame":NSStringFromRect(view.frame),@"view_bounds":NSStringFromRect(view.bounds),
+        @"layer_frame":NSStringFromRect(preview.frame)};
 }

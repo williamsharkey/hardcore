@@ -37,6 +37,7 @@ static void mac_camera_toggle(void);
 static int mac_camera_mouse(NSEvent *,int,int);
 static int mac_camera_cursor(int,int);
 static NSDictionary *mac_camera_metadata(void);
+static NSDictionary *mac_camera_status(void);
 static int mac_record_active(void);
 static void mac_record_start(void);
 static void mac_record_pause(void);
