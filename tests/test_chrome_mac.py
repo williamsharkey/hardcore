@@ -91,6 +91,10 @@ class NativeApp:
             self.send("cmd resize 1001,591")
             self.send("type sleep 600\\n")
             wait_for(lambda: self.state()["tabs"][0]["program"] == "sleep", description="quiet PTY")
+            # The header now shares row zero with the terminal. Remove this
+            # fixture shell's prompt before exercising its controls; covered
+            # controls correctly refuse clicks in the ordinary underlay.
+            self.feed([""] * self.chrome()["rows"])
         except BaseException:
             self.__exit__(*sys.exc_info())
             raise
@@ -132,11 +136,51 @@ class NativeApp:
 
     def state(self):
         result = json.loads(self.output("cmd state").read_text())
-        self.pids.update(tab["pid"] for tab in result["tabs"])
+        # Native browser tabs have no child process. PID zero would signal
+        # the fixture runner's entire process group during cleanup.
+        self.pids.update(tab["pid"] for tab in result["tabs"] if tab["pid"] > 1)
         return result
 
     def chrome(self):
         return json.loads(self.output("cmd chrome").read_text())
+
+    @staticmethod
+    def tv(chrome, name):
+        return next(item for item in chrome.get("tvs", []) if item["name"] == name)
+
+    @staticmethod
+    def settings_x(chrome):
+        return chrome["pages"].get("settings_x", chrome["dock"]["x"])
+
+    def open_settings(self):
+        c = self.chrome()
+        if not c["settings_open"]:
+            local = 4 if "tvs" in c else 6
+            c = self.click(c["dock"]["x"] + local, c["pages"]["settings_row"])
+        assert c["settings_open"], "settings header control did not open its panel"
+        return c
+
+    def settings_section(self, section):
+        c = self.open_settings()
+        if c["settings_tab"] != section:
+            c = self.click(self.settings_x(c) + (20 if section else 3), c["pages"]["section_row"])
+        assert c["settings_tab"] == section
+        return c
+
+    def toggle_settings(self):
+        c = self.chrome()
+        return self.click(c["dock"]["x"] + (4 if "tvs" in c else 6), c["pages"]["settings_row"])
+
+    def quiet_tabs(self, count):
+        """Size the primary menu using owned PTYs, independently of Settings."""
+        existing = len(self.state()["tabs"])
+        for _ in range(existing, count):
+            self.send("cmd newtab")
+            self.send("type sleep 600\\n")
+        wait_for(lambda: (len((s := self.state())["tabs"]) >= count and
+                         all(tab["program"] == "sleep" for tab in s["tabs"])),
+                 description="owned quiet menu tabs")
+        return self.chrome()
 
     def map(self, col, row):
         return json.loads(self.output(f"cmd map {col},{row}").read_text())
@@ -270,7 +314,7 @@ def test_reflow(app):
 
 def test_hover(app):
     c = app.chrome()
-    c = app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
+    c = app.toggle_settings()
     assert c["settings_open"], c
     dock, cell = c["dock"], c["cell"]
     # One long literal word cannot reflow; every menu row overlaps text.
@@ -299,7 +343,8 @@ def page_button(c, kind, direction):
     count = (page["total"] + page["capacity"] - 1) // page["capacity"]
     counter = f"{page['offset'] // page['capacity'] + 1}/{count}"
     local = 2 if direction < 0 else c["dock"]["width"] - (3 if kind == "tabs" else 1) - len(counter) - 3
-    return c["dock"]["x"] + local, page["row"]
+    origin = c["pages"].get("settings_x", c["dock"]["x"]) if kind == "settings" else c["dock"]["x"]
+    return origin + local, page["row"]
 
 
 def walk_pages(app, kind):
@@ -336,31 +381,33 @@ def walk_pages(app, kind):
 
 def test_pagination(app):
     c = app.chrome()
-    c = app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
+    c = app.toggle_settings()
     assert c["settings_open"] and c["settings_tab"] == 0, c
     assert c["pages"]["settings"]["capacity"] == c["pages"]["settings"]["total"], "roomy font list unnecessarily paginated"
-    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
+    c = app.click(app.settings_x(c) + 20, c["pages"]["section_row"])
     assert c["pages"]["settings"]["capacity"] == c["pages"]["settings"]["total"], "roomy theme list unnecessarily paginated"
     app.snap("sidebar-full-settings")
-    c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
+    c = app.click(app.settings_x(c) + 3, c["pages"]["section_row"])
     for expected in range(2, 12):
         app.send("cmd newtab")
         wait_for(lambda: len(app.state()["tabs"]) == expected, description="new test tab")
         app.send("type sleep 600\\n")
-    app.send("cmd resize 1001,160")
+    # Settings has the opposite edge available independently of the tab list;
+    # shrink the actual viewport enough that each separate list must paginate.
+    app.send("cmd resize 1001,100")
     c = walk_pages(app, "settings")
     before_font = c["fontkey"]
     button = next(button for button in c["font_buttons"] if button["fontkey"] != before_font)
-    c = app.click(c["dock"]["x"] + button["left"], button["row"])
+    c = app.click(app.settings_x(c) + button["left"], button["row"])
     assert c["fontkey"] == button["fontkey"], "font size button selected the wrong font"
     assert c["cell"] == {"width": button["width"], "height": button["height"]}, c
     font_offset = c["pages"]["settings"]["offset"]
     app.snap("sidebar-font-last-page")
-    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
+    c = app.click(app.settings_x(c) + 20, c["pages"]["section_row"])
     assert c["settings_tab"] == 1, c
     c = walk_pages(app, "settings")
     before_scheme = c["schemekey"]
-    c = app.click(c["dock"]["x"] + 8, c["pages"]["settings"]["row"])
+    c = app.click(app.settings_x(c) + 8, c["pages"]["settings"]["row"])
     assert c["schemekey"] != before_scheme, "first paginated option row did not select its theme"
     theme_offset = c["pages"]["settings"]["offset"]
     app.snap("sidebar-theme-last-page")
@@ -373,11 +420,11 @@ def test_pagination(app):
     print("PASS: font/theme/tab pages reach every option and return from partial last pages; option rows remain selectable and tabs occupy one row")
 
     # Reload preserves independent Font and Theme page positions.
-    c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
+    c = app.click(app.settings_x(c) + 3, c["pages"]["section_row"])
     font_offset = c["pages"]["settings"]["offset"]
-    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
+    c = app.click(app.settings_x(c) + 20, c["pages"]["section_row"])
     theme_offset = c["pages"]["settings"]["offset"]
-    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
+    c = app.click(app.settings_x(c) + 20, c["pages"]["section_row"])
     keys = ("mode", "settings_open", "settings_tab", "fontkey", "schemekey", "reflow_enabled", "dock", "pages")
     before = {key: c[key] for key in keys}
     result = subprocess.run([str(app.root / "hardcore.app/Contents/MacOS/hardcore"), "--reload"],
@@ -386,9 +433,9 @@ def test_pagination(app):
     assert app.state()["pid"] == app.proc.pid, "reload changed app PID"
     c = app.chrome()
     assert {key: c[key] for key in keys} == before, (before, c)
-    c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
+    c = app.click(app.settings_x(c) + 3, c["pages"]["section_row"])
     assert c["settings_tab"] == 0 and c["pages"]["settings"]["offset"] == font_offset, c
-    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
+    c = app.click(app.settings_x(c) + 20, c["pages"]["section_row"])
     assert c["settings_tab"] == 1 and c["pages"]["settings"]["offset"] == theme_offset, c
     print("PASS: in-place reload preserves dock settings, independent Font/Theme pages and app PID")
 
@@ -431,10 +478,9 @@ def test_codex_records(app):
     app.send(f"cmd resize {120 * c['cell']['width'] // c['scale']},591")
     c = app.chrome()
     assert c["cols"] == 120, c
-    if not c["settings_open"]:
-        c = app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
-    # A tall real menu places the entire output block in the obstruction band.
-    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
+    # A tall primary menu places the output block in the obstruction band;
+    # Settings is now a separately placed surface with its own lifetime.
+    c = app.quiet_tabs(10)
     start, boundary = c["dock"]["y"] + 2, c["dock"]["y"] + 8
     assert boundary <= c["dock"]["y"] + c["dock"]["height"] < c["rows"], c
     path = "/Users/wm/Applications/hardcore.app"
@@ -487,9 +533,9 @@ def test_codex_records(app):
         print(f"PASS: dock {app.mode} reflows styled Codex commands and paths with two-cell padding, retaining footers, boundaries and source coordinates")
     finally:
         c = app.chrome()
-        c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
-        if c["settings_open"]:
-            app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
+        while len(app.state()["tabs"]) > 1:
+            app.send("cmd closetab")
+            app.state()
         app.send("cmd resize 1001,591")
 
 
@@ -512,7 +558,11 @@ def test_visible_whitespace_and_rules(app):
     lines[row] = "\x1b[48;2;60;70;80m" + " " * c["cols"] + "\x1b[0m"
     app.feed(lines)
     shaded = app.snap("codex-meaningful-background")
-    assert shaded.crop(*box) == dim.crop(*box), "clear menu row is not fully opaque over highlighted blank space"
+    # Rounded exposed corners intentionally reveal terminal background. The
+    # entire remaining menu interior must still be opaque and unchanged.
+    radius = min(6, cell["width"]//2, cell["height"]//3)
+    interior_box = (box[0]+radius, box[1], box[2]-radius, box[3])
+    assert shaded.crop(*interior_box) == dim.crop(*interior_box), "clear menu row is not fully opaque over highlighted blank space"
     interior = shaded.crop(box[0] + cell["width"], box[1] + 2, box[2] - 3*cell["width"], box[3] - 4)
     assert len({interior[i:i+3] for i in range(0, len(interior), 4)}) > 1, "highlighted blank cells still hide the menu text"
     # Terminal text owns its whole cell even over the colored background.
@@ -522,7 +572,7 @@ def test_visible_whitespace_and_rules(app):
     assert occupied.crop((d["x"] + 8)*cell["width"], box[1], cell["width"], cell["height"]) == occupied.crop(40*cell["width"], box[1], cell["width"], cell["height"]), "underlay draws over highlighted terminal text"
 
     c = app.feed([""] * c["rows"])
-    c = app.click(d["x"] + 6, c["pages"]["settings_row"])
+    c = app.toggle_settings()
     assert c["pages"]["settings"]["capacity"] == c["pages"]["settings"]["total"], c
     c = app.hover(d["x"] + 6, c["pages"]["tabs"]["row"])
     front = app.snap("right-collapsed-rules-full-settings")
@@ -536,7 +586,7 @@ def test_visible_whitespace_and_rules(app):
     assert pixel(front, edge, y) == pixel(front, edge - 1, y), "right dock has a visible outside border"
     y = (c["pages"]["settings"]["row"] + 1) * ch
     assert pixel(front, edge - 2, y) == pixel(front, edge - 2, y - 1) == pixel(front, edge - 2, y + 1), "settings option rows still have separator rules"
-    c = app.click(d["x"] + 6, c["pages"]["settings_row"])
+    c = app.toggle_settings()
     app.hover(-1, -1)
     print("PASS: invisible styled spaces reveal chrome; borders collapse to one pixel, settings omit row rules, right edge is open")
 
@@ -641,7 +691,7 @@ def test_title_underlay(app):
 def test_drag_and_quiet_tabs(app):
     c = app.chrome()
     if c["settings_open"]:
-        c = app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
+        c = app.toggle_settings()
     app.send("cmd newtab")
     wait_for(lambda: len(app.state()["tabs"]) == 2, description="second drag-test tab")
     app.send("type sleep 600\\n")

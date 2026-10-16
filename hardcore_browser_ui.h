@@ -285,6 +285,9 @@ static void browser_ui_draw_editor(HCBrowser *b,int x,int y,int width,int height
 }
 
 static void mac_browser_draw_nav(void) {
+    /* A preview has no interactive browser toolbar or edit cursor. Its
+       real tab keeps its own responder and draft until a deliberate click. */
+    if(chrome_preview_active())return;
     Tab *tb=active_tab();HCBrowser *b=browser_for(tb);if(!b || !g_mac_title_hover)return;
     BrowserNav n=browser_nav();
     browser_ui_text(@"[←]",n.back,n.controlsRow,3,b->web.canGoBack ? DEF_FG : g_look.dim);
@@ -298,6 +301,9 @@ static void mac_browser_draw_nav(void) {
     fill_rect(0,n.rows*CH-1,tb->t.cols*CW,n.rows*CH,g_look.dim,1);
 }
 static void mac_browser_draw_overlay(void) {
+    /* The cached page uses the full preview grid; inspector/edit/menu state
+       remains untouched in the background and cannot cover the tab list. */
+    if(chrome_preview_active())return;
     Tab *tb=active_tab();HCBrowser *b=browser_for(tb);if(!b)return;
     if(b->inspectOpen) {
         int top=mac_browser_page_rows(tb),height=tb->t.rows-top;
@@ -330,6 +336,7 @@ static void mac_browser_draw_overlay(void) {
     }
 }
 static int mac_browser_hover_link(void) {
+    if(chrome_preview_active())return 0;
     Tab *tb=active_tab();HCBrowser *b=browser_for(tb);if(!b || tb->browser_native || g_mac_title_hover || b->menuKind || b->editKind || over_chrome(g_mouse_x,g_mouse_y))return 0;
     int x=g_mouse_x/CW,y=g_mouse_y/CH;
     if(g_mouse_x<0 || g_mouse_y<0 || x>=tb->t.cols || y>=b->pageRows)return 0;

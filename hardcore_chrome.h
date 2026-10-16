@@ -3,7 +3,8 @@
 enum {
     HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT,
     HIT_SCHEME, HIT_STAB, HIT_SCLOSE, HIT_UNDERLAY, HIT_TABPAGE, HIT_SETPAGE,
-    HIT_REFLOW, HIT_REFLOW_DEBUG, HIT_DOCK_ROW, HIT_CHROME_INERT, HIT_GRIP
+    HIT_REFLOW, HIT_REFLOW_DEBUG, HIT_DOCK_ROW, HIT_CHROME_INERT, HIT_GRIP,
+    HIT_WEB, HIT_FILES, HIT_CAF, HIT_TV, HIT_TV_CLOSE
 };
 static int plat_lights_bottom(void);
 static void plat_settings_shown(void);
@@ -88,6 +89,9 @@ static int chrome_page_hit(int col, int offset, int capacity, int total, int tab
 static int chrome_item_total(void) {
     return g_settings_tab == 0 ? g_font_menu_count : NFAMILIES;
 }
+static int scheme_index(int key);
+#include "hardcore_tv_ui.h"
+
 /* Capacity depends on the viewport and complete lists, never the short last
    page. A resize re-aligns each list's offset to the new page boundary. */
 static ChromeLayout chrome_measure(int rows, int lights, int tabs, int open,
@@ -129,21 +133,33 @@ static ChromeLayout chrome_measure(int rows, int lights, int tabs, int open,
     }
     return a;
 }
+/* Main tabs retain their own geometry when a secondary TV opens. */
+static ChromeLayout chrome_primary_measure(int rows,int lights,int tabs,int open,int underlay,int dock,int items) {
+#ifdef _WIN32
+    return chrome_measure(rows,lights,tabs,open,underlay,dock,items);
+#else
+    ChromeLayout a=chrome_measure(rows,lights,tabs,0,underlay,dock,0);
+    a.settings_row=-1; a.bottom=a.tab_row+a.tab_count;
+    (void)open;(void)items;
+    return a;
+#endif
+}
 static int scheme_index(int key) {
     const Scheme *s = scheme_by_key(key);
     return s ? (int)(s - SCHEMES) : 0;
 }
 static void tab_layout(void) {
     int i, win_w, win_h, items;
+    if(chrome_preview_active())return;
     UI_FONT;
     if (g_settings_tab < 0 || g_settings_tab > 1) g_settings_tab = 0;
-    if (!g_settings_tab) font_menu_build(0, 0);
+    if (!g_settings_tab && !g_settings_open) font_menu_build(0, 0);
     items = chrome_item_total();
     plat_client_size(&win_w, &win_h);
 #ifndef _WIN32
     if(active_tab() && active_tab()->kind==TK_BROWSER)win_h=mac_browser_page_rows(active_tab())*CH;
 #endif
-    g_chrome = chrome_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
+    g_chrome = chrome_primary_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
                               g_tab_underlay, g_dock_row, items);
     if (!g_settings_tab && g_settings_open && g_chrome.list_capacity > 0 && items > g_chrome.list_capacity) {
         /* Page controls share the first actual row. Pack that row into the
@@ -153,7 +169,7 @@ static void tab_layout(void) {
         for (pass = 0; pass < NFONTS; pass++) {
             int previous = items, capacity = g_chrome.list_capacity;
             items = font_menu_build(capacity, items);
-            g_chrome = chrome_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
+            g_chrome = chrome_primary_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
                                       g_tab_underlay, g_dock_row, items);
             if (items == previous && capacity == g_chrome.list_capacity) break;
         }
@@ -164,7 +180,9 @@ static void tab_layout(void) {
         g_layout_active = g_active; g_layout_ntabs = g_ntabs;
     }
     g_tab_offset = chrome_page_offset(g_tab_offset, g_ntabs, g_chrome.tab_capacity);
+#ifdef _WIN32
     g_setting_offset[g_settings_tab] = chrome_page_offset(g_setting_offset[g_settings_tab], items, g_chrome.list_capacity);
+#endif
     g_chrome.tab_count = chrome_min(g_chrome.tab_capacity, g_ntabs - g_tab_offset);
     if (g_chrome.settings_row >= 0) g_chrome.settings_row = g_chrome.tab_row + g_chrome.tab_count;
     g_chrome.bottom = g_chrome.tab_row + g_chrome.tab_count + (g_chrome.settings_row >= 0);
@@ -194,6 +212,10 @@ static int chrome_hovered(void) {
 static int hit_tabbar(int mx, int my, int *idx) {
     int col, row, i, page_hit;
     UI_FONT;
+#ifndef _WIN32
+    int tv_hit=chrome_tv_hit(mx,my,idx);
+    if(tv_hit!=HIT_NONE){UI_DONE;return tv_hit;}
+#endif
     mx -= sidebar_x();
     if (mx < 0 || mx >= sidebar_w() || my < 0) { UI_DONE; return HIT_NONE; }
     tab_layout();
@@ -205,6 +227,14 @@ static int hit_tabbar(int mx, int my, int *idx) {
         col = original;
     }
     if (row == g_chrome.top && col == 1) { UI_DONE; return HIT_GRIP; }
+#ifndef _WIN32
+    if(row==g_chrome.top) {
+        int hit=col>=3&&col<=5?HIT_SETTINGS:col>=7&&col<=9?HIT_PLUS:
+            col>=11&&col<=13?HIT_WEB:col>=15&&col<=17?HIT_FILES:
+            col>=20&&col<=24?HIT_CAF:HIT_BAR;
+        UI_DONE;return hit;
+    }
+#endif
     for (i = 0; i < g_chrome.tab_count; i++) {
         if (row != g_chrome.tab_row + i) continue;
         if (col == SB_COLS - 2) { *idx = g_tab_offset + i; UI_DONE; return HIT_CLOSE; }
@@ -242,11 +272,12 @@ static int hit_tabbar(int mx, int my, int *idx) {
 static int over_chrome(int x, int y) { int idx = -1; return hit_tabbar(x, y, &idx) != HIT_NONE; }
 static int chrome_setting_hit(int hit) {
     return hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_SCLOSE || hit == HIT_FONT || hit == HIT_SCHEME ||
-           hit == HIT_TABPAGE || hit == HIT_SETPAGE || hit == HIT_CHROME_INERT;
+           hit == HIT_TABPAGE || hit == HIT_SETPAGE || hit == HIT_CHROME_INERT || hit == HIT_TV || hit == HIT_TV_CLOSE;
 }
 static int tabbar_action(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
-    return (chrome_setting_hit(hit) && hit != HIT_CHROME_INERT) || hit == HIT_PLUS || hit == HIT_CLOSE;
+    return (chrome_setting_hit(hit) && hit != HIT_CHROME_INERT) || hit == HIT_PLUS || hit == HIT_CLOSE ||
+        hit == HIT_WEB || hit == HIT_FILES || hit == HIT_CAF || hit == HIT_TAB;
 }
 static void resize_all(void);
 static void settings_point(void) {
@@ -268,13 +299,26 @@ static void settings_pick(int hit, int idx) {
     else return;
     config_save(); plat_settings_tell(); settings_apply();
 }
+static int chrome_settings_capacity(void) {
+#ifdef _WIN32
+    return g_chrome.list_capacity;
+#else
+    return g_tvs[HC_TV_SETTINGS].layout.list_capacity;
+#endif
+}
 static void settings_click(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
+#ifndef _WIN32
+    if(hit==HIT_SETTINGS) {chrome_tv_toggle(HC_TV_SETTINGS);settings_point();return;}
+    if(hit==HIT_TV_CLOSE) {hc_tv_close(&g_tvs[idx].state);if(idx==HC_TV_SETTINGS)g_settings_open=0;settings_point();plat_invalidate();return;}
+    if(hit==HIT_TV) {chrome_tv_interaction(idx);plat_invalidate();return;}
+    if(hit!=HIT_TABPAGE)chrome_tv_interaction(HC_TV_SETTINGS);
+#endif
     if (hit == HIT_SETTINGS) g_settings_open = !g_settings_open;
     else if (hit == HIT_SCLOSE) g_settings_open = 0;
     else if (hit == HIT_STAB) g_settings_tab = idx == 1 ? 1 : 0;
     else if (hit == HIT_TABPAGE) g_tab_offset = chrome_page_offset(g_tab_offset + idx * g_chrome.tab_capacity, g_ntabs, g_chrome.tab_capacity);
-    else if (hit == HIT_SETPAGE) g_setting_offset[g_settings_tab] = chrome_page_offset(g_setting_offset[g_settings_tab] + idx * g_chrome.list_capacity, chrome_item_total(), g_chrome.list_capacity);
+    else if (hit == HIT_SETPAGE) g_setting_offset[g_settings_tab] = chrome_page_offset(g_setting_offset[g_settings_tab] + idx * chrome_settings_capacity(), chrome_item_total(), chrome_settings_capacity());
     else if (hit == HIT_FONT || hit == HIT_SCHEME) settings_pick(hit, idx);
     settings_point(); plat_invalidate();
 }

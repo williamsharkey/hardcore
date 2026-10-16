@@ -139,11 +139,11 @@ static int cp_pack(const Cell *input, const int *stream, int length, int *positi
 /* cursor_source is the original viewport cell, or -1. A successful active
  * panel always returns its exact destination via cursor_display, including
  * the blank cell after the final word. Synthetic padding cannot steal it. */
-static int chrome_panel_reflow_apply(ChromeReflow *out, const Cell *input, int cols, int rows,
+static int chrome_panel_reflow_apply_checked(ChromeReflow *out, const Cell *input, int cols, int rows,
                                       const int *wrapped_rows, int cursor_source,
                                       int side, int dock_x, int dock_y, int dock_width, int dock_height,
                                       uint32_t default_bg, ChromePanelBackground background,
-                                      int *cursor_display) {
+                                      int *cursor_display, const unsigned char *protected_rows) {
     ChromePanel panel;
     int scan = 0, changed = 0;
     (void)wrapped_rows; /* Recognized continuations have explicit indentation,
@@ -152,6 +152,13 @@ static int chrome_panel_reflow_apply(ChromeReflow *out, const Cell *input, int c
         int capacity = (panel.bottom-panel.top)*cols, length = 0, last = panel.last;
         int *stream, *positions, cursor_in, prefix = 0, fit = 0, previous_end = -1;
         if (capacity > 48000 || panel.top >= dock_y+dock_height || panel.bottom <= dock_y) continue;
+        /* A later TV cannot borrow another surface's rows, even when the
+         * protected row currently contains only this panel's blank padding. */
+        if (protected_rows) {
+            int blocked = 0;
+            for (int y = panel.top; y < panel.bottom; y++) if (protected_rows[y]) { blocked = 1; break; }
+            if (blocked) continue;
+        }
         cursor_in = cursor_source >= panel.top*cols && cursor_source < panel.bottom*cols;
         {
             int intrudes = 0;
@@ -220,5 +227,13 @@ static int chrome_panel_reflow_apply(ChromeReflow *out, const Cell *input, int c
         free(stream); free(positions);
     }
     return changed;
+}
+static int chrome_panel_reflow_apply(ChromeReflow *out, const Cell *input, int cols, int rows,
+                                      const int *wrapped_rows, int cursor_source,
+                                      int side, int dock_x, int dock_y, int dock_width, int dock_height,
+                                      uint32_t default_bg, ChromePanelBackground background,
+                                      int *cursor_display) {
+    return chrome_panel_reflow_apply_checked(out, input, cols, rows, wrapped_rows, cursor_source,
+        side, dock_x, dock_y, dock_width, dock_height, default_bg, background, cursor_display, NULL);
 }
 #endif

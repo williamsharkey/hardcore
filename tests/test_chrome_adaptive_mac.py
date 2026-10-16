@@ -13,11 +13,7 @@ from test_chrome_mac import NativeApp, pixel, wait_for
 
 
 def theme_menu(app):
-    c = app.chrome()
-    if not c["settings_open"]:
-        c = app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
-    if c["settings_tab"] != 1:
-        c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
+    app.settings_section(1)
     app.hover(-1, -1)
     return app.chrome()
 
@@ -27,26 +23,26 @@ def test_notch(app):
     app.feed([""] * c["rows"])
     clean = app.snap("clean-menu")
     c = app.chrome()
-    dock, cell = c["dock"], c["cell"]
+    dock, cell = app.tv(c, "settings")["rect"], c["cell"]
     row = c["pages"]["settings"]["row"] + 2  # Monokai
     lines = [""] * c["rows"]
     # Keep an ambiguous literal row: no semantic reflow can change the test.
     # Its internal spaces must cut one continuous hole through the menu.
-    lines[row] = "=" * (dock["x"] - 2) + "  c"
+    lines = ["=" * (dock["x"] - 2) + "  c"] * c["rows"]
     before = app.state()
     app.feed(lines)
     notched = app.snap("monokai-notch")
     c = app.chrome()
     assert c["source"] == c["display"], "literal intrusion unexpectedly reflowed"
-    mapping = next(item for item in c["menu_rows"] if item["row"] == row)
+    mapping = next(item for item in app.tv(c, "settings")["menu_rows"] if item["row"] == row)
     assert mapping["left"] == dock["x"] and mapping["right"] == dock["x"] + 1, mapping
     # Label originally begins one column in, so use a second intrusion that
     # covers its M as in the report. The complete word must shift by one.
-    lines[row] += "c"
+    lines = [line + "c" for line in lines]
     app.feed(lines)
     notched = app.snap("monokai-shifted")
     c = app.chrome()
-    mapping = next(item for item in c["menu_rows"] if item["row"] == row)
+    mapping = next(item for item in app.tv(c, "settings")["menu_rows"] if item["row"] == row)
     positions = [mapping["map"].index(source) for source in range(1, 8)]
     assert positions == list(range(2, 9)), mapping
     cw, ch = cell["width"], cell["height"]
@@ -60,11 +56,11 @@ def test_notch(app):
     edge = (dock["x"] + 2) * cw
     assert pixel(notched, edge, row * ch + ch // 2) != pixel(notched, edge + 1, row * ch + ch // 2)
     # All text, including spaces between terminal words, owns its full span.
-    lines[row] = "=" * (dock["x"] + 2) + "     Z"
+    lines = ["=" * (dock["x"] + 2) + "     Z"] * c["rows"]
     app.feed(lines)
     span = app.snap("continuous-intrusion")
     c = app.chrome()
-    mapping = next(item for item in c["menu_rows"] if item["row"] == row)
+    mapping = next(item for item in app.tv(c, "settings")["menu_rows"] if item["row"] == row)
     assert mapping["right"] == dock["x"] + 8, mapping
     assert mapping["map"][:8] == [-1] * 8, mapping
     empty = span.crop((dock["x"] + 2) * cw, row * ch + 2, 5 * cw, ch - 4)
@@ -72,7 +68,7 @@ def test_notch(app):
     before_theme = c["schemekey"]
     c = app.click(dock["x"] + 1, row)
     assert c["schemekey"] == before_theme, "covered control remained clickable"
-    lines[row] = "=" * (dock["x"] - 2) + "  cc"
+    lines = ["=" * (dock["x"] - 2) + "  cc"] * c["rows"]
     app.feed(lines)
     app.snap("shifted-control")
     c = app.click(dock["x"] + 2, row)
@@ -91,7 +87,8 @@ def observe(app, duration):
 
 
 def test_motion(app):
-    c = theme_menu(app)
+    c = app.quiet_tabs(10)
+    app.hover(-1, -1)
     dock, rows = c["dock"], c["rows"]
     height = dock["height"]
     gap = min(rows - height - 2, height + 3)
@@ -130,7 +127,8 @@ def test_motion(app):
 
 
 def test_opposite_side(app):
-    c = theme_menu(app)
+    c = app.quiet_tabs(8)
+    app.hover(-1, -1)
     # Every right-side position is blocked by a literal word, but the left
     # side is empty. A clear other side must beat all partial same-side fits.
     lines = [" " * c["dock"]["x"] + "X" * c["dock"]["width"] for _ in range(c["rows"])]

@@ -100,6 +100,25 @@ int main(int argc,char **argv) {
         int blank=0;
         for(int y=4;y<8;y++) {int ink=0;for(int x=0;x<COLS;x++)ink+=out.cells[y*COLS+x].ch>' ';if(!ink)blank++;}
         assert(blank>=1);
+    } else if(scenario>=12 && scenario<=14) {
+        unsigned char own[ROWS]={0}, protected_rows[ROWS]={0};
+        int cursor=3*COLS+86,mapped=cursor;
+        chrome_panel_protect(grid,COLS,ROWS,0,background,own);
+        assert(chrome_reflow_build_checked(&out,grid,COLS,ROWS,own,1,80,0,20,12,3,safe));
+        memcpy(original,grid,sizeof(grid));
+        /* Body protection and blank padding protection must both veto the
+           whole panel. Adjacent rows must not suppress independent work. */
+        protected_rows[scenario==12?3:scenario==13?9:10]=1;
+        int changed=chrome_panel_reflow_apply_checked(&out,grid,COLS,ROWS,NULL,cursor,
+            1,80,0,20,12,0,background,&mapped,protected_rows);
+        assert(!memcmp(grid,original,sizeof(grid)));
+        if(scenario<14) {
+            assert(changed==0 && out.changed==0 && mapped==cursor);
+            assert(!memcmp(out.cells,grid,sizeof(grid)));
+            for(int i=0;i<COLS*ROWS;i++)assert(out.source[i]==i);
+        } else {
+            assert(changed==1);out.cursor=mapped;invariant(grid,&out,2,10,1,cursor);
+        }
     }
     chrome_reflow_free(&out);puts("ok");return 0;
 }
@@ -137,5 +156,9 @@ class Panels(unittest.TestCase):
     def test_nonoverlapping_panel_is_unchanged(self): self.check_scenario(8)
     def test_cursor_on_empty_input_line_remains_visible(self): self.check_scenario(10)
     def test_paragraph_separator_is_retained(self): self.check_scenario(11)
+    def test_protected_body_or_padding_preserves_entire_panel(self):
+        for case in (12, 13):
+            with self.subTest(case=case): self.check_scenario(case)
+    def test_adjacent_protected_row_does_not_block_panel(self): self.check_scenario(14)
 
 if __name__ == "__main__": unittest.main()

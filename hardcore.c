@@ -622,6 +622,7 @@ static void plat_timer(int id, int ms);          /* one-shot (or, for TIMER_THRO
 #define TIMER_THROB 3
 #define TIMER_DISK 4              /* Win32: the low-disk check, every minute */
 #define TIMER_SETTLE 5            /* resizing stopped: rewrap the rest of every tab's scrollback */
+#define TIMER_TV 7                /* secondary panel idle countdown/fade */
 #define TIMER_CHROME 6            /* adaptive menu search and its brief fade transition */
 static DWORD g_chrome_input_at;   /* pause automatic menu motion while typing */
 static void plat_kill_timer(int id);
@@ -2949,6 +2950,20 @@ static DWORD g_last_paint;
 
 static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 
+#include "hardcore_tab_preview.h"
+static TabPreview g_tab_preview;
+static int chrome_preview_active(void) {
+    Tab *selected=active_tab();
+    tab_preview_validate(&g_tab_preview,selected?selected->id:0,
+        tab_by_id(g_tab_preview.target_id)!=NULL,g_focused);
+    return selected && tab_preview_active(&g_tab_preview,selected->id);
+}
+static Tab *display_tab(void) {
+    return chrome_preview_active()?tab_by_id(g_tab_preview.target_id):active_tab();
+}
+static void chrome_preview_cancel(void) {
+    if(tab_preview_cancel(&g_tab_preview))plat_invalidate();
+}
 /* the cell, in pixels: the terminal's, or the tab column's while it draws (see UI_FONT) */
 #define CW cell_w(g_cf)
 #define CH cell_h(g_cf)
@@ -2971,7 +2986,9 @@ static int sidebar_x(void) {
     int col = w / cell_w(g_font) - SB_COLS;
     return (col > 0 ? col : 0) * cell_w(g_font);
 }
+#ifdef _WIN32
 static int in_sidebar(int x) { return x >= sidebar_x() && x < sidebar_x() + sidebar_w(); }
+#endif
 /* (0,0) is the native drawable surface, inside any system-owned border.
    Rounded corners may obscure cells; they never shift the grid. */
 static int term_ox(void) { return 0; }
@@ -3025,6 +3042,7 @@ static void resize_all(void) {
     if (w < 1 || h < 1) return;
     compute_grid(w, h, &cols, &rows);
     if (cols == g_cols && rows == g_rows) return;
+    chrome_preview_cancel();
     g_cols = cols;
     g_rows = rows;
     g_sel_on = 0;
@@ -3997,7 +4015,21 @@ static void drip_init(void) {
 static int caption_btn_w(void) { return 46 * g_scale; }
 #endif
 
+#ifndef _WIN32
+static int mac_caf_active(void);
+static int mac_caf_toggle(void);
+static double mac_caf_elapsed(void);
+static const char *mac_caf_power(void);
+#endif
 #include "hardcore_chrome.h"
+static void chrome_preview_pointer(int mx,int my) {
+    int index=-1,hit=hit_tabbar(mx,my,&index);
+    Tab *selected=active_tab();
+    int target=(hit==HIT_TAB || hit==HIT_CLOSE) && index>=0 && index<g_ntabs?g_tabs[index]->id:0;
+    int eligible=g_focused && !g_sel_drag && !g_chrome_drag && !g_sb_drag;
+    if(tab_preview_point(&g_tab_preview,selected?selected->id:0,target,eligible))plat_invalidate();
+}
+
 
 #ifdef _WIN32
 /* caption buttons: HTMINBUTTON / HTMAXBUTTON / HTCLOSE, or 0 */
@@ -4120,6 +4152,7 @@ static void plat_render_title_underlay(void);
 static void plat_render_title_overlay(void);
 #endif
 static int chrome_intrusion_span(int row, int *left, int *right);
+static int chrome_intrusion_span_at(int row,int dock,int top,int bottom,int *left,int *right);
 #include "hardcore_chrome_draw.h"
 
 /* Foreground determines the continuous terminal span cut from chrome.
@@ -4248,13 +4281,13 @@ static void r_begin(int w, int h);
 
 /* Include spaces between terminal words so no menu glyph can leak into them.
    Return the interval in terminal columns, clipped to the current dock. */
-static int chrome_intrusion_span(int row, int *left, int *right) {
-    Tab *tb = active_tab();
+static int chrome_intrusion_span_at(int row,int dock,int top,int bottom,int *left,int *right) {
+    Tab *tb = display_tab();
     const Cell *cells;
-    int n, occupied, cursor_col, cursor_row, dock = sidebar_x()/CW;
+    int n, occupied, cursor_col, cursor_row;
     *left = *right = 0;
-    if (!tb || tb->browser_native || row < 0 || row >= tb->t.rows ||
-        row < g_chrome.top || row >= g_chrome.bottom) return 0;
+    if (!tb || (tb->browser_native && !chrome_preview_active()) || row < 0 || row >= tb->t.rows ||
+        row < top || row >= bottom) return 0;
     display_line(&tb->t, row, &cells, &n);
     occupied = chrome_terminal_span(cells, n, left, right);
     display_cursor_position(&tb->t, &cursor_col, &cursor_row);
@@ -4269,6 +4302,9 @@ static int chrome_intrusion_span(int row, int *left, int *right) {
     return 1;
 }
 
+static int chrome_intrusion_span(int row,int *left,int *right) {
+    return chrome_intrusion_span_at(row,sidebar_x()/CW,g_chrome.top,g_chrome.bottom,left,right);
+}
 /* Terminal fills are below the quiet chrome, while terminal foreground cells
    are above it. This lets the menu show through a highlighted row's blank
    tail without washing out the highlight or drawing over its text. */
@@ -4295,7 +4331,7 @@ static void render_terminal_backgrounds(const Term *t, int ox, int oy) {
 
 static void render(void) {
     struct { int right, bottom; } r;
-    Tab *tb = active_tab();
+    Tab *tb = display_tab();
     Term *t;
     int y, x, ox = term_ox(), oy = term_oy(), dock_col = sidebar_x()/CW;
     int overlay = g_tab_underlay || (tb && tb->kind == TK_BROWSER);
@@ -4309,12 +4345,13 @@ static void render(void) {
     r_begin(r.right, r.bottom);
     /* Browser/native and empty-window paths do not prepare a terminal grid.
        They must still end an old tab's fade and discard its pending target. */
-    if (!tb || (tb->kind == TK_BROWSER && tb->browser_native)) {
+    if (!tb || (tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active())) {
         cm_reset(&g_chrome_motion); g_chrome_motion_alpha = 1;
         plat_kill_timer(TIMER_CHROME);
     }
 #ifndef _WIN32
-    if (tb && tb->kind == TK_BROWSER && tb->browser_native) {
+    if (tb && tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active()) {
+        chrome_tv_clock();tab_layout();chrome_tv_prepare(&tb->t);
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
         mac_browser_draw_overlay();
@@ -4452,9 +4489,9 @@ static void render(void) {
     if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
         fill_rect(0, 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
     render_caption_buttons(r.right);
-    if (overlay && chrome_hovered()) render_tabbar(r.right, r.bottom);
+    if (overlay && (chrome_hovered() || chrome_preview_active())) render_tabbar(r.right, r.bottom);
 #else
-    if (overlay && chrome_hovered()) render_tabbar(r.right, r.bottom);
+    if (overlay && (chrome_hovered() || chrome_tv_hovered(0) || chrome_tv_hovered(1))) render_tabbar(r.right, r.bottom);
     mac_browser_draw_overlay();
     plat_render_title_overlay();
 #endif
@@ -4658,6 +4695,7 @@ static void update_busy(int tick) {
 
 static void activate(int i) {
     if (i < 0 || i >= g_ntabs) return;
+    chrome_preview_cancel();
     term_settle(&g_tabs[i]->t);  /* a tab not caught up since a resize: before it shows */
     g_active = i;
     resize_all();
@@ -5225,6 +5263,7 @@ static void remember_dir(Tab *tb) {
 }
 
 static void close_tab(int i) {
+    chrome_preview_cancel();
     Tab *tb;
     if (i < 0 || i >= g_ntabs) return;
     tb = g_tabs[i];

@@ -12,12 +12,13 @@ import tempfile
 import textwrap
 
 from test_chrome_mac import NativeApp, assert_mapping, pixel
-from test_chrome_adaptive_mac import theme_menu
 
 
 def arrange(app, side, top=5):
     app.send("cmd resize 1001,700")
-    c = theme_menu(app)
+    # The primary surface is now independent of Settings. Use real owned
+    # tabs to retain the original tall obstruction band for these fixtures.
+    c = app.quiet_tabs(12)
     c = app.feed([""] * c["rows"])
     cw, ch = c["cell"]["width"], c["cell"]["height"]
     x = int((c["dock"]["x"] + 1.5) * cw)
@@ -55,7 +56,8 @@ def conserved(app, c, source, cursor_before=None):
     assert_mapping(app, c)
     assert app.chrome()["source"] == source, "mapping queries changed original terminal rows"
     if cursor_before is not None:
-        t = app.state()["tabs"][0]
+        state = app.state()
+        t = state["tabs"][state["active"]]
         assert [t["cx"], t["cy"]] == cursor_before, "layout changed PTY cursor coordinates"
 
 

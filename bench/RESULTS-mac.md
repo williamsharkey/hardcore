@@ -47,6 +47,22 @@ they do not imply those older performance measurements were rerun.
 
 ## Speed
 
+October 16, 2026 TV-panel preparation microbenchmark: an optimized headless
+harness called the production `hardcore_tv_layout.h` preparation path with
+both Settings and CAF enabled, including allocation, validation, and secondary
+reflow composition. Each fresh layout evaluated 19 candidate callbacks across
+the two panels; each panel is bounded to twelve candidates.
+
+| Grid | Runs | Mean | p95 | Maximum |
+|---|---:|---:|---:|---:|
+| 120 × 50 (6,000 cells) | 300 | 0.176 ms | 0.180 ms | 0.207 ms |
+| 200 × 240 (48,000-cell cap) | 200 | 1.432 ms | 1.466 ms | 1.503 ms |
+
+These timings exclude building the primary-menu baseline and drawing the GUI;
+they are not end-to-end hover or frame-latency measurements. Native tests
+separately verify that rollover changes the Metal-rendered content without
+resizing PTYs, changing selected tabs, or moving browser keyboard focus.
+
 | | hardcore (Metal) | hardcore (GL, first port) | Terminal.app |
 |---|---|---|---|
 | **Keypress → frame on screen**, p50 / p90 / p99 (n=300) | **22.6 / 34.5 / 50.3 ms** | 27.2 / 36.8 / 38.8 ms | 38.8 / 61.0 / 77.9 ms |

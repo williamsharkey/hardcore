@@ -25,7 +25,8 @@ def production_functions():
                        re.MULTILINE | re.DOTALL)
     if layout is None:
         raise AssertionError("production chrome_measure function not found")
-    return layout.group(0) + "\n" + display[start:end]
+    primary = re.search(r"^static ChromeLayout chrome_primary_measure\(.*?^\}", chrome, re.MULTILINE | re.DOTALL)
+    return layout.group(0) + "\n" + primary.group(0) + "\n" + display[start:end]
 
 
 HARNESS = r'''
@@ -100,7 +101,7 @@ static int checked_search(Term *t, Cell *grid, unsigned char *protected_rows,
     assert(!memcmp(before, grid, bytes) && !memcmp(&term, t, sizeof(term)));
     assert(!memcmp(&layout, &g_chrome, sizeof(layout)) && side == g_tab_underlay);
     if (moved) {
-        ChromeLayout destination = chrome_measure(t->rows, 0, g_ntabs, g_settings_open,
+        ChromeLayout destination = chrome_primary_measure(t->rows, 0, g_ntabs, g_settings_open,
             winner->side, winner->row, fixture_items);
         assert(destination.top == winner->row);
         assert(destination.tab_capacity == layout.tab_capacity);
@@ -124,7 +125,7 @@ static void regional(int side, int limited) {
         grid[y*100+x].attr = (uint8_t)(x % 8);
     }
     g_tab_underlay = side;
-    g_chrome = chrome_measure(t.rows, 0, g_ntabs, 0, side, 0, 0);
+    g_chrome = chrome_primary_measure(t.rows, 0, g_ntabs, 0, side, 0, 0);
     ChromePlacementScore known = exact_score(&t, grid, protected_rows, side, 55);
     assert(!known.collision_rows); /* The candidate exists, at full capacity. */
     /* Simulate an expensive search: both edges must still get an early
@@ -147,7 +148,7 @@ static void cursor(void) {
     Cell *grid = blank_grid(t.cols, t.rows);
     unsigned char protected_rows[20] = {0};
     protected_rows[3] = 1;
-    g_chrome = chrome_measure(t.rows, 0, g_ntabs, 0, 1, 0, 0);
+    g_chrome = chrome_primary_measure(t.rows, 0, g_ntabs, 0, 1, 0, 0);
     ChromePlacementScore current = exact_score(&t, grid, protected_rows, 1, 0);
     assert(current.collision_rows == 1 && current.collision_cells == 1);
     grid[3*100+85].wflag = W_WIDE;
@@ -168,7 +169,7 @@ static void capacity(void) {
     Cell *grid = blank_grid(t.cols, t.rows);
     unsigned char protected_rows[36] = {0};
     g_ntabs = 30; fixture_items = 20; g_settings_open = 1;
-    g_chrome = chrome_measure(t.rows, 0, g_ntabs, 1, 1, 8, fixture_items);
+    g_chrome = chrome_primary_measure(t.rows, 0, g_ntabs, 1, 1, 8, fixture_items);
     for (int y = 8; y < 36; y++) { grid[y*100+80].ch = 'X'; protected_rows[y] = 1; }
     ChromePlacementScore winner = {0};
     assert(checked_search(&t, grid, protected_rows, &winner));
@@ -182,7 +183,7 @@ static void unchanged(void) {
     Term t = {100, 40, 0, 0, 0, 0};
     Cell *grid = blank_grid(t.cols, t.rows);
     unsigned char protected_rows[40] = {0};
-    g_chrome = chrome_measure(t.rows, 0, g_ntabs, 0, 1, 8, 0);
+    g_chrome = chrome_primary_measure(t.rows, 0, g_ntabs, 0, 1, 8, 0);
     ChromePlacementScore winner = {0};
     assert(!checked_search(&t, grid, protected_rows, &winner));
     for (int i = 0; i < t.cols * t.rows; i++) grid[i].ch = 'X';

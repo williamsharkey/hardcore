@@ -65,7 +65,7 @@ static NSString *browser_url(NSString *input) {
 @interface HCBrowser : NSObject <WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler> {
 @public
     int tabID, generation, epoch, scroll, total, dirty, requesting, changedAgain, focusedAction;
-    int lastCols, lastRows, lastX, lastY, lastHeight, lastSide;
+    int lastCols, lastRows, lastX, lastY, lastHeight, lastSide, lastPreview;
     WKWebView *web;
     BrowserBlock *blocks;
     int blockCount;
@@ -405,12 +405,16 @@ static void mac_browser_resize(Tab *tb) {
     b->web.frame=rect;b->dirty=1;
 }
 static void mac_browser_prepare(Tab *tb) {
-    HCBrowser *b=browser_for(tb); if (!b || tb->browser_native) return;
+    /* Every browser already keeps a DOM projection, including Native tabs.
+       Hover draws that cache without showing a WKWebView, changing native
+       mode, requesting a new document, resizing it, or handing it focus. */
+    int preview=chrome_preview_active() && tb==display_tab();
+    HCBrowser *b=browser_for(tb); if (!b || (tb->browser_native && !preview)) return;
     tab_layout();
-    int cols=tb->t.cols, rows=mac_browser_page_rows(tb), x=sidebar_x()/CW, y=g_chrome.top;
+    int cols=tb->t.cols, rows=preview ? tb->t.rows : mac_browser_page_rows(tb), x=sidebar_x()/CW, y=g_chrome.top;
     b->pageRows=rows;
     int height=g_chrome.bottom-y, side=g_tab_underlay==1 ? 1 : 2;
-    if (!b->dirty && b->lastCols==cols && b->lastRows==rows && b->lastX==x && b->lastY==y && b->lastHeight==height && b->lastSide==side) return;
+    if (!b->dirty && b->lastCols==cols && b->lastRows==rows && b->lastX==x && b->lastY==y && b->lastHeight==height && b->lastSide==side && b->lastPreview==preview) return;
     Cell *cells=calloc((size_t)cols*rows,sizeof(Cell)); if (!cells) return;
     if(b->nodeCols!=cols || b->nodeRows!=rows){free(b->nodeGrid);b->nodeGrid=calloc((size_t)cols*rows,sizeof(uint16_t));b->nodeCols=cols;b->nodeRows=rows;}
     for(int i=0;i<b->blockCount;i++)for(int j=0;j<b->blocks[i].count;j++)if(b->blocks[i].cells[j].wflag&BROWSER_IMAGE) {
@@ -419,11 +423,13 @@ static void mac_browser_prepare(Tab *tb) {
             int w,h;browser_image_size(image->sw ? image->sw : image->cols*8,image->sh ? image->sh : image->rows*16,CW/MAX(1,g_scale),CH/MAX(1,g_scale),&w,&h);
             c->fg=(uint32_t)MIN(w,MAX(1,cols/4));c->bg=(uint32_t)h;}
     }
-    b->total=browser_grid_layout_nodes(b->blocks,b->blockCount,cells,b->nodeGrid,cols,rows,b->scroll,side,x,y,SB_COLS,height);
+    int scroll=b->scroll;
+    b->total=browser_grid_layout_nodes(b->blocks,b->blockCount,cells,b->nodeGrid,cols,rows,scroll,side,x,y,SB_COLS,height);
     int limit=MAX(0,b->total-rows);
-    if (b->scroll>limit) {
-        b->scroll=limit;
-        b->total=browser_grid_layout_nodes(b->blocks,b->blockCount,cells,b->nodeGrid,cols,rows,b->scroll,side,x,y,SB_COLS,height);
+    if (scroll>limit) {
+        scroll=limit;
+        if(!preview)b->scroll=scroll;
+        b->total=browser_grid_layout_nodes(b->blocks,b->blockCount,cells,b->nodeGrid,cols,rows,scroll,side,x,y,SB_COLS,height);
     }
     if (b->focusedAction) for (int i=0;i<cols*rows;i++) if (cells[i].link==b->focusedAction && !(cells[i].wflag&BROWSER_IMAGE)) cells[i].attr|=A_INV;
     for (int row=0;row<rows;row++) {
@@ -432,7 +438,7 @@ static void mac_browser_prepare(Tab *tb) {
     }
     for(int row=rows;row<tb->t.rows;row++){memset(tb->t.row[0][row],0,(size_t)cols*sizeof(Cell));tb->t.rlen[0][row]=0;}
     tb->t.m_cursor_vis=0; tb->t.view=0;
-    free(cells); b->dirty=0; b->lastCols=cols; b->lastRows=rows; b->lastX=x; b->lastY=y; b->lastHeight=height; b->lastSide=side;
+    free(cells); b->dirty=0; b->lastCols=cols; b->lastRows=rows; b->lastX=x; b->lastY=y; b->lastHeight=height; b->lastSide=side; b->lastPreview=preview;
 }
 static void mac_browser_scroll(int lines) {
     HCBrowser *b=browser_for(active_tab()); if (!b) return;

@@ -102,7 +102,7 @@ geography, mathematics, population data, prose history and complex spans; they
 are not live-page screenshots. `python3 tools/capture_wikipedia.py --representative`
 can capture original article HTML and provenance when network access is available.
 
-Drag the single **↕** handle beside **hardcore** to position the menu. It snaps
+Drag the single **↕** handle in the header to position the menu. It snaps
 to the nearer left or right edge and follows the pointer vertically, keeping
 the terminal's full width. The menu uses full opacity wherever content fits
 around it. Unreflowable terminal text cuts a continuous notch into the menu,
@@ -112,6 +112,48 @@ spare space or shorten redundant gaps, retaining at least one space between
 words. Incomplete controls are not clickable. Hovering
 anywhere in its bounds brings the entire menu forward. Tabs occupy one row each
 without horizontal separators; their close button appears only on hover.
+On macOS, hovering a tab immediately previews it in the main canvas. Clicking
+selects it; leaving the tab list or window, typing, scrolling, losing focus,
+minimizing, or resizing restores the selected tab. The menu stays fixed and
+fully visible during preview. Hovering neither changes the input destination
+nor clears unread activity. A small **·** means output arrived in the background;
+the large **●** marks the selected tab. A spinner or **!** can replace these
+markers while a program is busy or needs attention. Native browser tabs preview
+their cached text projection without navigating or moving keyboard focus.
+
+The macOS header uses the selected bitmap font for all its controls:
+
+| Control | Action |
+|---|---|
+| **↕** | Drag the tab menu |
+| **S** | Toggle Settings |
+| **+** | New terminal in the current folder |
+| **W** | Open a new website tab |
+| **F** | Open the current folder in the bundled file browser |
+| **caf / CAF** | Toggle display and system sleep prevention |
+
+Settings and CAF appear in separate small panels called TVs. They prefer a
+two-row gap below the tab menu, can join it when space is tight, and consider
+nearby positions and the opposite edge. The tab menu has priority. Placement
+checks at most twelve positions per TV and keeps existing placements stable;
+content-driven moves use a 0.3-second fade out and 0.3-second fade in. Settings
+and CAF panels show a ten-second inactivity countdown, paused while hovered,
+then fade away. Using a panel restarts its countdown. Closing the CAF panel
+does not stop sleep prevention: click **CAF** in the header to stop it.
+If even a compact panel cannot fit, it waits for more room. Exposed corners
+are rounded, and docked backgrounds and hairlines reach the actual window edge,
+including partial character columns.
+
+CAF runs a window-owned `caffeinate -di` assertion. Its panel shows the flags,
+elapsed time and power source. It survives a live app update and stops when its
+owning window exits; it does not stop separately launched caffeinate processes.
+The file browser supports navigation, filtering, sorting, previews, Quick Look,
+opening files, new folders, rename, copy, move and Trash; press **?** for keys.
+It confirms changes and refuses overwrites. Cross-volume move and Trash are
+currently refused while preserving the source; copy can cross volumes.
+These TVs provide a base for further panels; compact live previews of other
+agents inside their own TVs are not implemented yet.
+
 Settings options use highlights without horizontal row borders;
 the right dock extends offscreen with no outside border. Lists use all available
 height and paginate only when needed. Harmless styles on blank cells, such as
@@ -1018,7 +1060,8 @@ If your login shell is zsh or fish, the tab still opens bash.
 
 ## Settings
 
-Click **Settings** beneath the tabs. The compact **Font / Theme**
+On macOS, click **S** in the tab-menu header; on Windows, click **Settings**
+beneath the tabs. The compact **Font / Theme**
 strip selects the list below it; a light underline marks the active section.
 Tabs and settings use pages when they cannot
 fit. Back/forward buttons and the page count share the first actual item row;
@@ -1102,11 +1145,18 @@ comparison.
 
 - `make reflow-test` exercises local word wrapping, both dock directions,
   source-cell mapping, paragraph boundaries, protected terminal content, menu
-  word packing, shaded panels, literal continuation chains, and the placement/fade state machine.
+  word packing, shaded panels, literal continuation chains, secondary-TV
+  composition, bounded placement, stale hit maps, and the placement/fade state machines.
 - `make chrome-test` (macOS desktop) checks native menu layout, pagination,
   both underlays, whole-menu hover, reflow, opaque cutouts, and timed atomic
   relocation using isolated terminal windows. Complex fixtures also verify
-  process columns, shaded input, and the actual mapped cursor pixels.
+  process columns, shaded input, and the actual mapped cursor pixels. TV tests
+  cover separate controls, corner/edge pixels, countdown, and CAF placement;
+  hover-preview tests use real owned PTYs and local browser pages to verify
+  source/unread preservation, no resize or input leaks, and focus-loss cleanup.
+- `tests/test_mac_caf.py` checks assertion ownership, independent windows,
+  exec updates, process exit, and bounded power queries. `tests/test_files.py`
+  checks file operations and drives the curses browser through an owned PTY.
 
 - `tests/run_xtermjs.py` replays xterm.js's escape-sequence fixtures through the
   parser (`hardcore.exe --replay`) and diffs against screens captured from real

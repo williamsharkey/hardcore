@@ -34,7 +34,7 @@ static int chrome_capture_plan(int raised) {
     }
     for (i = 0; i < rows; i++) {
         int left = 0, right = 0;
-        if (!raised && g_tab_underlay && chrome_intrusion_span(g_chrome.top + i, &left, &right)) {
+        if (!raised && g_tab_underlay && chrome_intrusion_span_at(g_chrome.top+i,g_chrome_x/CW,g_chrome.top,g_chrome.bottom,&left,&right)) {
             left -= g_chrome_x / CW; right -= g_chrome_x / CW;
         } else left = right = 0;
         chrome_pack_row(&g_chrome_menu_rows[i], ink + i * SB_COLS, SB_COLS, left, right);
@@ -46,10 +46,56 @@ static int chrome_capture_plan(int raised) {
     g_chrome_menu_alpha = g_chrome_motion_alpha;
     return 1;
 }
-static void chrome_emit_inst(const Inst *q, int x0, int x1, int y0, int y1) {
+static void chrome_emit_raw(const Inst *q, int x0, int x1, int y0, int y1) {
     if (x0 >= x1 || y0 >= y1) return;
     g_rgba = q->rgba;
     r_quad_uv((float)x0, (float)y0, (float)x1, (float)y1, q->u0, q->v0, q->u1, q->v1);
+}
+static int g_chrome_round_x, g_chrome_round_w, g_chrome_round_right;
+static int g_chrome_join_top, g_chrome_join_bottom;
+/* Equal-width panels on the same edge share the upper panel's last pixel.
+ * Exposed corners stay round; touching corners form a straight joint. */
+static int chrome_join_mask(int x,int top,int bottom,int other_x,int other_top,int other_bottom) {
+    if(x!=other_x || top>=bottom || other_top>=other_bottom)return 0;
+    return (top==other_bottom?1:0) | (bottom==other_top?2:0);
+}
+static void chrome_prepare_edges(ChromeLayout primary,int primary_x,float primary_alpha) {
+    int mask=0;
+#ifndef _WIN32
+    if(primary_alpha>0)
+        mask|=chrome_join_mask(g_chrome_x,g_chrome.top,g_chrome.bottom,
+                               primary_x,primary.top,primary.bottom);
+    for(int i=0;i<2;i++) {
+        const ChromeTv *tv=g_tvs+i;HcTvRect r=tv->state.rect;
+        if(tv->state.open && tv->state.placed && tv->state.alpha*tv->motion.alpha>0)
+            mask|=chrome_join_mask(g_chrome_x,g_chrome.top,g_chrome.bottom,r.x*CW,r.y,r.y+r.h);
+    }
+#else
+    (void)primary;(void)primary_x;(void)primary_alpha;
+#endif
+    g_chrome_join_top=mask&1;g_chrome_join_bottom=(mask&2)!=0;
+}
+static int chrome_corner_inset(int y) {
+    int radius=chrome_min(6,chrome_min(CW/2,CH/3));
+    int top=g_chrome.top*CH,bottom=g_chrome.bottom*CH;
+    int d=chrome_min(g_chrome_join_top?radius:y-top,
+                    g_chrome_join_bottom?radius:bottom-1-y),inset=0;
+    if(d<0)return radius;
+    if(d>=radius)return 0;
+    while(inset<radius && (radius-inset)*(radius-inset)+(radius-d-1)*(radius-d-1)>radius*radius)inset++;
+    return inset;
+}
+static void chrome_emit_inst(const Inst *q,int x0,int x1,int y0,int y1) {
+    int r=chrome_min(6,chrome_min(CW/2,CH/3));
+    if(q->u0!=0xffff || (y0>=g_chrome.top*CH+r && y1<=g_chrome.bottom*CH-r)) {
+        chrome_emit_raw(q,x0,x1,y0,y1);return;
+    }
+    for(int y=y0;y<y1;y++) {
+        int inset=chrome_corner_inset(y);
+        int left=g_chrome_round_x+(g_chrome_round_x>0?inset:0);
+        int right=g_chrome_round_x+g_chrome_round_w-(g_chrome_round_right?inset:0);
+        chrome_emit_raw(q,chrome_max(x0,left),chrome_min(x1,right),y,y+1);
+    }
 }
 static int chrome_pack_translation(const ChromePackRow *p, int left, int right, int *shift) {
     int x, d;
@@ -63,6 +109,9 @@ static void chrome_capture_end(int raised) {
     int i, x, origin = g_chrome_x;
     g_chrome_capture = 0;
     if (!chrome_capture_plan(raised)) return;
+    g_chrome_round_x=origin;
+    g_chrome_round_w=origin+sidebar_w()>=g_clip_w-CW?g_clip_w-origin:sidebar_w();
+    g_chrome_round_right=origin+g_chrome_round_w<g_clip_w;
     g_chrome_x = 0;
     for (i = 0; i < g_chrome_quad_count; i++) {
         const Inst *q = &g_chrome_quads[i];
@@ -124,13 +173,25 @@ static void chrome_capture_end(int raised) {
     }
     g_chrome_x = origin;
 }
-static int chrome_draw_width(void) { return sidebar_w() + (g_tab_underlay == 1 ? CW : 0); }
+static int chrome_draw_width(void) {
+    return g_chrome_x+sidebar_w()>=g_clip_w-CW?g_clip_w-g_chrome_x:sidebar_w();
+}
+static void chrome_round_edges(void) {
+    int width=chrome_draw_width(),radius=chrome_min(6,chrome_min(CW/2,CH/3));
+    for(int i=0;i<radius;i++)for(int edge=0;edge<2;edge++) {
+        if(edge?g_chrome_join_bottom:g_chrome_join_top)continue;
+        int y=edge?g_chrome.bottom*CH-1-i:g_chrome.top*CH+i,inset=chrome_corner_inset(y);
+        if(g_chrome_x>0)fill_rect((float)inset,(float)y,(float)(inset+1),(float)(y+1),g_look.dim,1);
+        if(g_chrome_x+width<g_clip_w)fill_rect((float)(width-inset-1),(float)y,(float)(width-inset),(float)(y+1),g_look.dim,1);
+    }
+}
 static void chrome_sides(int row, uint32_t color) {
     float y = row_y(row), w = (float)chrome_draw_width();
     fill_rect(0, y, 1, y + CH, color, 1);
-    if (g_tab_underlay != 1) fill_rect(w - 1, y, w, y + CH, color, 1);
+    if (g_chrome_x+(int)w<g_clip_w) fill_rect(w - 1, y, w, y + CH, color, 1);
 }
 static void chrome_rule(int row, uint32_t color) {
+    if(row==g_chrome.top && g_chrome_join_top)return;
     fill_rect(0, row_y(row), (float)chrome_draw_width(), row_y(row) + 1, color, 1);
 }
 static void chrome_frame(int row, uint32_t color) {
@@ -229,15 +290,23 @@ static void render_settings(int hover, int hidx) {
     }
 }
 
+#include "hardcore_tv_draw.h"
+
+static int chrome_tab_hover(int hit,int row) {
+    return (hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_TABPAGE || hit==HIT_CHROME_INERT) &&
+        g_mouse_x>=g_chrome_x && g_mouse_x<g_chrome_x+sidebar_w() && g_mouse_y/CH==row;
+}
 static void render_tabbar(int win_w, int win_h) {
     int i, idx = -1, hover = HIT_NONE;
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
     float saved_alpha = g_draw_alpha;
+    int clip=g_clip_w;g_clip_w=win_w;
     g_chrome_base_alpha = saved_alpha;
     UI_FONT;
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
     g_chrome_x = sidebar_x();
+    chrome_prepare_edges(g_chrome,g_chrome_x,g_chrome_motion_alpha);
     chrome_capture_begin();
     for (i = g_chrome.top; i < g_chrome.bottom; i++) {
         chrome_begin_row(i);
@@ -251,12 +320,23 @@ static void render_tabbar(int win_w, int win_h) {
         if (hover == HIT_GRIP || g_chrome_drag)
             fill_rect((float)CW, row_y(g_chrome.top), (float)(2 * CW), row_y(g_chrome.top + 1), TAB_HOVER, 1);
         grid_text(L"↕", 1, g_chrome.top, hover == HIT_GRIP || g_chrome_drag ? g_look.text : g_look.detail);
-        grid_text(L"hardcore", 3, g_chrome.top, g_look.detail);
+#ifdef _WIN32
+        grid_text(L"hardcore",3,g_chrome.top,g_look.detail);
+#else
+        const wchar_t *labels[]={L"S",L"+",L"W",L"F",mac_caf_active()?L"CAF":L"caf"};
+        const int columns[]={4,8,12,16,21},hits[]={HIT_SETTINGS,HIT_PLUS,HIT_WEB,HIT_FILES,HIT_CAF};
+        for(int n=0;n<5;n++) {
+            if(hover==hits[n])fill_rect((float)((columns[n]-1)*CW),row_y(g_chrome.top),
+                (float)((columns[n]+(n==4?4:2))*CW),row_y(g_chrome.top+1),TAB_HOVER,1);
+            grid_text(labels[n],columns[n],g_chrome.top,hover==hits[n]?g_look.text:
+                n==4?(mac_caf_active()?AMBER:g_look.dim):g_look.detail);
+        }
+#endif
         chrome_frame(g_chrome.top, g_look.dim);
     }
     for (i = 0; i < g_chrome.tab_count; i++) {
         int tab = g_tab_offset + i, row = g_chrome.tab_row + i, left = 1, right = SB_COLS - 3;
-        int active = tab == g_active, hovered = hover != HIT_NONE && g_mouse_y / CH == row;
+        int active = tab == g_active, hovered = chrome_tab_hover(hover,row);
         Tab *tb = g_tabs[tab];
         wchar_t label[256];
         uint32_t fg = active ? AMBER : g_look.text_lo;
@@ -286,7 +366,12 @@ static void render_tabbar(int win_w, int win_h) {
         chrome_begin_row(g_chrome.bottom - 1);
         fill_rect(0, row_y(g_chrome.bottom) - 1, (float)chrome_draw_width(), row_y(g_chrome.bottom), g_look.dim, 1);
     }
+    chrome_round_edges();
     chrome_capture_end(chrome_hovered() || !g_tab_underlay);
+#ifndef _WIN32
+    render_tvs();
+#endif
+    g_clip_w=clip;
     g_draw_alpha = saved_alpha;
 #ifdef _WIN32
     render_disk_warning(win_h);

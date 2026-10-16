@@ -86,6 +86,8 @@ static char g_mac_bin_dir[4096];
 static const char *g_shell;      /* your login shell */
 
 #include "hardcore_mac_dock.m"
+#define HARDCORE_CAF_CHANGED() plat_invalidate()
+#include "hardcore_mac_caf.m"
 
 /* A Dock tile summarizes metadata, never terminal output or command arguments.
    Both the tab model and AppKit live on the main thread. Rendering is bounded
@@ -377,7 +379,7 @@ static void r_begin(int w, int h) {
     g_build->w = w;
     g_build->h = h;
     Tab *tb = active_tab();
-    g_build->transparent = tb && tb->kind == TK_BROWSER && tb->browser_native;
+    g_build->transparent = tb && tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active();
 }
 
 static void write_bmp(const char *path, const void *px, int w, int h) {
@@ -785,7 +787,7 @@ static void child_env(void) {
                                  "CLAUDE_CODE_MESSAGING_TOKEN", "OLDPWD",
                                  /* our own test knobs */
                                  "HARDCORE_CTL", "HARDCORE_NO_ACTIVATE", "HARDCORE_SHELL", "HARDCORE_MAC_ROLLBACK", "HARDCORE_TEST_CONFIG",
-                                 "HARDCORE_BRIDGE_READY_FD"};
+                                 "HARDCORE_BRIDGE_READY_FD", "HARDCORE_CAF_CHILD"};
     size_t i;
     for (i = 0; i < sizeof(drop) / sizeof(drop[0]); i++) unsetenv(drop[i]);
     const char *path = getenv("PATH");
@@ -913,6 +915,11 @@ static int tab_spawn(Tab *tb) {
         if (!strncmp(tb->run, "terminal:", 9)) {
             child_env();
             execl(g_mac_exe_path, "hardcore", "--terminal-bridge", tb->run + 9, tb->hist, (char *)NULL);
+            _exit(127);
+        }
+        if (!strcmp(tb->run,"files:")) {
+            child_env();
+            execl("/usr/bin/env","env","python3","-I","-B",tb->hist,tb->start_dir,(char *)NULL);
             _exit(127);
         }
         if (tb->run[0]) {   /* tmux slurp: argv only, never shell-evaluate a session name */
@@ -1084,6 +1091,7 @@ static void on_output(void) {
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         if (tab_drain(tb) <= 0) continue;
+        if(tb==display_tab())changed=1;
         if (i == g_active) {
             changed = 1;
             if (g_lat && g_lat_key && !g_lat_out) g_lat_out = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
@@ -1509,6 +1517,39 @@ static void new_tab_mac(void) {
     new_tab_here();
 }
 
+static void mac_files_new(void) {
+    if(g_ntabs>=MAX_TABS)return;
+    Tab *cur=active_tab();
+    const char *dir=cur && cur->t.cwd[0]?cur->t.cwd:cur?cur->start_dir:g_start_dir;
+    NSString *script=[[[NSString stringWithUTF8String:g_mac_bin_dir] stringByDeletingLastPathComponent]
+        stringByAppendingPathComponent:@"Resources/files.py"];
+    if(![[NSFileManager defaultManager] isReadableFileAtPath:script]) {
+        script=[[[NSString stringWithUTF8String:g_mac_bin_dir] stringByDeletingLastPathComponent]
+            stringByAppendingPathComponent:@"tools/files.py"];
+    }
+    if(![[NSFileManager defaultManager] isReadableFileAtPath:script]){NSBeep();return;}
+    Tab *tb=calloc(1,sizeof(Tab));
+    if(!tb || !term_init(&tb->t,g_cols,g_rows)){free(tb);return;}
+    tb->id=g_next_id++;tb->fd=-1;
+    snprintf(tb->start_dir,sizeof(tb->start_dir),"%s",dir);
+    snprintf(tb->run,sizeof(tb->run),"files:");
+    snprintf(tb->hist,sizeof(tb->hist),"%s",[script fileSystemRepresentation]);
+    set_cwd(&tb->t,dir);
+    tab_spawn(tb);g_tabs[g_ntabs++]=tb;activate(g_ntabs-1);
+}
+static int mac_header_action(int hit) {
+    if(hit==HIT_PLUS)new_tab_mac();
+    else if(hit==HIT_WEB)mac_browser_open_welcome();
+    else if(hit==HIT_FILES)mac_files_new();
+    else if(hit==HIT_CAF) {
+        int on=mac_caf_toggle();
+        if(on>0)hc_tv_open(&g_tvs[HC_TV_CAF].state,GetTickCount());
+        else hc_tv_close(&g_tvs[HC_TV_CAF].state);
+        plat_invalidate();
+    } else return 0;
+    return 1;
+}
+
 /* ── the view: drawing, keys, mouse, drops ─────────────────────────── */
 
 @interface HCView : NSView <NSTextInputClient> {
@@ -1582,16 +1623,22 @@ static void view_px(NSEvent *e, int *x, int *y) {
 /* A view tracking area alone misses motion delivered to the native buttons.
    A local monitor observes the same window's events before AppKit routes them,
    including traffic-light views, without capturing events from other apps. */
-static void mac_title_track_events(void) {
-    if (g_mac_title_monitor) return;
-    g_mac_title_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:
-        NSEventMaskMouseMoved | NSEventMaskMouseEntered | NSEventMaskMouseExited |
-        NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp | NSEventMaskKeyDown
-        handler:^NSEvent *(NSEvent *e) {
+static void mac_preview_event(NSEvent *e) {
+    NSEventType type=[e type];
+    if(type==NSEventTypeKeyDown || type==NSEventTypeScrollWheel || type==NSEventTypeLeftMouseDown)
+        chrome_preview_cancel();
+    if([e window]!=g_win && (type==NSEventTypeMouseMoved || type==NSEventTypeLeftMouseDown)) {
+        chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();plat_invalidate();
+    }
+}
+
+static NSEvent *mac_title_event(NSEvent *e) {
+            mac_preview_event(e);
             if ([e window] == g_win) {
                 int x, y;
                 view_px(e, &x, &y);
                 Tab *tb=active_tab();
+                if ([e type]==NSEventTypeScrollWheel) return e;
                 if ([e type]==NSEventTypeKeyDown) {
                     if (tb && tb->kind==TK_BROWSER && tb->browser_native) {
                         NSString *key=[e charactersIgnoringModifiers];
@@ -1623,15 +1670,27 @@ static void mac_title_track_events(void) {
                 if([e type]==NSEventTypeLeftMouseDown && mac_browser_nav_editing() && !mac_title_contains(x,y))mac_browser_ui_mouse(x,y);
                 mac_title_hover_at(x, y);
                 if (tb && tb->kind==TK_BROWSER && tb->browser_native && !g_sel_drag) {
-                    int before=chrome_hovered();
+                    int before=chrome_hovered() || chrome_tv_hovered(0) || chrome_tv_hovered(1);
                     g_mouse_x=x; g_mouse_y=y;
-                    if (before!=chrome_hovered() || over_chrome(x,y)) plat_invalidate();
+                    NSSize bounds=[g_view bounds].size;CGFloat scale=[g_win backingScaleFactor];
+                    if([e type]==NSEventTypeMouseExited && (x<0 || y<0 || x>=bounds.width*scale || y>=bounds.height*scale)) {
+                        chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;
+                    } else if([e type]==NSEventTypeMouseMoved || [e type]==NSEventTypeMouseEntered)
+                        chrome_preview_pointer(x,y);
+                    int after=chrome_hovered() || chrome_tv_hovered(0) || chrome_tv_hovered(1);
+                    if(before || after){settings_point();plat_invalidate();}
                 }
             } else if ([e type] == NSEventTypeMouseMoved || [e type] == NSEventTypeLeftMouseDown) {
                 mac_title_hover_at(-1, -1);
             }
             return e;
-        }];
+}
+static void mac_title_track_events(void) {
+    if (g_mac_title_monitor) return;
+    g_mac_title_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:
+        NSEventMaskMouseMoved | NSEventMaskMouseEntered | NSEventMaskMouseExited |
+        NSEventMaskLeftMouseDown | NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp | NSEventMaskKeyDown | NSEventMaskScrollWheel
+        handler:^NSEvent *(NSEvent *e) { return mac_title_event(e); }];
     mac_title_sync_buttons();
 }
 
@@ -1663,7 +1722,7 @@ static int plain_layout(void) {
 @implementation HCView
 
 - (BOOL)isFlipped { return YES; }
-- (BOOL)isOpaque { Tab *tb=active_tab(); return !(tb && tb->kind==TK_BROWSER && tb->browser_native); }
+- (BOOL)isOpaque { Tab *tb=active_tab(); return chrome_preview_active() || !(tb && tb->kind==TK_BROWSER && tb->browser_native); }
 - (NSView *)hitTest:(NSPoint)point {
     Tab *tb=active_tab();
     if (tb && tb->kind==TK_BROWSER && tb->browser_native) {
@@ -1701,6 +1760,7 @@ static int plain_layout(void) {
 
 - (void)setFrameSize:(NSSize)size {
     double t0 = g_lat ? uptime_ms() : 0, t1;
+    chrome_preview_cancel();
     [super setFrameSize:size];
     if (!g_layer) return;
     layer_fit();
@@ -1852,6 +1912,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 }
 
 - (void)keyDown:(NSEvent *)e {
+    chrome_preview_cancel();
     g_chrome_input_at = GetTickCount();
     NSEventModifierFlags f = [e modifierFlags];
     Tab *tb = active_tab();
@@ -1983,6 +2044,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 /* ── mouse ── */
 
 - (void)mouseDown:(NSEvent *)e {
+    chrome_preview_cancel();
     int mx, my, idx = -1, col, row, hit, w, h, mods = ev_mods(e);
     Tab *tb = active_tab();
     view_px(e, &mx, &my);
@@ -2004,7 +2066,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     hit = hit_tabbar(mx, my, &idx);
     if (hit == HIT_TAB) { activate(idx); return; }
     if (hit == HIT_CLOSE) { user_close_tab(idx); return; }
-    if (hit == HIT_PLUS) { new_tab_mac(); return; }
+    if (mac_header_action(hit)) return;
     if (chrome_setting_hit(hit)) { settings_click(mx, my); return; }
     if (hit == HIT_BAR) {        /* the tab column's empty part is the title bar */
         if ([e clickCount] == 2) [g_win performZoom:nil];
@@ -2116,15 +2178,17 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 }
 
 - (void)mouseMoved:(NSEvent *)e {
-    int mx, my, was_bar = g_mouse_y >= 0 && in_sidebar(g_mouse_x), on_bar;
+    int mx, my, was_bar = over_chrome(g_mouse_x,g_mouse_y) || chrome_tv_contains(0,g_mouse_x,g_mouse_y) ||
+        chrome_tv_contains(1,g_mouse_x,g_mouse_y), on_bar;
     Tab *tb = active_tab();
     view_px(e, &mx, &my);
     mac_title_hover_at(mx, my);
-    on_bar = over_chrome(mx, my);
+    on_bar = over_chrome(mx, my) || chrome_tv_contains(0,mx,my) || chrome_tv_contains(1,mx,my);
     g_mouse_x = mx;
     g_mouse_y = my;
-    if(mac_browser_ui_move(mx,my))return;
+    chrome_preview_pointer(mx,my);
     if (was_bar || on_bar) plat_invalidate();    if (was_bar || on_bar) settings_point();
+    if(mac_browser_ui_move(mx,my))return;
     if(tb && tb->kind==TK_BROWSER) {
         plat_invalidate();
         if(mac_browser_hover_link()){[[NSCursor pointingHandCursor] set];return;}
@@ -2141,6 +2205,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (void)mouseEntered:(NSEvent *)e { [self mouseMoved:e]; }
 
 - (void)mouseExited:(NSEvent *)e {
+    chrome_preview_cancel();
     int x, y;
     view_px(e, &x, &y);
     mac_title_hover_at(x, y);
@@ -2150,6 +2215,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 }
 
 - (void)scrollWheel:(NSEvent *)e {
+    chrome_preview_cancel();
     Tab *tb = active_tab();
     int mx, my, lines, i;
     CGFloat dy = [e scrollingDeltaY];
@@ -2242,6 +2308,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 static void focus_changed(int focused) {
     Tab *tb = active_tab();
     g_focused = focused;
+    if(!focused){chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
     if (g_focused && tb) tb->attention = 0;
     if (tb && tb->t.m_focus) tab_write(tb, g_focused ? "\x1b[I" : "\x1b[O", 3);
     mac_dock_update(0);
@@ -2254,6 +2321,7 @@ static void focus_changed(int focused) {
 @implementation HCDelegate
 - (void)applicationWillFinishLaunching:(NSNotification *)n { (void)n; trace("applicationWillFinishLaunching"); }
 - (void)applicationDidFinishLaunching:(NSNotification *)n { (void)n; trace("applicationDidFinishLaunching"); }
+- (void)windowWillMiniaturize:(NSNotification *)n {(void)n;chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
 - (void)windowDidBecomeKey:(NSNotification *)n { (void)n; trace("window key"); focus_changed(1); }
 - (void)windowDidResignKey:(NSNotification *)n { (void)n; if (g_chrome_drag) chrome_drag_end(); focus_changed(0); }
 - (void)windowDidEnterFullScreen:(NSNotification *)n {
@@ -2404,7 +2472,7 @@ static NSString *ctl_unescape(const char *s) {
 
 /* Native renderer inspection, available only through the opt-in local test FIFO. */
 static void ctl_chrome(const char *path) {
-    Tab *tb = active_tab();
+    Tab *tb = display_tab();
     if (!tb) return;
     Term *t = &tb->t;
     chrome_prepare_display(t);
@@ -2453,6 +2521,7 @@ static void ctl_chrome(const char *path) {
         @"display":@[@(cursor_col), @(cursor_row)], @"visible":@(t->m_cursor_vis)};
     state[@"fontkey"] = [NSString stringWithFormat:@"%c", g_font->key];
     state[@"schemekey"] = [NSString stringWithFormat:@"%c", g_scheme->key];
+    state[@"shown_schemekey"] = [NSString stringWithFormat:@"%c", g_shown->key];
     state[@"motion"] = @{@"phase":@(g_chrome_motion.phase), @"alpha":@(g_chrome_motion_alpha),
         @"side":@(g_chrome_motion.side), @"row":@(g_chrome_motion.row),
         @"target_side":@(g_chrome_motion.target_side), @"target_row":@(g_chrome_motion.target_row),
@@ -2466,14 +2535,37 @@ static void ctl_chrome(const char *path) {
         [menu_rows addObject:@{@"row":@(y), @"left":@(left), @"right":@(right), @"map":mapping}];
     }
     state[@"menu_rows"] = menu_rows;
+    NSMutableArray *tvs=[NSMutableArray array];
+    for(int i=0;i<2;i++) {
+        ChromeTv *tv=g_tvs+i;HcTvRect r=tv->state.rect;
+        NSMutableArray *maprows=[NSMutableArray array];
+        for(int y=0;y<tv->frame.count;y++) {
+            NSMutableArray *mapping=[NSMutableArray array];
+            ChromePackRow *packed=tv->frame.rows+y;
+            for(int x=0;x<SB_COLS;x++)[mapping addObject:@(tv->frame.raised?x:packed->actionable[x]?packed->src[x]:-1)];
+            [maprows addObject:@{@"row":@(tv->frame.top+y),@"left":@(r.x+packed->blocked_left),
+                @"right":@(r.x+packed->blocked_right),@"map":mapping}];
+        }
+        [tvs addObject:@{@"name":i?@"caf":@"settings",@"menu_rows":maprows,@"open":@(tv->state.open),@"placed":@(tv->state.placed),
+            @"rect":@{@"x":@(r.x),@"y":@(r.y),@"width":@(r.w),@"height":@(r.h)},
+            @"alpha":@(tv->state.alpha*tv->motion.alpha),@"countdown":@(hc_tv_seconds_left(&tv->state,GetTickCount())),
+            @"motion":@{@"phase":@(tv->motion.phase),@"alpha":@(tv->motion.alpha),
+                @"target":@{@"x":@(tv->motion.target.x),@"y":@(tv->motion.target.y),@"width":@(tv->motion.target.w),@"height":@(tv->motion.target.h)}},
+            @"placement_candidates":@(tv->placement.candidates)}];
+    }
+    state[@"tvs"]=tvs;state[@"caf_active"]=@(mac_caf_active());
+    Tab *selected=active_tab(),*shown=display_tab();
+    state[@"preview"]=@{@"active_id":@(selected?selected->id:0),@"display_id":@(shown?shown->id:0),
+        @"preview_id":@(g_tab_preview.target_id)};
+    ChromeLayout settings=g_tvs[HC_TV_SETTINGS].layout;
     state[@"pages"] = @{
         @"tabs":@{@"offset":@(g_tab_offset), @"capacity":@(g_chrome.tab_capacity), @"total":@(g_ntabs), @"row":@(g_chrome.tab_row)},
-        @"settings":@{@"offset":@(g_setting_offset[g_settings_tab]), @"capacity":@(g_chrome.list_capacity), @"total":@(chrome_item_total()), @"row":@(g_chrome.list_row)},
-        @"settings_row":@(g_chrome.settings_row), @"section_row":@(g_chrome.section_row)
+        @"settings":@{@"offset":@(g_setting_offset[g_settings_tab]), @"capacity":@(settings.list_capacity), @"total":@(chrome_item_total()), @"row":@(settings.list_row)},
+        @"settings_row":@(g_chrome.top), @"settings_x":@(g_tvs[HC_TV_SETTINGS].state.rect.x), @"section_row":@(settings.section_row)
     };
     NSMutableArray *font_buttons = [NSMutableArray array];
     if (g_settings_open && g_settings_tab == 0) {
-        for (int n = 0; n < g_chrome.list_count; n++) {
+        for (int n = 0; n < settings.list_count; n++) {
             const FontMenuRow *row = &g_font_menu_rows[g_setting_offset[0] + n];
             for (int i = 0; i < row->count; i++) {
                 const FontMenuSize *size = &row->sizes[i];
@@ -2482,7 +2574,7 @@ static void ctl_chrome(const char *path) {
                     @"fontkey":[NSString stringWithFormat:@"%c", font->key],
                     @"name":[NSString stringWithUTF8String:font->name],
                     @"width":@(cell_w(font)), @"height":@(cell_h(font)),
-                    @"row":@(g_chrome.list_row + n), @"left":@(size->left), @"right":@(size->right)
+                    @"row":@(settings.list_row + n), @"left":@(size->left), @"right":@(size->right)
                 }];
             }
         }
@@ -2507,7 +2599,26 @@ static void ctl_line(char *s) {
         else if (!mac_input_held(tb)) tab_write(tb, s, (int)(o - s));
     } else if (!strncmp(s, "cmd ", 4)) {
         const char *c = s + 4;
-        if (!strcmp(c, "newtab")) { g_trace_tab_t = uptime_ms(); trace("ctl newtab"); new_tab_mac(); }
+        if(!strncmp(c,"focus ",6))focus_changed(atoi(c+6));
+        else if(!strcmp(c,"preview-cancel"))chrome_preview_cancel();
+        else if(!strncmp(c,"preview-event ",14)) {
+            const char *event=c+14;
+            if(!strcmp(event,"exit")) {
+                NSEvent *e=[NSEvent enterExitEventWithType:NSEventTypeMouseExited location:NSMakePoint(-1,-1)
+                    modifierFlags:0 timestamp:0 windowNumber:[g_win windowNumber] context:nil eventNumber:0 trackingNumber:0 userData:NULL];
+                [g_view mouseExited:e];
+            }
+            else if(!strcmp(event,"resign"))[(HCDelegate *)[g_win delegate] windowDidResignKey:
+                [NSNotification notificationWithName:NSWindowDidResignKeyNotification object:g_win]];
+            else if(!strcmp(event,"minimize"))[(HCDelegate *)[g_win delegate] windowWillMiniaturize:
+                [NSNotification notificationWithName:NSWindowWillMiniaturizeNotification object:g_win]];
+            else if(!strcmp(event,"monitor-key")) {
+                NSEvent *e=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0
+                    windowNumber:[g_win windowNumber] context:nil characters:@"x" charactersIgnoringModifiers:@"x" isARepeat:NO keyCode:0];
+                mac_preview_event(e);
+            }
+        }
+        else if (!strcmp(c, "newtab")) { g_trace_tab_t = uptime_ms(); trace("ctl newtab"); new_tab_mac(); }
         else if (!strcmp(c, "nexttab") && g_ntabs) activate((g_active + 1) % g_ntabs);
         else if (!strcmp(c, "closetab")) close_tab(g_active);
         else if (!strcmp(c, "jump")) jump_to_attention();
@@ -2535,10 +2646,13 @@ static void ctl_line(char *s) {
                 [tabs addObject:@{@"pid":@(t->pid), @"fd":@(t->fd), @"view":@(t->t.view), @"hist":@(t->t.hcount),
                                   @"alt":@(t->t.alt), @"cols":@(t->t.cols), @"rows":@(t->t.rows),
                                   @"cx":@(t->t.cx), @"cy":@(t->t.cy), @"parser":@(t->t.st),
+                                  @"id":@(t->id), @"activity":@(t->activity), @"attention":@(t->attention),
                                   @"program":[NSString stringWithUTF8String:t->program] ?: @""}];
             }
             NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"pid":@(getpid()), @"active":@(g_active),
-                @"frame":NSStringFromRect([g_win frame]), @"tabs":tabs} options:0 error:nil];
+                @"frame":NSStringFromRect([g_win frame]), @"tabs":tabs,
+                @"first_responder":[NSString stringWithFormat:@"%p:%@",[g_win firstResponder],NSStringFromClass([[g_win firstResponder] class])],
+                @"key_window":@([g_win isKeyWindow])} options:0 error:nil];
             [data writeToFile:[NSString stringWithUTF8String:c+6] atomically:YES];
         } else if (!strncmp(c, "view ", 5) && tb) {
             tb->t.view = atoi(c+5); if (tb->t.view > tb->t.hcount) tb->t.view = tb->t.hcount;
@@ -2558,16 +2672,22 @@ static void ctl_line(char *s) {
             g_mouse_x = atoi(c + 6);
             g_mouse_y = strchr(c + 6, ',') ? atoi(strchr(c + 6, ',') + 1) : -1;
             mac_title_hover_at(g_mouse_x, g_mouse_y);
+            chrome_preview_pointer(g_mouse_x,g_mouse_y);
             settings_point();
         } else if (!strncmp(c, "pointer ", 8)) {
             char action[16]; int x, y;
             if (sscanf(c+8, "%15s %d,%d", action, &x, &y) == 3) {
                 NSEventType kind = !strcmp(action, "down") ? NSEventTypeLeftMouseDown :
-                                   !strcmp(action, "drag") ? NSEventTypeLeftMouseDragged : NSEventTypeLeftMouseUp;
+                                   !strcmp(action, "drag") ? NSEventTypeLeftMouseDragged :
+                                   (!strcmp(action,"move") || !strcmp(action,"monitor")) ? NSEventTypeMouseMoved : NSEventTypeLeftMouseUp;
                 CGFloat scale = [g_win backingScaleFactor];
                 NSPoint p = [(NSView *)g_view convertPoint:NSMakePoint(x/scale, y/scale) toView:nil];
                 NSEvent *e = [NSEvent mouseEventWithType:kind location:p modifierFlags:0 timestamp:0
                     windowNumber:[g_win windowNumber] context:nil eventNumber:0 clickCount:1 pressure:1];
+                if(kind==NSEventTypeMouseMoved) {
+                    if(!strcmp(action,"monitor"))mac_title_event(e);else[g_view mouseMoved:e];
+                    return; /* Exercise real invalidation; do not mask a missed hover-exit redraw. */
+                }
                 /* Allow grid controls at the top edge, but never enter AppKit's
                    modal window-drag loop from a synthetic titlebar down. */
                 int idx = -1, hit = hit_tabbar(x, y, &idx);
@@ -2577,7 +2697,9 @@ static void ctl_line(char *s) {
                 else if (kind == NSEventTypeLeftMouseUp) [g_view mouseUp:e];
             }
         } else if (!strncmp(c, "click ", 6)) {
-            settings_click(atoi(c + 6), strchr(c + 6, ',') ? atoi(strchr(c + 6, ',') + 1) : -1);
+            int x=atoi(c+6),y=strchr(c+6,',')?atoi(strchr(c+6,',')+1):-1,idx=-1;
+            int hit=hit_tabbar(x,y,&idx);
+            if(!mac_header_action(hit))settings_click(x,y);
         }
         plat_invalidate();
     } else if (!strncmp(s, "key ", 4)) {

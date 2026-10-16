@@ -1,3 +1,6 @@
+#ifndef _WIN32
+static void chrome_tv_prepare(Term *t);
+#endif
 /* Display-only chrome reflow. The terminal and scrollback remain authoritative;
    moved cells carry source addresses so selection and copying use real text. */
 static int chrome_background_safe(const Cell *c) {
@@ -161,7 +164,7 @@ static int chrome_motion_search(Term *t, const Cell *input, const unsigned char 
         ChromeLayout measure;
         int position, base = (lane - 1) * (CANDIDATES / 2), count = counts[lane], bin;
         if (lane == side && row == g_chrome.top) continue;
-        measure = chrome_measure(t->rows, first_row(), g_ntabs, g_settings_open,
+        measure = chrome_primary_measure(t->rows, first_row(), g_ntabs, g_settings_open,
                                   lane, row, chrome_item_total());
         if (measure.top != row || measure.tab_capacity != g_chrome.tab_capacity ||
             measure.list_capacity != g_chrome.list_capacity) continue;
@@ -234,7 +237,10 @@ static void chrome_autoplace_prepare(Term *t, const Cell *input, const unsigned 
     hash = chrome_motion_hash(hash, cursor, sizeof(cursor));
     hash = chrome_motion_hash(hash, protected_rows, (size_t)t->rows);
     held = (!g_focused && !(getenv("HARDCORE_CTL") && test && !strcmp(test, "1"))) ||
-           g_chrome_drag || chrome_hovered() || g_sel_on || g_sel_drag || g_sb_drag;
+           g_chrome_drag || chrome_hovered() || chrome_preview_active() || g_sel_on || g_sel_drag || g_sb_drag;
+#ifndef _WIN32
+    held=held || chrome_tv_hovered(0) || chrome_tv_hovered(1);
+#endif
     blocked = held || (uint32_t)(now - g_chrome_input_at) < 700;
     action = cm_observe(&g_chrome_motion, now, hash, chrome_motion_context(t),
                          g_tab_underlay, g_chrome.top, blocked);
@@ -267,7 +273,7 @@ static void chrome_prepare_display_internal(Term *t, int dock_x, int dock_y, int
     chrome_reflow_free(&g_display);
     g_display_term = NULL;
     if (!g_tab_underlay || !g_chrome_reflow || t->cols <= SB_COLS + 4 ||
-        (active_tab() && &active_tab()->t == t && active_tab()->kind == TK_BROWSER)) {
+        (display_tab() && &display_tab()->t == t && display_tab()->kind == TK_BROWSER)) {
         if (automatic) {
             cm_reset(&g_chrome_motion); g_chrome_motion_alpha = 1;
             plat_kill_timer(TIMER_CHROME);
@@ -329,8 +335,14 @@ static void chrome_prepare_display_at(Term *t, int dock_x, int dock_y, int dock_
     chrome_prepare_display_internal(t, dock_x, dock_y, dock_height, 0);
 }
 static void chrome_prepare_display(Term *t) {
+#ifndef _WIN32
+    chrome_tv_clock();
+#endif
     tab_layout();
     chrome_prepare_display_internal(t, sidebar_x()/CW, g_chrome.top, g_chrome.bottom-g_chrome.top, 1);
+#ifndef _WIN32
+    chrome_tv_prepare(t);
+#endif
 }
 
 static void display_cursor_position(const Term *t, int *col, int *row) {
@@ -359,7 +371,7 @@ static void display_line(const Term *t, int row, const Cell **cells, int *n) {
 static int display_selected(const Term *t, int col, int row) {
     long long r0, r1, sr;
     int c0, c1, source;
-    if (!g_sel_on) return 0;
+    if (!g_sel_on || !active_tab() || t != &active_tab()->t) return 0;
     sel_norm(&r0, &c0, &r1, &c1);
     source = display_source(t, col, row);
     sr = term_base(t) + t->hcount - t->view + source / t->cols;
@@ -383,3 +395,5 @@ static void chrome_draw_markers(Term *t) {
         quad(x+CW-3, mid-1, x+CW-2, mid+2);
     }
 }
+
+#include "hardcore_tv_layout.h"
