@@ -30,7 +30,10 @@ a lower grid pane with DOM attributes/child nodes, computed styles, and text;
 click child nodes or the parent button to navigate the tree. This is a compact
 DOM inspector, not a JavaScript console or a full browser developer-tools suite.
 
-Inline images snap to whole character rectangles, up to 12 columns by 4 rows.
+Inline images snap to whole character rectangles, up to 24 columns by 8 rows.
+Smaller originals stay near their natural device-pixel size, rounded to the nearest
+whole-cell rectangle. Image orientation and intrinsic dimensions survive font
+changes and window resizing.
 Text in the same block wraps beside them. Thumbnails are decoded at bounded
 size, nearest-neighbor sampled, ordered-dithered into the theme's 16 terminal
 colors plus its foreground/background, and cached between frames. Downloads
@@ -57,7 +60,12 @@ reload the existing window with `./hardcore.app/Contents/MacOS/hardcore --reload
 before trying these commands in that window.
 
 This first pass uses its own WebKit cookies/profile, separate from Safari and
-Chrome. Grid mode covers the main document's first 100,000 characters and 2,000
+Chrome. It does not inherit their signed-in sessions or password-manager
+extensions. Successful logins in Hardcore use its persistent WebKit store;
+switching Mono/Native keeps that same session. Some providers, including Google,
+restrict login in embedded browsers. Native mode is still the embedded WebKit
+page, so it does not bypass that restriction. Use the regular browser for sites
+that require its existing login. Grid mode covers the main document's first 100,000 characters and 2,000
 blocks; canvas, embedded frames, rich editors, combining marks and advanced
 controls need native mode. Browser URLs, mode and parent IDs survive an app
 reload, but pages reload and their in-memory JavaScript/form state is lost;
@@ -157,14 +165,28 @@ open alongside Settings and CAF. They use the current font and theme, preserve
 terminal colors, wrap text into their compact viewport, and collapse repeated
 empty rows. The source process, terminal dimensions, scroll position, selected
 tab and unread indicator stay unchanged when a TV opens. Scroll inside a TV to
-browse its bounded recent history independently.
+browse its bounded recent history independently. Automatic Cuties prefer a vertical
+stack below the tab menu, in tab-list order even when opened in a different order.
+When that stack cannot fit, they use nearby space or the other edge.
+
+Drag **↕** in a TV header (left of **↗** and **−**) to position it on the grid.
+The bottom-right grip has a diagonal resize cursor; drag it to change the TV
+viewport. A manually positioned TV stays put while room permits. Placement and
+resizing avoid the main menu and other TVs. TVs can range from 18×4 to 64×64
+cells, limited by available space, without resizing the source terminal or
+sending its program a resize event. **Escape**, focus loss, minimize, or window
+resize ends a drag at its last valid position.
 
 Click inside a terminal TV to type into that session; its footer turns amber
 and says **Typing · Esc returns**. **Escape** or a click elsewhere returns input
 to the main tab. **Option–Escape** sends Escape to the TV's program. Paste and
 arrow keys work, and mouse-aware programs receive clicks mapped back to current
 source cells. Focus also clears on window exit, focus loss, minimize, resize or
-tab selection. **↗** expands the source tab; **×** closes only the TV. Cuties do
+tab selection. **↗** expands the source tab; **−** minimizes only the TV.
+An open TV has a persistent **□** beside its tab. Hover that row to turn **□**
+into **−**, beside the tab’s separate **×** close button. Click **−** to return
+the miniature to the tab menu while its session keeps running. A selected or
+hover-previewed tab gives its TV a double hairline border. Cuties do
 not expire after ten seconds. Their placement stays fixed during interaction;
 if the window cannot fit a panel, it waits for room.
 
@@ -311,6 +333,36 @@ shared by every window.
   ConPTY and the WSL attachment helper built in. Nothing to install, no
   runtime dependencies to download. It draws with Direct3D 11 on a flip-model
   swap chain.
+
+## Run inside another terminal
+
+`hardcore here` opens terminal tabs inside your current terminal instead of
+creating a GPU window. It works with Python 3.10+ on macOS and Linux, including
+WSL. The host supplies the font and character rendering; Hardcore keeps separate
+PTYs, screen state, colors, and bounded scrollback for each tab.
+
+```sh
+hardcore here
+hardcore here --cwd ~/project
+hardcore here -- python3 my_program.py
+```
+
+Press **Ctrl-B**, release it, then **c** for a new shell, **n/p** to switch tabs,
+**1–9** to select, or **?** for help. **x** closes a tab and **q** quits, both
+with confirmation. **u/d** scroll history; **]** returns to live output.
+**Ctrl-B Ctrl-B** sends a literal Ctrl-B to the program. Tabs are also clickable.
+Resizing updates the child PTYs; exiting restores the host terminal.
+
+The Mac app includes this frontend. For a standalone Linux/WSL installation,
+run `make install-here` and put `~/.local/bin` on your PATH. This needs no graphics
+libraries or cross compiler. If a native Hardcore command already exists as a
+symlink, the launcher preserves it for commands other than `here`.
+
+This is an initial terminal frontend: it supports shell tabs and common ANSI,
+256-color, truecolor, alternate-screen, mouse, and bracketed-paste operations.
+Bitmap-font selection, browser tabs, Cutie TVs, GUI session transfers, and full
+terminal-protocol parity remain features of the native app. It does not attach
+the host's existing shell or detach its child sessions when it exits.
 
 ## Install
 

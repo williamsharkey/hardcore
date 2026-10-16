@@ -12,17 +12,17 @@ static void chrome_capture_begin(void) {
     g_chrome_quad_count = 0; g_chrome_capture_failed = 0; g_chrome_capture = 1;
 }
 static int chrome_capture_plan(int raised) {
-    int rows = g_chrome.bottom - g_chrome.top, i, x;
+    int rows = g_chrome.bottom - g_chrome.top, cols = g_chrome_surface_cols, i, x;
     unsigned char *ink;
     /* Failure is fail-closed for hit testing: no invisible menu targets. */
-    g_chrome_menu_count = -1; g_chrome_menu_raised = 0;
-    if (g_chrome_capture_failed || rows <= 0) return 0;
+    g_chrome_menu_count = -1; g_chrome_menu_raised = 0; g_chrome_menu_cols = 0;
+    if (g_chrome_capture_failed || rows <= 0 || cols < 1 || cols > CHROME_PACK_MAX) return 0;
     if (rows > g_chrome_menu_capacity) {
         ChromePackRow *more = (ChromePackRow *)realloc(g_chrome_menu_rows, (size_t)rows * sizeof(*more));
         if (!more) return 0;
         g_chrome_menu_rows = more; g_chrome_menu_capacity = rows;
     }
-    ink = (unsigned char *)calloc((size_t)rows * SB_COLS, 1);
+    ink = (unsigned char *)calloc((size_t)rows * cols, 1);
     if (!ink) return 0;
     for (i = 0; i < g_chrome_quad_count; i++) {
         const Inst *q = &g_chrome_quads[i];
@@ -30,17 +30,18 @@ static int chrome_capture_plan(int raised) {
         if (q->u0 == 0xffff || row < 0 || row >= rows) continue;
         int left = (q->x0 - g_chrome_x) / CW;
         int right = (q->x1 - g_chrome_x + CW - 1) / CW;
-        for (x = chrome_max(left, 0); x < chrome_min(right, SB_COLS); x++) ink[row * SB_COLS + x] = 1;
+        for (x = chrome_max(left, 0); x < chrome_min(right, cols); x++) ink[row * cols + x] = 1;
     }
     for (i = 0; i < rows; i++) {
         int left = 0, right = 0;
         if (!raised && g_tab_underlay && chrome_intrusion_span_at(g_chrome.top+i,g_chrome_x/CW,g_chrome.top,g_chrome.bottom,&left,&right)) {
             left -= g_chrome_x / CW; right -= g_chrome_x / CW;
         } else left = right = 0;
-        chrome_pack_row(&g_chrome_menu_rows[i], ink + i * SB_COLS, SB_COLS, left, right);
+        chrome_pack_row(&g_chrome_menu_rows[i], ink + i * cols, cols, left, right);
     }
     free(ink);
     g_chrome_menu_top = g_chrome.top; g_chrome_menu_count = rows;
+    g_chrome_menu_cols = cols;
     g_chrome_menu_x = g_chrome_x; g_chrome_menu_cw = CW; g_chrome_menu_ch = CH;
     g_chrome_menu_raised = raised;
     g_chrome_menu_alpha = g_chrome_motion_alpha;
@@ -55,20 +56,20 @@ static int g_chrome_round_x, g_chrome_round_w, g_chrome_round_right;
 static int g_chrome_join_top, g_chrome_join_bottom;
 /* Equal-width panels on the same edge share the upper panel's last pixel.
  * Exposed corners stay round; touching corners form a straight joint. */
-static int chrome_join_mask(int x,int top,int bottom,int other_x,int other_top,int other_bottom) {
-    if(x!=other_x || top>=bottom || other_top>=other_bottom)return 0;
+static int chrome_join_mask(int x,int cols,int top,int bottom,int other_x,int other_cols,int other_top,int other_bottom) {
+    if(x!=other_x || cols!=other_cols || cols<1 || top>=bottom || other_top>=other_bottom)return 0;
     return (top==other_bottom?1:0) | (bottom==other_top?2:0);
 }
 static void chrome_prepare_edges(ChromeLayout primary,int primary_x,float primary_alpha) {
     int mask=0;
 #ifndef _WIN32
     if(primary_alpha>0)
-        mask|=chrome_join_mask(g_chrome_x,g_chrome.top,g_chrome.bottom,
-                               primary_x,primary.top,primary.bottom);
+        mask|=chrome_join_mask(g_chrome_x,g_chrome_surface_cols,g_chrome.top,g_chrome.bottom,
+                               primary_x,SB_COLS,primary.top,primary.bottom);
     for(int i=0;i<HC_TV_COUNT;i++) {
         const ChromeTv *tv=g_tvs+i;HcTvRect r=tv->state.rect;
         if(tv->state.open && tv->state.placed && tv->state.alpha*tv->motion.alpha>0)
-            mask|=chrome_join_mask(g_chrome_x,g_chrome.top,g_chrome.bottom,r.x*CW,r.y,r.y+r.h);
+            mask|=chrome_join_mask(g_chrome_x,g_chrome_surface_cols,g_chrome.top,g_chrome.bottom,r.x*CW,r.w,r.y,r.y+r.h);
     }
 #else
     (void)primary;(void)primary_x;(void)primary_alpha;
@@ -99,7 +100,7 @@ static void chrome_emit_inst(const Inst *q,int x0,int x1,int y0,int y1) {
 }
 static int chrome_pack_translation(const ChromePackRow *p, int left, int right, int *shift) {
     int x, d;
-    if (left < 0 || right > SB_COLS || left >= right || p->dst[left] < 0) return 0;
+    if (left < 0 || right > g_chrome_menu_cols || left >= right || p->dst[left] < 0) return 0;
     d = p->dst[left] - left;
     for (x = left + 1; x < right; x++) if (p->dst[x] != x + d) return 0;
     *shift = d * CW;
@@ -110,7 +111,8 @@ static void chrome_capture_end(int raised) {
     g_chrome_capture = 0;
     if (!chrome_capture_plan(raised)) return;
     g_chrome_round_x=origin;
-    g_chrome_round_w=origin+sidebar_w()>=g_clip_w-CW?g_clip_w-origin:sidebar_w();
+    int width=g_chrome_surface_cols*CW;
+    g_chrome_round_w=origin+width>g_clip_w-CW?g_clip_w-origin:width;
     g_chrome_round_right=origin+g_chrome_round_w<g_clip_w;
     g_chrome_x = 0;
     for (i = 0; i < g_chrome_quad_count; i++) {
@@ -154,7 +156,7 @@ static void chrome_capture_end(int raised) {
             int edge = origin + p->blocked_left * CW;
             quad((float)(edge-1), (float)y, (float)edge, (float)(y+CH));
         }
-        if (p->blocked_right < SB_COLS) {
+        if (p->blocked_right < g_chrome_menu_cols) {
             int edge = origin + p->blocked_right * CW;
             quad((float)edge, (float)y, (float)(edge+1), (float)(y+CH));
         }
@@ -162,7 +164,7 @@ static void chrome_capture_end(int raised) {
     for (i = 1; i < g_chrome_menu_count; i++) {
         const ChromePackRow *a = &g_chrome_menu_rows[i-1], *b = &g_chrome_menu_rows[i];
         int y = (g_chrome.top + i) * CH;
-        for (x = 0; x < SB_COLS; x++) {
+        for (x = 0; x < g_chrome_menu_cols; x++) {
             int above = x >= a->blocked_left && x < a->blocked_right;
             int below = x >= b->blocked_left && x < b->blocked_right;
             if (above != below) {
@@ -174,7 +176,9 @@ static void chrome_capture_end(int raised) {
     g_chrome_x = origin;
 }
 static int chrome_draw_width(void) {
-    return g_chrome_x+sidebar_w()>=g_clip_w-CW?g_clip_w-g_chrome_x:sidebar_w();
+    int width=g_chrome_surface_cols*CW;
+    /* Fill only a partial edge column, never an intentional full-cell gap. */
+    return g_chrome_x+width>g_clip_w-CW?g_clip_w-g_chrome_x:width;
 }
 static void chrome_round_edges(void) {
     int width=chrome_draw_width(),radius=chrome_min(6,chrome_min(CW/2,CH/3));
@@ -185,6 +189,38 @@ static void chrome_round_edges(void) {
         if(g_chrome_x+width<g_clip_w)fill_rect((float)(width-inset-1),(float)y,(float)(width-inset),(float)(y+1),g_look.dim,1);
     }
 }
+#ifndef _WIN32
+/* A second one-device-pixel outline leaves one untouched pixel between the
+ * strokes. Its smaller corner radius shares the outer outline's center. */
+static void chrome_inner_frame(uint32_t color) {
+    int width=chrome_draw_width(),left=2,right=width-2;
+    int top=g_chrome.top*CH+2,bottom=g_chrome.bottom*CH-2;
+    int radius=chrome_max(0,chrome_min(6,chrome_min(CW/2,CH/3))-2);
+    int round_left=g_chrome_x>0,round_right=g_chrome_x+width<g_clip_w;
+    int tr=g_chrome_join_top?0:radius,br=g_chrome_join_bottom?0:radius;
+    int ti=0,bi=0;
+    if(left>=right || top>=bottom)return;
+    while(ti<tr && (tr-ti)*(tr-ti)+(tr-1)*(tr-1)>tr*tr)ti++;
+    while(bi<br && (br-bi)*(br-bi)+(br-1)*(br-1)>br*br)bi++;
+    fill_rect((float)(left+(round_left?ti:0)),(float)top,
+              (float)(right-(round_right?ti:0)),(float)(top+1),color,1);
+    fill_rect((float)(left+(round_left?bi:0)),(float)(bottom-1),
+              (float)(right-(round_right?bi:0)),(float)bottom,color,1);
+    fill_rect((float)left,(float)(top+(round_left?tr:0)),
+              (float)(left+1),(float)(bottom-(round_left?br:0)),color,1);
+    fill_rect((float)(right-1),(float)(top+(round_right?tr:0)),
+              (float)right,(float)(bottom-(round_right?br:0)),color,1);
+    for(int edge=0;edge<2;edge++) {
+        int r=edge?br:tr;
+        for(int d=0;d<r;d++) {
+            int inset=0,y=edge?bottom-1-d:top+d;
+            while(inset<r && (r-inset)*(r-inset)+(r-d-1)*(r-d-1)>r*r)inset++;
+            if(round_left)fill_rect((float)(left+inset),(float)y,(float)(left+inset+1),(float)(y+1),color,1);
+            if(round_right)fill_rect((float)(right-inset-1),(float)y,(float)(right-inset),(float)(y+1),color,1);
+        }
+    }
+}
+#endif
 static void chrome_sides(int row, uint32_t color) {
     float y = row_y(row), w = (float)chrome_draw_width();
     fill_rect(0, y, 1, y + CH, color, 1);
@@ -305,6 +341,7 @@ static void render_tabbar(int win_w, int win_h) {
     UI_FONT;
     if (g_mouse_y >= 0) hover = hit_tabbar(g_mouse_x, g_mouse_y, &idx);
     tab_layout();
+    g_chrome_surface_cols=SB_COLS;
     g_chrome_x = sidebar_x();
     chrome_prepare_edges(g_chrome,g_chrome_x,g_chrome_motion_alpha);
     chrome_capture_begin();
@@ -349,7 +386,10 @@ static void render_tabbar(int win_w, int win_h) {
         draw_glyph(tb->busy ? drip : tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR || tb->attention ? '!' : active ? 0x25CF : tb->activity ? 0x00B7 : ' ',
                    (float)(left * CW), row_y(row), 1, g_scale);
         #ifndef _WIN32
-        if (hovered) grid_text(L"□", SB_COLS - 4, row, hover == HIT_CUTIE && idx == tab ? AMBER : g_look.text_lo);
+        int cutie_open=chrome_tv_slot_for(tb->id)>=0;
+        if (hovered || cutie_open)
+            grid_text(hovered && cutie_open?L"−":L"□", SB_COLS - 4, row,
+                      hover == HIT_CUTIE && idx == tab ? AMBER : g_look.text_lo);
         #endif
         if (hovered) grid_text(L"×", SB_COLS - 2, row, hover == HIT_CLOSE && idx == tab ? g_look.red : g_look.dim);
         chrome_sides(row, g_look.dim);

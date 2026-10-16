@@ -8,6 +8,19 @@ import subprocess
 import sys
 import tempfile
 
+HERE_LAUNCHER_HEADER = b"#!/usr/bin/env python3\n# HARDCORE_TERMINAL_LAUNCHER_V1\n"
+
+
+def here_launcher(path):
+    """Only our exact portable launcher header permits migration to the app."""
+    if path.is_symlink():
+        return False
+    try:
+        with path.open("rb") as source:
+            return source.read(len(HERE_LAUNCHER_HEADER)) == HERE_LAUNCHER_HEADER
+    except OSError:
+        return False
+
 
 def install(source, appdir, bindir):
     source, appdir, bindir = (Path(p).expanduser().absolute() for p in (source, appdir, bindir))
@@ -22,7 +35,7 @@ def install(source, appdir, bindir):
     if not (source / "Contents/MacOS/hardcore").is_file():
         raise SystemExit(f"Missing app executable in {source}")
     if os.path.lexists(command) and not (
-        command.is_symlink() and command.resolve() == executable.resolve()
+        (command.is_symlink() and command.resolve() == executable.resolve()) or here_launcher(command)
     ):
         raise SystemExit(f"Refusing to overwrite {command}; choose another BINDIR.")
     appdir.mkdir(parents=True, exist_ok=True)
@@ -31,7 +44,8 @@ def install(source, appdir, bindir):
         raise SystemExit(f"Refusing to replace app symlink: {app}")
     # Finish copying and validation before touching the installed bundle.
     # Retain the previous app: an older running process may still need it.
-    with tempfile.TemporaryDirectory(prefix=".hardcore-install-", dir=appdir) as temp:
+    with tempfile.TemporaryDirectory(prefix=".hardcore-install-", dir=appdir) as temp, \
+         tempfile.TemporaryDirectory(prefix=".hardcore-command-", dir=bindir) as command_temp:
         replacement = Path(temp) / source.name
         shutil.copytree(source, replacement, symlinks=True)
         subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(replacement)],
@@ -40,6 +54,14 @@ def install(source, appdir, bindir):
                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15, check=True)
         if probe.stdout != "hardcore-mac-reload-1\n":
             raise ValueError("App does not support the current macOS update protocol")
+        # Stage the command before publishing the app. Existing portable
+        # launchers keep working until their one atomic replacement below.
+        replacement_command = Path(command_temp) / "hardcore"
+        replacement_command.symlink_to(executable)
+        if os.path.lexists(command) and not (
+            (command.is_symlink() and command.resolve() == executable.resolve()) or here_launcher(command)
+        ):
+            raise SystemExit(f"Refusing to overwrite {command}; command changed during installation.")
         backup = app.with_name(app.name + ".previous")
         if app.exists():
             if backup.is_symlink():
@@ -58,8 +80,8 @@ def install(source, appdir, bindir):
                     print(f"Previous app retained for recovery: {backup}", file=sys.stderr)
                     raise
             raise
-    if not command.is_symlink():
-        command.symlink_to(executable)
+        if not command.is_symlink():
+            os.replace(replacement_command, command)
     print(f"Installed {app}")
     print(f"Installed command: {command}")
     try:

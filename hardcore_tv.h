@@ -9,6 +9,7 @@
 
 enum { HC_TV_COUNT = 6, HC_TV_MAX_SLOTS = HC_TV_COUNT, HC_TV_MAX_CANDIDATES = 12 };
 enum { HC_TV_CUTIE_FIRST = 2, HC_TV_CUTIE_COUNT = 4, HC_TV_CUTIE_ROWS = 9 };
+enum { HC_TV_MIN_WIDTH = 18, HC_TV_MAX_WIDTH = 64, HC_TV_MIN_HEIGHT = 4, HC_TV_MAX_HEIGHT = 64 };
 enum { HC_TV_SETTINGS, HC_TV_CAF, HC_TV_AUXILIARY_1, HC_TV_AUXILIARY_2 };
 enum { HC_TV_CLOSED, HC_TV_VISIBLE, HC_TV_FADING };
 enum { HC_TV_IDLE_MS = 10000, HC_TV_FADE_MS = 300 };
@@ -148,6 +149,91 @@ static inline int hc_tv_clamp(int value, int maximum) {
 }
 static inline int hc_tv_anchor(int64_t value) {
     return value < 0 || value > INT_MAX ? -1 : (int)value;
+}
+/* Keep the user's request intact across temporary viewport shrinkage. */
+static inline HcTvRect hc_tv_requested_rect(HcTvRect requested,int cols,int rows) {
+    if(cols<1 || rows<1)return (HcTvRect){0};
+    int w=requested.w?requested.w:28,h=requested.h?requested.h:HC_TV_CUTIE_ROWS;
+    w=w<HC_TV_MIN_WIDTH?HC_TV_MIN_WIDTH:w>HC_TV_MAX_WIDTH?HC_TV_MAX_WIDTH:w;
+    h=h<HC_TV_MIN_HEIGHT?HC_TV_MIN_HEIGHT:h>HC_TV_MAX_HEIGHT?HC_TV_MAX_HEIGHT:h;
+    if(w>cols)w=cols;if(h>rows)h=rows;
+    return (HcTvRect){hc_tv_clamp(requested.x,cols-w),hc_tv_clamp(requested.y,rows-h),w,h};
+}
+/* Jump past rectangles, never scan screen rows. Each pass advances beyond at
+ * least one obstacle, so even interior manual panels take at most seven passes. */
+static inline HcTvRect hc_tv_lane(int cols,int rows,int x,int y,int width,int height,
+                                 const HcTvRect *occupied,int count,int gap) {
+    HcTvRect r={x,y,width,height};
+    if(count<0 || count>HC_TV_MAX_SLOTS || (count && !occupied))return (HcTvRect){0};
+    for(int pass=0;pass<=count;pass++) {
+        if(!hc_tv_rect_fits(r,cols,rows))return (HcTvRect){0};
+        int next=r.y;
+        for(int i=0;i<count;i++)if(hc_tv_rect_overlap(r,occupied[i])) {
+            int bottom=hc_tv_anchor((int64_t)occupied[i].y+occupied[i].h+gap);
+            if(bottom<0)return (HcTvRect){0};
+            if(bottom>next)next=bottom;
+        }
+        if(next==r.y)return r;
+        r.y=next;
+    }
+    return (HcTvRect){0};
+}
+static inline int hc_tv_stack_band(const HcTvPlacement *p,HcTvRect primary) {
+    /* A short amount of terminal text should not scatter a vertical stack.
+       Dense content still gets the normal least-collision placement. */
+    int modest=p->cost.collision_cells <= ((int64_t)p->rect.w*p->rect.h)/3;
+    if(modest && p->rank<=1)return 0;
+    if(modest && p->rect.y>=primary.y+primary.h)return 1;
+    return 2;
+}
+static inline int hc_tv_stack_better(const HcTvPlacement *a,const HcTvPlacement *b,HcTvRect primary) {
+    if(!b->valid)return a->valid;if(!a->valid)return 0;
+    int aa=hc_tv_stack_band(a,primary),bb=hc_tv_stack_band(b,primary);
+    if(aa!=bb)return aa<bb;
+    if(!aa && a->rank!=b->rank)return a->rank<b->rank;
+    return hc_tv_score_better(a,b);
+}
+/* Ordered Cuties favor the next slot below their predecessor. Opposite and
+ * restarted lanes are a bounded fallback, retaining top-to-bottom order. */
+static inline HcTvPlacement hc_tv_place_stacked(int cols,int rows,HcTvRect primary,HcTvRect anchor,
+        int width,int height,const HcTvRect *occupied,int count,const HcTvPlacement *previous,
+        HcTvOccupancy occupancy,void *ctx) {
+    HcTvPlacement best={0},old={0};HcTvRect choices[HC_TV_MAX_CANDIDATES];int calls=0;
+    if(width<1 || height<1 || width>cols || height>rows || !hc_tv_rect_fits(primary,cols,rows) ||
+       count<0 || count>HC_TV_MAX_SLOTS || (count&&!occupied))return best;
+    int edge=(int64_t)anchor.x*2+anchor.w>=cols?cols-width:0,other=edge?0:cols-width;
+    int below=hc_tv_anchor((int64_t)primary.y+primary.h);
+    int next=hc_tv_anchor((int64_t)anchor.y+anchor.h);
+    choices[0]=hc_tv_lane(cols,rows,edge,hc_tv_anchor((int64_t)next+2),width,height,occupied,count,2);
+    choices[1]=hc_tv_lane(cols,rows,edge,next,width,height,occupied,count,0);
+    choices[2]=hc_tv_lane(cols,rows,other,hc_tv_anchor((int64_t)below+2),width,height,occupied,count,2);
+    choices[3]=hc_tv_lane(cols,rows,other,below,width,height,occupied,count,0);
+    choices[4]=hc_tv_lane(cols,rows,edge,hc_tv_anchor((int64_t)below+2),width,height,occupied,count,2);
+    choices[5]=hc_tv_lane(cols,rows,edge,below,width,height,occupied,count,0);
+    choices[6]=hc_tv_lane(cols,rows,other,0,width,height,occupied,count,2);
+    choices[7]=hc_tv_lane(cols,rows,other,0,width,height,occupied,count,0);
+    choices[8]=hc_tv_lane(cols,rows,edge,0,width,height,occupied,count,2);
+    choices[9]=hc_tv_lane(cols,rows,edge,0,width,height,occupied,count,0);
+    choices[10]=(HcTvRect){(cols-width)/2,hc_tv_clamp(below,rows-height),width,height};
+    choices[11]=previous&&previous->valid?previous->rect:(HcTvRect){0};
+    for(int i=0;i<HC_TV_MAX_CANDIDATES;i++) {
+        HcTvPlacement p={0};int duplicate=0;
+        if(!hc_tv_rect_fits(choices[i],cols,rows) || choices[i].w!=width || choices[i].h!=height ||
+           hc_tv_rect_overlap(choices[i],primary))continue;
+        for(int j=0;j<i;j++)if(hc_tv_rect_equal(choices[j],choices[i]))duplicate=1;
+        if(duplicate)continue;
+        p.rect=choices[i];p.rank=i;calls++;
+        if(occupancy&&!occupancy(p.rect,&p.cost,ctx))continue;
+        if(p.cost.collision_rows<0 || p.cost.collision_cells<0 || p.cost.reflow_cells<0)continue;
+        if(p.cost.collision_rows&&!p.cost.collision_cells)p.cost.collision_cells=p.cost.collision_rows;
+        if(p.cost.collision_cells&&!p.cost.collision_rows)p.cost.collision_rows=1;
+        p.valid=1;p.joined=hc_tv_rect_joined(p.rect,anchor);
+        if(previous&&previous->valid&&hc_tv_rect_equal(p.rect,previous->rect))old=p;
+        if(hc_tv_stack_better(&p,&best,primary))best=p;
+    }
+    if(old.valid && hc_tv_stack_band(&best,primary)>=hc_tv_stack_band(&old,primary) &&
+       !hc_tv_material_improvement(&best,&old))best=old;
+    best.candidates=calls;return best;
 }
 static inline HcTvPlacement hc_tv_place(int cols, int rows, HcTvRect primary,
                                          int width, int height, const HcTvPlacement *previous,

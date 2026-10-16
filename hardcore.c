@@ -606,6 +606,7 @@ static int mac_browser_cutie_project(Tab*,Cell*,int,int,int);
 static int mac_browser_cutie_generation(Tab*);
 static void mac_browser_cutie_action(Tab*,int);
 static void mac_cutie_blur(void);
+static void mac_tv_drag_end(void);
 static void mac_browser_scroll(int lines);
 static void mac_browser_draw_overlay(void);
 static void mac_browser_draw_tile(Tab *tb,const Cell *cell,int x,int y);
@@ -2458,6 +2459,7 @@ static const char RC_BASH[] =
     "if [ -n \"$HARDCORE_EXE\" ] && ! declare -F hardcore >/dev/null; then\n"
     "  hardcore() {\n"
     "    case $1 in\n"
+    "      here) shift; python3 -B \"${HARDCORE_EXE%/*}/here.py\" \"$@\" ;;\n"
     "      update|--update|version|--version|-v|help|--help|-h) \"$HARDCORE_EXE\" \"$@\" | cat ;;\n"
     "      *) local d; d=$(cd -- \"${1:-.}\" 2>/dev/null && pwd) || { echo \"hardcore: no folder $1\" >&2; return 1; }\n"
     "         ( \"$HARDCORE_EXE\" --cd \"$d\" </dev/null >/dev/null 2>&1 & ) ;;\n"
@@ -4053,6 +4055,9 @@ static void chrome_preview_pointer(int mx,int my) {
     Tab *selected=active_tab();
     int target=(hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_CUTIE) && index>=0 && index<g_ntabs?g_tabs[index]->id:0;
     int eligible=g_focused && !g_sel_drag && !g_chrome_drag && !g_sb_drag;
+#ifndef _WIN32
+    eligible=eligible && g_tv_drag_slot<0;
+#endif
     if(tab_preview_point(&g_tab_preview,selected?selected->id:0,target,eligible))plat_invalidate();
 }
 
@@ -4166,7 +4171,7 @@ static void grid_text(const wchar_t *s, int col, int row, uint32_t rgb) {
     uint8_t ws[64];
     int n = text_cells(s, cps, ws, 64), i;
     r_color(rgb, 1);
-    for (i = 0; i < n && col < SB_COLS; col += ws[i++])
+    for (i = 0; i < n && col + ws[i] <= g_chrome_surface_cols; col += ws[i++])
         if (cps[i] != ' ') draw_glyph(cps[i], (float)(col * CW), row_y(row), ws[i], g_scale);
 }
 
@@ -4323,7 +4328,7 @@ static int chrome_intrusion_span_at(int row,int dock,int top,int bottom,int *lef
         if (end > *right) *right = end;
     }
     if (*left < dock) *left = dock;
-    if (*right > dock + SB_COLS) *right = dock + SB_COLS;
+    if (*right > dock + g_chrome_surface_cols) *right = dock + g_chrome_surface_cols;
     if (*right <= *left) { *left = *right = 0; return 0; }
     return 1;
 }
@@ -4723,7 +4728,7 @@ static void update_busy(int tick) {
 
 static void activate(int i) {
 #ifndef _WIN32
-    mac_cutie_blur();
+    mac_tv_drag_end();mac_cutie_blur();
 #endif
     if (i < 0 || i >= g_ntabs) return;
     chrome_preview_cancel();
@@ -7487,6 +7492,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 char request[600];
                 if (!WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, request, sizeof(request), NULL, NULL) || !slurp_filter(request)) return 2;
             }
+        } else if (!strcmp(a, "here")) {
+            cli("hardcore here runs inside a POSIX terminal. In WSL, install the terminal launcher with make install-here, then run ~/.local/bin/hardcore here.\n");
+            return 2;
         } else if (!strcmp(a, "browser")) {
             cli("hardcore: browser tabs are available on macOS in this first pass; Windows WebView2 is not implemented yet.\n");
             return 1;
@@ -7498,6 +7506,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         } else if (!strcmp(a, "help") || !strcmp(a, "--help") || !strcmp(a, "-h")) {
             cli("hardcore %s: a terminal for WSL\n"
                 "  hardcore [DIR]          a new window in DIR (from a tab: this folder)\n"
+                "  hardcore here           terminal-hosted mode through the WSL launcher\n"
                 "  hardcore update         install the latest release (--force: even if current)\n"
                 "  hardcore slurp          attach running WSL and classic Windows consoles\n"
                 "  hardcore slurp --list   discover eligible sessions without attaching\n"

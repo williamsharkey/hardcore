@@ -3,7 +3,7 @@
 #include "hardcore_tv.h"
 typedef struct {
     ChromePackRow *rows;
-    int count, capacity, top, x, cw, ch, raised;
+    int count, capacity, top, x, cw, ch, raised, cols;
     float alpha;
     int settings_tab, settings_offset, font_rows;
 } ChromeMenuFrame;
@@ -15,19 +15,28 @@ typedef struct {
     ChromeLayout layout;
     ChromeMenuFrame frame;
     int motion_blocked;
+    int manual;
+    HcTvRect requested;
     int tab_id, scroll;             /* Cuties bind stable tab IDs, never array positions. */
 } ChromeTv;
 static ChromeTv g_tvs[HC_TV_COUNT];
+static int g_tv_drag_slot=-1, g_tv_drag_mode;
+static int chrome_tv_slot_for(int tab_id) {
+    if(tab_id<=0)return -1;
+    for(int i=HC_TV_CUTIE_FIRST;i<HC_TV_COUNT;i++)
+        if(g_tvs[i].state.open && g_tvs[i].tab_id==tab_id)return i;
+    return -1;
+}
 static ChromeMenuFrame chrome_frame_save(void) {
     return (ChromeMenuFrame){g_chrome_menu_rows, g_chrome_menu_count, g_chrome_menu_capacity,
         g_chrome_menu_top, g_chrome_menu_x, g_chrome_menu_cw, g_chrome_menu_ch,
-        g_chrome_menu_raised, g_chrome_menu_alpha,
+        g_chrome_menu_raised, g_chrome_menu_cols, g_chrome_menu_alpha,
         g_settings_tab,g_setting_offset[g_settings_tab],g_font_menu_count};
 }
 static void chrome_frame_load(ChromeMenuFrame f) {
     g_chrome_menu_rows=f.rows; g_chrome_menu_count=f.count; g_chrome_menu_capacity=f.capacity;
     g_chrome_menu_top=f.top; g_chrome_menu_x=f.x; g_chrome_menu_cw=f.cw; g_chrome_menu_ch=f.ch;
-    g_chrome_menu_raised=f.raised; g_chrome_menu_alpha=f.alpha;
+    g_chrome_menu_raised=f.raised; g_chrome_menu_cols=f.cols; g_chrome_menu_alpha=f.alpha;
 }
 static int chrome_tv_contains(int slot, int mx, int my) {
     if(slot<0 || slot>=HC_TV_COUNT)return 0;
@@ -53,6 +62,7 @@ static void chrome_tv_close_slot(int slot) {
     if(slot<0 || slot>=HC_TV_COUNT)return;
     ChromeTv *tv=g_tvs+slot;
     if(slot>=HC_TV_CUTIE_FIRST && g_cutie_focus_id==tv->tab_id)g_cutie_focus_id=0;
+    if(g_tv_drag_slot==slot)g_tv_drag_slot=-1;
     hc_tv_close(&tv->state);hc_tv_motion_reset(&tv->motion);
     tv->state.placed=0;tv->frame.count=0;tv->frame.alpha=0;
     tv->tab_id=tv->scroll=0;
@@ -66,8 +76,8 @@ static void chrome_tv_prune(void) {
 static int chrome_tv_open_tab(int tab_id) {
     if(tab_id<=0 || !tab_by_id(tab_id))return -1;
     chrome_tv_prune();
-    for(int i=HC_TV_CUTIE_FIRST;i<HC_TV_COUNT;i++)
-        if(g_tvs[i].state.open && g_tvs[i].tab_id==tab_id)return i;
+    int existing=chrome_tv_slot_for(tab_id);
+    if(existing>=0)return existing;
     for(int i=HC_TV_CUTIE_FIRST;i<HC_TV_COUNT;i++)if(!g_tvs[i].state.open) {
         ChromeTv *tv=g_tvs+i;
         /* Preserve the reusable row allocation, but invalidate its old map. */
@@ -120,19 +130,23 @@ static int chrome_tv_hit(int mx,int my,int *idx) {
     for(int i=0;i<HC_TV_COUNT;i++) if(chrome_tv_contains(i,mx,my)) {
         ChromeTv *tv=g_tvs+i; ChromeLayout a=tv->layout;
         int col=mx/CW-tv->state.rect.x,row=my/CH,at=row-tv->frame.top;
-        if(tv->frame.alpha<=0 || at<0 || at>=tv->frame.count || col<0 || col>=SB_COLS ||
+        if(tv->frame.alpha<=0 || at<0 || at>=tv->frame.count || col<0 || col>=tv->state.rect.w || tv->frame.cols!=tv->state.rect.w ||
            !tv->frame.rows || tv->frame.cw!=CW || tv->frame.ch!=CH ||
            tv->frame.x!=tv->state.rect.x*CW || tv->frame.top!=a.top || tv->frame.count!=a.bottom-a.top) return HIT_NONE;
         if(i==HC_TV_SETTINGS && (tv->frame.settings_tab!=g_settings_tab ||
            tv->frame.settings_offset!=g_setting_offset[g_settings_tab] ||
            (!g_settings_tab && tv->frame.font_rows!=g_font_menu_count)))return HIT_NONE;
         *idx=i;
-        if(i>=HC_TV_CUTIE_FIRST && row!=a.top)return HIT_TV;
+        if(i>=HC_TV_CUTIE_FIRST && row!=a.top)
+            return row==a.bottom-1 && col>=tv->state.rect.w-2?HIT_TV_RESIZE:HIT_TV;
         if(!tv->frame.raised) {
             if(!tv->frame.rows[at].actionable[col]) return HIT_NONE;
             col=tv->frame.rows[at].src[col];
         }
-        if(row==a.top) return col>=SB_COLS-3 ? HIT_TV_CLOSE : HIT_TV;
+        if(row==a.top) {
+            if(i>=HC_TV_CUTIE_FIRST && col==tv->state.rect.w-6)return HIT_TV_GRIP;
+            return col>=tv->state.rect.w-3 ? HIT_TV_CLOSE : HIT_TV;
+        }
         if(i==HC_TV_CAF) return HIT_TV;
         if(row==a.section_row){*idx=col<SB_COLS/2?0:1;return HIT_STAB;}
         if(row>=a.list_row && row<a.list_row+a.list_count) {

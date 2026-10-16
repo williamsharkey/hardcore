@@ -153,10 +153,12 @@ static void browser_decode_runs(HCBrowser *b,BrowserBlock *block,NSArray *runs,
                 [b->images addObject:image];
                 int width=MAX(1,MIN(20000,browser_integer(asset[@"width"])));
                 int height=MAX(1,MIN(20000,browser_integer(asset[@"height"])));
-                browser_image_size(width,height,cell_w(g_font)/MAX(1,g_scale),cell_h(g_font)/MAX(1,g_scale),&image->cols,&image->rows);
+                if(image->source_width<1)image->source_width=width;
+                if(image->source_height<1)image->source_height=height;
+                browser_image_size(image->source_width,image->source_height,cell_w(g_font)/MAX(1,g_scale),cell_h(g_font)/MAX(1,g_scale),&image->cols,&image->rows);
                 if (!browser_reserve(block,capacity,block->count+1)) { *remaining=0; break; }
                 Cell cell={0}; cell.ch=(uint32_t)b->images.count; cell.wflag=BROWSER_IMAGE;
-                cell.fg=(uint32_t)MIN(image->cols,MAX(1,g_cols/4)); cell.bg=(uint32_t)image->rows; cell.link=(uint16_t)action;
+                cell.fg=(uint32_t)image->cols; cell.bg=(uint32_t)image->rows; cell.link=(uint16_t)action;
                 block->nodes[block->count]=(uint16_t)node; block->cells[block->count++]=cell;
                 (*remaining)--; continue;
             }
@@ -433,8 +435,8 @@ static void mac_browser_prepare(Tab *tb) {
     for(int i=0;i<b->blockCount;i++)for(int j=0;j<b->blocks[i].count;j++)if(b->blocks[i].cells[j].wflag&BROWSER_IMAGE) {
         Cell *c=b->blocks[i].cells+j;int id=c->ch;
         if(id>0 && id<=(int)b->images.count){HCBrowserImage *image=b->images[id-1];
-            int w,h;browser_image_size(image->sw ? image->sw : image->cols*8,image->sh ? image->sh : image->rows*16,CW/MAX(1,g_scale),CH/MAX(1,g_scale),&w,&h);
-            c->fg=(uint32_t)MIN(w,MAX(1,cols/4));c->bg=(uint32_t)h;}
+            int w,h;browser_image_size(image->source_width,image->source_height,CW/MAX(1,g_scale),CH/MAX(1,g_scale),&w,&h);
+            c->fg=(uint32_t)w;c->bg=(uint32_t)h;}
     }
     int scroll=b->scroll;
     b->total=browser_grid_layout_nodes(b->blocks,b->blockCount,cells,b->nodeGrid,cols,rows,scroll,side,x,y,SB_COLS,height);

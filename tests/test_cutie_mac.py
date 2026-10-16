@@ -6,6 +6,7 @@ They emit deterministic styled frames on private file requests, so assertions
 do not confuse an unchanged tab index with correctly routed terminal input.
 """
 import argparse
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import sys
 import tempfile
 import time
 
-from test_chrome_mac import NativeApp, wait_for
+from test_chrome_mac import NativeApp, pixel, wait_for
 from test_tab_preview_extended_mac import selected, select_tab, tab
 from test_tv_mac import header, rect_overlap
 
@@ -207,7 +208,11 @@ def test_live(app):
     assert tab(app.state(), source)["activity"], "live Cutie cleared unread just by displaying output"
     stable_pty(logs[source], data(path))
     c = open_cutie(app, source)
-    assert len(cuties(c)) == 1, "reopening one source created a duplicate Cutie"
+    assert not cuties(c), "open-source tab button did not minimize its existing Cutie"
+    os.kill(data(path)["pid"], 0)
+    stable_pty(logs[source], data(path))
+    c = open_cutie(app, source)
+    assert len(cuties(c)) == 1, "restoring one source created a duplicate Cutie"
     c = close_cutie(app, source)
     assert not cuties(c) and selected(app.state()) == main
     assert any(t["id"] == source for t in app.state()["tabs"]), "Cutie close removed its source tab"
@@ -542,10 +547,301 @@ def test_browser(app):
     print("PASS: cached browser Cuties scroll independently, run links/buttons in source, expand form edits and return terminal input focus to WK")
 
 
+def drag_cutie(app, identity, *, x=None, y=None, width=None, height=None, finish=True):
+    c = app.chrome()
+    r = cutie(c, identity)["rect"]
+    resize = width is not None or height is not None
+    sx = r["x"]+r["width"]-(1 if resize else 6)
+    sy = r["y"]+r["height"]-1 if resize else r["y"]
+    tx = r["x"]+(width if width is not None else r["width"])-1 if resize else (x if x is not None else r["x"])+r["width"]-6
+    ty = r["y"]+(height if height is not None else r["height"])-1 if resize else (y if y is not None else r["y"])
+    c = app.hover(sx, sy)
+    cw, ch = c["cell"]["width"], c["cell"]["height"]
+    app.send(f"cmd pointer down {int((sx+.5)*cw)},{int((sy+.5)*ch)}")
+    started = app.chrome()
+    assert started["tv_drag_slot"] >= 0 and started["tv_drag_mode"] == int(resize), \
+        ("Cutie handle did not begin pointer capture", resize, started["tv_drag_slot"], started["tv_drag_mode"])
+    app.send(f"cmd pointer drag {int((tx+.5)*cw)},{int((ty+.5)*ch)}")
+    if finish:
+        app.send(f"cmd pointer up {int((tx+.5)*cw)},{int((ty+.5)*ch)}")
+    c = app.chrome()
+    assert (c["tv_drag_slot"] < 0) == finish
+    return c
+
+
+def wait_order(app, identities):
+    def ordered():
+        c = app.chrome()
+        panels = [cutie(c, identity) for identity in identities]
+        if not all(tv["placed"] and tv["motion"]["phase"] == 0 for tv in panels):
+            return None
+        previous = c["dock"]
+        for tv in panels:
+            r = tv["rect"]
+            if tv["manual"] or r["x"] != previous["x"] or r["y"] != previous["y"]+previous["height"]+2:
+                return None
+            previous = r
+        return c
+    return wait_for(ordered, timeout=6, description="automatic Cuties stack in source tab order")
+
+
+def test_tab_order(app):
+    main, workers = setup_workers(app, 5)
+    logs = {identity: data(path) for identity, path in workers}
+    original = app.chrome()["source"]
+    identities = [identity for identity, path in workers[1:]]
+    for identity in reversed(identities):
+        open_cutie(app, identity)
+    app.hover(-1, -1)
+    c = wait_order(app, identities)
+    check_geometry(c)
+    assert selected(app.state()) == main and c["source"] == original
+    app.snap("cuties-stack-in-tab-order-after-reverse-open")
+    close_cutie(app, identities[1])
+    app.hover(-1, -1)
+    c = wait_order(app, [identities[0]]+identities[2:])
+    open_cutie(app, identities[1])
+    app.hover(-1, -1)
+    c = wait_order(app, identities)
+    # Manual geometry is deliberately outside the automatic order contract.
+    manual_id = identities[2]
+    c = drag_cutie(app, manual_id, x=50, y=10)
+    manual_rect = cutie(c, manual_id)["rect"]
+    assert cutie(c, manual_id)["manual"]
+    app.hover(-1, -1)
+    remaining = [identity for identity in identities if identity != manual_id]
+    c = wait_order(app, remaining)
+    assert cutie(c, manual_id)["rect"] == manual_rect
+    check_geometry(c)
+    for identity, path in workers:
+        stable_pty(logs[identity], data(path))
+    print("PASS: reverse-opened Cuties stack by tab-list order, close/reopen preserves ordering, and manual panels retain their position")
+
+
+def test_geometry(app):
+    main, workers = setup_workers(app)
+    source, path = workers[1]
+    request_frame(workers[0][1], sparse=True, mouse=True, cursor_visible=False)
+    request_frame(path, mouse=True, cursor=[12,2])
+    select_tab(app, source)
+    source_before = app.chrome()["source"]
+    select_tab(app, main)
+    original = app.chrome()["source"]
+    logs = {identity: data(p) for identity, p in workers}
+    def width_pixels(c, name):
+        r = cutie(c, source)["rect"]
+        image = app.snap(name)
+        cw,ch = c["cell"]["width"],c["cell"]["height"]
+        right,top = (r["x"]+r["width"])*cw,r["y"]*ch
+        background = pixel(image,30*cw,30*ch)
+        assert image.crop(right,top,cw,r["height"]*ch) == background*(cw*r["height"]*ch), \
+            "Cutie glyphs/footer grip escaped the resized right edge"
+        y = top+ch+ch//2
+        assert pixel(image,right-1,y) != background, "resized right outline missing"
+        assert pixel(image,right,y) == background, "resized right outline exceeded one pixel"
+        for offset,label in ((6,"move"),(4,"expand"),(2,"minimize")):
+            pixels=image.crop((r["x"]+r["width"]-offset)*cw,top+3,cw,ch-4)
+            values=[pixels[i:i+4] for i in range(0,len(pixels),4)]
+            assert len(set(values))>1, f"{r['width']}-column Cutie hides its {label} header glyph"
+    c = open_cutie(app, source)
+    before = dict(cutie(c, source)["rect"])
+    c = drag_cutie(app, source, x=40, y=10)
+    moved = cutie(c, source)
+    assert moved["manual"] and moved["rect"] == dict(before, x=40, y=10)
+    assert selected(app.state()) == main and c["source"] == original
+    c = drag_cutie(app, source, width=42, height=14)
+    assert cutie(c, source)["rect"] == {"x":40,"y":10,"width":42,"height":14}
+    c = drag_cutie(app, source, width=1, height=1)
+    assert cutie(c, source)["rect"] == {"x":40,"y":10,"width":18,"height":4}
+    width_pixels(c,"cutie-resized-minimum-18-columns")
+    c = drag_cutie(app, source, width=1000, height=1000)
+    assert cutie(c, source)["rect"] == {"x":40,"y":10,"width":64,"height":min(64,c["rows"]-10)}
+    width_pixels(c,"cutie-resized-maximum-64-columns")
+    c = drag_cutie(app, source, width=42, height=12)
+    r = cutie(c, source)["rect"]
+    assert r == {"x":40,"y":10,"width":42,"height":12}
+    width_pixels(c,"cutie-resized-42-columns")
+    check_geometry(c)
+    for identity, p in workers:
+        stable_pty(logs[identity], data(p))
+    assert c["source"] == original
+    tv = cutie(c, source)
+    assert len(tv["source_map"]) == tv["body"]["width"]*tv["body"]["height"] == 40*10
+    image = panel_pixels(app, c, source, "cutie-manual-variable-size")
+    assert image.count(bytes((115,55,35,255))) > len(image)//16
+    # A new projection width must also replace the mouse/source mapping.
+    at = next(i for i, value in enumerate(tv["source_map"]) if value >= 0 and value%tv["source_cols"] > 40)
+    value = tv["source_map"][at]
+    sx = value%tv["source_cols"]
+    sy = tv["source_first_line"]+value//tv["source_cols"]-tv["source_hcount"]
+    body = tv["body"]
+    actual_click(app, c, body["x"]+at%body["width"], body["y"]+at//body["width"])
+    expected = f"\x1b[<0;{sx+1};{sy+1}M\x1b[<0;{sx+1};{sy+1}m".encode()
+    wait_input(path, expected)
+    type_key(app, "q")
+    wait_input(path, expected+b"q")
+    assert data(workers[0][1])["input"] == "", "geometry controls or mapped input leaked into main PTY"
+    app.send(r"key 53 0 \x1b \x1b")
+    c = app.chrome()
+    r = cutie(c, source)["rect"]
+    # Expand and close are anchored to the new width, not the old 28 columns.
+    c = app.hover(r["x"]+r["width"]-4, r["y"])
+    actual_click(app, c, r["x"]+r["width"]-4, r["y"])
+    assert selected(app.state()) == source
+    assert app.chrome()["source"] == source_before, "panel movement/resizing rewrote authoritative terminal cells"
+    select_tab(app, main)
+    c = close_cutie(app, source)
+    assert not cuties(c) and selected(app.state()) == main
+    os.kill(data(path)["pid"],0)
+    assert data(path)["size"] == logs[source]["size"] and data(path)["winch"] == logs[source]["winch"]
+    print("PASS: free-grid drag, bounded variable resize and relocated controls preserve source/PTY dimensions and retain mapped mouse/keyboard input")
+
+
+def test_drag_cancel(app):
+    main, workers = setup_workers(app, 3)
+    source, path = workers[1]
+    blocker = workers[2][0]
+    request_frame(workers[0][1], sparse=True, mouse=True, cursor_visible=False)
+    request_frame(path, mouse=True, cursor_visible=False)
+    original = app.chrome()["source"]
+    for identity in (source,blocker):
+        open_cutie(app, identity)
+    c = drag_cutie(app, source, x=40, y=10)
+    r = dict(cutie(c, source)["rect"])
+    obstruction = cutie(c, blocker)["rect"]
+    c = drag_cutie(app, source, x=obstruction["x"], y=obstruction["y"])
+    assert cutie(c, source)["rect"] == r, "drag accepted an overlap with another panel"
+    c = drag_cutie(app, source, x=c["dock"]["x"], y=c["dock"]["y"])
+    assert cutie(c, source)["rect"] == r, "drag accepted an overlap with the primary menu"
+    # Clamp out-of-window positions to a valid free grid corner.
+    c = drag_cutie(app, source, x=-100, y=-100)
+    assert cutie(c, source)["rect"]["x"] == cutie(c, source)["rect"]["y"] == 0
+    c = drag_cutie(app, source, x=40, y=10)
+    for name, command in (("Escape",r"key 53 0 \x1b \x1b"),
+                          ("focus loss","cmd focus 0"), ("minimize","cmd preview-event minimize")):
+        c = drag_cutie(app, source, x=45, y=12, finish=False)
+        kept = dict(cutie(c, source)["rect"])
+        cw,ch = c["cell"]["width"],c["cell"]["height"]
+        before_scroll = {identity: tab(app.state(), identity)["view"] for identity, _ in workers}
+        app.send(f"cmd wheel {70*cw},{30*ch},-3")
+        for button in ("right", "middle"):
+            app.send(f"cmd pointer {button}-down {70*cw},{30*ch}")
+            app.send(f"cmd pointer {button}-up {70*cw},{30*ch}")
+        captured = app.chrome()
+        assert captured["tv_drag_slot"] >= 0 and cutie(captured, source)["rect"] == kept, \
+            "wheel or auxiliary mouse button disrupted the captured panel drag"
+        assert {identity: tab(app.state(), identity)["view"] for identity, _ in workers} == before_scroll, \
+            "wheel during a panel drag scrolled an underlying terminal"
+        app.send(command)
+        c = app.chrome()
+        assert c["tv_drag_slot"] < 0, name+" left Cutie pointer capture active"
+        if name == "Escape":
+            # The native local event monitor must consume the outstanding press
+            # even if the final pointer lies over a WKWebView instead of HCView.
+            for event in ("monitor-drag", "monitor-up"):
+                app.send(f"cmd pointer {event} {70*cw},{30*ch}")
+                assert app.chrome()["monitor_consumed"], "cancelled drag escaped the native event monitor"
+        else:
+            app.send(f"cmd pointer drag {70*cw},{30*ch}")
+            app.send(f"cmd pointer up {70*cw},{30*ch}")
+        app.send("cmd focus 1")
+        c = app.chrome()
+        assert cutie(c, source)["rect"] == kept, name+" allowed a stale pointer drag to continue"
+        assert c["source"] == original and selected(app.state()) == main
+        assert data(workers[0][1])["input"] == data(path)["input"] == "", name+" leaked a drag/cancel event into a PTY"
+        c = drag_cutie(app, source, x=40, y=10)
+    check_geometry(c)
+    app.snap("cutie-cancelled-drag-retains-last-valid-position")
+    print("PASS: collisions are rejected, movement clamps to viewport and Escape/focus/minimize cancel capture without stale motion or PTY leakage")
+
+
+def test_markers(app):
+    main, workers = setup_workers(app, 3)
+    source, path = workers[1]
+    request_frame(path, sparse=True, cursor_visible=False)
+    request_frame(workers[2][1], sparse=True, cursor_visible=False)
+    logs = {identity: data(p) for identity, p in workers}
+
+    def tab_cell(c, identity):
+        index = next(i for i,t in enumerate(app.state()["tabs"]) if t["id"] == identity)
+        return c["dock"]["x"]+c["dock"]["width"]-4, c["tab_rows"][index]//c["cell"]["height"]
+
+    def glyph_mask(image,c,x,y):
+        cw,ch = c["cell"]["width"],c["cell"]["height"]
+        # Ignore the frame's top/bottom hairlines when comparing a header
+        # control with the same glyph in a plain primary-menu tab row.
+        pixels = image.crop(x*cw,y*ch+3,cw,ch-4)
+        values = [pixels[i:i+4] for i in range(0,len(pixels),4)]
+        background = Counter(values).most_common(1)[0][0]
+        return tuple(value != background for value in values)
+
+    c = app.chrome()
+    x,y = tab_cell(c,source)
+    c = app.hover(x,y)
+    square = glyph_mask(app.snap("cutie-tab-closed-hover-square"),c,x,y)
+    assert any(square), "closed tab has no Cutie opening icon"
+    actual_click(app,c,x,y)
+    c = app.hover(-1,-1)
+    x,y = tab_cell(c,source)
+    image = app.snap("cutie-tab-open-persistent-square")
+    assert glyph_mask(image,c,x,y) == square, "open Cutie lacks its persistent non-hover square marker"
+    assert not any(glyph_mask(image,c,x+2,y)), "non-hover tab exposes its process-close control"
+    c = app.hover(x,y)
+    image = app.snap("cutie-tab-open-hover-minimize")
+    minus = glyph_mask(image,c,x,y)
+    assert any(minus) and minus != square and sum(minus) < sum(square), \
+        "open Cutie hover icon did not change to a minimize stroke"
+    r = cutie(c,source)["rect"]
+    assert glyph_mask(image,c,r["x"]+r["width"]-2,r["y"]) == minus, \
+        "Cutie header does not use the matching minimize icon"
+    actual_click(app,c,x,y)
+    c = app.hover(-1,-1)
+    assert not cuties(c) and selected(app.state()) == main
+    x,y = tab_cell(c,source)
+    assert not any(glyph_mask(app.snap("cutie-tab-minimized-no-marker"),c,x,y)), \
+        "minimized Cutie leaves a persistent open marker"
+    os.kill(data(path)["pid"],0)
+    c = open_cutie(app,source)
+    c = drag_cutie(app,source,x=40,y=10)
+    c = app.hover(-1,-1)
+
+    def border(c,highlighted,label):
+        tv = cutie(c,source)
+        assert bool(tv["highlighted"]) == highlighted
+        image = app.snap(label)
+        r=tv["rect"];cw,ch=c["cell"]["width"],c["cell"]["height"]
+        # Stay above glyph ink and away from rounded corners. Both strokes
+        # must be actual single device pixels, separated by one empty pixel.
+        x=(r["x"]+r["width"]//2)*cw;y=r["y"]*ch
+        outer,gap,inner,inside=(pixel(image,x,y+dy) for dy in range(4))
+        assert outer != gap and gap == inside, "Cutie top border is not a separated one-pixel stroke"
+        assert (inner == outer) if highlighted else (inner == gap), \
+            "selected/preview Cutie border did not switch between one and two hairlines"
+
+    border(c,False,"cutie-unselected-single-border")
+    x,y=tab_cell(c,source)
+    c=app.hover(x-8,y)
+    assert c["preview"]["preview_id"] == source and selected(app.state()) == main
+    border(c,True,"cutie-hover-preview-double-border")
+    c=app.hover(-1,-1)
+    border(c,False,"cutie-after-preview-single-border")
+    select_tab(app,source)
+    c=app.hover(-1,-1)
+    border(c,True,"cutie-selected-double-border")
+    select_tab(app,main)
+    c=app.hover(-1,-1)
+    border(c,False,"cutie-restored-selection-single-border")
+    for identity,p in workers:
+        stable_pty(logs[identity],data(p))
+    print("PASS: persistent square/hover minus and panel minus minimize without stopping source; selected/preview panels have separated device-pixel double borders")
+
+
 def main():
     cases = {"live": test_live, "input": test_input, "mouse-cursor": test_mouse_cursor,
              "focus-reports": test_focus_reports, "capacity": test_capacity,
-             "source-close": test_source_close, "browser": test_browser}
+             "source-close": test_source_close, "browser": test_browser,
+             "tab-order": test_tab_order, "geometry": test_geometry, "drag-cancel": test_drag_cancel,
+             "markers": test_markers}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=cases)
     parser.add_argument("--artifacts", type=Path, default=Path("build/cutie-native"))

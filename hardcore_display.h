@@ -239,7 +239,7 @@ static void chrome_autoplace_prepare(Term *t, const Cell *input, const unsigned 
     held = (!g_focused && !(getenv("HARDCORE_CTL") && test && !strcmp(test, "1"))) ||
            g_chrome_drag || chrome_hovered() || chrome_preview_active() || g_sel_on || g_sel_drag || g_sb_drag;
 #ifndef _WIN32
-    held=held || chrome_any_tv_hovered() || g_cutie_focus_id>0;
+    held=held || chrome_any_tv_hovered() || g_cutie_focus_id>0 || g_tv_drag_slot>=0;
 #endif
     blocked = held || (uint32_t)(now - g_chrome_input_at) < 700;
     action = cm_observe(&g_chrome_motion, now, hash, chrome_motion_context(t),

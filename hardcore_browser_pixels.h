@@ -2,14 +2,17 @@
    Runs once per thumbnail/font/theme change; drawing uses cached palette IDs. */
 #ifndef HARDCORE_BROWSER_PIXELS_H
 #define HARDCORE_BROWSER_PIXELS_H
+#include "hardcore_browser_image_geometry.h"
 static void browser_image_size(int width,int height,int cw,int ch,int *cols,int *rows) {
     if(width<1)width=1;if(height<1)height=1;if(cw<1)cw=1;if(ch<1)ch=1;
     double scale=1;
-    if(width>12*cw)scale=(double)(12*cw)/width;
-    if(height*scale>4*ch)scale=(double)(4*ch)/height;
+    /* Twice the old maximum in each direction. Smaller originals retain
+       their native size, rounded to the nearest complete character cell. */
+    if(width>(double)BROWSER_IMAGE_COLUMNS*cw)scale=(double)BROWSER_IMAGE_COLUMNS*cw/width;
+    if(height*scale>(double)BROWSER_IMAGE_ROWS*ch)scale=(double)BROWSER_IMAGE_ROWS*ch/height;
     *cols=(int)(width*scale/cw+.5);*rows=(int)(height*scale/ch+.5);
-    if(*cols<1)*cols=1;if(*cols>12)*cols=12;
-    if(*rows<1)*rows=1;if(*rows>4)*rows=4;
+    if(*cols<1)*cols=1;if(*cols>BROWSER_IMAGE_COLUMNS)*cols=BROWSER_IMAGE_COLUMNS;
+    if(*rows<1)*rows=1;if(*rows>BROWSER_IMAGE_ROWS)*rows=BROWSER_IMAGE_ROWS;
 }
 static void browser_image_quantize(const unsigned char *rgba,int sw,int sh,unsigned char *out,int w,int h,
     const uint32_t *palette,int count,uint32_t background) {

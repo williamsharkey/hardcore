@@ -7,7 +7,7 @@ static void browser_image_ready(int tabID);
     NSMutableData *received;
     NSData *rgba;
     NSURLSession *session;
-    int owner,sw,sh,cols,rows,qw,qh;
+    int owner,sw,sh,source_width,source_height,cols,rows,qw,qh;
     unsigned char *indexed;
     uint32_t palette[18],background;
     int failed;
@@ -41,19 +41,32 @@ static void browser_image_ready(int tabID);
 - (void)decode:(NSData *)data {
     if(!data.length)return;
     CGImageSourceRef src=CGImageSourceCreateWithData((CFDataRef)data,NULL);if(!src)return;
+    NSDictionary *properties=[(NSDictionary *)CGImageSourceCopyPropertiesAtIndex(src,0,NULL) autorelease];
+    long long original_width=[properties[(id)kCGImagePropertyPixelWidth] longLongValue];
+    long long original_height=[properties[(id)kCGImagePropertyPixelHeight] longLongValue];
+    int orientation=[properties[(id)kCGImagePropertyOrientation] intValue];
+    if(orientation>=5 && orientation<=8) {
+        long long swap=original_width;original_width=original_height;original_height=swap;
+    }
     CGImageRef image=CGImageSourceCreateThumbnailAtIndex(src,0,(CFDictionaryRef)@{
-        (id)kCGImageSourceCreateThumbnailFromImageAlways:@YES,(id)kCGImageSourceThumbnailMaxPixelSize:@128,
+        (id)kCGImageSourceCreateThumbnailFromImageAlways:@YES,(id)kCGImageSourceThumbnailMaxPixelSize:@(BROWSER_IMAGE_DECODE_LIMIT),
         (id)kCGImageSourceCreateThumbnailWithTransform:@YES,(id)kCGImageSourceShouldCacheImmediately:@YES});
     CFRelease(src);if(!image)return;
     sw=(int)CGImageGetWidth(image);sh=(int)CGImageGetHeight(image);
-    if(sw<1 || sh<1 || sw>128 || sh>128){CGImageRelease(image);return;}
+    if(sw<1 || sh<1 || sw>BROWSER_IMAGE_DECODE_LIMIT || sh>BROWSER_IMAGE_DECODE_LIMIT){CGImageRelease(image);return;}
+    if(original_width>0 && original_width<=INT_MAX && original_height>0 && original_height<=INT_MAX) {
+        source_width=(int)original_width;source_height=(int)original_height;
+    } else {
+        if(source_width<1)source_width=sw;if(source_height<1)source_height=sh;
+    }
     NSMutableData *pixels=[NSMutableData dataWithLength:(NSUInteger)sw*sh*4];
     CGColorSpaceRef color=CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGContextRef context=CGBitmapContextCreate(pixels.mutableBytes,sw,sh,8,sw*4,color,kCGImageAlphaPremultipliedLast|kCGBitmapByteOrder32Big);
     CGColorSpaceRelease(color);
     if(context) {
         CGContextSetInterpolationQuality(context,kCGInterpolationNone);
-        CGContextTranslateCTM(context,0,sh);CGContextScaleCTM(context,1,-1);
+        /* ImageIO already applies EXIF orientation. Bitmap memory is read
+           top-to-bottom by the grid; a view-coordinate flip inverts it. */
         CGContextDrawImage(context,CGRectMake(0,0,sw,sh),image);
         [rgba release];rgba=[pixels copy];CGContextRelease(context);
     }

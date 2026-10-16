@@ -2,6 +2,7 @@
    rectangles, with text flowing beside them. No platform dependencies. */
 #ifndef HARDCORE_BROWSER_GRID_H
 #define HARDCORE_BROWSER_GRID_H
+#include "hardcore_browser_image_geometry.h"
 #define BROWSER_IMAGE 8
 typedef struct {
     Cell *cells;
@@ -217,9 +218,11 @@ static int browser_grid_layout_nodes(const BrowserBlock *blocks,int count,Cell *
             const Cell *token=block->cells+from;
             uint16_t node=block->nodes ? block->nodes[from] : 0;
             if(token->wflag&BROWSER_IMAGE) {
-                int width=token->fg>12?12:(int)token->fg,height=token->bg>4?4:(int)token->bg,fit=1;
-                if(width<1)width=1; if(width>12)width=12;
-                if(height<1)height=1; if(height>4)height=4;
+                int width=token->fg>BROWSER_IMAGE_COLUMNS?BROWSER_IMAGE_COLUMNS:(int)token->fg;
+                int height=token->bg>BROWSER_IMAGE_ROWS?BROWSER_IMAGE_ROWS:(int)token->bg,fit=1;
+                if(width<1)width=1;
+                if(height<1)height=1;
+                int original_width=width;
                 if(width>cols)width=cols;
                 for(int y=0;y<height;y++) {
                     int a,z; browser_grid_span(cols,screen+y,side,dx,dy,dw,dh,0,&a,&z);
@@ -227,10 +230,16 @@ static int browser_grid_layout_nodes(const BrowserBlock *blocks,int count,Cell *
                     else if(width>z-cursor)width=z-cursor;
                 }
                 if(!fit) { row++;cursor=-1;continuation=0;continue; }
+                /* A narrow lane scales the whole image, rather than squeezing
+                   its width while retaining the old height. */
+                if(width<original_width) {
+                    height=(height*width+original_width/2)/original_width;
+                    if(height<1)height=1;
+                }
                 for(int y=0;y<height;y++) if(screen+y>=0 && screen+y<rows)
                     for(int x=0;x<width;x++) {
                         Cell cell={0};cell.ch=token->ch|((uint32_t)width<<8)|((uint32_t)height<<16);cell.wflag=BROWSER_IMAGE;cell.link=token->link;
-                        cell.attr=(uint8_t)(x+(y<<4));
+                        cell.attr=(uint8_t)(x+(y<<BROWSER_IMAGE_TILE_SHIFT));
                         int at=(screen+y)*cols+cursor+x; output[at]=cell; if(nodes)nodes[at]=node;
                     }
                 if(nf<32) {floats[nf].top=row;floats[nf].bottom=row+height;floats[nf++].right=cursor+width;}

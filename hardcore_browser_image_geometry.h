@@ -1,0 +1,9 @@
+/* Shared bounds for the image atlas and the grid's packed tile coordinates. */
+#ifndef HARDCORE_BROWSER_IMAGE_GEOMETRY_H
+#define HARDCORE_BROWSER_IMAGE_GEOMETRY_H
+enum {
+    BROWSER_IMAGE_COLUMNS=24, BROWSER_IMAGE_ROWS=8,
+    BROWSER_IMAGE_TILE_SHIFT=5, BROWSER_IMAGE_TILE_MASK=31,
+    BROWSER_IMAGE_DECODE_LIMIT=512
+};
+#endif

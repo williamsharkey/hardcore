@@ -4,7 +4,7 @@ enum {
     HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT,
     HIT_SCHEME, HIT_STAB, HIT_SCLOSE, HIT_UNDERLAY, HIT_TABPAGE, HIT_SETPAGE,
     HIT_REFLOW, HIT_REFLOW_DEBUG, HIT_DOCK_ROW, HIT_CHROME_INERT, HIT_GRIP,
-    HIT_WEB, HIT_FILES, HIT_CAF, HIT_TV, HIT_TV_CLOSE, HIT_CUTIE
+    HIT_WEB, HIT_FILES, HIT_CAF, HIT_TV, HIT_TV_CLOSE, HIT_CUTIE, HIT_TV_GRIP, HIT_TV_RESIZE
 };
 static int plat_lights_bottom(void);
 static void plat_settings_shown(void);
@@ -44,6 +44,7 @@ static ChromePackRow *g_chrome_menu_rows;
 static int g_chrome_menu_count, g_chrome_menu_capacity, g_chrome_menu_top;
 static int g_chrome_menu_x, g_chrome_menu_cw, g_chrome_menu_ch, g_chrome_menu_raised;
 static float g_chrome_menu_alpha = 1;
+static int g_chrome_surface_cols = SB_COLS, g_chrome_menu_cols = SB_COLS;
 /* This map describes the last painted frame, not a speculative hover frame.
    A click before the hover repaint therefore cannot activate hidden controls. */
 static int chrome_menu_source_col(int row, int col) {

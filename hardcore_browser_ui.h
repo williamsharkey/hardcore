@@ -345,13 +345,15 @@ static int mac_browser_hover_link(void) {
 static void mac_browser_draw_tile(Tab *tb,const Cell *cell,int x,int y) {
     HCBrowser *b=browser_for(tb);int id=cell->ch&255;if(!b || id<1 || id>(int)b->images.count)return;
     HCBrowserImage *image=b->images[id-1];int width=(cell->ch>>8)&255,height=(cell->ch>>16)&255;
+    if(width<1 || width>BROWSER_IMAGE_COLUMNS || height<1 || height>BROWSER_IMAGE_ROWS)return;
     int scale=MAX(1,g_scale),cw=CW/scale,ch=CH/scale;
     browser_image_palette(image,width*cw,height*ch);
     if(!image->indexed) {
         if(!cell->attr)browser_ui_text(image->failed ? @"[img]" : @"[…]",x,y,MIN(width,5),g_look.dim);
         return;
     }
-    int tx=cell->attr&15,ty=cell->attr>>4;
+    int tx=cell->attr&BROWSER_IMAGE_TILE_MASK,ty=cell->attr>>BROWSER_IMAGE_TILE_SHIFT;
+    if(tx>=width || ty>=height)return;
     for(int py=0;py<ch;py++) {
         int px=0;while(px<cw) {
             unsigned char color=image->indexed[(ty*ch+py)*image->qw+tx*cw+px];int end=px+1;

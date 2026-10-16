@@ -152,6 +152,70 @@ class InstallTests(unittest.TestCase):
         self.assertTrue((self.bindir / "hardcore").is_symlink())
         self.assertEqual((self.app / "Contents/MacOS/hardcore").read_text(), "new")
 
+    def portable_command(self):
+        self.bindir.mkdir(parents=True, exist_ok=True)
+        command = self.bindir/"hardcore"
+        command.write_bytes(installer.HERE_LAUNCHER_HEADER + b"print('portable launcher')\n")
+        command.chmod(0o755)
+        return command
+
+    def test_portable_first_install_migrates_atomically_after_validation(self):
+        command = self.portable_command();original = command.read_bytes()
+        real_process = self.process;real_replace = os.replace;replacements = []
+        def checked_process(argv, **kwargs):
+            if argv[-1] != "--reload":
+                self.assertFalse(command.is_symlink())
+                self.assertEqual(command.read_bytes(), original)
+            return real_process(argv, **kwargs)
+        def checked_replace(source, target):
+            self.assertEqual(Path(target), command)
+            self.assertTrue(Path(source).is_symlink())
+            self.assertEqual(command.read_bytes(), original)
+            self.assertEqual(len(self.calls), 2)  # signature and protocol passed
+            self.assertEqual((self.app/"Contents/MacOS/hardcore").read_text(), "new")
+            replacements.append(target);return real_replace(source, target)
+        self.process = checked_process
+        with mock.patch.object(installer.os, "replace", side_effect=checked_replace):
+            self.install()
+        self.assertEqual(replacements, [command])
+        self.assertEqual(command.resolve(), (self.app/"Contents/MacOS/hardcore").resolve())
+        self.assertFalse(list(self.bindir.glob(".hardcore-command-*")))
+
+    def test_validation_failure_keeps_portable_launcher_and_old_app(self):
+        self.old_app();command = self.portable_command();original = command.read_bytes()
+        for result in (subprocess.CalledProcessError(1, "codesign"),
+                       subprocess.CompletedProcess([], 0, stdout="unknown protocol\n")):
+            with self.subTest(result=result), \
+                 mock.patch.object(installer.subprocess, "run", side_effect=result if isinstance(result, Exception) else None,
+                                   return_value=result):
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    installer.install(self.source, self.appdir, self.bindir)
+            self.assertFalse(command.is_symlink())
+            self.assertEqual(command.read_bytes(), original)
+            self.assertEqual((self.app/"Contents/MacOS/hardcore").read_text(), "old")
+            self.assertFalse(self.backup.exists())
+
+    def test_partial_or_embedded_portable_marker_does_not_allow_overwrite(self):
+        self.bindir.mkdir();command = self.bindir/"hardcore"
+        for text in (b"#!/bin/sh\n# HARDCORE_TERMINAL_LAUNCHER_V1\necho keep\n",
+                     b"#!/usr/bin/env python3\n# HARDCORE_TERMINAL_LAUNCHER_V10\n"):
+            command.write_bytes(text)
+            with self.assertRaises(SystemExit):self.install()
+            self.assertEqual(command.read_bytes(), text)
+            self.assertFalse(self.calls)
+
+    def test_command_changed_during_validation_is_preserved(self):
+        self.old_app();command = self.portable_command();real_process = self.process
+        def changed_process(argv, **kwargs):
+            command.write_text("user replaced this command")
+            return real_process(argv, **kwargs)
+        self.process = changed_process
+        with self.assertRaisesRegex(SystemExit, "command changed"):
+            self.install()
+        self.assertEqual(command.read_text(), "user replaced this command")
+        self.assertEqual((self.app/"Contents/MacOS/hardcore").read_text(), "old")
+        self.assertFalse(self.backup.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

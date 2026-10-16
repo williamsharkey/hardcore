@@ -128,8 +128,9 @@ bench/termbench.exe: bench/termbench.c
 selftest: hardcore.exe
 	./hardcore.exe --selftest selftest.txt; rc=$$?; cat selftest.txt; exit $$rc
 
-win-install: hardcore.exe
-	powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/install.ps1 -Exe "$$(wslpath -w hardcore.exe 2>/dev/null || echo hardcore.exe)"
+win-install: hardcore.exe tools/here.py
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/install.ps1 -Exe "$$(wslpath -w hardcore.exe 2>/dev/null || echo hardcore.exe)" -HereScript "$$(wslpath -w tools/here.py 2>/dev/null || echo tools/here.py)"
+	python3 tools/install_here.py "$(BINDIR)"
 
 # ── macOS ──────────────────────────────────────────────────────────────
 
@@ -149,7 +150,7 @@ build/hardcore.metallib: hardcore.metal
 build/browser.inc: tools/embed_browser.py browser/project.js browser/welcome.html $(wildcard browser/adapters/*.js)
 	python3 tools/embed_browser.py
 
-build/hardcore: build/browser.inc hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
+build/hardcore: build/browser.inc hardcore_browser_image_geometry.h hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
@@ -159,13 +160,13 @@ build/hardcore.icns: tools/gen_icon.py
 CLAUDE_PLUGINS = plugins/.claude-plugin/marketplace.json \
                  $(wildcard plugins/*/.claude-plugin/*.json plugins/*/hooks/*.json plugins/*/hooks/*.js plugins/*/README.md)
 
-$(APP): tools/files.py build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
+$(APP): tools/here.py tools/files.py build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
 	rm -rf $@
 	mkdir -p $@/Contents/MacOS $@/Contents/Resources
 	cp build/hardcore $@/Contents/MacOS/hardcore
 	cp build/hardcore.icns $@/Contents/Resources/hardcore.icns
 	cp tools/update_mac.py $@/Contents/Resources/update_mac.py
-	cp tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py tools/files.py $@/Contents/Resources/
+	cp tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py tools/files.py tools/here.py $@/Contents/Resources/
 	mkdir -p $@/Contents/Resources/plugins
 	cp -R plugins/.claude-plugin plugins/hardcore-slurp plugins/hardcore-slurp-driver $@/Contents/Resources/plugins/
 	sed 's/@VERSION@/$(shell sed -n 's/^#define HARDCORE_VERSION "\(.*\)"/\1/p' hardcore.c)/' tools/Info.plist > $@/Contents/Info.plist
@@ -209,7 +210,7 @@ mac-release: $(APP)
 
 # Build and deterministic regressions without live shell-clone or GUI probes.
 .PHONY: mac-offline-test
-mac-offline-test: mac-release reflow-test browser-test
+mac-offline-test: mac-release reflow-test browser-test here-test
 	python3 tests/test_cutie_browser.py
 	python3 tests/test_mac_caf.py
 	python3 tests/test_files.py
@@ -310,6 +311,7 @@ reflow-test:
 	build/test-chrome-motion
 	python3 tests/test_chrome_pack.py
 	python3 tests/test_chrome_edges.py
+	python3 tests/test_chrome_capture.py
 	python3 tests/test_chrome_search.py
 	python3 tests/test_tv.py
 	python3 tests/test_tv_layout.py
@@ -332,7 +334,25 @@ chrome-test: $(APP)
 browser-test: build/browser.inc
 	cc -std=c99 -O2 -Wall -Wextra tests/test_browser_grid.c -o build/test-browser-grid
 	build/test-browser-grid
+	python3 tests/test_browser_image_decode.py
 	node --check browser/project.js
 	node tests/test_browser_dom.js
 	cc -std=c99 -O2 -Wall -Wextra -Wno-unused-function tests/browser_document_dump.c -o build/browser-document-dump
 	node tests/test_wikipedia.js --preview
+
+# Portable terminal-hosted mode, with no graphics or cross compiler required.
+.PHONY: install-here here-test
+install-here:
+	python3 tools/install_here.py "$(BINDIR)"
+here-test:
+	python3 tests/test_here.py
+	python3 tests/test_here_events.py
+	python3 tests/test_here_install.py
+
+.PHONY: mac-here-test
+mac-here-test: $(APP)
+	python3 tests/test_here_dispatch.py
+
+.PHONY: mac-browser-images-test
+mac-browser-images-test: $(APP)
+	python3 tests/test_browser_images_mac.py

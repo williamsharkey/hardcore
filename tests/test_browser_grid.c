@@ -204,7 +204,7 @@ int main(void) {
         browser_grid_layout_nodes(&illustrated,1,out,mapped,50,40,0,side,side==1?34:0,0,16,8);
         int count=0;
         for(int i=0;i<50*40;i++) {
-            if(out[i].wflag&BROWSER_IMAGE){count++;assert(mapped[i]==42);assert((out[i].ch&255)==1);assert((out[i].attr&15)<8 && (out[i].attr>>4)<3);}
+            if(out[i].wflag&BROWSER_IMAGE){count++;assert(mapped[i]==42);assert((out[i].ch&255)==1);assert((out[i].attr&BROWSER_IMAGE_TILE_MASK)<8 && (out[i].attr>>BROWSER_IMAGE_TILE_SHIFT)<3);}
             else if(out[i].ch=='a')assert(mapped[i]==43);
         }
         assert(count==24);
@@ -215,7 +215,31 @@ int main(void) {
     int varied=0;for(int i=0;i<64*64;i++){assert(indexed[i]<3);varied|=indexed[i]!=indexed[0];}assert(varied);
     memset(rgba,0,sizeof(rgba));browser_image_quantize(rgba,4,4,indexed,64,64,palette,3,0x808080);
     for(int i=0;i<64*64;i++)assert(indexed[i]==2);
-    for(int w=1;w<4000;w+=97)for(int h=1;h<2000;h+=61){int cols,rows;browser_image_size(w,h,8,16,&cols,&rows);assert(cols>=1 && cols<=12 && rows>=1 && rows<=4);}
+    for(int w=1;w<4000;w+=97)for(int h=1;h<2000;h+=61){int cols,rows;browser_image_size(w,h,8,16,&cols,&rows);assert(cols>=1 && cols<=24 && rows>=1 && rows<=8);}
+    int image_cols,image_rows;
+    browser_image_size(384,256,8,16,&image_cols,&image_rows);assert(image_cols==24 && image_rows==8);
+    browser_image_size(64,48,8,16,&image_cols,&image_rows);assert(image_cols==8 && image_rows==3);
+    browser_image_size(12,24,8,16,&image_cols,&image_rows);assert(image_cols==2 && image_rows==2);
+    browser_image_size(INT_MAX,INT_MAX,INT_MAX,INT_MAX,&image_cols,&image_rows);assert(image_cols==1 && image_rows==1);
+    /* The doubled image width needs five x bits; column16 must not alias
+       column0 on the following row. Every tile and its action stays unique. */
+    Cell big_image={.ch=3,.fg=24,.bg=8,.wflag=BROWSER_IMAGE,.link=7};uint16_t image_node=91;
+    BrowserBlock big_picture={.cells=&big_image,.count=1,.nodes=&image_node};
+    browser_grid_layout_nodes(&big_picture,1,out,mapped,50,40,0,0,0,0,0,0);
+    unsigned char seen_tiles[256]={0};int image_tiles=0;
+    for(int i=0;i<50*40;i++)if(out[i].wflag&BROWSER_IMAGE) {
+        int tx=out[i].attr&BROWSER_IMAGE_TILE_MASK,ty=out[i].attr>>BROWSER_IMAGE_TILE_SHIFT;
+        assert(tx==i%50 && ty==i/50 && tx<24 && ty<8);
+        assert(!seen_tiles[out[i].attr]++ && mapped[i]==91 && out[i].link==7);
+        assert(((out[i].ch>>8)&255)==24 && ((out[i].ch>>16)&255)==8);image_tiles++;
+    }
+    assert(image_tiles==24*8);
+    browser_grid_layout_nodes(&big_picture,1,out,mapped,12,40,0,0,0,0,0,0);
+    image_tiles=0;
+    for(int i=0;i<12*40;i++)if(out[i].wflag&BROWSER_IMAGE) {
+        assert(((out[i].ch>>8)&255)==12 && ((out[i].ch>>16)&255)==4);image_tiles++;
+    }
+    assert(image_tiles==12*4); /* Narrow lanes retain approximate aspect. */
     puts("PASS browser grid/pixels: inline image flow, DOM maps, palette dithering, alpha and image bounds");
     puts("PASS browser grid: both docks, viewport scrolling, literal lines, narrow fallback, wide glyphs and 500 randomized documents");
     return 0;

@@ -26,7 +26,7 @@ typedef struct { uint32_t ch,fg,bg; uint8_t attr,wflag; uint16_t link; } Cell;
 typedef struct { Cell *cells; int count; } BrowserBlock;
 typedef struct { int cols,rows,m_cursor_vis,view; Cell *row[1][10]; int rlen[1][10]; } Term;
 typedef struct { Term t; int browser_native; void *browser; } Tab;
-@interface HCBrowserImage : NSObject { @public int sw,sh,cols,rows; }
+@interface HCBrowserImage : NSObject { @public int sw,sh,source_width,source_height,cols,rows; }
 @end
 @implementation HCBrowserImage
 @end

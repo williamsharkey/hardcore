@@ -19,11 +19,12 @@ HARNESS=r'''
 #define CH 20
 #define TIMER_TV 7
 #include "hardcore_chrome_pack.h"
-enum{HIT_NONE,HIT_TV_CLOSE,HIT_TV,HIT_STAB,HIT_SETPAGE,HIT_CHROME_INERT,HIT_FONT,HIT_SCHEME};
+enum{HIT_NONE,HIT_TV_GRIP,HIT_TV_RESIZE,HIT_TV_CLOSE,HIT_TV,HIT_STAB,HIT_SETPAGE,HIT_CHROME_INERT,HIT_FONT,HIT_SCHEME};
 typedef struct{int top,bottom,section_row,list_row,list_count,list_capacity;}ChromeLayout;
 static ChromePackRow *g_chrome_menu_rows;
 static int g_chrome_menu_count,g_chrome_menu_capacity,g_chrome_menu_top,g_chrome_menu_x,g_chrome_menu_cw,g_chrome_menu_ch,g_chrome_menu_raised;
 static float g_chrome_menu_alpha;
+static int g_chrome_menu_cols=SB_COLS;
 static int g_settings_tab=1,g_setting_offset[3],g_font_menu_count=8,g_sel_drag,g_mouse_x=-1,g_mouse_y=-1,g_settings_open;
 static const struct{int light,dark;}FAMILIES[NFAMILIES]={{0,1}};
 typedef struct {int id,browser_native;} Tab;
@@ -43,6 +44,7 @@ static int chrome_pager_geometry(int a,int b,int c,int d,int *e,int *f){(void)a;
 #include "hardcore_tv_ui.h"
 static ChromePackRow rows[12];
 static void init(void){
+    g_chrome_menu_cols=SB_COLS;g_tv_drag_slot=-1;g_tv_drag_mode=0;
     memset(g_tvs,0,sizeof(g_tvs));memset(rows,0,sizeof(rows));g_settings_tab=1;g_setting_offset[1]=0;
     memset(tabs,0,sizeof(tabs));g_cutie_focus_id=g_timer=g_invalidations=g_settings_open=0;now=1000;
     for(int i=0;i<8;i++)tabs[i].id=100+i;
@@ -81,8 +83,10 @@ static void caf(void){
 }
 static void lifecycle(void){
     init();assert(chrome_tv_open_tab(0)==-1&&chrome_tv_open_tab(999)==-1);
+    assert(chrome_tv_slot_for(0)==-1&&chrome_tv_slot_for(100)==-1);
     tabs[0].browser_native=1;int first=chrome_tv_open_tab(100);
     assert(first==HC_TV_CUTIE_FIRST&&g_tvs[first].tab_id==100);
+    assert(chrome_tv_slot_for(100)==first);
     chrome_tv_scroll(first,7);assert(chrome_tv_open_tab(100)==first&&g_tvs[first].scroll==7);
     /* Tab reordering never changes the source identity. */
     Tab tmp=tabs[0];tabs[0]=tabs[1];tabs[1]=tmp;
@@ -93,6 +97,7 @@ static void lifecycle(void){
     chrome_tv_scroll(first,INT_MAX);assert(g_tvs[first].scroll==INT_MAX);
     chrome_tv_scroll(first,INT_MIN);assert(g_tvs[first].scroll==0);
     g_cutie_focus_id=100;chrome_tv_close_slot(first);assert(!g_cutie_focus_id&&!g_tvs[first].state.open);
+    assert(chrome_tv_slot_for(100)==-1);
     assert(chrome_tv_open_tab(104)==first&&g_tvs[first].scroll==0&&g_tvs[first].frame.count==0);
     tabs[4].id=0;g_cutie_focus_id=104;chrome_tv_prune();
     assert(!g_tvs[first].state.open&&!g_cutie_focus_id);
@@ -111,6 +116,11 @@ static void cutie_hit(void){
     g_tvs[HC_TV_COUNT-1].tab_id=100;
     rows[3].actionable[5]=0; /* terminal body uses projection, not word packing */
     assert(hit(5,13,&idx)==HIT_TV&&idx==HC_TV_COUNT-1);
+    assert(hit(22,10,&idx)==HIT_TV_GRIP);
+    assert(hit(27,21,&idx)==HIT_TV_RESIZE);
+    assert(hit(25,21,&idx)==HIT_TV);
+    g_tvs[HC_TV_COUNT-1].frame.cols--;assert(hit(22,10,&idx)==HIT_NONE);
+    g_tvs[HC_TV_COUNT-1].frame.cols++;
     rows[0].src[24]=26;rows[0].actionable[26]=0;
     assert(hit(24,10,&idx)==HIT_TV_CLOSE&&idx==HC_TV_COUNT-1);
     assert(hit(26,10,&idx)==HIT_NONE);
