@@ -1972,8 +1972,10 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     NSRect cell = NSMakeRect(0, 0, CW / s, CH / s);
     (void)r; (void)a;
     if (tb) {
-        cell.origin.x = (term_ox() + tb->t.cx * CW) / s;
-        cell.origin.y = (term_oy() + (tb->t.cy + 1) * CH) / s;
+        int col, row;
+        display_cursor_position(&tb->t, &col, &row);
+        cell.origin.x = (term_ox() + col * CW) / s;
+        cell.origin.y = (term_oy() + (row + 1) * CH) / s;
     }
     return [g_win convertRectToScreen:[self convertRect:cell toView:nil]];
 }
@@ -2445,6 +2447,10 @@ static void ctl_chrome(const char *path) {
     state[@"titlebar"] = @{@"height":@(mac_title_height()), @"hovered":@(g_mac_title_hover),
         @"buttons_visible":@(![[g_win standardWindowButton:NSWindowCloseButton] isHidden]),
         @"button_rects":button_rects, @"selection_drag":@(g_sel_drag), @"selection_on":@(g_sel_on)};
+    int cursor_col, cursor_row;
+    display_cursor_position(t, &cursor_col, &cursor_row);
+    state[@"cursor"] = @{@"source":@[@(t->cx), @(t->cy)],
+        @"display":@[@(cursor_col), @(cursor_row)], @"visible":@(t->m_cursor_vis)};
     state[@"fontkey"] = [NSString stringWithFormat:@"%c", g_font->key];
     state[@"schemekey"] = [NSString stringWithFormat:@"%c", g_scheme->key];
     state[@"motion"] = @{@"phase":@(g_chrome_motion.phase), @"alpha":@(g_chrome_motion_alpha),

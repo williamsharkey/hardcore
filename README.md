@@ -126,7 +126,7 @@ rearranges recognizable prose around the menu for display only, using spare
 space in the paragraph's existing rows, then at most three following blank rows.
 If that cannot fit, it can also borrow up to three immediately preceding blank
 rows. It prefers a two-character gap beside the menu, falling back to a flush
-fit before moving a block upward. Rows with meaningful backgrounds, active input,
+fit before moving a block upward. Rows owned by other panels, active input,
 or earlier reflowed content cannot be borrowed. Prose words stay whole and
 unrelated text stays on its original row. A left dock shifts only the rows beside the menu; other rows retain the
 full width. Foreground colors, bold/dim/italic
@@ -143,8 +143,17 @@ A local record block moves its output and details footer together, including
 Codex's `+ 1 line (⌃t to expand)` and `+ N lines (⌃t to expand)` footers, so blank
 rows after the footer are available for continuations. When only
 some records fit, the others retain their complete text beneath the menu.
-Boxes, tables, fenced code, wide/combining text, and input rows remain protected.
-Unrecognized prose backgrounds also keep their original layout.
+Short Started, Completed, and similar status lines can shift intact beside a
+left dock. A record may borrow blank space beyond one such status after its
+details footer, without cascading through later sections. Recognized process
+tables wrap only the COMMAND column. Proven painted diff continuations stay
+joined exactly, including physical midword splits. The empty left wing of the
+centered Back-to-bottom control is usable while that control stays fixed.
+
+Uniform shaded message/input panels with a recognized prompt reflow within
+their own rows and padding. Their cursor, selection, links, and colors follow
+the moved cells. Uncertain panels, ordinary tables, fenced code, and unrelated
+input rows retain their original layout; no content is discarded to make room.
 Mouse reporting does not disable prose reflow; reported mouse
 coordinates map back to the original cells. Ambiguous physical continuations
 retain their original layout rather than acquiring guessed word boundaries.
@@ -1093,10 +1102,11 @@ comparison.
 
 - `make reflow-test` exercises local word wrapping, both dock directions,
   source-cell mapping, paragraph boundaries, protected terminal content, menu
-  word packing, and the placement/fade state machine.
+  word packing, shaded panels, literal continuation chains, and the placement/fade state machine.
 - `make chrome-test` (macOS desktop) checks native menu layout, pagination,
   both underlays, whole-menu hover, reflow, opaque cutouts, and timed atomic
-  relocation using isolated terminal windows.
+  relocation using isolated terminal windows. Complex fixtures also verify
+  process columns, shaded input, and the actual mapped cursor pixels.
 
 - `tests/run_xtermjs.py` replays xterm.js's escape-sequence fixtures through the
   parser (`hardcore.exe --replay`) and diffs against screens captured from real

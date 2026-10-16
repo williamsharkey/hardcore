@@ -37,6 +37,8 @@ HARNESS = r'''
 typedef struct { uint32_t ch, fg, bg; uint8_t attr, wflag; uint16_t link; } Cell;
 #include "hardcore_reflow.h"
 #include "hardcore_chrome_motion.h"
+#include "hardcore_panel_reflow.h"
+#define DEF_BG 0
 #define SB_COLS 28
 #define W_WIDE 1
 typedef struct { int cols, rows, cx, cy, view, m_cursor_vis; } Term;
@@ -53,6 +55,7 @@ static int first_row(void) { return 0; }
 static int chrome_item_total(void) { return fixture_items; }
 static uint32_t GetTickCount(void) { tick += tick_step; return tick; }
 static int chrome_background_safe(const Cell *c) { return !c->bg; }
+static uint32_t chrome_panel_background(const Cell *c) { return c->bg; }
 /* These fixtures use ordinary visible ASCII; rendering-specific occupancy
  * (hidden attributes, combining cells, palette colors) has native coverage. */
 static int cell_covers_chrome(const Cell *c) { return c->ch > ' '; }

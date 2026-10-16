@@ -6,7 +6,13 @@ static int chrome_background_safe(const Cell *c) {
     return bg == DEF_BG;
 }
 #include "hardcore_chrome_motion.h"
+#include "hardcore_panel_reflow.h"
 static ChromeMotion g_chrome_motion;
+static uint32_t chrome_panel_background(const Cell *cell) {
+    uint32_t fg, bg;
+    cell_colors(cell, &fg, &bg);
+    return bg;
+}
 
 static uint64_t chrome_motion_hash(uint64_t hash, const void *data, size_t length) {
     const unsigned char *bytes = (const unsigned char *)data;
@@ -58,6 +64,30 @@ static ChromePlacementScore chrome_motion_score(const Cell *cells, const int *so
     return score;
 }
 
+/* All final and candidate layouts use the same panel pass. Recognized panel
+ * continuations have explicit indentation, so their row boundary is a word
+ * separator; no VT-only metadata is needed to reproduce the exact result. */
+static int chrome_display_build(ChromeReflow *out, const Cell *input, Term *t,
+                                 const unsigned char *protected_rows, int side,
+                                 int dock_x, int dock_y, int dock_width, int dock_height) {
+    int cursor = !t->view && t->m_cursor_vis && t->cx >= 0 && t->cx < t->cols &&
+                 t->cy >= 0 && t->cy < t->rows ? t->cy*t->cols+t->cx : -1;
+    if (!chrome_reflow_build_checked(out, input, t->cols, t->rows, protected_rows,
+                                     side, dock_x, dock_y, dock_width, dock_height, 3,
+                                     chrome_background_safe)) return 0;
+    chrome_panel_reflow_apply(out, input, t->cols, t->rows, NULL, cursor,
+                              side, dock_x, dock_y, dock_width, dock_height,
+                              DEF_BG, chrome_panel_background, &out->cursor);
+    return 1;
+}
+static ChromePlacementScore chrome_motion_display_score(const ChromeReflow *out, Term *t,
+                                                        int side, int row, int height) {
+    Term cursor = *t;
+    if (out->cursor >= 0) { cursor.cx = out->cursor % t->cols; cursor.cy = out->cursor / t->cols; }
+    return chrome_motion_score(out->cells, out->source, t->cols, t->rows,
+                                side, row, height, g_tab_underlay, g_chrome.top, &cursor);
+}
+
 /* Rank cheap raw-grid candidates first, then run the exact reflow engine on
  * a small scratch shortlist. No probe may change display state or pagination.
  * The existing menu capacities must survive the move: shrinking a list is not
@@ -73,11 +103,9 @@ static int chrome_motion_search(Term *t, const Cell *input, const unsigned char 
     int *prefix = NULL;
     uint32_t began = GetTickCount();
     if (height <= 0 || (size_t)t->cols * t->rows > 48000) return 0;
-    if (!chrome_reflow_build_checked(&scratch, input, t->cols, t->rows, protected_rows,
-            side, side == 1 ? t->cols - SB_COLS : 0, g_chrome.top, SB_COLS,
-            height, 3, chrome_background_safe)) return 0;
-    baseline = chrome_motion_score(scratch.cells, scratch.source, t->cols, t->rows,
-                                    side, g_chrome.top, height, side, g_chrome.top, t);
+    if (!chrome_display_build(&scratch, input, t, protected_rows,
+            side, side == 1 ? t->cols - SB_COLS : 0, g_chrome.top, SB_COLS, height)) return 0;
+    baseline = chrome_motion_display_score(&scratch, t, side, g_chrome.top, height);
     chrome_reflow_free(&scratch);
     *winner = baseline;
     if (!baseline.collision_rows) return 0;
@@ -90,16 +118,27 @@ static int chrome_motion_search(Term *t, const Cell *input, const unsigned char 
          * rows which might reflow. Otherwise many tiny protected rows can
          * crowd a much better prose region out of the bounded shortlist. */
         int fenced = 0, tree_indent = -1;
+        ChromeReflowRow *info = (ChromeReflowRow *)calloc((size_t)t->rows, sizeof(*info));
+        if (!info) { free(prefix); free(fixed); return 0; }
         for (int row = 0; row < t->rows; row++) {
             const Cell *line = input + row * t->cols;
-            ChromeReflowRow info = cr_classify(line, t->cols, protected_rows && protected_rows[row],
-                                               fenced, chrome_background_safe, tree_indent);
-            fixed[row] = info.type == CR_PROTECTED;
-            if (info.type == CR_RECORD && info.record == CR_RECORD_TREE) {
-                if (tree_indent < 0) tree_indent = info.body;
-            } else if (!(info.type == CR_RECORD && info.record != CR_RECORD_FOOTER &&
-                         tree_indent >= 0 && info.indent >= tree_indent)) tree_indent = -1;
-            if (cr_fence(line, info.indent, info.end)) fenced = !fenced;
+            ChromeReflowRow *r = info+row;
+            *r = cr_classify(line, t->cols, protected_rows && protected_rows[row],
+                             fenced, chrome_background_safe, tree_indent);
+            if (r->type == CR_RECORD && r->record == CR_RECORD_TREE) {
+                if (tree_indent < 0) tree_indent = r->body;
+            } else if (!(r->type == CR_RECORD && r->record != CR_RECORD_FOOTER &&
+                         tree_indent >= 0 && r->indent >= tree_indent)) tree_indent = -1;
+            if (cr_fence(line, r->indent, r->end)) fenced = !fenced;
+        }
+        cr_classify_records(info, input, t->cols, t->rows, protected_rows);
+        for (int row = 0; row < t->rows; row++) fixed[row] = info[row].type == CR_PROTECTED;
+        free(info);
+        {   /* The panel pass deliberately protects its owned rows from the
+             * generic engine, but can still clear them in a scratch plan. */
+            ChromePanel panel; int scan = 0;
+            while (cp_next(input, t->cols, t->rows, &scan, DEF_BG, chrome_panel_background, &panel))
+                for (int row = panel.top; row < panel.bottom; row++) fixed[row] = 0;
         }
     }
     for (int lane = 1; lane <= 2; lane++) {
@@ -172,11 +211,9 @@ static int chrome_motion_search(Term *t, const Cell *input, const unsigned char 
             if (index >= counts[lane]) continue;
             score = choices[(lane - 1) * (CANDIDATES / 2) + index];
         }
-        if (!chrome_reflow_build_checked(&scratch, input, t->cols, t->rows, protected_rows,
-                score.side, score.side == 1 ? t->cols - SB_COLS : 0, score.row,
-                SB_COLS, height, 3, chrome_background_safe)) continue;
-        score = chrome_motion_score(scratch.cells, scratch.source, t->cols, t->rows,
-                                     score.side, score.row, height, side, g_chrome.top, t);
+        if (!chrome_display_build(&scratch, input, t, protected_rows,
+                score.side, score.side == 1 ? t->cols - SB_COLS : 0, score.row, SB_COLS, height)) continue;
+        score = chrome_motion_display_score(&scratch, t, score.side, score.row, height);
         if (cm_score_better(&score, winner)) *winner = score;
         chrome_reflow_free(&scratch);
         if (i >= 1 && (uint32_t)(GetTickCount() - began) >= 12) break;
@@ -257,6 +294,10 @@ static void chrome_prepare_display_internal(Term *t, int dock_x, int dock_y, int
         if (line < 0) continue;
         term_line(t, line, &previous, &n, &wrapped);
         if (wrapped > 0 && n >= wrapped && previous[wrapped-1].ch > ' ' && input[y*t->cols].ch > ' ') {
+            int hyphen_join = wrapped >= 2 && previous[wrapped-1].ch == '-' &&
+                (cr_letter(previous[wrapped-2].ch) || (previous[wrapped-2].ch >= '0' && previous[wrapped-2].ch <= '9')) &&
+                cr_letter(input[y*t->cols].ch);
+            if (hyphen_join) continue; /* explicit classifier joins this one known boundary */
             protected_rows[y] = 1;
             if (y) protected_rows[y-1] = 1;
         }
@@ -269,14 +310,14 @@ static void chrome_prepare_display_internal(Term *t, int dock_x, int dock_y, int
     /* Never move an input/cursor row, even when the application hides it. */
     if (t->cy + t->view >= 0 && t->cy + t->view < t->rows)
         protected_rows[t->cy + t->view] = 1;
+    chrome_panel_protect(input, t->cols, t->rows, DEF_BG, chrome_panel_background, protected_rows);
     if (automatic) {
         chrome_autoplace_prepare(t, input, protected_rows);
         dock_x = sidebar_x()/CW; dock_y = g_chrome.top;
         dock_height = g_chrome.bottom - g_chrome.top;
     }
-    if (chrome_reflow_build_checked(&g_display, input, t->cols, t->rows, protected_rows,
-                            g_tab_underlay, dock_x, dock_y, SB_COLS,
-                            dock_height, 3, chrome_background_safe)) {
+    if (chrome_display_build(&g_display, input, t, protected_rows,
+                             g_tab_underlay, dock_x, dock_y, SB_COLS, dock_height)) {
         g_display_term = t;
         g_display_view = t->view;
         g_display_hcount = t->hcount;
@@ -290,6 +331,16 @@ static void chrome_prepare_display_at(Term *t, int dock_x, int dock_y, int dock_
 static void chrome_prepare_display(Term *t) {
     tab_layout();
     chrome_prepare_display_internal(t, sidebar_x()/CW, g_chrome.top, g_chrome.bottom-g_chrome.top, 1);
+}
+
+static void display_cursor_position(const Term *t, int *col, int *row) {
+    *col = t->cx; *row = t->cy;
+    if (g_display_term == t && g_display.cells && g_display.cursor >= 0 &&
+        g_display.cursor < t->cols*t->rows && g_display.cols == t->cols && g_display.rows == t->rows &&
+        g_display_view == t->view && g_display_hcount == t->hcount) {
+        *col = g_display.cursor % t->cols;
+        *row = g_display.cursor / t->cols;
+    }
 }
 
 static void display_line(const Term *t, int row, const Cell **cells, int *n) {

@@ -4251,15 +4251,16 @@ static void r_begin(int w, int h);
 static int chrome_intrusion_span(int row, int *left, int *right) {
     Tab *tb = active_tab();
     const Cell *cells;
-    int n, occupied, dock = sidebar_x()/CW;
+    int n, occupied, cursor_col, cursor_row, dock = sidebar_x()/CW;
     *left = *right = 0;
     if (!tb || tb->browser_native || row < 0 || row >= tb->t.rows ||
         row < g_chrome.top || row >= g_chrome.bottom) return 0;
     display_line(&tb->t, row, &cells, &n);
     occupied = chrome_terminal_span(cells, n, left, right);
-    if (tb->t.view == 0 && tb->t.m_cursor_vis && tb->t.cy == row && tb->t.cx < tb->t.cols) {
-        int end = tb->t.cx + (CELL(&tb->t, tb->t.cx, row)->wflag == W_WIDE ? 2 : 1);
-        if (!occupied || tb->t.cx < *left) *left = tb->t.cx;
+    display_cursor_position(&tb->t, &cursor_col, &cursor_row);
+    if (tb->t.view == 0 && tb->t.m_cursor_vis && cursor_row == row && tb->t.cx < tb->t.cols) {
+        int end = cursor_col + (CELL(&tb->t, tb->t.cx, tb->t.cy)->wflag == W_WIDE ? 2 : 1);
+        if (!occupied || cursor_col < *left) *left = cursor_col;
         if (end > *right) *right = end;
     }
     if (*left < dock) *left = dock;
@@ -4409,7 +4410,9 @@ static void render(void) {
 
     /* cursor: dumbterm amber */
     if (t->view == 0 && t->m_cursor_vis) {
-        float cx = (float)(ox + t->cx * CW), cy = (float)(oy + t->cy * CH);
+        int cursor_col, cursor_row;
+        display_cursor_position(t, &cursor_col, &cursor_row);
+        float cx = (float)(ox + cursor_col * CW), cy = (float)(oy + cursor_row * CH);
         int w = (t->cx < t->cols && CELL(t, t->cx, t->cy)->wflag == W_WIDE) ? 2 : 1;
         float cw = (float)(CW * w);
         if (!g_focused) {

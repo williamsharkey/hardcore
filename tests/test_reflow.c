@@ -1129,6 +1129,125 @@ static void test_randomized_literal_trees(void) {
     checks++;
 }
 
+static void test_short_status_records(void) {
+    const char *statuses[] = {
+        "• Started `/root/parse_state`", "• Completed `/root/native_probe`",
+        "• Interacted with `/root/test_runner`", "• Explored", "• Edited 2 files (+6 -3)",
+        "• Viewed image fixture.png", "• Finished waiting", "• Context compacted"
+    };
+    for (size_t k = 0; k < sizeof(statuses)/sizeof(*statuses); k++) {
+        const char *lines[] = {"123", statuses[k], "", "456"};
+        Cell *grid = make_grid(lines, 4, 96);
+        for (int x = 0; x < 96; x++) {
+            grid[96+x].fg = 0x02112200u + (uint32_t)x;
+            if (!cr_space(grid[96+x].ch)) {
+                grid[96+x].attr = (uint8_t)(x%16); /* underline belongs to the literal glyph too */
+                grid[96+x].link = (uint16_t)(x%5);
+            }
+        }
+        ChromeReflowRow r = cr_classify(grid+96, 96, 0, 0, NULL, -1);
+        assert(r.type == CR_RECORD && r.record == CR_RECORD_STATUS);
+        ChromeReflow out = run(grid, 96, 4, NULL, 2, 0, 1, 28, 1, 0);
+        assert(out.changed == 1);
+        for (int x = 0; x < 30; x++) assert(cr_space(out.cells[96+x].ch));
+        for (int x = 0; x < r.end; x++) {
+            assert(!memcmp(out.cells+96+30+x, grid+96+x, sizeof(Cell)));
+            assert(out.source[96+30+x] == 96+x);
+        }
+        assert(!memcmp(out.cells, grid, 96*sizeof(Cell)));
+        assert(!memcmp(out.cells+3*96, grid+3*96, 96*sizeof(Cell)));
+        chrome_reflow_free(&out);
+        unsigned char protected_rows[4] = {0, 1, 0, 0};
+        out = run(grid, 96, 4, protected_rows, 2, 0, 1, 28, 1, 3);
+        assert(!memcmp(out.cells, grid, 4*96*sizeof(Cell)));
+        chrome_reflow_free(&out); free(grid);
+    }
+    {
+        const char *lines[] = {"• Startedness `/root/parse_state`", ""};
+        Cell *grid = make_grid(lines, 2, 96);
+        ChromeReflowRow r = cr_classify(grid, 96, 0, 0, NULL, -1);
+        assert(r.record != CR_RECORD_STATUS); /* exact status words, not a broad prefix */
+        free(grid);
+    }
+    checks++;
+}
+
+static void test_sentence_inline_code(void) {
+    const char *sentences[] = {
+        "The terminal inherited NO_COLOR=1 and FORCE_COLOR=0 which disabled colored output until the environment was fixed.",
+        "The helper uses `g_mac_image` and checks ready(state) before restoring the original terminal process and its colors.",
+        "The parser accepts <value> and keeps each config_name unchanged while arranging ordinary prose beside the menu."
+    };
+    for (size_t k = 0; k < sizeof(sentences)/sizeof(*sentences); k++) {
+        const char *lines[] = {"123", sentences[k], "", "", "456"};
+        Cell *grid = make_grid(lines, 5, 120);
+        for (int x = 0; x < 120; x++) {
+            grid[120+x].fg = 0x02112200u+(uint32_t)x;
+            grid[120+x].attr = (uint8_t)(x%8);
+        }
+        ChromeReflowRow r = cr_classify(grid+120, 120, 0, 0, NULL, -1);
+        assert(r.type == CR_PROSE);
+        for (int side = 1; side <= 2; side++) {
+            int dock = side == 1 ? 92 : 0;
+            ChromeReflow out = run(grid, 120, 5, NULL, side, dock, 1, 28, 3, 2);
+            assert(out.changed == 1);
+            for (int y = 1; y < 4; y++)
+                for (int x = side == 1 ? 90 : 0; x < (side == 1 ? 120 : 30); x++)
+                    assert(cr_space(out.cells[y*120+x].ch));
+            assert(!memcmp(out.cells, grid, 120*sizeof(Cell)));
+            assert(!memcmp(out.cells+4*120, grid+4*120, 120*sizeof(Cell)));
+            chrome_reflow_free(&out);
+        }
+        free(grid);
+    }
+    checks++;
+}
+
+/* A physical row boundary inside a hyphenated word is not a separating
+ * space. Verify exact glyph order/style/address instead of normalized_words,
+ * whose input contract intentionally treats unrelated hard rows separately. */
+static void test_hyphenated_physical_boundary(void) {
+    enum { COLS = 80, ROWS = 6 };
+    char first[COLS+1];
+    const char *seed = "The terminal reliably displays ordinary text and supports a full range of colorful output ";
+    memcpy(first, seed, COLS-5);
+    if (first[COLS-6] == ' ') first[COLS-6] = 'x';
+    memcpy(first+COLS-5, " 256-", 5); first[COLS] = 0;
+    const char *lines[] = {first, "color output while preserving this exact word and every original character.", "", "", "", "456"};
+    Cell *grid = make_grid(lines, ROWS, COLS);
+    for (int i = 0; i < 2*COLS; i++) {
+        grid[i].fg = 0x02112200u+(uint32_t)i;
+        grid[i].attr = (uint8_t)(i%8);
+    }
+    Cell before[ROWS*COLS]; memcpy(before, grid, sizeof(before));
+    for (int side = 1; side <= 2; side++) {
+        ChromeReflow out;
+        assert(chrome_reflow_build(&out, grid, COLS, ROWS, NULL, side,
+                                   side == 1 ? 52 : 0, 0, 28, 5, 3));
+        assert(out.changed && !memcmp(before, grid, sizeof(before)));
+        int previous = -1, next_source = 0, hyphen = -1, color = -1;
+        for (int i = 0; i < ROWS*COLS; i++) {
+            assert(out.source[i] >= 0 && out.source[i] < ROWS*COLS);
+            if (cr_space(out.cells[i].ch)) continue;
+            while (next_source < ROWS*COLS && cr_space(grid[next_source].ch)) next_source++;
+            assert(next_source < ROWS*COLS && out.source[i] == next_source);
+            assert(out.source[i] > previous && !memcmp(out.cells+i, grid+next_source, sizeof(Cell)));
+            previous = next_source++;
+            if (out.source[i] == COLS-1) hyphen = i;
+            if (out.source[i] == COLS) color = i;
+        }
+        while (next_source < ROWS*COLS && cr_space(grid[next_source].ch)) next_source++;
+        assert(next_source == ROWS*COLS);
+        assert(hyphen >= 0 && color == hyphen+1); /* no invented separator */
+        for (int y = 0; y < 5; y++)
+            for (int x = side == 1 ? 50 : 0; x < (side == 1 ? COLS : 30); x++)
+                assert(cr_space(out.cells[y*COLS+x].ch));
+        assert(!memcmp(out.cells+5*COLS, grid+5*COLS, COLS*sizeof(Cell)));
+        chrome_reflow_free(&out);
+    }
+    free(grid); checks++;
+}
+
 int main(void) {
     test_fox_examples();
     test_slack_no_blank();
@@ -1137,6 +1256,9 @@ int main(void) {
     test_cells_and_cursor_protection();
     test_styled_codex_prose();
     test_bullet_commands_and_boundaries();
+    test_short_status_records();
+    test_sentence_inline_code();
+    test_hyphenated_physical_boundary();
     test_structured_diff_records();
     test_literal_paths_and_tool_output();
     test_compact_diff_gutters();
