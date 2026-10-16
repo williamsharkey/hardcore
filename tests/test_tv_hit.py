@@ -19,7 +19,7 @@ HARNESS=r'''
 #define CH 20
 #define TIMER_TV 7
 #include "hardcore_chrome_pack.h"
-enum{HIT_NONE,HIT_TV_GRIP,HIT_TV_RESIZE,HIT_TV_CLOSE,HIT_TV,HIT_STAB,HIT_SETPAGE,HIT_CHROME_INERT,HIT_FONT,HIT_SCHEME};
+enum{HIT_NONE,HIT_TV_GRIP,HIT_TV_RESIZE,HIT_TV_CLOSE,HIT_TV,HIT_STAB,HIT_SETPAGE,HIT_CHROME_INERT,HIT_FONT,HIT_SCHEME,HIT_TV_EXPAND};
 typedef struct{int top,bottom,section_row,list_row,list_count,list_capacity;}ChromeLayout;
 static ChromePackRow *g_chrome_menu_rows;
 static int g_chrome_menu_count,g_chrome_menu_capacity,g_chrome_menu_top,g_chrome_menu_x,g_chrome_menu_cw,g_chrome_menu_ch,g_chrome_menu_raised;
@@ -59,9 +59,11 @@ static void init(void){
 }
 static int hit(int col,int row,int *idx){return chrome_tv_hit((72+col)*CW+1,row*CH+1,idx);}
 static void packed(void){
-    int idx=-1;init();assert(hit(3,10,&idx)==HIT_TV&&idx==0);assert(hit(26,10,&idx)==HIT_TV_CLOSE);
+    int idx=-1;init();assert(hit(3,10,&idx)==HIT_TV_GRIP&&idx==0);assert(hit(26,10,&idx)==HIT_TV_CLOSE);
     rows[0].src[24]=26;rows[0].actionable[26]=0;
-    assert(hit(24,10,&idx)==HIT_TV_CLOSE);assert(hit(26,10,&idx)==HIT_NONE);
+    assert(hit(24,10,&idx)==HIT_TV_CLOSE);assert(hit(26,10,&idx)==HIT_TV_GRIP);
+    rows[0].blocked_left=25;rows[0].blocked_right=27;
+    assert(hit(26,10,&idx)==HIT_NONE);assert(hit(27,10,&idx)==HIT_TV_GRIP);
     rows[3].actionable[5]=0;assert(hit(5,13,&idx)==HIT_NONE);
 }
 static void stale(void){
@@ -80,6 +82,7 @@ static void caf(void){
     int idx=-1;init();g_tvs[1]=g_tvs[0];g_tvs[0].state.open=0;
     assert(hit(3,13,&idx)==HIT_TV&&idx==1);
     assert(hit(26,10,&idx)==HIT_TV_CLOSE&&idx==1);
+    for(int col=0;col<SB_COLS;col++)assert(hit(col,10,&idx)==(col==26?HIT_TV_CLOSE:HIT_TV_GRIP));
 }
 static void lifecycle(void){
     init();assert(chrome_tv_open_tab(0)==-1&&chrome_tv_open_tab(999)==-1);
@@ -110,6 +113,8 @@ static void persistent(void){
     assert(g_tvs[slot].state.open&&g_tvs[slot].state.alpha==1);
     assert(!g_tvs[0].state.open&&!g_timer);
     chrome_tv_interaction(slot);now+=600000;chrome_tv_clock();assert(g_tvs[slot].state.open);
+    /* A settings drag owns its title even with the pointer outside the TV. */
+    init();g_tv_drag_slot=0;now+=600000;chrome_tv_clock();assert(g_tvs[0].state.open&&g_tvs[0].state.alpha==1);
 }
 static void cutie_hit(void){
     int idx=-1;init();g_tvs[HC_TV_COUNT-1]=g_tvs[0];g_tvs[0].state.open=0;
@@ -117,20 +122,40 @@ static void cutie_hit(void){
     rows[3].actionable[5]=0; /* terminal body uses projection, not word packing */
     assert(hit(5,13,&idx)==HIT_TV&&idx==HC_TV_COUNT-1);
     assert(hit(22,10,&idx)==HIT_TV_GRIP);
+    for(int col=0;col<SB_COLS;col++)assert(hit(col,10,&idx)==
+        (col==26?HIT_TV_CLOSE:col==24?HIT_TV_EXPAND:HIT_TV_GRIP));
     assert(hit(27,21,&idx)==HIT_TV_RESIZE);
     assert(hit(25,21,&idx)==HIT_TV);
     g_tvs[HC_TV_COUNT-1].frame.cols--;assert(hit(22,10,&idx)==HIT_NONE);
     g_tvs[HC_TV_COUNT-1].frame.cols++;
     rows[0].src[24]=26;rows[0].actionable[26]=0;
     assert(hit(24,10,&idx)==HIT_TV_CLOSE&&idx==HC_TV_COUNT-1);
-    assert(hit(26,10,&idx)==HIT_NONE);
+    assert(hit(26,10,&idx)==HIT_TV_GRIP);
     assert(chrome_any_tv_contains(721,201));g_mouse_x=721;g_mouse_y=201;
     assert(chrome_any_tv_hovered());g_sel_drag=1;assert(!chrome_any_tv_hovered());g_sel_drag=0;
     tabs[0].id=0;assert(hit(24,10,&idx)==HIT_NONE&&!chrome_any_tv_hovered());
 }
+static void packed_title(void){
+    int idx=-1;init();ChromeTv *tv=g_tvs+HC_TV_CUTIE_FIRST;*tv=g_tvs[0];g_tvs[0].state.open=0;tv->tab_id=100;
+    unsigned char ink[SB_COLS]={0};
+    for(int x=1;x<13;x++)ink[x]=1;ink[22]=ink[24]=ink[26]=1;
+    for(int left=0;left<SB_COLS;left++)for(int right=left+1;right<=SB_COLS;right++) {
+        chrome_pack_row(rows,ink,SB_COLS,left,right);
+        for(int x=0;x<SB_COLS;x++) {
+            int result=hit(x,10,&idx);
+            if(x>=left&&x<right)assert(result==HIT_NONE);
+            else if(rows[0].actionable[x]&&rows[0].src[x]==26)assert(result==HIT_TV_CLOSE);
+            else if(rows[0].actionable[x]&&rows[0].src[x]==24)assert(result==HIT_TV_EXPAND);
+            else assert(result==HIT_TV_GRIP);
+        }
+    }
+    /* Raised titles ignore the intrusion map and preserve all original controls. */
+    tv->frame.raised=1;
+    for(int x=0;x<SB_COLS;x++)assert(hit(x,10,&idx)==(x==26?HIT_TV_CLOSE:x==24?HIT_TV_EXPAND:HIT_TV_GRIP));
+}
 int main(int argc,char **argv){int n=argc>1?atoi(argv[1]):0;
     if(!n)packed();else if(n==1)stale();else if(n==2)caf();else if(n==3)lifecycle();
-    else if(n==4)persistent();else cutie_hit();puts("ok");return 0;}
+    else if(n==4)persistent();else if(n==5)cutie_hit();else packed_title();puts("ok");return 0;}
 '''
 class Hit(unittest.TestCase):
     @classmethod
@@ -148,4 +173,5 @@ class Hit(unittest.TestCase):
     def test_cuties_bind_stable_ids_deduplicate_and_prune(self):self.check_case(3)
     def test_cuties_do_not_idle_expire_or_schedule_idle_ticks(self):self.check_case(4)
     def test_last_cutie_slot_header_and_body_are_interactive(self):self.check_case(5)
+    def test_every_visible_title_cell_drags_except_actual_packed_button_cells(self):self.check_case(6)
 if __name__=="__main__":unittest.main()

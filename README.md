@@ -365,7 +365,11 @@ included when available; the panel reports when a recording will be silent.
 speech model or permission is unavailable, the movie still saves and the panel
 reports that captions could not be completed. Captions can also be edited later.
 
-**Clips N** opens the saved-recording library. Recordings live in
+**Clips N** flips the camera TV to its saved-recording library, drawn in
+Hardcore's current font and theme. **Camera** returns to the preview;
+opening Clips alone does not turn on the camera. Select a recording and use
+**Replay** to open its player/editor in a Hardcore tab, **MP4** to export it,
+or **ZIP** to make a portable bundle. Recordings live in
 `~/Movies/Hardcore/` as `.hcrec` directories containing a compressed H.264/AAC
 camera movie, replay data, captions, and a portable HTML player. The replay
 stores the application's bitmap glyphs, layout, colors, and pointer activity;
@@ -376,11 +380,19 @@ mode afterward.
 Open a saved clip to scrub, trim, crop, change captions or pointer visibility,
 and export a composed video. Editing preserves the original take. The native
 exporter combines the interface replay, camera and audio into an MP4;
-its progress appears in the editor. **Share ZIP** creates a portable compressed
-bundle; unzip it before opening its player. The bundled `index.html` can also be opened
+its progress appears in both the editor and the TV's **Exports** list. Exports
+keep running when the camera/Clips TV or replay tab is closed. The **cam** header
+and active export rows use the same braille drip animation as busy terminal
+tabs. Reopen Clips to see progress, then click **Output** to play the finished
+MP4 in Hardcore, or **Files** to browse its folder in Hardcore's file viewer.
+Exports receive unique filenames under `~/Movies/Hardcore/Exports/` and never
+overwrite another export. **Share ZIP** creates a portable compressed bundle;
+unzip it before opening its player. The bundled `index.html` can also be opened
 in a browser for playback. Interrupted saves remain `.partial.hcrec` drafts.
 The header shows red **REC** while a recording is active or saving. Save or
-discard a recording before quitting or running a live update.
+discard a recording, and let active exports finish, before quitting or running
+a live update. Any TV's title row can be dragged except its actual button cells
+(such as expand or minimize); the controls keep their normal actions.
 
 `make recording-test` runs synthetic capture, player, exporter and library checks
 without opening any devices. `make recording-native-test` also compares the

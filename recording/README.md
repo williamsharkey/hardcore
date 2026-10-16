@@ -1,7 +1,7 @@
 # Hardcore recordings
 
 A `.hcrec` folder is a portable recording bundle. Open `index.html` in a
-browser, or open the bundle in Hardcore's recordings library to replay and
+browser, or open the bundle from Hardcore's Clips TV to replay and
 edit it. No server, package install, web font, or network connection is needed.
 
 The bundle holds compressed camera video and the terminal renderer's draw
@@ -22,7 +22,10 @@ does not substitute a browser font.
 
 The player also accepts an entire folder through its folder picker or drag and
 drop. It parses a dropped `recording.js` as data; it never evaluates that file.
-Native library playback applies saved edits through `applyEdits`.
+Clips opens replay/editing in an existing Hardcore browser tab and applies saved
+edits through `applyEdits`. Exported MP4s also play inside Hardcore. The Files
+action opens Hardcore's file viewer. Opening an older bundle refreshes its four
+player assets; recording data, camera media, and saved edits are preserved.
 
 ## Replay version 1
 
@@ -84,14 +87,25 @@ frames as needed. The source JSON remains loaded for random access.
 Edits are `{version:1,startMs,endMs,crop,captions,pointer,captionItems}`. `crop`
 is null for the whole frame, or `[x,y,width,height]`; the booleans control
 captions and pointer cues. `captionItems` uses the replay caption format.
-Import `.srt` or `.vtt` files with **Add captions**. **Save edit settings** saves
+Import `.srt` or `.vtt` files with **Add captions** in a standalone browser.
+Inside Hardcore, paste timed captions into the inline caption editor or drop a
+caption file onto the replay tab. **Save edit settings** saves
 edits in the native host or downloads `edits.json` in a standalone browser.
 
 The embedded player sends messages to
 `window.webkit.messageHandlers.hardcoreRecording` with actions `open`,
-`library`, `saveEdits`, and `export`. The last two include the edit fields.
+`library`, `files`, `saveEdits`, `export`, `zip`, and `output`. Save/export/ZIP
+include the edit fields; output includes only a known job `id`. The host accepts
+messages only from the opened bundle's canonical main document. Ordinary
+browser tabs do not receive this bridge, even when viewing the same file.
 The host can call `window.hardcoreRecordingPlayer.applyEdits(edits)`,
-`seek(milliseconds)`, or `pause()`.
+`seek(milliseconds)`, `pause()`, `hostStatus(job)`, or `hostTheme(palette)`.
+
+MP4 and ZIP exports go to `~/Movies/Hardcore/Exports` with unique names. The job
+manager keeps them running after the replay tab or Clips TV closes. Progress
+and completed outputs appear in Clips and the replay tab. A replay tab's explicit
+host marker and saved edits survive an app reload; a running export must finish
+before the app reloads.
 
 The native `recording-export` helper exports composed video from the original
 commands. In a standalone browser, **Export video** shows the equivalent CLI
@@ -100,3 +114,5 @@ arguments. Trimming and cropping do not alter the original replay data.
 Run `node tests/test_recording.js` to check draw-byte parsing, glyph restoration
 across seeks, timestamp boundaries, pointer cues, captions, edits, and malformed
 bundle rejection.
+Run `node tests/test_recording_host.js` to check the embedded bridge UI without
+opening a browser or capture device.

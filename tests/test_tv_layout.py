@@ -241,6 +241,29 @@ static void pending_wakeup(void){
     now+=300;chrome_tv_prepare(&t);
     assert(!g_tv_stack_pending&&g_tvs[3].state.rect.y<g_tvs[2].state.rect.y);
 }
+static void manual_utility_panels(void){
+    Term t;init(&t,100,60);hc_tv_open(&g_tvs[1].state,now);
+    g_tvs[0].manual=g_tvs[1].manual=1;
+    g_tvs[0].requested=(HcTvRect){30,4,28,12};g_tvs[1].requested=(HcTvRect){30,20,28,6};
+    chrome_tv_prepare(&t);
+    for(int i=0;i<2;i++)assert(g_tvs[i].state.placed&&hc_tv_rect_equal(g_tvs[i].state.rect,g_tvs[i].requested));
+    assert(g_tvs[0].layout.list_count==10&&g_tvs[0].layout.list_capacity==10);
+    g_settings_tab=0;now+=100;chrome_tv_prepare(&t);
+    assert(g_tvs[0].state.placed&&g_tvs[0].state.rect.h==10&&g_tvs[0].state.rect.y==4);
+    assert(g_tvs[0].layout.list_count==8&&g_tvs[0].layout.list_capacity==8);
+    assert(g_tvs[1].state.rect.h==6&&g_tvs[1].state.rect.y==20);
+    /* Natural size changes never turn Settings into a stale empty rectangle. */
+    t.cols=50;t.rows=25;g_sidebar=22;now+=100;chrome_tv_prepare(&t);
+    assert(g_tvs[1].state.placed&&g_tvs[1].state.rect.x==22&&g_tvs[1].state.rect.y==19);
+    t.cols=100;t.rows=60;g_sidebar=72;now+=100;chrome_tv_prepare(&t);
+    assert(g_tvs[0].state.placed&&g_tvs[0].state.rect.x==30&&g_tvs[0].state.rect.y==4);
+    assert(g_tvs[1].state.placed&&hc_tv_rect_equal(g_tvs[1].state.rect,g_tvs[1].requested));
+    g_tvs[1].requested.y=14;now+=100;chrome_tv_prepare(&t);
+    assert(g_tvs[1].state.placed&&g_tvs[1].state.rect.y==14);
+    g_settings_tab=1;now+=100;chrome_tv_prepare(&t);
+    assert(g_tvs[0].state.placed&&g_tvs[1].state.placed);
+    assert(!hc_tv_rect_overlap(g_tvs[0].state.rect,g_tvs[1].state.rect));
+}
 static void varied_geometry(void){
     unsigned rng=1979;
     for(int trial=0;trial<400;trial++) {
@@ -272,7 +295,7 @@ int main(int argc,char **argv){
     if(n==0)stacked();else if(n==1)motion();else if(n==2)frozen();else if(n==3)compact();
     else if(n==4)masked_anchor();else if(n==5)cuties();else if(n==6)cutie_no_fit();
     else if(n==7)reverse_order();else if(n==8)modest_overlap_stack();else if(n==9)custom_manual();
-    else if(n==10)manual_priority_and_limits();else if(n==11)pending_wakeup();else varied_geometry();
+    else if(n==10)manual_priority_and_limits();else if(n==11)pending_wakeup();else if(n==12)varied_geometry();else manual_utility_panels();
     puts("ok");return 0;
 }
 '''
@@ -302,5 +325,6 @@ class Layout(unittest.TestCase):
     def test_manual_reservations_precede_auto_and_size_limits_are_safe(self):self.check_case(10)
     def test_recent_input_deferred_reorder_schedules_one_quiet_wakeup(self):self.check_case(11)
     def test_varied_manual_and_auto_geometry_stays_bounded_and_disjoint(self):self.check_case(12)
+    def test_settings_and_caf_move_without_losing_natural_size_or_settings_rows(self):self.check_case(13)
 
 if __name__=="__main__":unittest.main()

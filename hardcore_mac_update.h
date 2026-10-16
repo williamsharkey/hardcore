@@ -81,6 +81,7 @@ static NSDictionary *mac_pack_tab(Tab *tb) {
         @"browser_url": [NSString stringWithUTF8String:tb->browser_url] ?: @"",
         @"browser_site": [NSString stringWithUTF8String:tb->browser_site] ?: @"",
         @"browser_native": @(tb->browser_native),
+        @"browser_recording": @(tb->browser_recording),
         @"fd": @(tb->fd), @"pid": @(tb->pid), @"cols": @(t->cols), @"rows": @(t->rows),
         @"view": @(t->view), @"activity": @(tb->activity), @"attention": @(tb->attention),
         @"exited": @(tb->exited), @"help": @(tb->help), @"born": @(tb->born),
@@ -132,6 +133,7 @@ static Tab *mac_unpack_tab(NSDictionary *d) {
     if ([d[@"kind"] intValue]==TK_BROWSER) {
         tb->kind=TK_BROWSER; tb->parent_id=[d[@"parent"] intValue];
         tb->browser_native=[d[@"browser_native"] boolValue];
+        int recording=[d[@"browser_recording"] intValue];tb->browser_recording=recording==1 || recording==2 ? recording : 0;
         snprintf(tb->browser_url,sizeof(tb->browser_url),"%s",[browser_string(d[@"browser_url"]) UTF8String]);
         snprintf(tb->browser_site,sizeof(tb->browser_site),"%s",[browser_string(d[@"browser_site"]) UTF8String]);
         if (fd>=0 || [d[@"pid"] intValue]>0) { term_free(&tb->t); free(tb); return NULL; }
@@ -178,6 +180,7 @@ static Tab *mac_unpack_tab(NSDictionary *d) {
 
 static int mac_reload(int ack, char *why, size_t cap) {
     if(mac_record_active()){snprintf(why,cap,"save or discard the camera recording before updating");return 0;}
+    if(mac_record_exports_active()){snprintf(why,cap,"wait for clip exports to finish before updating");return 0;}
     if (!mac_probe(g_mac_exe)) { snprintf(why, cap, "replacement is missing or does not support live updates"); return 0; }
     /* A blocked paste may wait indefinitely. Do not discard it or freeze UI. */
     for (int i = 0; i < g_ntabs; i++) {
@@ -513,6 +516,17 @@ static int mac_update_unit(FILE *f) {
     fprintf(f,"%s browser reload metadata, stable IDs and lazy engine restoration\n",ok ? "ok  " : "FAIL");
     fails+=!ok;
     if (restored) { term_free(&restored->t); free(restored); }
+    for(int marker=0;marker<=3;marker++) {
+        browser->browser_recording=marker;
+        restored=mac_unpack_tab(mac_pack_tab(browser));
+        ok=restored && restored->browser_recording==(marker<=2?marker:0);
+        fprintf(f,"%s Clips reload host marker %d\n",ok ? "ok  " : "FAIL",marker);fails+=!ok;
+        if(restored){term_free(&restored->t);free(restored);}
+    }
+    NSMutableDictionary *legacy=[[mac_pack_tab(browser) mutableCopy] autorelease];[legacy removeObjectForKey:@"browser_recording"];
+    restored=mac_unpack_tab(legacy);ok=restored && !restored->browser_recording;
+    fprintf(f,"%s old browser snapshots do not acquire a Clips bridge\n",ok ? "ok  " : "FAIL");fails+=!ok;
+    if(restored){term_free(&restored->t);free(restored);}
     term_free(&browser->t); free(browser);
     return fails;
 }

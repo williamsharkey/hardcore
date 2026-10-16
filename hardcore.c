@@ -485,6 +485,7 @@ typedef struct Tab {
     uint64_t output_generation;  /* invalidate miniature input maps after each parsed batch */
     int parent_id;               /* browser children retain their owning terminal */
     int browser_native;          /* default 0: Hardcore grid; 1: live native view */
+    int browser_recording;       /* explicit Clips host: 1 replay, 2 exported video */
     void *browser;               /* platform-owned live document, never a shell */
     char browser_url[4096];
     char browser_site[512];
@@ -3884,7 +3885,7 @@ static int layout_text(const wchar_t *s, float x, float y, float max_w, int max_
     uint32_t cps[512];
     uint8_t ws[512];
     int n = text_cells(s, cps, ws, 512), per = (int)(max_w / CW), i = 0, line, k;
-    if (per < 2) return 1;
+    if (per < 1) return 1;
     if (draw) r_color(rgb, 1);
     for (line = 0; line < max_lines && i < n; line++) {
         int last = line == max_lines - 1, cols = 0, end = i, brk = -1, rest = 0, col;
@@ -4055,6 +4056,7 @@ static int caption_btn_w(void) { return 46 * g_scale; }
 #ifndef _WIN32
 static int mac_caf_active(void);
 static int mac_record_active(void);
+static int mac_record_exports_active(void);
 static int mac_caf_toggle(void);
 static double mac_caf_elapsed(void);
 static const char *mac_caf_power(void);
@@ -4732,6 +4734,9 @@ static void update_busy(int tick) {
         }
         any |= b;
     }
+#ifndef _WIN32
+    any |= mac_record_exports_active();
+#endif
     if (any && !g_throb_on) plat_timer(TIMER_THROB, DRIP_MS);
     if (!any && g_throb_on) plat_kill_timer(TIMER_THROB);
     g_throb_on = any;

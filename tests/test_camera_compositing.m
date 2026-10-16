@@ -59,7 +59,17 @@ static void mac_record_start(void){}
 static void mac_record_pause(void){}
 static void mac_record_stop(void){}
 static void mac_record_discard(void){}
-static void mac_record_library(void){}
+static int mac_record_exports_active(void){return 0;}
+static NSArray *mac_record_jobs(void){return @[];}
+static NSArray *mac_record_items(void){return @[];}
+static BOOL mac_record_export(NSString *path,NSDictionary *edits,BOOL zip){return NO;}
+static void mac_record_file_viewer(NSString *path){}
+static void record_library_open(NSString *path){}
+static void record_library_open_output(NSString *path){}
+#define DRIP_MS 80
+static unsigned GetTickCount(void){return 0;}
+static int g_ndrip;
+static uint16_t g_drip[40];
 static void chrome_label(const wchar_t *text,int a,int b,int y,uint32_t color){(void)text;(void)a;(void)b;(void)y;(void)color;}
 static void fill_rect(float a,float b,float c,float d,uint32_t color,float alpha){(void)a;(void)b;(void)c;(void)d;(void)color;(void)alpha;}
 static void utf8_to_wide(const char *s,wchar_t *out,int capacity){(void)s;if(capacity)out[0]=0;}

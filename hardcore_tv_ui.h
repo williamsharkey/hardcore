@@ -119,7 +119,7 @@ static void chrome_tv_clock(void) {
     if (g_settings_open && !g_tvs[HC_TV_SETTINGS].state.open)
         hc_tv_open(&g_tvs[HC_TV_SETTINGS].state,now);
     for (int i=0;i<HC_TV_COUNT;i++) {
-        if(i<HC_TV_CUTIE_FIRST)hc_tv_tick(&g_tvs[i].state,now,chrome_tv_hovered(i));
+        if(i<HC_TV_CUTIE_FIRST)hc_tv_tick(&g_tvs[i].state,now,chrome_tv_hovered(i) || g_tv_drag_slot==i);
         if(!g_tvs[i].state.open)hc_tv_motion_reset(&g_tvs[i].motion);
     }
     g_settings_open=g_tvs[HC_TV_SETTINGS].state.open;
@@ -139,13 +139,23 @@ static int chrome_tv_hit(int mx,int my,int *idx) {
         *idx=i;
         if(i>=HC_TV_CUTIE_FIRST && row!=a.top)
             return row==a.bottom-1 && col>=tv->state.rect.w-2?HIT_TV_RESIZE:HIT_TV;
+        if(row==a.top) {
+            /* The full visible title is a handle. Packed button glyphs keep
+               their source action, while exposed whitespace also drags.
+               A terminal intrusion still belongs to the terminal below. */
+            int source=col;
+            if(!tv->frame.raised) {
+                ChromePackRow *packed=tv->frame.rows+at;
+                if(col>=packed->blocked_left && col<packed->blocked_right)return HIT_NONE;
+                source=packed->actionable[col]?packed->src[col]:-1;
+            }
+            if(source==tv->state.rect.w-2)return HIT_TV_CLOSE;
+            if(i>=HC_TV_CUTIE_FIRST && source==tv->state.rect.w-4)return HIT_TV_EXPAND;
+            return HIT_TV_GRIP;
+        }
         if(!tv->frame.raised) {
             if(!tv->frame.rows[at].actionable[col]) return HIT_NONE;
             col=tv->frame.rows[at].src[col];
-        }
-        if(row==a.top) {
-            if(i>=HC_TV_CUTIE_FIRST && col==tv->state.rect.w-6)return HIT_TV_GRIP;
-            return col>=tv->state.rect.w-3 ? HIT_TV_CLOSE : HIT_TV;
         }
         if(i==HC_TV_CAF) return HIT_TV;
         if(row==a.section_row){*idx=col<SB_COLS/2?0:1;return HIT_STAB;}

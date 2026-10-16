@@ -2,6 +2,11 @@
  * capture object and recording callbacks are owned by hardcore_recording.m. */
 static int g_camera_visible, g_camera_placed, g_camera_manual, g_camera_drag, g_camera_down;
 static int g_camera_pending_action;
+static int g_camera_clips;
+static int mac_clips_hit(int,int);
+static void mac_clips_action(int);
+static void mac_clips_refresh(void);
+static void mac_clips_draw(void);
 static HcTvRect g_camera_rect, g_camera_requested, g_camera_drag_origin;
 static int g_camera_drag_x, g_camera_drag_y;
 static HcTvPlacement g_camera_placement;
@@ -37,7 +42,7 @@ static NSRect mac_camera_body_pixels(void) {
 }
 static void mac_camera_preview_sync(void) {
     if(!g_view)return;
-    BOOL show=g_camera_visible && g_camera_placed && g_camera_capture &&
+    BOOL show=g_camera_visible && !g_camera_clips && g_camera_placed && g_camera_capture &&
         g_camera_capture.state!=HCCameraCapturePreparing && g_camera_capture.state!=HCCameraCaptureFailed;
     if(show && !g_camera_preview_view) {
         g_camera_preview_view=[[HCCameraPreviewView alloc] initWithFrame:NSZeroRect];
@@ -66,7 +71,7 @@ static void mac_camera_preview_sync(void) {
     [CATransaction commit];
 }
 static void mac_camera_release_hidden(void) {
-    if(!g_camera_visible && !mac_record_active() && g_camera_capture) {
+    if((!g_camera_visible || g_camera_clips) && !mac_record_active() && g_camera_capture) {
         [g_camera_capture.previewLayer removeFromSuperlayer];
         [g_camera_capture shutdown];[g_camera_capture release];g_camera_capture=nil;
     }
@@ -86,8 +91,7 @@ static void mac_camera_tick_start(void) {
     if(g_camera_timer)return;
     g_camera_timer=[NSTimer scheduledTimerWithTimeInterval:.2 repeats:YES block:^(NSTimer *timer) {
         int active=mac_record_active();
-        if(!g_view.window.isKeyWindow)mac_camera_cancel_press();
-        if(g_camera_was_recording && !active)mac_camera_library_refresh();
+        if(g_camera_was_recording && !active){mac_camera_library_refresh();if(g_camera_clips)mac_clips_refresh();}
         g_camera_was_recording=active;
         if(!g_camera_visible && !active) {
             mac_camera_release_hidden();[timer invalidate];g_camera_timer=nil;return;
@@ -96,10 +100,8 @@ static void mac_camera_tick_start(void) {
     }];
     [[NSRunLoop mainRunLoop] addTimer:g_camera_timer forMode:NSRunLoopCommonModes];
 }
-static void mac_camera_toggle(void) {
-    g_camera_visible=!g_camera_visible;
-    g_camera_drag=g_camera_down=g_camera_pending_action=0;
-    if(g_camera_visible) {
+static void mac_camera_open_preview(void) {
+        g_camera_clips=0;g_camera_visible=1;
         mac_camera_library_refresh();mac_camera_tick_start();
         if(!g_camera_capture) {
             g_camera_capture=[[HCCameraCapture alloc] init];
@@ -109,6 +111,14 @@ static void mac_camera_toggle(void) {
         if(!mac_record_active() && (g_camera_capture.state==HCCameraCaptureIdle || g_camera_capture.state==HCCameraCaptureFailed)) {
             [g_camera_capture prepareWithCompletion:^(NSError *error) { (void)error;mac_camera_preview_sync();plat_invalidate(); }];
         }
+    mac_camera_preview_sync();plat_invalidate();
+}
+static void mac_camera_toggle(void) {
+    g_camera_visible=!g_camera_visible;
+    g_camera_drag=g_camera_down=g_camera_pending_action=0;
+    if(g_camera_visible) {
+        if(g_camera_clips){mac_clips_refresh();mac_camera_tick_start();}
+        else mac_camera_open_preview();
     } else mac_camera_release_hidden();
     mac_camera_preview_sync();plat_invalidate();
 }
@@ -153,8 +163,9 @@ static int mac_camera_hit(int x,int y) {
     HcTvRect r=g_camera_rect;int col=x/CW-r.x,row=y/CH-r.y;
     UI_DONE;
     if(col<0 || col>=r.w || row<0 || row>=r.h)return MAC_CAMERA_NONE;
-    if(row==0)return col>=r.w-3?MAC_CAMERA_MINIMIZE:MAC_CAMERA_MOVE;
+    if(row==0)return col==r.w-2?MAC_CAMERA_MINIMIZE:MAC_CAMERA_MOVE;
     if(row==r.h-1 && col>=r.w-3)return MAC_CAMERA_RESIZE;
+    if(g_camera_clips)return mac_clips_hit(col,row);
     if(row==r.h-4) {
         if(col>=1 && col<8)return MAC_CAMERA_RECORD;
         if(col>=9 && col<16)return MAC_CAMERA_PAUSE;
@@ -172,6 +183,7 @@ static void mac_camera_label(const wchar_t *label,int col,int width,int row,uint
         fill_rect(col*CW,row*CH,(col+width)*CW,(row+1)*CH,TAB_HOVER,1);
     chrome_label(label,col,col+width,row,color);
 }
+#include "hardcore_clips_panel.m"
 static void mac_camera_draw(void) {
     if(!g_camera_visible || !g_camera_placed)return;
     UI_FONT;
@@ -184,6 +196,10 @@ static void mac_camera_draw(void) {
     fill_rect(0,(r.y+r.h)*CH-1,r.w*CW,(r.y+r.h)*CH,g_look.dim,1);
     fill_rect(0,r.y*CH,1,(r.y+r.h)*CH,g_look.dim,1);
     fill_rect(r.w*CW-1,r.y*CH,r.w*CW,(r.y+r.h)*CH,g_look.dim,1);
+    if(g_camera_clips) {
+        mac_clips_draw();
+        g_chrome_x=origin;g_chrome_surface_cols=surface;g_draw_alpha=alpha;g_chrome_capture=capture;UI_DONE;return;
+    }
     HCCameraCaptureState state=g_camera_capture?g_camera_capture.state:HCCameraCaptureIdle;
     BOOL busy=mac_record_active(),recording=state==HCCameraCaptureRecording,paused=state==HCCameraCapturePaused;
     wchar_t title[96];
@@ -209,6 +225,10 @@ static void mac_camera_draw(void) {
     wchar_t library[32];
     _snwprintf(library,32,L"Clips %lu",(unsigned long)chrome_min((int)g_camera_library_count,999));
     mac_camera_label(library,19,8,row,g_look.text_lo,MAC_CAMERA_LIBRARY);
+    if(mac_record_exports_active()) {
+        wchar_t drip[2]={g_ndrip?g_drip[(GetTickCount()/DRIP_MS)%g_ndrip]:0x2800,0};
+        chrome_label(drip,28,29,row,AMBER);
+    }
     NSString *status=g_record_status.length?g_record_status:g_camera_capture.stateDescription;
     if(g_camera_capture.lastError)status=g_camera_capture.lastError.localizedDescription;
     wchar_t text[512];utf8_to_wide(status.UTF8String ?: "",text,512);
@@ -261,12 +281,16 @@ static int mac_camera_mouse(NSEvent *event,int x,int y) {
              * the terminal back in front when the button is released. */
             if(action==MAC_CAMERA_LIBRARY && mac_camera_hit(x,y)==action) {
                 mac_camera_library_refresh();mac_record_library();
-            }
+            } else if(g_camera_clips && action>=MAC_CLIPS_CAMERA && mac_camera_hit(x,y)==action)mac_clips_action(action);
         }
         return 1;
     }
     int hit=mac_camera_hit(x,y);
     if(!hit)return 0;
+    if(g_camera_clips && type==NSEventTypeScrollWheel) {
+        if(event.scrollingDeltaY!=0)mac_clips_action(event.scrollingDeltaY>0?MAC_CLIPS_PREVIOUS:MAC_CLIPS_NEXT);
+        return 1;
+    }
     if(type==NSEventTypeMouseMoved) {
         g_mouse_x=x;g_mouse_y=y;plat_invalidate();return 0;
     }
@@ -288,7 +312,7 @@ static int mac_camera_mouse(NSEvent *event,int x,int y) {
     else if(hit==MAC_CAMERA_CAPTIONS && !busy) {
         g_camera_capture.captionsEnabled=!g_camera_capture.captionsEnabled;
         [[NSUserDefaults standardUserDefaults] setBool:g_camera_capture.captionsEnabled forKey:@"HCCameraCaptions"];
-    } else if(hit==MAC_CAMERA_LIBRARY)g_camera_pending_action=hit;
+    } else if(hit==MAC_CAMERA_LIBRARY || (g_camera_clips && hit>=MAC_CLIPS_CAMERA))g_camera_pending_action=hit;
     plat_invalidate();return 1;
 }
 static int mac_camera_cursor(int x,int y) {
@@ -300,7 +324,7 @@ static int mac_camera_cursor(int x,int y) {
 }
 static NSDictionary *mac_camera_metadata(void) {
     UI_FONT;NSRect rect=mac_camera_body_pixels();UI_DONE;
-    return @{@"visible":@(g_camera_visible && g_camera_placed),@"mirrored":@YES,
+    return @{@"visible":@(g_camera_visible && !g_camera_clips && g_camera_placed),@"mirrored":@YES,
         @"rect":@[@(rect.origin.x),@(rect.origin.y),@(rect.size.width),@(rect.size.height)]};
 }
 
@@ -309,7 +333,9 @@ static NSDictionary *mac_camera_status(void) {
     HCCameraCapture *camera=g_camera_capture;
     AVCaptureVideoPreviewLayer *preview=camera.previewLayer;
     NSView *view=g_camera_preview_view;
-    return @{@"visible":@(g_camera_visible),@"placed":@(g_camera_placed),
+    return @{@"visible":@(g_camera_visible),@"placed":@(g_camera_placed),@"clips":@(g_camera_clips),
+        @"rect":@{@"x":@(g_camera_rect.x),@"y":@(g_camera_rect.y),@"width":@(g_camera_rect.w),@"height":@(g_camera_rect.h)},
+        @"clips_exports":@(g_clips_exports),@"clips_selected":@(g_clips_selected),@"clips_count":@(mac_clips_rows().count),
         @"recording":@(mac_record_active()),@"state":camera.stateDescription ?: @"Camera closed",
         @"camera":camera.cameraName ?: @"",
         @"error":camera.lastError.localizedDescription ?: @"",@"warning":camera.warning ?: @"",

@@ -86,6 +86,9 @@ static NSString *browser_url(NSString *input) {
     int hoverLink;
 }
 - (id)initWithTab:(Tab *)tb;
+- (WKWebViewConfiguration *)configuration;
+- (NSRect)contentRect:(NSRect)bounds;
+- (void)prepareNative;
 - (void)load:(NSString *)url;
 - (void)project;
 - (void)accept:(NSDictionary *)snapshot;
@@ -98,6 +101,7 @@ static void mac_browser_context_native(NSDictionary *message);
 static void browser_inspect_refresh(HCBrowser *b);
 static void browser_ui_reset(HCBrowser *b);
 static NSView *g_browser_root;
+static HCBrowser *record_library_restore(Tab *tb);
 static void mac_browser_edit(SEL action, id sender) {
     /* Native selection and text editing belong to WebKit's responder chain. */
     if ([g_win firstResponder]!=(NSResponder *)g_view) [NSApp sendAction:action to:nil from:sender];
@@ -234,9 +238,9 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
 }
 
 @implementation HCBrowser
-- (id)initWithTab:(Tab *)tb {
-    if (!(self=[super init])) return nil;
-    tabID=tb->id; dirty=1;
+- (NSRect)contentRect:(NSRect)bounds { return bounds; }
+- (void)prepareNative {}
+- (WKWebViewConfiguration *)configuration {
     WKWebViewConfiguration *config=[[[WKWebViewConfiguration alloc] init] autorelease];
     WKUserContentController *controller=[[[WKUserContentController alloc] init] autorelease];
     [controller addScriptMessageHandler:self contentWorld:browser_world() name:@"hardcoreBrowser"];
@@ -244,6 +248,12 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
     WKUserScript *script=[[[WKUserScript alloc] initWithSource:source injectionTime:WKUserScriptInjectionTimeAtDocumentStart
         forMainFrameOnly:YES inContentWorld:browser_world()] autorelease];
     [controller addUserScript:script]; config.userContentController=controller;
+    return config;
+}
+- (id)initWithTab:(Tab *)tb {
+    if (!(self=[super init])) return nil;
+    tabID=tb->id; dirty=1;
+    WKWebViewConfiguration *config=[self configuration];
     web=[[WKWebView alloc] initWithFrame:[g_browser_root bounds] configuration:config];
     web.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
     web.navigationDelegate=self; web.UIDelegate=self;
@@ -385,19 +395,23 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
 }
 @end
 
-static void mac_browser_sync(void) {
-    if (!g_view || !g_win) return;
-    Tab *active=active_tab(); g_browser_native_drag=0;
-    if (active && active->kind==TK_BROWSER && !g_browser_root) {
+static void mac_browser_ensure_root(void) {
+    if (g_view && g_win && !g_browser_root) {
         g_browser_root=[[NSView alloc] initWithFrame:[g_view bounds]];
         g_view.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
         [g_win setContentView:g_browser_root];
         [g_browser_root addSubview:g_view];
     }
+}
+static void mac_browser_sync(void) {
+    if (!g_view || !g_win) return;
+    Tab *active=active_tab(); g_browser_native_drag=0;
+    if (active && active->kind==TK_BROWSER) mac_browser_ensure_root();
     for (int i=0;i<g_ntabs;i++) {
         Tab *tb=g_tabs[i];
         if (tb==active && tb->kind==TK_BROWSER && !tb->browser) {
-            tb->browser=[[HCBrowser alloc] initWithTab:tb];
+            tb->browser=record_library_restore(tb) ?: [[HCBrowser alloc] initWithTab:tb];
+            mac_browser_resize(tb);
             [browser_for(tb) load:browser_url([NSString stringWithUTF8String:tb->browser_url]) ?: @"hardcore:welcome"];
         }
         HCBrowser *b=browser_for(tb);
@@ -415,7 +429,7 @@ static void mac_browser_destroy(Tab *tb) {
 }
 static void mac_browser_resize(Tab *tb) {
     HCBrowser *b=browser_for(tb); if (!b) return;
-    NSRect rect=[g_browser_root bounds];
+    NSRect rect=[b contentRect:[g_browser_root bounds]];
     if(b->inspectOpen) {CGFloat scale=[g_win backingScaleFactor];CGFloat pane=(tb->t.rows-mac_browser_page_rows(tb))*CH/scale;rect.origin.y+=pane;rect.size.height=MAX(1,rect.size.height-pane);}
     b->web.frame=rect;b->dirty=1;
 }
@@ -424,7 +438,8 @@ static void mac_browser_prepare(Tab *tb) {
        Hover draws that cache without showing a WKWebView, changing native
        mode, requesting a new document, resizing it, or handing it focus. */
     int preview=chrome_preview_active() && tb==display_tab();
-    HCBrowser *b=browser_for(tb); if (!b || (tb->browser_native && !preview)) return;
+    HCBrowser *b=browser_for(tb); if (!b) return;
+    if(tb->browser_native && !preview){[b prepareNative];return;}
     tab_layout();
     int cols=tb->t.cols, rows=preview ? tb->t.rows : mac_browser_page_rows(tb), x=sidebar_x()/CW, y=g_chrome.top;
     b->pageRows=rows;
@@ -483,7 +498,9 @@ static void mac_browser_scroll(int lines) {
     b->scroll=MAX(0,MIN(MAX(0,b->total-mac_browser_page_rows(active_tab())),b->scroll+lines));
     b->dirty=1; g_sel_on=0; plat_invalidate();
 }
-static Tab *mac_browser_new(NSString *address, int parent, int native) {
+/* Specialized local documents opt in at creation; ordinary file/web tabs never
+   acquire a host bridge just by navigating to a matching URL. */
+static Tab *mac_browser_new_with_class(NSString *address, int parent, int native, Class browserClass) {
     NSString *url=browser_url(address); if (!url || g_ntabs>=MAX_TABS) return NULL;
     Tab *owner=tab_by_id(parent);
     if (!owner) owner=active_tab();
@@ -498,8 +515,14 @@ static Tab *mac_browser_new(NSString *address, int parent, int native) {
         at=i+1; while (at<g_ntabs && g_tabs[at]->parent_id==owner->id) at++; break;
     }
     memmove(g_tabs+at+1,g_tabs+at,(size_t)(g_ntabs-at)*sizeof(Tab *));
-    g_tabs[at]=tb; g_ntabs++; activate(at);
+    g_tabs[at]=tb; g_ntabs++;
+    if(browserClass) {mac_browser_ensure_root();tb->browser=[[browserClass alloc] initWithTab:tb];}
+    activate(at);
+    if(browserClass)[browser_for(tb) load:url];
     return tb;
+}
+static Tab *mac_browser_new(NSString *address, int parent, int native) {
+    return mac_browser_new_with_class(address,parent,native,Nil);
 }
 static void mac_browser_address(void) { mac_browser_address_grid(); }
 
@@ -587,10 +610,15 @@ static NSDictionary *mac_browser_request(NSDictionary *request) {
         NSMutableArray *tabs=[NSMutableArray array];
         for (int i=0;i<g_ntabs;i++) {
             Tab *tb=g_tabs[i];
+            HCBrowser *browser=browser_for(tb);NSRect frame=browser?browser->web.frame:NSZeroRect,bounds=g_browser_root.bounds;
             [tabs addObject:@{@"id":@(tb->id),@"parent":@(tb->parent_id),@"active":@(i==g_active),
                 @"kind":tb->kind==TK_BROWSER ? @"browser" : @"terminal",@"url":[NSString stringWithUTF8String:tb->browser_url],
                 @"title":tb->kind==TK_BROWSER ? browser_page_title(tb) : @"",@"site":[NSString stringWithUTF8String:tb->browser_site] ?: @"",
-                @"mode":tb->browser_native ? @"native" : @"hardcore"}];
+                @"mode":tb->browser_native ? @"native" : @"hardcore",
+                @"host":tb->browser_recording==1?@"replay":tb->browser_recording==2?@"video":@"web",
+                @"viewFrame":@[@(frame.origin.x),@(frame.origin.y),@(frame.size.width),@(frame.size.height)],
+                @"viewBounds":@[@(bounds.origin.x),@(bounds.origin.y),@(bounds.size.width),@(bounds.size.height)],
+                @"viewFlipped":@([g_browser_root isFlipped]),@"backingScale":@([g_win backingScaleFactor])}];
         }
         return @{@"ok":@YES,@"tabs":tabs};
     }

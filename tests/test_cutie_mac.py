@@ -547,13 +547,14 @@ def test_browser(app):
     print("PASS: cached browser Cuties scroll independently, run links/buttons in source, expand form edits and return terminal input focus to WK")
 
 
-def drag_cutie(app, identity, *, x=None, y=None, width=None, height=None, finish=True):
+def drag_cutie(app, identity, *, x=None, y=None, width=None, height=None, finish=True, grab_col=None):
     c = app.chrome()
     r = cutie(c, identity)["rect"]
     resize = width is not None or height is not None
-    sx = r["x"]+r["width"]-(1 if resize else 6)
+    handle = r["width"]-6 if grab_col is None else grab_col
+    sx = r["x"]+r["width"]-1 if resize else r["x"]+handle
     sy = r["y"]+r["height"]-1 if resize else r["y"]
-    tx = r["x"]+(width if width is not None else r["width"])-1 if resize else (x if x is not None else r["x"])+r["width"]-6
+    tx = r["x"]+(width if width is not None else r["width"])-1 if resize else (x if x is not None else r["x"])+handle
     ty = r["y"]+(height if height is not None else r["height"])-1 if resize else (y if y is not None else r["y"])
     c = app.hover(sx, sy)
     cw, ch = c["cell"]["width"], c["cell"]["height"]
@@ -567,6 +568,73 @@ def drag_cutie(app, identity, *, x=None, y=None, width=None, height=None, finish
     c = app.chrome()
     assert (c["tv_drag_slot"] < 0) == finish
     return c
+
+
+def test_title_drag(app):
+    main, workers = setup_workers(app, 2)
+    source, path = workers[1]
+    logs = {identity: data(p) for identity, p in workers}
+    c = open_cutie(app, source)
+    # A label character, then ordinary header whitespace, both capture moves.
+    c = drag_cutie(app, source, x=40, y=10, grab_col=3)
+    assert cutie(c, source)["rect"]["x"] == 40
+    c = drag_cutie(app, source, x=42, y=11, grab_col=cutie(c, source)["rect"]["width"]-3)
+    assert cutie(c, source)["rect"]["x"] == 42 and cutie(c, source)["open"]
+    assert selected(app.state()) == main, "dragging a title selected its source tab"
+
+    def utility_move(name, x, y, grab_col):
+        c = app.chrome()
+        r = app.tv(c, name)["rect"]
+        sx, sy = r["x"]+grab_col, r["y"]
+        c = app.hover(sx, sy)
+        cw, ch = c["cell"]["width"], c["cell"]["height"]
+        app.send(f"cmd pointer cursor {int((sx+.5)*cw)},{int((sy+.5)*ch)}")
+        c = app.chrome()
+        assert c["pointer_cursor"] == "open-hand", (name, c["pointer_cursor"])
+        app.send(f"cmd pointer down {int((sx+.5)*cw)},{int((sy+.5)*ch)}")
+        c = app.chrome()
+        assert c["tv_drag_slot"] >= 0 and c["tvs"][c["tv_drag_slot"]]["name"] == name
+        assert not c["tv_drag_mode"], "utility title accidentally started a resize"
+        px, py = int((x+grab_col+.5)*cw), int((y+.5)*ch)
+        app.send(f"cmd pointer drag {px},{py}")
+        app.send(f"cmd pointer up {px},{py}")
+        c = app.chrome()
+        moved = app.tv(c, name)
+        assert c["tv_drag_slot"] < 0 and moved["manual"] and moved["placed"]
+        assert moved["rect"] == dict(r, x=x, y=y), (name, r, moved["rect"])
+        return c
+
+    app.settings_section(1)
+    c = utility_move("settings", 0, 4, 3)
+    assert c["pages"]["settings"]["capacity"] > 0
+    c = app.settings_section(0)
+    assert c["settings_tab"] == 0 and c["font_buttons"], "moving settings lost its live controls"
+    c = app.header_click("caf")
+    try:
+        c = utility_move("caf", 0, 22, 16)
+        assert c["caf_active"], "moving CAF toggled its assertion"
+        c = app.hover(-1, -1)
+        app.snap("all-tv-titles-drag-with-live-controls")
+        # Only the visible close/minimize glyph is a button, not its padding.
+        for name in ("settings", "caf"):
+            r = app.tv(c, name)["rect"]
+            c = actual_click(app, app.hover(r["x"]+r["width"]-2, r["y"]), r["x"]+r["width"]-2, r["y"])
+            assert not app.tv(c, name)["open"]
+        assert c["caf_active"], "closing CAF details ended its assertion"
+        r = cutie(c, source)["rect"]
+        c = actual_click(app, app.hover(r["x"]+r["width"]-4, r["y"]), r["x"]+r["width"]-4, r["y"])
+        assert selected(app.state()) == source and cutie(c, source)["open"], "expand glyph became a drag target"
+        r = cutie(c, source)["rect"]
+        c = actual_click(app, app.hover(r["x"]+r["width"]-2, r["y"]), r["x"]+r["width"]-2, r["y"])
+        assert not any(tv["source_tab_id"] == source for tv in cuties(c))
+        os.kill(data(path)["pid"], 0)
+        for identity, p in workers:
+            stable_pty(logs[identity], data(p))
+            assert data(p)["input"] == "", "title/control pointer event leaked into a PTY"
+    finally:
+        if app.chrome()["caf_active"]:
+            app.header_click("caf")
+    print("PASS: title labels and whitespace drag Cutie, Settings and CAF without PTY input; expand/minimize glyphs retain actions")
 
 
 def wait_order(app, identities):
@@ -841,7 +909,7 @@ def main():
              "focus-reports": test_focus_reports, "capacity": test_capacity,
              "source-close": test_source_close, "browser": test_browser,
              "tab-order": test_tab_order, "geometry": test_geometry, "drag-cancel": test_drag_cancel,
-             "markers": test_markers}
+             "markers": test_markers, "title-drag": test_title_drag}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=cases)
     parser.add_argument("--artifacts", type=Path, default=Path("build/cutie-native"))

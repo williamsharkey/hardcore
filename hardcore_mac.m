@@ -44,6 +44,8 @@ static void mac_record_pause(void);
 static void mac_record_stop(void);
 static void mac_record_discard(void);
 static void mac_record_library(void);
+static void mac_record_file_viewer(NSString *);
+static int mac_record_exports_active(void);
 static void mac_record_upload(int,int,const unsigned char *);
 static void mac_record_event(NSEvent *,int,int);
 static void mac_record_hide_pointer(void);
@@ -1541,10 +1543,10 @@ static void new_tab_mac(void) {
     new_tab_here();
 }
 
-static void mac_files_new(void) {
+static void mac_files_at(const char *requested) {
     if(g_ntabs>=MAX_TABS)return;
     Tab *cur=active_tab();
-    const char *dir=cur && cur->t.cwd[0]?cur->t.cwd:cur?cur->start_dir:g_start_dir;
+    const char *dir=requested ?: (cur && cur->t.cwd[0]?cur->t.cwd:cur?cur->start_dir:g_start_dir);
     NSString *script=[[[NSString stringWithUTF8String:g_mac_bin_dir] stringByDeletingLastPathComponent]
         stringByAppendingPathComponent:@"Resources/files.py"];
     if(![[NSFileManager defaultManager] isReadableFileAtPath:script]) {
@@ -1560,6 +1562,13 @@ static void mac_files_new(void) {
     snprintf(tb->hist,sizeof(tb->hist),"%s",[script fileSystemRepresentation]);
     set_cwd(&tb->t,dir);
     tab_spawn(tb);g_tabs[g_ntabs++]=tb;activate(g_ntabs-1);
+}
+static void mac_files_new(void) {mac_files_at(NULL);}
+static void mac_record_file_viewer(NSString *path) {
+    BOOL directory=NO;
+    if(![NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&directory] || !directory)
+        path=path.stringByDeletingLastPathComponent;
+    if(path.length)mac_files_at(path.fileSystemRepresentation);
 }
 static int mac_header_action(int hit) {
     if(hit==HIT_PLUS)new_tab_mac();
@@ -1638,17 +1647,18 @@ static void mac_tv_drag_end(void) {
 }
 static int mac_tv_drag_begin(int mx,int my) {
     int slot=-1,hit=chrome_tv_hit(mx,my,&slot);
-    if(slot<HC_TV_CUTIE_FIRST || (hit!=HIT_TV_GRIP && hit!=HIT_TV_RESIZE))return 0;
+    if(slot<0 || slot>=HC_TV_COUNT || (hit!=HIT_TV_GRIP && hit!=HIT_TV_RESIZE))return 0;
     mac_cutie_blur();chrome_preview_cancel();
     g_tv_drag_slot=slot;g_tv_drag_mode=hit==HIT_TV_RESIZE;
     g_tv_drag_origin=g_tvs[slot].state.rect;g_tv_drag_x=mx;g_tv_drag_y=my;
     g_cutie_mouse_consumed=1;g_cutie_mouse_id=0;
     g_mouse_x=mx;g_mouse_y=my;g_sel_drag=g_sb_drag=0;
     hc_tv_motion_reset(&g_tvs[slot].motion);
+    chrome_tv_interaction(slot);
     [(g_tv_drag_mode?mac_tv_resize_cursor():[NSCursor closedHandCursor]) set];plat_invalidate();return 1;
 }
 static void mac_tv_drag_move(int mx,int my) {
-    if(g_tv_drag_slot<HC_TV_CUTIE_FIRST || g_tv_drag_slot>=HC_TV_COUNT)return;
+    if(g_tv_drag_slot<0 || g_tv_drag_slot>=HC_TV_COUNT)return;
     ChromeTv *tv=g_tvs+g_tv_drag_slot;Tab *tb=active_tab();
     if(!tv->state.open || !tb){mac_tv_drag_end();return;}
     int cols=tb->t.cols,rows=tb->kind==TK_BROWSER?mac_browser_page_rows(tb):tb->t.rows;
@@ -1669,7 +1679,8 @@ static void mac_tv_drag_move(int mx,int my) {
     if(fits && !hc_tv_rect_equal(r,tv->state.rect)) {
         tv->manual=1;tv->requested=r;tv->state.rect=r;
         tv->placement=(HcTvPlacement){.rect=r,.valid=1};
-        tv->frame.count=0;g_cuties[g_tv_drag_slot].valid=0;
+        tv->frame.count=0;
+        if(g_tv_drag_slot>=HC_TV_CUTIE_FIRST)g_cuties[g_tv_drag_slot].valid=0;
         hc_tv_motion_reset(&tv->motion);chrome_tv_interaction(g_tv_drag_slot);plat_invalidate();
     }
     [(g_tv_drag_mode?mac_tv_resize_cursor():[NSCursor closedHandCursor]) set];
@@ -1685,7 +1696,7 @@ static int mac_cutie_click(int mx,int my,int mods) {
     HcTvRect r=tv->state.rect;
     if(my/CH==r.y) {
         g_cutie_mouse_consumed=1;
-        if(mx/CW-r.x==r.w-4)for(int i=0;i<g_ntabs;i++)if(g_tabs[i]==tb){activate(i);break;}
+        if(hit==HIT_TV_EXPAND)for(int i=0;i<g_ntabs;i++)if(g_tabs[i]==tb){activate(i);break;}
         g_cutie_mouse_consumed=1;return 1;
     }
     int col=0,row=0,node=0,mapped=cutie_source_at(slot,mx,my,&col,&row,&node);
@@ -2545,6 +2556,8 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 
 #include "hardcore_browser_mac.m"
 #include "hardcore_recording.m"
+static void record_jobs_changed(void) {update_busy(0);plat_invalidate();}
+#include "hardcore_recording_jobs.m"
 #include "hardcore_recording_library.m"
 #include "hardcore_camera_panel.m"
 
@@ -2594,6 +2607,12 @@ static void focus_changed(int focused) {
     if (mac_record_active()) {
         NSAlert *alert=[[[NSAlert alloc] init] autorelease];
         alert.messageText=@"Save or discard the camera recording before quitting.";
+        [alert runModal];return NSTerminateCancel;
+    }
+    if(mac_record_exports_active()) {
+        NSAlert *alert=[[[NSAlert alloc] init] autorelease];
+        alert.messageText=@"Exports are still running.";
+        alert.informativeText=@"You can hide the camera or Clips TV while they finish. Reopen Clips to see progress.";
         [alert runModal];return NSTerminateCancel;
     }
     if (!g_quitting && !confirm_close(-1)) return NSTerminateCancel;
@@ -2842,6 +2861,7 @@ static void ctl_chrome(const char *path) {
     state[@"tv_drag_slot"]=@(g_tv_drag_slot);state[@"tv_drag_mode"]=@(g_tv_drag_mode);
     state[@"input_tab_id"]=@(input_tab()?input_tab()->id:0);
     state[@"tvs"]=tvs;state[@"caf_active"]=@(mac_caf_active());
+    state[@"camera"]=mac_camera_status();state[@"exports"]=mac_record_jobs();
     Tab *selected=active_tab(),*shown=display_tab();
     state[@"preview"]=@{@"active_id":@(selected?selected->id:0),@"display_id":@(shown?shown->id:0),
         @"preview_id":@(g_tab_preview.target_id)};
@@ -2888,6 +2908,7 @@ static void ctl_line(char *s) {
     } else if (!strncmp(s, "cmd ", 4)) {
         const char *c = s + 4;
         if(!strncmp(c,"record-fixture ",15))mac_record_fixture([NSString stringWithUTF8String:c+15]);
+        else if(!strcmp(c,"clips"))mac_record_library();
         else if(!strncmp(c,"focus ",6))focus_changed(atoi(c+6));
         else if(!strcmp(c,"preview-cancel"))chrome_preview_cancel();
         else if(!strncmp(c,"preview-event ",14)) {
@@ -2976,14 +2997,14 @@ static void ctl_line(char *s) {
                                    !strcmp(action,"right-up")?NSEventTypeRightMouseUp:
                                    !strcmp(action,"middle-down")?NSEventTypeOtherMouseDown:
                                    !strcmp(action,"middle-up")?NSEventTypeOtherMouseUp:
-                                   !strcmp(action, "down") ? NSEventTypeLeftMouseDown :
+                                   (!strcmp(action,"down") || !strcmp(action,"monitor-down")) ? NSEventTypeLeftMouseDown :
                                    (!strcmp(action, "drag") || !strcmp(action,"monitor-drag")) ? NSEventTypeLeftMouseDragged :
                                    (!strcmp(action,"move") || !strcmp(action,"monitor") || !strcmp(action,"cursor") || !strcmp(action,"flags")) ? NSEventTypeMouseMoved : NSEventTypeLeftMouseUp;
                 CGFloat scale = [g_win backingScaleFactor];
                 NSPoint p = [(NSView *)g_view convertPoint:NSMakePoint(x/scale, y/scale) toView:nil];
                 NSEvent *e = [NSEvent mouseEventWithType:kind location:p modifierFlags:0 timestamp:0
                     windowNumber:[g_win windowNumber] context:nil eventNumber:0 clickCount:1 pressure:1];
-                if(!strcmp(action,"monitor-up") || !strcmp(action,"monitor-drag")) {
+                if(!strcmp(action,"monitor-down") || !strcmp(action,"monitor-up") || !strcmp(action,"monitor-drag")) {
                     g_mac_test_monitor_consumed=mac_title_event(e)==nil;return;
                 }
                 if(kind==NSEventTypeMouseMoved) {

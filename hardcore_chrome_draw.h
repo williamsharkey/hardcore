@@ -356,6 +356,10 @@ static void chrome_render_header(int hover) {
             const wchar_t *label = c->hit == HIT_CAF && !mac_caf_active() ? L"caf" : c->label;
             if(c->hit==HIT_CAMERA && mac_record_active()){label=L"REC";color=g_look.red;}
             grid_text(label, c->col, y, color);
+            if(c->hit==HIT_CAMERA && mac_record_exports_active()) {
+                wchar_t drip[2]={g_ndrip?g_drip[(GetTickCount()/DRIP_MS)%g_ndrip]:0x2800,0};
+                grid_text(drip,c->col+3,y,AMBER);
+            }
         }
         if (!row) chrome_frame(y, g_look.dim);
         else chrome_sides(y, g_look.dim);

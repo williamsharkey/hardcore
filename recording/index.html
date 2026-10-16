@@ -9,8 +9,8 @@
 </head>
 <body>
   <header class="toolbar">
-    <a class="wordmark" href="#" id="library-link">Hardcore <span>recordings</span></a>
-    <div class="toolbar-actions"><button id="open-button">Open recording</button><button id="export-button" disabled>Export video</button></div>
+    <a class="wordmark" href="#" id="library-link">Hardcore <span id="library-name">recordings</span></a>
+    <div class="toolbar-actions"><button id="open-button">Open recording</button><button id="files-button" hidden>Files</button><button id="zip-button" hidden>Share ZIP</button><button id="export-button" disabled>Export video</button></div>
   </header>
   <main>
     <section id="welcome" class="welcome">
@@ -38,8 +38,10 @@
       <div class="footer"><p id="edit-summary" class="quiet"></p><button id="save-edits">Save edit settings</button></div>
     </section>
     <p id="status" role="status" aria-live="polite"></p>
+    <div id="job-status" class="job-status" hidden role="status" aria-live="polite"><progress id="job-progress" max="1"></progress><span id="job-message"></span><button id="job-output" hidden>Open output</button></div>
   </main>
   <dialog id="export-dialog"><form method="dialog"><h2>Export video</h2><p id="export-note"></p><pre id="export-command"></pre><div class="dialog-actions"><button id="download-edits" type="button">Download edit settings</button><button value="close">Done</button></div></form></dialog>
+  <dialog id="captions-dialog"><form method="dialog"><h2>Add captions</h2><p>Paste SRT or WebVTT captions, or drop a caption file into the replay tab.</p><textarea id="captions-text" aria-label="Timed captions" spellcheck="false" placeholder="1&#10;00:00:00,000 --> 00:00:02,000&#10;Caption text"></textarea><p id="captions-error" role="status"></p><div class="dialog-actions"><button value="cancel">Cancel</button><button id="captions-apply" type="button">Add captions</button></div></form></dialog>
   <input id="folder-picker" type="file" webkitdirectory multiple hidden>
   <input id="caption-picker" type="file" accept=".srt,.vtt,text/vtt" hidden>
   <video id="camera" playsinline preload="auto" hidden></video>

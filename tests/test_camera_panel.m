@@ -47,7 +47,24 @@ static void mac_record_start(void){}
 static void mac_record_pause(void){}
 static void mac_record_stop(void){}
 static void mac_record_discard(void){}
-static void mac_record_library(void){test_library_opens++;}
+static int mac_record_exports_active(void){return 0;}
+static NSMutableArray *test_jobs;
+static NSArray *test_items;
+static NSString *test_output;
+static BOOL test_export_start;
+static NSArray *mac_record_jobs(void){return test_jobs ?: @[];}
+static NSArray *mac_record_items(void){test_library_opens++;return test_items ?: @[];}
+static BOOL mac_record_export(NSString *path,NSDictionary *edits,BOOL zip){
+    if(!test_export_start)return NO;
+    [test_jobs addObject:@{@"id":@"new-export",@"bundle":path,@"state":@"running",@"output":@"new-output"}];return YES;
+}
+static void mac_record_file_viewer(NSString *path){}
+static void record_library_open(NSString *path){}
+static void record_library_open_output(NSString *path){[test_output release];test_output=[path copy];}
+#define DRIP_MS 80
+static unsigned GetTickCount(void){return 0;}
+static int g_ndrip;
+static uint16_t g_drip[40];
 static void chrome_label(const wchar_t *text,int a,int b,int y,uint32_t color){}
 static void fill_rect(float a,float b,float c,float d,uint32_t color,float alpha){}
 static void utf8_to_wide(const char *s,wchar_t *out,int capacity){if(capacity)out[0]=0;}
@@ -64,6 +81,15 @@ static void chrome_tv_reflow_apply(Term *t,HcTvRect rect,const HcTvRect *prior,i
 }
 #import "../hardcore_camera_panel.m"
 
+@interface HCTestWheelEvent:NSObject
+@property CGFloat vertical;
+@end
+@implementation HCTestWheelEvent
+- (NSEventType)type{return NSEventTypeScrollWheel;}
+- (CGFloat)scrollingDeltaY{return self.vertical;}
+- (CGFloat)scrollingDeltaX{return 10;}
+@end
+
 static int at(int col,int row) {
     return mac_camera_hit((g_camera_rect.x+col)*CW+CW/2,(g_camera_rect.y+row)*CH+CH/2);
 }
@@ -79,7 +105,9 @@ static void clips_clicks(void) {
     assert(pointer(NSEventTypeLeftMouseDragged,21,row));
     assert(test_library_opens==0);
     assert(pointer(NSEventTypeLeftMouseUp,21,row));
-    assert(test_library_opens==1 && !g_camera_down && !g_camera_pending_action);
+    assert(test_library_opens==1 && g_camera_clips && !g_camera_down && !g_camera_pending_action);
+    assert(!g_camera_capture); /* opening Clips never asks for camera access */
+    g_camera_clips=0;
     pointer(NSEventTypeLeftMouseUp,21,row);
     assert(test_library_opens==1); /* exactly one action per click */
 
@@ -93,6 +121,7 @@ static void clips_clicks(void) {
     pointer(NSEventTypeLeftMouseDragged,20,row);
     pointer(NSEventTypeLeftMouseUp,20,row);
     assert(test_library_opens==2); /* returning to the button still works */
+    g_camera_clips=0;
 
     pointer(NSEventTypeLeftMouseDown,20,row);
     mac_camera_cancel_press(); /* key window loss/minimization */
@@ -119,6 +148,48 @@ static void clips_clicks(void) {
     pointer(NSEventTypeLeftMouseDown,20,row);
     pointer(NSEventTypeLeftMouseUp,20,row);
     assert(test_library_opens==3); /* cancellation never leaves a stuck press */
+    g_camera_clips=0;
+    [g_camera_timer invalidate];g_camera_timer=nil;
+    g_camera_requested=(HcTvRect){0};
+}
+static void clips_selection(void) {
+    g_camera_visible=g_camera_placed=g_camera_clips=1;g_camera_rect=(HcTvRect){30,0,48,12};
+    test_items=@[@{@"path":@"alpha"},@{@"path":@"beta"},@{@"path":@"gamma"}];
+    mac_clips_action(MAC_CLIPS_RECORDINGS);mac_clips_action(MAC_CLIPS_ITEM+1);
+    assert([mac_clips_selected()[@"path"] isEqual:@"beta"]);
+    test_items=@[@{@"path":@"newer"},@{@"path":@"gamma"},@{@"path":@"alpha"},@{@"path":@"beta"}];
+    mac_clips_refresh();assert(g_clips_selected==3 && [mac_clips_selected()[@"path"] isEqual:@"beta"]);
+    mac_clips_action(MAC_CLIPS_PREVIOUS);assert([mac_clips_selected()[@"path"] isEqual:@"alpha"]);
+    mac_clips_action(MAC_CLIPS_NEXT);assert([mac_clips_selected()[@"path"] isEqual:@"beta"]);
+    /* Removing the selected clip cannot silently redirect a pending action. */
+    test_items=@[@{@"path":@"newer"},@{@"path":@"gamma"},@{@"path":@"alpha"}];
+    mac_clips_refresh();assert(g_clips_selected==-1 && !mac_clips_selected());
+    mac_clips_action(MAC_CLIPS_ITEM+2);assert([mac_clips_selected()[@"path"] isEqual:@"alpha"]);
+
+    test_jobs=[NSMutableArray array];
+    for(int i=0;i<32;i++)[test_jobs addObject:@{@"id":[NSString stringWithFormat:@"job-%d",i],
+        @"bundle":@"alpha",@"state":@"done",@"output":[NSString stringWithFormat:@"output-%d",i]}];
+    mac_clips_action(MAC_CLIPS_EXPORTS);mac_clips_action(MAC_CLIPS_ITEM+20);
+    [test_jobs removeObjectAtIndex:0];
+    [test_jobs addObject:@{@"id":@"job-32",@"bundle":@"alpha",@"state":@"done",@"output":@"output-32"}];
+    mac_clips_action(MAC_CLIPS_OUTPUT);
+    assert(g_clips_selected==19 && [test_output isEqual:@"output-20"]);
+    assert(g_clips_offset<=19 && 19<g_clips_offset+mac_clips_capacity());
+    [test_jobs removeObjectAtIndex:19];mac_clips_action(MAC_CLIPS_OUTPUT);
+    assert(g_clips_selected==-1 && !mac_clips_selected() && [test_output isEqual:@"output-20"]);
+    mac_clips_action(MAC_CLIPS_NEXT);assert([mac_clips_selected()[@"id"] isEqual:@"job-1"]);
+    mac_clips_action(MAC_CLIPS_ITEM+10);NSString *identity=[mac_clips_selected()[@"id"] copy];
+    HCTestWheelEvent *wheel=[HCTestWheelEvent new];wheel.vertical=0;
+    assert(mac_camera_mouse((NSEvent *)wheel,(g_camera_rect.x+2)*CW,(g_camera_rect.y+2)*CH));
+    assert([mac_clips_selected()[@"id"] isEqual:identity]);
+    wheel.vertical=-1;mac_camera_mouse((NSEvent *)wheel,(g_camera_rect.x+2)*CW,(g_camera_rect.y+2)*CH);
+    assert(g_clips_selected==11);[wheel release];[identity release];
+    test_export_start=YES;mac_clips_action(MAC_CLIPS_MP4);test_export_start=NO;
+    assert([mac_clips_selected()[@"id"] isEqual:@"new-export"]);
+    mac_camera_toggle();assert(!g_camera_visible);
+    mac_camera_toggle();assert(g_camera_visible&&g_camera_clips&&[mac_clips_selected()[@"id"] isEqual:@"new-export"]);
+    assert(!g_camera_capture);
+    [g_camera_timer invalidate];g_camera_timer=nil;test_jobs=nil;test_items=nil;
 }
 int main(void) {
     @autoreleasepool {
@@ -165,7 +236,8 @@ int main(void) {
         assert(at(2,2)==MAC_CAMERA_NONE);
         test_tab.t.cols=120;g_camera_visible=0;mac_camera_layout(&test_tab.t);
         assert(!g_camera_placed && !mac_camera_hit(10,10));
-        puts("camera panel: placement, reflow, metadata and Clips click/release/cancellation passed (no devices opened)");
+        clips_selection();
+        puts("camera panel: placement, reflow, metadata, Clips click/release/cancellation, stable selection and scroll passed (no devices opened)");
     }
     return 0;
 }

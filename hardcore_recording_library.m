@@ -1,384 +1,261 @@
-/* Saved recordings and the native host for the portable replay editor.
- * Included after hardcore_recording.m. The bridge accepts only the local main
- * document, validates every argument, and invokes fixed executables without a shell. */
-#import <WebKit/WebKit.h>
+/* Clips replay uses Hardcore's existing tab/view lifecycle. The job manager
+ * (included before this file) owns exports independently of the editor. */
+#include "hardcore_recording_view_geometry.h"
 static void mac_record_library(void);
-static NSMutableSet *g_record_editors;
-static BOOL record_library_number(id value) {
-    return [value isKindOfClass:NSNumber.class] && isfinite([value doubleValue]);
-}
-static BOOL record_library_local_document(NSURL *url,NSString *bundle) {
-    if(!url.isFileURL)return NO;
-    NSString *root=bundle.stringByResolvingSymlinksInPath;
-    NSString *expected=[[root stringByAppendingPathComponent:@"index.html"] stringByResolvingSymlinksInPath];
-    return [expected hasPrefix:[root stringByAppendingString:@"/"]] && [url.path.stringByResolvingSymlinksInPath isEqualToString:expected];
-}
-static NSDictionary *record_library_edits(id body,NSString **error) {
-    if(![body isKindOfClass:NSDictionary.class]){*error=@"Invalid export settings";return nil;}
-    if(!record_library_number(body[@"startMs"]) || !record_library_number(body[@"endMs"])) {
-        *error=@"Choose a valid start and end for the clip";return nil;
-    }
-    double start=[body[@"startMs"] doubleValue],end=[body[@"endMs"] doubleValue];
-    if(start<0 || end<=start || end>7*24*3600*1000.0) {
-        *error=@"Choose a valid start and end for the clip";return nil;
-    }
-    id crop=body[@"crop"];
-    if(crop && crop!=NSNull.null) {
-        if(![crop isKindOfClass:NSArray.class] || [crop count]!=4){*error=@"Invalid crop rectangle";return nil;}
-        for(id n in crop)if(!record_library_number(n) || [n doubleValue]<0 || [n doubleValue]>8192){*error=@"Invalid crop rectangle";return nil;}
-        if([crop[2] doubleValue]<=0 || [crop[3] doubleValue]<=0){*error=@"Crop dimensions must be positive";return nil;}
-    }
-    id captions=body[@"captionItems"] ?: @[];
-    if(![captions isKindOfClass:NSArray.class] || [captions count]>10000){*error=@"Too many captions";return nil;}
-    NSMutableArray *clean=[NSMutableArray array];NSUInteger textLength=0;
-    for(id cue in captions) {
-        if(![cue isKindOfClass:NSDictionary.class] || !record_library_number(cue[@"start"]) || !record_library_number(cue[@"end"]) ||
-           [cue[@"start"] doubleValue]<0 || [cue[@"end"] doubleValue]<=[cue[@"start"] doubleValue] || [cue[@"end"] doubleValue]>7*24*3600*1000.0 ||
-           ![cue[@"text"] isKindOfClass:NSString.class] || [cue[@"text"] length]>10000) {*error=@"Invalid caption";return nil;}
-        textLength+=[cue[@"text"] length];
-        if(textLength>512*1024){*error=@"Caption text is too large";return nil;}
-        [clean addObject:@{@"start":cue[@"start"],@"end":cue[@"end"],@"text":cue[@"text"]}];
-    }
-    for(NSString *key in @[@"captions",@"pointer"])if(body[key] && ![body[key] isKindOfClass:NSNumber.class]){*error=@"Invalid display setting";return nil;}
-    return @{@"version":@1,@"startMs":@(start),@"endMs":@(end),@"crop":crop ?: NSNull.null,
-        @"captions":body[@"captions"] ?: @YES,@"pointer":body[@"pointer"] ?: @YES,@"captionItems":clean};
-}
-static NSString *record_library_srt_time(double milliseconds) {
-    long long value=llround(milliseconds);
-    return [NSString stringWithFormat:@"%02lld:%02lld:%02lld,%03lld",value/3600000,value/60000%60,value/1000%60,value%1000];
-}
-static NSString *record_library_srt(NSArray *captions) {
-    NSMutableString *s=[NSMutableString string];int index=1;
-    for(NSDictionary *cue in captions) {
-        NSString *text=[cue[@"text"] stringByReplacingOccurrencesOfString:@"\r" withString:@""];
-        /* SRT blank lines separate cues; preserve the visible paragraph break
-           as a single line break, rather than accidentally creating a new cue. */
-        while([text rangeOfString:@"\n\n"].location!=NSNotFound)text=[text stringByReplacingOccurrencesOfString:@"\n\n" withString:@"\n"];
-        [s appendFormat:@"%d\n%@ --> %@\n%@\n\n",index++,record_library_srt_time([cue[@"start"] doubleValue]),record_library_srt_time([cue[@"end"] doubleValue]),text];
-    }
-    return s;
-}
-static NSTextField *record_library_label(NSRect rect,NSString *text) {
-    NSTextField *label=[[[NSTextField alloc] initWithFrame:rect] autorelease];
-    label.stringValue=text ?: @"";label.editable=NO;label.selectable=NO;label.bordered=NO;label.drawsBackground=NO;
-    label.font=[NSFont systemFontOfSize:12];return label;
-}
-static NSButton *record_library_button(NSRect rect,NSString *title,id target,SEL action) {
-    NSButton *button=[[[NSButton alloc] initWithFrame:rect] autorelease];button.title=title;button.bezelStyle=NSBezelStyleRounded;
-    button.target=target;button.action=action;return button;
-}
-static NSString *record_library_log(NSString *path) {
-    NSFileHandle *file=[NSFileHandle fileHandleForReadingAtPath:path];
-    if(!file)return @"";
-    unsigned long long size=[file seekToEndOfFile];[file seekToFileOffset:size>16384?size-16384:0];
-    NSData *data=[file readDataToEndOfFile];[file closeFile];
-    return [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease] ?: @"";
-}
-
-@interface HCRecordingJob : NSObject {
-    NSTask *_task;
-    NSString *_temporary;
-    NSString *_staged;
-    NSString *_destination;
-    NSString *_log;
-    void (^_completion)(BOOL,NSString *);
-}
-@property(readonly) NSString *log;
-- (BOOL)start:(NSString *)tool arguments:(NSArray *)arguments staged:(NSString *)staged destination:(NSString *)destination temporary:(NSString *)temporary completion:(void (^)(BOOL,NSString *))completion;
-@end
-@implementation HCRecordingJob
-- (NSString *)log {return record_library_log(_log);}
-- (void)dealloc {
-    [_task release];[_temporary release];[_staged release];[_destination release];[_log release];[_completion release];[super dealloc];
-}
-- (BOOL)start:(NSString *)tool arguments:(NSArray *)arguments staged:(NSString *)staged destination:(NSString *)destination temporary:(NSString *)temporary completion:(void (^)(BOOL,NSString *))completion {
-    _temporary=[temporary copy];_staged=[staged copy];_destination=[destination copy];_completion=[completion copy];
-    _log=[[_temporary stringByAppendingPathComponent:@"export.log"] copy];
+static void mac_record_file_viewer(NSString *path);
+static void record_library_open(NSString *bundle);
+static void record_library_open_output(NSString *path);
+/* Refresh only executable player assets. Replay/video/edit data are untouched;
+   prepare every replacement first and roll back assets on a write failure. */
+static BOOL record_library_refresh_assets(NSString *bundle) {
     NSFileManager *fm=NSFileManager.defaultManager;
-    [fm createFileAtPath:_log contents:[NSData data] attributes:@{NSFilePosixPermissions:@0600}];
-    NSFileHandle *output=[NSFileHandle fileHandleForWritingAtPath:_log];
-    _task=[[NSTask alloc] init];_task.executableURL=[NSURL fileURLWithPath:tool];_task.arguments=arguments;
-    _task.standardOutput=output;_task.standardError=output;_task.standardInput=[NSFileHandle fileHandleWithNullDevice];
-    _task.terminationHandler=^(NSTask *task){
-        int status=task.terminationStatus;
-        dispatch_async(dispatch_get_main_queue(),^{
-            NSError *error=nil;BOOL ok=status==0;
-            if(ok) {
-                if([fm fileExistsAtPath:_destination])ok=[fm replaceItemAtURL:[NSURL fileURLWithPath:_destination] withItemAtURL:[NSURL fileURLWithPath:_staged] backupItemName:nil options:0 resultingItemURL:NULL error:&error];
-                else ok=[fm moveItemAtPath:_staged toPath:_destination error:&error];
-            }
-            NSString *message=ok?[NSString stringWithFormat:@"Saved %@",_destination.lastPathComponent]:error.localizedDescription;
-            if(!message.length)message=record_library_log(_log);
-            if(!message.length)message=[NSString stringWithFormat:@"Export stopped with status %d",status];
-            if(_completion)_completion(ok,message);
-            [fm removeItemAtPath:_temporary error:nil];[fm removeItemAtPath:_staged error:nil];
-            _task.terminationHandler=nil;
-        });
-    };
-    NSError *error=nil;
-    if(![_task launchAndReturnError:&error]) {
-        _task.terminationHandler=nil;[output closeFile];
-        if(_completion)_completion(NO,error.localizedDescription);
-        [fm removeItemAtPath:_temporary error:nil];[fm removeItemAtPath:_staged error:nil];return NO;
+    NSMutableDictionary *replacements=[NSMutableDictionary dictionary],*originals=[NSMutableDictionary dictionary];
+    for(NSString *name in @[@"index.html",@"core.js",@"player.js",@"style.css"]) {
+        NSString *path=[bundle stringByAppendingPathComponent:name];
+        if(![path.stringByResolvingSymlinksInPath hasPrefix:[bundle stringByAppendingString:@"/"]]){record_status(@"This clip has a player asset outside its folder");return NO;}
+        NSData *replacement=[NSData dataWithContentsOfFile:record_resource([@"recording/" stringByAppendingString:name])];
+        if(!replacement || replacement.length>4*1024*1024){record_status(@"The Clips player assets are missing. Rebuild or reinstall Hardcore.");return NO;}
+        NSData *original=[NSData dataWithContentsOfFile:path];
+        if(original.length>4*1024*1024){record_status(@"This clip has an oversized player asset");return NO;}
+        if([original isEqual:replacement])continue;
+        replacements[name]=replacement;originals[name]=original ?: (id)NSNull.null;
     }
-    [output closeFile];return YES;
+    NSMutableArray *written=[NSMutableArray array];
+    for(NSString *name in replacements) {
+        NSString *path=[bundle stringByAppendingPathComponent:name];NSError *error=nil;
+        if(![replacements[name] writeToFile:path options:NSDataWritingAtomic error:&error]) {
+            for(NSString *previous in written) {
+                NSString *restore=[bundle stringByAppendingPathComponent:previous];id original=originals[previous];
+                if(original==NSNull.null)[fm removeItemAtPath:restore error:nil];
+                else [original writeToFile:restore options:NSDataWritingAtomic error:nil];
+            }
+            record_status(error.localizedDescription ?: @"Could not update this clip's replay controls");return NO;
+        }
+        [fm setAttributes:@{NSFilePosixPermissions:@0600} ofItemAtPath:path error:nil];[written addObject:name];
+    }
+    return YES;
 }
+
+@interface HCRecordingBrowser : HCBrowser {
+@public
+    NSString *recordPath;
+    BOOL recordMovie,recordClosed,recordReady;
+    double recordDuration;
+    NSTimer *recordTimer;
+    NSDictionary *recordLastStatus,*recordLastTheme;
+}
+- (BOOL)allowsDocument:(NSURL *)url;
+- (void)hostStatus:(NSDictionary *)status;
+- (void)pollJobs:(NSTimer *)timer;
 @end
 
-static NSString *record_library_temporary(void) {
-    NSString *path=[NSTemporaryDirectory() stringByAppendingPathComponent:[@"hardcore-export-" stringByAppendingString:NSUUID.UUID.UUIDString]];
-    return [NSFileManager.defaultManager createDirectoryAtPath:path withIntermediateDirectories:NO attributes:@{NSFilePosixPermissions:@0700} error:nil]?path:nil;
+static NSDictionary *record_browser_theme(void) {
+    return @{ @"bg":[NSString stringWithFormat:@"#%06x",g_look.bg & 0xffffff],
+        @"surface":[NSString stringWithFormat:@"#%06x",g_look.bar & 0xffffff],
+        @"line":[NSString stringWithFormat:@"#%06x",g_look.hover & 0xffffff],
+        @"text":[NSString stringWithFormat:@"#%06x",g_look.fg & 0xffffff],
+        @"muted":[NSString stringWithFormat:@"#%06x",g_look.dim & 0xffffff],
+        @"accent":[NSString stringWithFormat:@"#%06x",g_look.accent & 0xffffff] };
 }
-static NSString *record_library_stage(NSString *destination) {
-    return [[destination stringByDeletingLastPathComponent] stringByAppendingPathComponent:[NSString stringWithFormat:@".hardcore-%@-%@",NSUUID.UUID.UUIDString,destination.lastPathComponent]];
+static NSString *record_browser_json(id value) {
+    NSData *data=[NSJSONSerialization dataWithJSONObject:value options:NSJSONWritingFragmentsAllowed error:nil];
+    NSString *json=data?[[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease]:@"null";
+    return [[json stringByReplacingOccurrencesOfString:@"\u2028" withString:@"\\u2028"] stringByReplacingOccurrencesOfString:@"\u2029" withString:@"\\u2029"];
 }
-@interface HCRecordingEditor : NSWindowController <NSWindowDelegate,WKNavigationDelegate,WKUIDelegate,WKScriptMessageHandler> {
-    NSString *_bundle;
-    WKWebView *_web;
-    NSTextField *_status;
-    NSProgressIndicator *_progress;
-    HCRecordingJob *_job;
-    NSTimer *_timer;
-    BOOL _closed;
-    double _durationMs;
+
+@implementation HCRecordingBrowser
+- (void)prepareNative {
+    Tab *tb=tab_by_id(tabID);if(!tb || tb->browser!=self || recordClosed)return;
+    NSRect rect=[self contentRect:[g_browser_root bounds]];
+    if(inspectOpen){CGFloat scale=[g_win backingScaleFactor];CGFloat pane=(tb->t.rows-mac_browser_page_rows(tb))*CH/scale;rect.origin.y+=pane;rect.size.height=MAX(1,rect.size.height-pane);}
+    if(!NSEqualRects(web.frame,rect))mac_browser_resize(tb);
 }
-- (instancetype)initWithBundle:(NSString *)bundle;
-- (void)exportEdits:(NSDictionary *)edits;
-- (void)updateProgress:(NSTimer *)timer;
-@end
-static void record_library_open(NSString *path) {
-    BOOL directory=NO;
-    if(![NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&directory] || !directory ||
-       ![NSFileManager.defaultManager fileExistsAtPath:[path stringByAppendingPathComponent:@"index.html"]]) {
-        record_status(@"This recording has no portable player");return;
-    }
-    if(!g_record_editors)g_record_editors=[[NSMutableSet alloc] init];
-    HCRecordingEditor *editor=[[[HCRecordingEditor alloc] initWithBundle:path] autorelease];
-    [g_record_editors addObject:editor];[editor showWindow:nil];[editor.window makeKeyAndOrderFront:nil];
+- (NSRect)contentRect:(NSRect)bounds {
+    UI_FONT;int title=mac_title_height();UI_DONE;
+    return hc_recording_content_rect(bounds,[g_win backingScaleFactor],title,sidebar_w(),cell_w(g_font),g_tab_underlay==1,[g_browser_root isFlipped]);
 }
-@implementation HCRecordingEditor
-- (instancetype)initWithBundle:(NSString *)bundle {
-    NSWindow *window=[[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,1120,780) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO] autorelease];
-    if(!(self=[super initWithWindow:window]))return nil;
-    _bundle=[bundle.stringByStandardizingPath.stringByResolvingSymlinksInPath copy];
-    NSData *manifestData=[NSData dataWithContentsOfFile:[_bundle stringByAppendingPathComponent:@"manifest.json"]];
-    NSDictionary *manifest=manifestData.length<1024*1024 && manifestData?[NSJSONSerialization JSONObjectWithData:manifestData options:0 error:nil]:nil;
-    if([manifest isKindOfClass:NSDictionary.class] && record_library_number(manifest[@"durationMs"]))_durationMs=[manifest[@"durationMs"] doubleValue];
-    window.title=[@"Recording · " stringByAppendingString:bundle.lastPathComponent];window.delegate=self;window.releasedWhenClosed=NO;window.minSize=NSMakeSize(720,500);[window center];
-    WKWebViewConfiguration *config=[[[WKWebViewConfiguration alloc] init] autorelease];
+- (WKWebViewConfiguration *)configuration {
+    WKWebViewConfiguration *config=[super configuration];
     config.websiteDataStore=WKWebsiteDataStore.nonPersistentDataStore;
     [config.userContentController addScriptMessageHandler:self name:@"hardcoreRecording"];
-    _web=[[WKWebView alloc] initWithFrame:NSMakeRect(0,32,1120,748) configuration:config];
-    _web.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;_web.navigationDelegate=self;_web.UIDelegate=self;[window.contentView addSubview:_web];
-    _status=[record_library_label(NSMakeRect(14,7,1050,18),@"Trim, crop, add captions, then export a video or save your edits.") retain];
-    _status.autoresizingMask=NSViewWidthSizable;[window.contentView addSubview:_status];
-    _progress=[[NSProgressIndicator alloc] initWithFrame:NSMakeRect(1086,8,16,16)];_progress.style=NSProgressIndicatorStyleSpinning;_progress.displayedWhenStopped=NO;_progress.autoresizingMask=NSViewMinXMargin;[window.contentView addSubview:_progress];
-    /* Local replay assets are self-contained. Blocking network subresources
-       also prevents remote scripts from borrowing the local bridge origin. */
-    NSString *rules=@"[{\"trigger\":{\"url-filter\":\"^https?://\"},\"action\":{\"type\":\"block\"}}]";
-    [WKContentRuleListStore.defaultStore compileContentRuleListForIdentifier:@"HardcoreRecordingOffline" encodedContentRuleList:rules completionHandler:^(WKContentRuleList *list,NSError *error){
-        if(_closed)return;
-        if(!list){_status.stringValue=error.localizedDescription ?: @"Could not prepare the offline player";return;}
-        [_web.configuration.userContentController addContentRuleList:list];
-        [_web loadFileURL:[NSURL fileURLWithPath:[_bundle stringByAppendingPathComponent:@"index.html"]] allowingReadAccessToURL:[NSURL fileURLWithPath:_bundle isDirectory:YES]];
-    }];
+    return config;
+}
+- (id)initWithTab:(Tab *)tb {
+    if(!(self=[super initWithTab:tb]))return nil;
+    NSURL *url=[NSURL URLWithString:[NSString stringWithUTF8String:tb->browser_url]];
+    recordMovie=[url.path.pathExtension.lowercaseString isEqual:@"mp4"];
+    tb->browser_recording=recordMovie?2:1;
+    recordPath=[(recordMovie?url.path:url.path.stringByDeletingLastPathComponent).stringByStandardizingPath.stringByResolvingSymlinksInPath copy];
+    if(recordMovie) {
+        /* Media documents need no privileged recording actions. */
+        [web.configuration.userContentController removeScriptMessageHandlerForName:@"hardcoreRecording"];
+    } else {
+        NSDictionary *attributes=[NSFileManager.defaultManager attributesOfItemAtPath:[recordPath stringByAppendingPathComponent:@"manifest.json"] error:nil];
+        NSData *data=[attributes fileSize]<=1024*1024?[NSData dataWithContentsOfFile:[recordPath stringByAppendingPathComponent:@"manifest.json"]]:nil;
+        NSDictionary *manifest=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:nil;
+        if([manifest isKindOfClass:NSDictionary.class] && record_library_number(manifest[@"durationMs"]))recordDuration=[manifest[@"durationMs"] doubleValue];
+    }
     return self;
 }
+- (BOOL)allowsDocument:(NSURL *)url {
+    if(!recordMovie)return record_library_local_document(url,recordPath);
+    return url.isFileURL && [url.path.stringByStandardizingPath.stringByResolvingSymlinksInPath isEqualToString:recordPath];
+}
+- (void)load:(NSString *)url {
+    NSURL *destination=[NSURL URLWithString:url];
+    if(recordClosed || ![self allowsDocument:destination])return;
+    recordReady=NO;
+    /* No network script, iframe, or popup can borrow the local document bridge.
+       Wait for the content blocker before loading any bundle assets. */
+    NSString *rules=@"[{\"trigger\":{\"url-filter\":\"^https?://\"},\"action\":{\"type\":\"block\"}}]";
+    [WKContentRuleListStore.defaultStore compileContentRuleListForIdentifier:@"HardcoreRecordingOffline" encodedContentRuleList:rules completionHandler:^(WKContentRuleList *list,NSError *error){
+        if(recordClosed)return;
+        Tab *tb=tab_by_id(tabID);if(!tb || tb->browser!=self)return;
+        if(!list){tb->busy=0;record_status(error.localizedDescription ?: @"Could not prepare the Clips player");update_busy(0);plat_invalidate();return;}
+        [web.configuration.userContentController addContentRuleList:list];
+        [super load:url];
+    }];
+}
+- (void)dispose {
+    if(recordClosed)return;
+    recordClosed=YES;[recordTimer invalidate];[recordTimer release];recordTimer=nil;
+    [web.configuration.userContentController removeScriptMessageHandlerForName:@"hardcoreRecording"];
+    [super dispose];
+}
 - (void)dealloc {
-    [_timer invalidate];[_timer release];[_web.configuration.userContentController removeScriptMessageHandlerForName:@"hardcoreRecording"];
-    [_web release];[_bundle release];[_status release];[_progress release];[_job release];[super dealloc];
+    [recordTimer invalidate];[recordTimer release];[recordPath release];[recordLastStatus release];[recordLastTheme release];[super dealloc];
 }
-- (void)windowWillClose:(NSNotification *)notification {
-    (void)notification;_closed=YES;[_web.configuration.userContentController removeScriptMessageHandlerForName:@"hardcoreRecording"];
-    _web.navigationDelegate=nil;_web.UIDelegate=nil;[_web stopLoading];
-    [[self retain] autorelease];if(!_job)[g_record_editors removeObject:self];
+- (void)hostStatus:(NSDictionary *)status {
+    if(recordClosed || !recordReady || recordMovie || ![self allowsDocument:web.URL])return;
+    [web evaluateJavaScript:[NSString stringWithFormat:@"window.hardcoreRecordingPlayer?.hostStatus(%@)",record_browser_json(status)] completionHandler:nil];
 }
-- (void)webView:(WKWebView *)web decidePolicyForNavigationAction:(WKNavigationAction *)action decisionHandler:(void (^)(WKNavigationActionPolicy))handler {
-    (void)web;
-    NSURL *url=action.request.URL;
-    BOOL local=action.targetFrame.isMainFrame && record_library_local_document(url,_bundle);
-    if(!local && ([url.scheme.lowercaseString isEqual:@"https"] || [url.scheme.lowercaseString isEqual:@"http"]) && action.navigationType==WKNavigationTypeLinkActivated)
-        [NSWorkspace.sharedWorkspace openURL:url];
-    handler(local?WKNavigationActionPolicyAllow:WKNavigationActionPolicyCancel);
+- (void)accept:(NSDictionary *)snapshot {
+    [super accept:snapshot];
+    Tab *tb=tab_by_id(tabID);if(!tb || tb->browser!=self)return;
+    NSString *title=[snapshot[@"title"] isKindOfClass:NSString.class]?snapshot[@"title"]:recordPath.lastPathComponent;
+    mac_browser_metadata(tb,title,recordMovie?@"Video":@"Clips",nil);
 }
-- (WKWebView *)webView:(WKWebView *)web createWebViewWithConfiguration:(WKWebViewConfiguration *)config forNavigationAction:(WKNavigationAction *)action windowFeatures:(WKWindowFeatures *)features {
-    (void)web;(void)config;(void)features;
-    NSURL *url=action.request.URL;
-    if(action.navigationType==WKNavigationTypeLinkActivated && ([url.scheme.lowercaseString isEqual:@"https"] || [url.scheme.lowercaseString isEqual:@"http"]))[NSWorkspace.sharedWorkspace openURL:url];
-    return nil;
+- (void)pollJobs:(NSTimer *)timer {
+    (void)timer;if(recordClosed || recordMovie)return;
+    NSDictionary *latest=nil;BOOL exporting=NO;
+    for(NSDictionary *job in mac_record_jobs())if([job[@"bundle"] isEqual:recordPath]){latest=job;if([job[@"state"] isEqual:@"running"])exporting=YES;}
+    Tab *tb=tab_by_id(tabID);BOOL busy=web.loading || exporting;
+    if(tb && tb->browser==self && tb->busy!=busy){tb->busy=busy;update_busy(0);plat_invalidate();}
+    if(latest && ![latest isEqual:recordLastStatus]) {
+        [recordLastStatus release];recordLastStatus=[latest copy];[self hostStatus:latest];
+    }
+    /* Theme changes follow the surrounding Hardcore controls. */
+    NSDictionary *theme=record_browser_theme();
+    if(recordReady && ![theme isEqual:recordLastTheme]) {
+        [recordLastTheme release];recordLastTheme=[theme copy];
+        [web evaluateJavaScript:[NSString stringWithFormat:@"window.hardcoreRecordingPlayer?.hostTheme(%@)",record_browser_json(theme)] completionHandler:nil];
+    }
 }
-- (void)webView:(WKWebView *)web didFinishNavigation:(WKNavigation *)navigation {
-    (void)navigation;
-    if(!record_library_local_document(web.URL,_bundle))return;
-    NSData *data=[NSData dataWithContentsOfFile:[_bundle stringByAppendingPathComponent:@"edits.json"]];
-    if(data.length>4*1024*1024)return;
+- (void)webView:(WKWebView *)view decidePolicyForNavigationAction:(WKNavigationAction *)action decisionHandler:(void (^)(WKNavigationActionPolicy))handler {
+    (void)view;
+    handler(!recordClosed && action.targetFrame.isMainFrame && [self allowsDocument:action.request.URL]?WKNavigationActionPolicyAllow:WKNavigationActionPolicyCancel);
+}
+- (WKWebView *)webView:(WKWebView *)view createWebViewWithConfiguration:(WKWebViewConfiguration *)config forNavigationAction:(WKNavigationAction *)action windowFeatures:(WKWindowFeatures *)features {
+    (void)view;(void)config;(void)action;(void)features;return nil;
+}
+- (void)webView:(WKWebView *)view runJavaScriptAlertPanelWithMessage:(NSString *)message initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(void))completion {
+    (void)view;(void)message;(void)frame;completion();
+}
+- (void)webView:(WKWebView *)view runJavaScriptConfirmPanelWithMessage:(NSString *)message initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(BOOL))completion {
+    (void)view;(void)message;(void)frame;completion(NO);
+}
+- (void)webView:(WKWebView *)view runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(NSArray<NSURL *> *))completion {
+    (void)view;(void)parameters;(void)frame;completion(nil);
+}
+- (void)webView:(WKWebView *)view didFinishNavigation:(WKNavigation *)navigation {
+    [super webView:view didFinishNavigation:navigation];
+    if(recordClosed || ![self allowsDocument:view.URL])return;
+    recordReady=YES;
+    Tab *tb=tab_by_id(tabID);
+    if(tb)mac_browser_metadata(tb,[recordPath.lastPathComponent stringByDeletingPathExtension],recordMovie?@"Video":@"Clips",nil);
+    if(recordMovie)return;
+    NSDictionary *attributes=[NSFileManager.defaultManager attributesOfItemAtPath:[recordPath stringByAppendingPathComponent:@"edits.json"] error:nil];
+    NSData *data=[attributes fileSize]<=4*1024*1024?[NSData dataWithContentsOfFile:[recordPath stringByAppendingPathComponent:@"edits.json"]]:nil;
     id value=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:nil;
     NSString *why=nil;NSDictionary *edits=value?record_library_edits(value,&why):nil;
-    if(!edits)return;
-    NSData *json=[NSJSONSerialization dataWithJSONObject:edits options:0 error:nil];
-    NSString *source=[[[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] autorelease];
-    [web evaluateJavaScript:[NSString stringWithFormat:@"window.hardcoreRecordingPlayer && window.hardcoreRecordingPlayer.applyEdits(%@)",source] completionHandler:nil];
-}
-- (void)webView:(WKWebView *)web didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
-    (void)web;(void)navigation;_status.stringValue=error.localizedDescription;
-}
-- (void)webView:(WKWebView *)web runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters initiatedByFrame:(WKFrameInfo *)frame completionHandler:(void (^)(NSArray<NSURL *> *))completion {
-    (void)web;
-    if(!frame.isMainFrame || !record_library_local_document(frame.request.URL,_bundle)){completion(nil);return;}
-    NSOpenPanel *panel=[NSOpenPanel openPanel];panel.canChooseFiles=YES;panel.canChooseDirectories=NO;
-    panel.allowsMultipleSelection=parameters.allowsMultipleSelection;panel.allowedFileTypes=@[@"srt",@"vtt"];panel.prompt=@"Add captions";
-    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response){completion(response==NSModalResponseOK?panel.URLs:nil);}];
+    if(edits && (!recordDuration || [edits[@"endMs"] doubleValue]<=recordDuration+.001))
+        [view evaluateJavaScript:[NSString stringWithFormat:@"window.hardcoreRecordingPlayer?.applyEdits(%@)",record_browser_json(edits)] completionHandler:nil];
+    [recordLastStatus release];recordLastStatus=nil;[recordLastTheme release];recordLastTheme=nil;[self pollJobs:nil];
+    if(!recordTimer){recordTimer=[[NSTimer timerWithTimeInterval:.5 target:self selector:@selector(pollJobs:) userInfo:nil repeats:YES] retain];[NSRunLoop.mainRunLoop addTimer:recordTimer forMode:NSRunLoopCommonModes];}
 }
 - (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
-    (void)controller;
-    if(_closed || !message.frameInfo.isMainFrame || !record_library_local_document(message.frameInfo.request.URL,_bundle) || !record_library_local_document(_web.URL,_bundle))return;
+    if([message.name isEqual:@"hardcoreBrowser"]){[super userContentController:controller didReceiveScriptMessage:message];return;}
+    if(recordClosed || recordMovie || message.webView!=web || ![message.name isEqual:@"hardcoreRecording"] || !message.frameInfo.isMainFrame ||
+       ![self allowsDocument:message.frameInfo.request.URL] || ![self allowsDocument:web.URL])return;
     id body=message.body;if(![body isKindOfClass:NSDictionary.class])return;
     NSString *action=body[@"action"];
-    if([action isEqual:@"library"]){mac_record_library();return;}
-    if([action isEqual:@"open"]) {
-        NSOpenPanel *panel=[NSOpenPanel openPanel];panel.canChooseDirectories=YES;panel.canChooseFiles=NO;panel.allowsMultipleSelection=NO;panel.prompt=@"Open recording";panel.directoryURL=[NSURL fileURLWithPath:record_root()];
-        [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response){if(response==NSModalResponseOK)record_library_open(panel.URL.path);}];return;
+    if([action isEqual:@"library"] || [action isEqual:@"open"]){mac_record_library();return;}
+    if([action isEqual:@"files"]){mac_record_file_viewer(recordPath);return;}
+    if([action isEqual:@"output"]) {
+        /* Accept a known job id, never a page-supplied filesystem path. */
+        for(NSDictionary *job in mac_record_jobs())if([job[@"bundle"] isEqual:recordPath] && [job[@"id"] isEqual:body[@"id"]] && [job[@"state"] isEqual:@"done"]){record_library_open_output(job[@"output"]);break;}
+        return;
     }
-    if(![action isEqual:@"export"] && ![action isEqual:@"saveEdits"])return;
+    if(![action isEqual:@"export"] && ![action isEqual:@"saveEdits"] && ![action isEqual:@"zip"])return;
     NSString *why=nil;NSDictionary *edits=record_library_edits(body,&why);
-    if(!edits){_status.stringValue=why;return;}
-    if(_durationMs>0 && [edits[@"endMs"] doubleValue]>_durationMs+.001){_status.stringValue=@"The clip end exceeds this recording's duration";return;}
+    if(!edits || (recordDuration>0 && [edits[@"endMs"] doubleValue]>recordDuration+.001)) {
+        [self hostStatus:@{@"state":@"failed",@"message":why ?: @"The clip end exceeds this recording's duration"}];return;
+    }
     if([action isEqual:@"saveEdits"]) {
-        NSError *error=nil;NSString *path=[_bundle stringByAppendingPathComponent:@"edits.json"];
+        NSError *error=nil;NSString *path=[recordPath stringByAppendingPathComponent:@"edits.json"];
         NSData *data=[NSJSONSerialization dataWithJSONObject:edits options:NSJSONWritingPrettyPrinted error:&error];
         BOOL ok=data && [data writeToFile:path options:NSDataWritingAtomic error:&error];
         if(ok) {
             [NSFileManager.defaultManager setAttributes:@{NSFilePosixPermissions:@0600} ofItemAtPath:path error:nil];
-            NSString *json=[[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
-            json=[[json stringByReplacingOccurrencesOfString:@"\u2028" withString:@"\\u2028"] stringByReplacingOccurrencesOfString:@"\u2029" withString:@"\\u2029"];
-            NSString *script=[NSString stringWithFormat:@"window.HARDCORE_EDITS = %@;\n",json];
-            NSString *scriptPath=[_bundle stringByAppendingPathComponent:@"edits.js"];
+            NSString *script=[NSString stringWithFormat:@"window.HARDCORE_EDITS = %@;\n",record_browser_json(edits)];
+            NSString *scriptPath=[recordPath stringByAppendingPathComponent:@"edits.js"];
             ok=[script writeToFile:scriptPath atomically:YES encoding:NSUTF8StringEncoding error:&error];
             if(ok)[NSFileManager.defaultManager setAttributes:@{NSFilePosixPermissions:@0600} ofItemAtPath:scriptPath error:nil];
         }
-        _status.stringValue=ok?@"Saved edits to this recording":(error.localizedDescription ?: @"Could not save recording edits");return;
+        [self hostStatus:@{@"state":ok?@"saved":@"failed",@"message":ok?@"Saved edits to this clip":(error.localizedDescription ?: @"Could not save clip edits")}];return;
     }
-    [self exportEdits:edits];
-}
-- (void)updateProgress:(NSTimer *)timer {
-    (void)timer;
-    NSString *log=_job.log;
-    NSArray *lines=[log componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
-    for(NSString *line in lines.reverseObjectEnumerator)if([line hasPrefix:@"hardcore export:"]){_status.stringValue=line;break;}
-}
-- (void)exportEdits:(NSDictionary *)edits {
-    if(_job){_status.stringValue=@"A video export is already running";return;}
-    NSString *tool=record_resource(@"recording-export");
-    if(![NSFileManager.defaultManager isExecutableFileAtPath:tool])tool=record_resource(@"build/recording-export");
-    if(![NSFileManager.defaultManager isExecutableFileAtPath:tool]){_status.stringValue=@"The video exporter is missing. Rebuild or reinstall Hardcore.";return;}
-    NSSavePanel *panel=[NSSavePanel savePanel];panel.allowedFileTypes=@[@"mp4"];panel.nameFieldStringValue=[[_bundle.lastPathComponent stringByDeletingPathExtension] stringByAppendingPathExtension:@"mp4"];
-    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response){
-        if(response!=NSModalResponseOK || _job)return;
-        NSString *temp=record_library_temporary();if(!temp){_status.stringValue=@"Cannot create temporary export files";return;}
-        NSString *destination=panel.URL.path,*staged=record_library_stage(destination);
-        NSMutableArray *args=[NSMutableArray arrayWithObjects:_bundle,staged,@"--start",[NSString stringWithFormat:@"%.6f",[edits[@"startMs"] doubleValue]/1000],@"--end",[NSString stringWithFormat:@"%.6f",[edits[@"endMs"] doubleValue]/1000],nil];
-        if(edits[@"crop"]!=NSNull.null)[args addObjectsFromArray:@[@"--crop",[edits[@"crop"] componentsJoinedByString:@","]]];
-        if(![edits[@"pointer"] boolValue])[args addObject:@"--no-pointer"];
-        if(![edits[@"captions"] boolValue])[args addObject:@"--no-captions"];
-        NSString *srt=[temp stringByAppendingPathComponent:@"captions.srt"];
-        NSError *error=nil;
-        if(![record_library_srt(edits[@"captionItems"]) writeToFile:srt atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
-            _status.stringValue=error.localizedDescription;[NSFileManager.defaultManager removeItemAtPath:temp error:nil];return;
-        }
-        [NSFileManager.defaultManager setAttributes:@{NSFilePosixPermissions:@0600} ofItemAtPath:srt error:nil];
-        [args addObjectsFromArray:@[@"--captions",srt]];
-        _job=[[HCRecordingJob alloc] init];_status.stringValue=@"Exporting MP4…";[_progress startAnimation:nil];
-        _timer=[[NSTimer scheduledTimerWithTimeInterval:.5 target:self selector:@selector(updateProgress:) userInfo:nil repeats:YES] retain];
-        [_job start:tool arguments:args staged:staged destination:destination temporary:temp completion:^(BOOL ok,NSString *message){
-            [_timer invalidate];[_timer release];_timer=nil;[_progress stopAnimation:nil];_status.stringValue=message;
-            record_status(ok?[@"Exported " stringByAppendingString:destination.lastPathComponent]:@"Video export failed");
-            if(!ok && !_closed){NSAlert *alert=[[[NSAlert alloc] init] autorelease];alert.messageText=@"Video export failed";alert.informativeText=message;[alert beginSheetModalForWindow:self.window completionHandler:nil];}
-            [_job autorelease];_job=nil;
-            if(_closed)[g_record_editors removeObject:self];
-        }];
-    }];
+    if(mac_record_export(recordPath,edits,[action isEqual:@"zip"]))[self pollJobs:nil];
+    else [self hostStatus:@{@"state":@"failed",@"message":@"The export could not start. Check Clips for details."}];
 }
 @end
 
-@interface HCRecordingLibrary : NSWindowController <NSTableViewDataSource,NSTableViewDelegate> {
-    NSTableView *_table;
-    NSArray *_items;
-    NSTextField *_status;
-    NSProgressIndicator *_progress;
-    HCRecordingJob *_job;
+static HCBrowser *record_library_restore(Tab *tb) {
+    if(!tb || (tb->browser_recording!=1 && tb->browser_recording!=2))return nil;
+    NSURL *url=[NSURL URLWithString:[NSString stringWithUTF8String:tb->browser_url]];
+    BOOL movie=tb->browser_recording==2;
+    BOOL valid=url.isFileURL && [NSFileManager.defaultManager isReadableFileAtPath:url.path] &&
+        (movie?[url.path.pathExtension.lowercaseString isEqual:@"mp4"]:
+            ([url.lastPathComponent isEqual:@"index.html"] && record_library_local_document(url,url.path.stringByDeletingLastPathComponent)));
+    if(!valid || (!movie && !record_library_refresh_assets(url.path.stringByDeletingLastPathComponent.stringByResolvingSymlinksInPath))){tb->browser_recording=0;return nil;}
+    return [[HCRecordingBrowser alloc] initWithTab:tb];
 }
-- (void)refresh:(id)sender;
-- (void)openSelected:(id)sender;
-- (void)shareSelected:(id)sender;
-- (void)revealSelected:(id)sender;
-@end
-@implementation HCRecordingLibrary
-- (instancetype)init {
-    NSWindow *window=[[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,840,480) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable|NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO] autorelease];
-    if(!(self=[super initWithWindow:window]))return nil;
-    window.title=@"Hardcore recordings";window.releasedWhenClosed=NO;window.minSize=NSMakeSize(640,300);[window center];
-    NSScrollView *scroll=[[[NSScrollView alloc] initWithFrame:NSMakeRect(16,78,808,386)] autorelease];scroll.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;scroll.hasVerticalScroller=YES;scroll.borderType=NSBezelBorder;
-    _table=[[NSTableView alloc] initWithFrame:scroll.bounds];_table.delegate=self;_table.dataSource=self;_table.rowHeight=28;_table.target=self;_table.doubleAction=@selector(openSelected:);_table.allowsMultipleSelection=NO;
-    for(NSArray *definition in @[@[@"title",@"Recording",@440],@[@"date",@"Created",@235],@[@"duration",@"Length",@90]]) {
-        NSTableColumn *column=[[[NSTableColumn alloc] initWithIdentifier:definition[0]] autorelease];column.title=definition[1];column.width=[definition[2] doubleValue];[_table addTableColumn:column];
+
+static BOOL record_library_activate(NSString *path,BOOL movie) {
+    for(int i=0;i<g_ntabs;i++) {
+        HCBrowser *browser=browser_for(g_tabs[i]);
+        if([browser isKindOfClass:HCRecordingBrowser.class]) {
+            HCRecordingBrowser *clip=(HCRecordingBrowser *)browser;
+            if(clip->recordMovie==movie && [clip->recordPath isEqual:path]){g_tabs[i]->browser_native=!mac_record_active();activate(i);return YES;}
+        }
     }
-    _table.columnAutoresizingStyle=NSTableViewFirstColumnOnlyAutoresizingStyle;scroll.documentView=_table;[window.contentView addSubview:scroll];
-    [window.contentView addSubview:record_library_button(NSMakeRect(14,40,122,30),@"Replay / edit",self,@selector(openSelected:))];
-    [window.contentView addSubview:record_library_button(NSMakeRect(140,40,112,30),@"Export MP4",self,@selector(openSelected:))];
-    [window.contentView addSubview:record_library_button(NSMakeRect(256,40,104,30),@"Share ZIP",self,@selector(shareSelected:))];
-    [window.contentView addSubview:record_library_button(NSMakeRect(364,40,92,30),@"Reveal",self,@selector(revealSelected:))];
-    NSButton *refresh=record_library_button(NSMakeRect(726,40,100,30),@"Refresh",self,@selector(refresh:));refresh.autoresizingMask=NSViewMinXMargin;[window.contentView addSubview:refresh];
-    _status=[record_library_label(NSMakeRect(18,14,770,18),@"") retain];_status.autoresizingMask=NSViewWidthSizable;[window.contentView addSubview:_status];
-    _progress=[[NSProgressIndicator alloc] initWithFrame:NSMakeRect(802,14,16,16)];_progress.style=NSProgressIndicatorStyleSpinning;_progress.displayedWhenStopped=NO;_progress.autoresizingMask=NSViewMinXMargin;[window.contentView addSubview:_progress];
-    [self refresh:nil];return self;
+    return NO;
 }
-- (void)dealloc {[_table release];[_items release];[_status release];[_progress release];[_job release];[super dealloc];}
-- (NSInteger)numberOfRowsInTableView:(NSTableView *)table {(void)table;return _items.count;}
-- (id)tableView:(NSTableView *)table objectValueForTableColumn:(NSTableColumn *)column row:(NSInteger)row {(void)table;return row>=0 && (NSUInteger)row<_items.count?_items[row][column.identifier]:@"";}
-- (NSDictionary *)selected {
-    NSInteger row=_table.selectedRow;
-    if(row<0 || (NSUInteger)row>=_items.count){_status.stringValue=@"Select a recording first";return nil;}
-    return _items[row];
-}
-- (void)refresh:(id)sender {
-    (void)sender;NSMutableArray *items=[NSMutableArray array];
-    NSFileManager *fm=NSFileManager.defaultManager;
-    for(NSString *name in [fm contentsOfDirectoryAtPath:record_root() error:nil]) {
-        if(![name.pathExtension isEqual:@"hcrec"] || [name hasSuffix:@".partial.hcrec"])continue;
-        NSString *path=[record_root() stringByAppendingPathComponent:name];
-        NSData *data=[NSData dataWithContentsOfFile:[path stringByAppendingPathComponent:@"manifest.json"]];
-        if(data.length>1024*1024)continue;
-        NSDictionary *meta=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:nil;
-        if(![meta isKindOfClass:NSDictionary.class])continue;
-        NSString *title=[meta[@"title"] isKindOfClass:NSString.class]?meta[@"title"]:name.stringByDeletingPathExtension;
-        NSString *date=[meta[@"createdAt"] isKindOfClass:NSString.class]?meta[@"createdAt"]:@"";
-        double duration=record_library_number(meta[@"durationMs"])?fmax(0,[meta[@"durationMs"] doubleValue]/1000):0;
-        [items addObject:@{@"path":path,@"title":title,@"date":date,@"duration":[NSString stringWithFormat:@"%d:%02d",(int)duration/60,(int)duration%60]}];
+static void record_library_open(NSString *bundle) {
+    if(![bundle isKindOfClass:NSString.class])return;
+    NSString *path=bundle.stringByStandardizingPath.stringByResolvingSymlinksInPath;
+    BOOL directory=NO;NSString *index=[path stringByAppendingPathComponent:@"index.html"];
+    if(![NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&directory] || !directory ||
+       ![NSFileManager.defaultManager isReadableFileAtPath:index] || !record_library_local_document([NSURL fileURLWithPath:index],path)) {
+        record_status(@"This clip has no portable replay editor");return;
     }
-    [items sortUsingComparator:^NSComparisonResult(NSDictionary *a,NSDictionary *b){return [b[@"date"] compare:a[@"date"]];}];
-    [_items release];_items=[items copy];[_table reloadData];
-    if(_items.count)[_table selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
-    if(!_job)_status.stringValue=_items.count?[NSString stringWithFormat:@"%lu recordings · %@",(unsigned long)_items.count,record_root()]:@"No saved recordings yet. Start a recording from the camera panel.";
+    if(!record_library_refresh_assets(path))return;
+    if(!record_library_activate(path,NO) && !mac_browser_new_with_class([NSURL fileURLWithPath:index].absoluteString,0,1,HCRecordingBrowser.class))record_status(@"Cannot open another replay tab");
 }
-- (void)openSelected:(id)sender {(void)sender;NSDictionary *item=[self selected];if(item)record_library_open(item[@"path"]);}
-- (void)revealSelected:(id)sender {(void)sender;NSDictionary *item=[self selected];if(item)[NSWorkspace.sharedWorkspace activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:item[@"path"]]]];}
-- (void)shareSelected:(id)sender {
-    (void)sender;if(_job){_status.stringValue=@"A ZIP export is already running";return;}
-    NSDictionary *item=[self selected];if(!item)return;
-    NSSavePanel *panel=[NSSavePanel savePanel];panel.allowedFileTypes=@[@"zip"];panel.nameFieldStringValue=[[[item[@"path"] lastPathComponent] stringByDeletingPathExtension] stringByAppendingPathExtension:@"zip"];
-    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response){
-        if(response!=NSModalResponseOK || _job)return;
-        NSString *temp=record_library_temporary();if(!temp){_status.stringValue=@"Cannot prepare the ZIP export";return;}
-        NSString *destination=panel.URL.path,*staged=record_library_stage(destination);
-        _job=[[HCRecordingJob alloc] init];_status.stringValue=@"Creating portable ZIP…";[_progress startAnimation:nil];
-        [_job start:@"/usr/bin/ditto" arguments:@[@"-c",@"-k",@"--sequesterRsrc",@"--keepParent",item[@"path"],staged] staged:staged destination:destination temporary:temp completion:^(BOOL ok,NSString *message){
-            (void)ok;[_progress stopAnimation:nil];_status.stringValue=message;[_job autorelease];_job=nil;
-        }];
-    }];
-}
-@end
-static HCRecordingLibrary *g_record_library;
-static void mac_record_library(void) {
-    if(!g_record_library)g_record_library=[[HCRecordingLibrary alloc] init];
-    [g_record_library refresh:nil];[g_record_library showWindow:nil];[g_record_library.window makeKeyAndOrderFront:nil];
+static void record_library_open_output(NSString *path) {
+    if(![path isKindOfClass:NSString.class] || !path.length)return;
+    path=path.stringByStandardizingPath.stringByResolvingSymlinksInPath;
+    BOOL directory=NO;
+    if(![NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&directory]){record_status(@"This output file is no longer available");return;}
+    if(directory || ![path.pathExtension.lowercaseString isEqual:@"mp4"]){mac_record_file_viewer(path);return;}
+    if(!record_library_activate(path,YES) && !mac_browser_new_with_class([NSURL fileURLWithPath:path].absoluteString,0,1,HCRecordingBrowser.class))record_status(@"Cannot open another video tab");
 }

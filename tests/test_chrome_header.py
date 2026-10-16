@@ -74,6 +74,14 @@ static float row_y(int r) { return (float)(r*CH); }
 static int caf_active;
 static int mac_caf_active(void) { return caf_active; }
 static int mac_record_active(void) { return 0; }
+static int export_active;
+static int mac_record_exports_active(void) { return export_active; }
+#ifndef _WIN32
+#define DRIP_MS 80
+static unsigned GetTickCount(void) { return 80; }
+static int g_ndrip=2;
+static uint16_t g_drip[]={0x2801,0x2802};
+#endif
 static int fills, glyphs, frames, sides, row_fills;
 static struct { int col,row; wchar_t text[32]; uint32_t color; } labels[8];
 static float fx,fy,fr,fb;
@@ -171,6 +179,10 @@ static void paint(void) {
     }
     caf_active=1;reset_paint();chrome_render_header(HIT_NONE);
     assert(labels[3].color==AMBER && !wcscmp(labels[3].text,L"CAF"));
+    export_active=1;reset_paint();chrome_render_header(HIT_NONE);
+    assert(glyphs==8 && labels[3].col==21 && labels[3].color==AMBER);
+    assert(labels[3].text[0]==0x2802); /* same drip frame as busy terminal tabs */
+    export_active=0;
     g_chrome=chrome_primary_measure(1,1,g_ntabs,0,1,8,0);
     reset_paint();chrome_render_header(HIT_NONE);
     assert(glyphs==4 && row_fills==1 && frames==1 && !sides);

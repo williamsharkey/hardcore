@@ -7,11 +7,31 @@
   let trimStart = 0, trimEnd = 0, crop = null, cropping = false, cropDrag = null;
   let animation = 0, cameraReady = false, objectURLs = [];
   const preferences = {pointer: true, captions: true};
+  const embedded = !!window.webkit?.messageHandlers?.hardcoreRecording;
+  let currentJob = null;
   function status(message = '', error = false) { $('status').textContent = message; $('status').classList.toggle('error', error); }
   function host(message) {
     const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hardcoreRecording;
     if (!bridge) return false;
     bridge.postMessage(message); return true;
+  }
+  function hostTheme(theme) {
+    if (!theme || typeof theme !== 'object') return;
+    for (const name of ['bg', 'surface', 'line', 'text', 'muted', 'accent']) {
+      if (/^#[0-9a-f]{6}$/i.test(theme[name])) document.documentElement.style.setProperty('--' + name, theme[name]);
+    }
+  }
+  function hostStatus(job) {
+    if (!job || typeof job !== 'object' || typeof job.message !== 'string') return;
+    if (!job.id) { status(job.message, job.state === 'failed'); return; }
+    currentJob = job;
+    $('job-status').hidden = false; $('job-message').textContent = job.message;
+    $('job-status').classList.toggle('error', job.state === 'failed');
+    $('job-progress').hidden = job.state !== 'running';
+    if (typeof job.progress === 'number' && Number.isFinite(job.progress) && job.progress >= 0) $('job-progress').value = Math.min(1, job.progress);
+    else $('job-progress').removeAttribute('value');
+    $('job-output').hidden = job.state !== 'done';
+    $('job-output').textContent = job.kind === 'zip' ? 'Show ZIP in Files' : 'Play exported video';
   }
   class NativeRenderer {
     constructor(record) {
@@ -212,7 +232,7 @@
     if (!recording) return;
     pause();
     let edits; try { edits = getEdits(); } catch (error) { status(error.message, true); return; }
-    if (host({action: 'export', ...edits})) { status('Choose where to save the exported video in Hardcore.'); return; }
+    if (host({action: 'export', ...edits})) { status('Exporting to Movies/Hardcore/Exports. You can keep editing or close this tab.'); return; }
     $('export-note').textContent = 'For a crisp video export, open this recording in Hardcore. You can also use the native exporter with these settings.';
     let command = 'recording-export "Recording.hcrec" "Recording.mp4" --start ' + (trimStart / 1000).toFixed(3) + ' --end ' + (trimEnd / 1000).toFixed(3);
     if (crop) command += ' --crop ' + crop.join(','); if (!preferences.pointer) command += ' --no-pointer'; if (!preferences.captions) command += ' --no-captions';
@@ -262,18 +282,35 @@
   $('crop-toggle').onclick = toggleCrop; $('crop-reset').onclick = () => { crop = null; updateSummary(); resizeStage(); render(); };
   $('pointer-toggle').onchange = event => { preferences.pointer = event.target.checked; render(); };
   $('captions-toggle').onchange = event => { preferences.captions = event.target.checked; render(); };
-  $('captions-import').onclick = () => $('caption-picker').click();
+  function addCaptions(text) {
+    if (!recording) throw new Error('Open a recording before adding captions.');
+    if (text.length > 1024 * 1024) throw new Error('This caption file is too large.');
+    const captions = R.parseCaptions(text, recording.durationMs);
+    if (!captions.length) throw new Error('No timed captions were found. Use SRT or WebVTT captions.');
+    recording.captions = captions; preferences.captions = true; $('captions-toggle').checked = true; render(); status(captions.length + ' captions added. Save edit settings to keep them.');
+  }
+  $('captions-import').onclick = () => {
+    if (!embedded) { $('caption-picker').click(); return; }
+    $('captions-error').textContent = ''; $('captions-dialog').showModal(); $('captions-text').focus();
+  };
+  $('captions-apply').onclick = () => {
+    try { addCaptions($('captions-text').value); $('captions-dialog').close(); }
+    catch (error) { $('captions-error').textContent = error.message; }
+  };
   $('caption-picker').onchange = async event => {
     const file = event.target.files[0]; if (!file || !recording) return;
-    const captions = R.parseCaptions(await file.text(), recording.durationMs);
-    if (!captions.length) { status('No timed captions were found. Choose an SRT or WebVTT file.', true); return; }
-    recording.captions = captions; preferences.captions = true; $('captions-toggle').checked = true; render(); status(captions.length + ' captions added. Save edit settings to keep them.');
+    try { if (file.size > 1024 * 1024) throw new Error('This caption file is too large.'); addCaptions(await file.text()); }
+    catch (error) { status(error.message, true); }
   };
   $('save-edits').onclick = $('download-edits').onclick = saveEdits; $('export-button').onclick = exportVideo;
+  $('files-button').onclick = () => host({action: 'files'});
+  $('zip-button').onclick = () => { try { host({action: 'zip', ...getEdits()}); } catch (error) { status(error.message, true); } };
+  $('job-output').onclick = () => { if (currentJob?.state === 'done') host({action: 'output', id: currentJob.id}); };
+  if (embedded) { document.body.classList.add('embedded'); $('library-name').textContent = 'Clips'; $('open-button').textContent = 'Clips'; $('files-button').hidden = $('zip-button').hidden = false; }
   video.addEventListener('loadeddata', () => { cameraReady = true; syncCamera(true); render(); }); video.addEventListener('seeked', render);
   video.addEventListener('error', () => { if (recording?.camera && video.getAttribute('src')) status('The camera video could not be opened. Terminal replay is available.', true); });
   document.addEventListener('keydown', event => {
-    if (!recording || /INPUT|SELECT|TEXTAREA|BUTTON/.test(event.target.tagName) || $('export-dialog').open) return;
+    if (!recording || /INPUT|SELECT|TEXTAREA|BUTTON/.test(event.target.tagName) || $('export-dialog').open || $('captions-dialog').open) return;
     if (event.code === 'Space') { event.preventDefault(); play(); }
     if (event.code === 'ArrowLeft' || event.code === 'ArrowRight') { event.preventDefault(); seek(time + (event.code === 'ArrowLeft' ? -1 : 1) * (event.shiftKey ? 1000 : 5000)); }
     if (event.key === 'Escape' && cropping) toggleCrop();
@@ -290,10 +327,13 @@
   }
   document.addEventListener('drop', async event => {
     event.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping');
+    const captions = Array.from(event.dataTransfer.files).find(file => /\.(srt|vtt)$/i.test(file.name));
+    if (captions) { try { if (captions.size > 1024 * 1024) throw new Error('This caption file is too large.'); addCaptions(await captions.text()); } catch (error) { status(error.message, true); } return; }
+    if (embedded) { status('Open another recording from Clips. You can drop SRT or WebVTT captions here.'); return; }
     try { const entries = Array.from(event.dataTransfer.items).map(item => item.webkitGetAsEntry?.()).filter(Boolean); await openFiles(entries.length ? (await Promise.all(entries.map(entryFiles))).flat() : Array.from(event.dataTransfer.files)); }
     catch (error) { status('The recording folder could not be opened: ' + error.message, true); }
   });
   // Native host may replace a recording without reloading the player.
-  window.hardcoreRecordingPlayer = {load, seek, pause, getEdits, applyEdits, get time() { return time; }};
+  window.hardcoreRecordingPlayer = {load, seek, pause, getEdits, applyEdits, hostStatus, hostTheme, get time() { return time; }};
   if (window.HARDCORE_RECORDING) load(window.HARDCORE_RECORDING).then(() => { if (window.HARDCORE_EDITS) applyEdits(window.HARDCORE_EDITS); }).catch(error => status(error.message, true));
 })();

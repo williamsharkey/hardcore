@@ -35,8 +35,10 @@ typedef struct { Term t; int browser_native; void *browser; } Tab;
     int nodeCols,nodeRows,blockCount,scroll,total,focusedAction,inspectOpen,editKind;
     uint16_t *nodeGrid; BrowserBlock *blocks; NSArray *images;
 }
+- (void)prepareNative;
 @end
 @implementation HCBrowser
+- (void)prepareNative {}
 @end
 static struct { int top,bottom; } g_chrome={1,5};
 static int g_tab_underlay=1,g_scale=1,preview,layouts,grid_calls,grid_scroll,grid_rows;

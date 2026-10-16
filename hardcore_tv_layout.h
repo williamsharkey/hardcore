@@ -153,18 +153,28 @@ static void chrome_tv_prepare(Term *t) {
     if(rebuild_stack)g_tv_stack_pending=0;
     /* Manual rectangles reserve space before automatic surfaces. While the
        pointer is interacting, a drag cannot shove an existing panel away. */
-    for(int at=HC_TV_CUTIE_FIRST;at<HC_TV_COUNT;at++) {
+    for(int at=0;at<HC_TV_COUNT;at++) {
         int i=order[at];ChromeTv *tv=g_tvs+i;
         if(!tv->state.open || !tv->manual)continue;
         HcTvRect r=hc_tv_requested_rect(tv->requested,t->cols,t->rows);
-        int valid=r.w>=HC_TV_MIN_WIDTH && r.h>=HC_TV_MIN_HEIGHT && chrome_tv_rect_available(r,primary,t,i);
+        if(i<HC_TV_CUTIE_FIRST) {
+            /* Settings/CAF remain content-sized when moved. Font changes,
+               paging and viewport resize may change their natural height. */
+            r.w=widths[i];r.h=heights[i];
+            r.x=chrome_min(chrome_max(0,tv->requested.x),chrome_max(0,t->cols-r.w));
+            r.y=chrome_min(chrome_max(0,tv->requested.y),chrome_max(0,t->rows-r.h));
+        }
+        int min_height=i==HC_TV_SETTINGS?3:i==HC_TV_CAF?2:HC_TV_MIN_HEIGHT;
+        int valid=r.w>=HC_TV_MIN_WIDTH && r.h>=min_height && chrome_tv_rect_available(r,primary,t,i);
         if(valid && blocked)for(int j=0;j<HC_TV_COUNT;j++)if(j!=i && g_tvs[j].state.open &&
             !g_tvs[j].manual && was_placed[j] && hc_tv_rect_overlap(r,previous[j]))valid=0;
-        if(!valid && was_placed[i] && chrome_tv_rect_available(previous[i],primary,t,i))r=previous[i],valid=1;
+        if(!valid && was_placed[i] && (i>=HC_TV_CUTIE_FIRST ||
+           (previous[i].w==widths[i] && previous[i].h==heights[i])) &&
+           chrome_tv_rect_available(previous[i],primary,t,i))r=previous[i],valid=1;
         hc_tv_motion_reset(&tv->motion);
         if(!valid)continue;
         tv->placement=(HcTvPlacement){.rect=r,.valid=1};reserved[i]=1;
-        chrome_tv_accept(t,i,r,0,0,obstacles,&count);
+        chrome_tv_accept(t,i,r,items[i],capacities[i],obstacles,&count);
     }
     /* Existing surfaces stay still while hovered, typed into, or dragged.
        New surfaces may use the remaining room without moving their neighbors. */
@@ -179,7 +189,10 @@ static void chrome_tv_prepare(Term *t) {
     for(int at=0;at<HC_TV_COUNT;at++) {
         int i=order[at];ChromeTv *tv=g_tvs+i;
         if(!tv->state.open){hc_tv_motion_reset(&tv->motion);continue;}
-        if(tv->manual)continue;
+        /* A content-sized utility may grow after switching Font/Theme. Keep
+           its requested origin for later, but find room instead of hiding it
+           when that new size cannot fit at the manually chosen position. */
+        if(tv->manual && (reserved[i] || i>=HC_TV_CUTIE_FIRST))continue;
         if(reserved[i]) {
             if(i>=HC_TV_CUTIE_FIRST)cost_context.ordered[cost_context.nordered++]=tv->state.rect;
             anchor=tv->state.rect;continue;

@@ -16,6 +16,8 @@ static double g_record_duration;
 static NSMutableDictionary *g_record_info;
 static NSMutableArray *g_record_native_tabs;
 static NSString *record_root(void) {
+    if(getenv("HARDCORE_CTL") && getenv("HARDCORE_TEST_RECORDINGS"))
+        return [NSString stringWithUTF8String:getenv("HARDCORE_TEST_RECORDINGS")];
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Movies/Hardcore"];
 }
 static void record_status(NSString *s) {
