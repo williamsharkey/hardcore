@@ -180,8 +180,13 @@ static void partial_badge_row(void) {
     ChromeReflow out = run(grid, COLS, ROWS, NULL, 1, 60, 40, 3);
     assert(out.changed);
     assert(location(&out, COLS+2)/COLS == 2);
-    assert(!memcmp(out.cells+2*COLS+63, grid+2*COLS+63, (COLS-63)*sizeof(Cell)));
-    for (int x = 63; x < COLS; x++) assert(out.source[2*COLS+x] == 2*COLS+x);
+    /* The footer uses the blank wing first. The intact badge can then slide
+       into the remaining space without covering it or adding another row. */
+    int badge_at = location(&out, 2*COLS+65);
+    assert(badge_at/COLS == 2 && badge_at%COLS+22 == 58);
+    assert(!memcmp(out.cells+badge_at, grid+2*COLS+65, 22*sizeof(Cell)));
+    for (int x = 0; x < 22; x++) assert(out.source[badge_at+x] == 2*COLS+65+x);
+    gap(&out, 58, COLS, 3);
     chrome_reflow_free(&out);
     /* If a failed full-width literal would land in the badge wing, discard
        the candidate. Restoring the badge must never erase terminal text. */
@@ -189,7 +194,11 @@ static void partial_badge_row(void) {
     put(grid, COLS, 1, 0, "  125 + ");
     for (int x = 8; x < 95; x++) grid[COLS+x].ch = 'A'+x%26;
     out = run(grid, COLS, ROWS, NULL, 1, 60, 40, 3);
-    assert(!out.changed && !memcmp(out.cells, grid, COLS*ROWS*sizeof(Cell)));
+    assert(!memcmp(out.cells, grid, 2*COLS*sizeof(Cell)));
+    badge_at = location(&out, 2*COLS+65);
+    assert(badge_at/COLS == 2 && badge_at%COLS+22 == 58);
+    assert(!memcmp(out.cells+badge_at, grid+2*COLS+65, 22*sizeof(Cell)));
+    assert(!memcmp(out.cells+3*COLS, grid+3*COLS, COLS*sizeof(Cell)));
     chrome_reflow_free(&out); free(grid);
 }
 

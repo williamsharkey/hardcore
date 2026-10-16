@@ -407,7 +407,7 @@ static int mac_browser_ui_move(int mx,int my) {
         BrowserNav nav=browser_nav();
         if(row==nav.urlRow && col>=nav.url && col<nav.go-1)[[NSCursor IBeamCursor] set];
         else if((row==nav.controlsRow && ((col>=nav.back && col<nav.forward+3) || col>=nav.close)) || (row==nav.urlRow && col>=nav.go && col<nav.go+4))[[NSCursor pointingHandCursor] set];
-        else [[NSCursor openHandCursor] set];
+        else [[NSCursor arrowCursor] set];
         return 1;
     }
     if(b->editKind>1 && col>=b->editX && col<b->editX+b->editWidth && row>=b->editY && row<b->editY+b->editHeight){[[NSCursor IBeamCursor] set];return 1;}

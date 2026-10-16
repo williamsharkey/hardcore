@@ -152,11 +152,19 @@ class NativeApp:
     def settings_x(chrome):
         return chrome["pages"].get("settings_x", chrome["dock"]["x"])
 
+    @staticmethod
+    def header_point(chrome, name):
+        control = next(item for item in chrome["header_controls"] if item["name"] == name)
+        return chrome["dock"]["x"] + control["col"], chrome["dock"]["y"] + control["row"]
+
+    def header_click(self, name):
+        c = self.chrome()
+        return self.click(*self.header_point(c, name))
+
     def open_settings(self):
         c = self.chrome()
         if not c["settings_open"]:
-            local = 4 if "tvs" in c else 6
-            c = self.click(c["dock"]["x"] + local, c["pages"]["settings_row"])
+            c = self.header_click("settings")
         assert c["settings_open"], "settings header control did not open its panel"
         return c
 
@@ -168,8 +176,7 @@ class NativeApp:
         return c
 
     def toggle_settings(self):
-        c = self.chrome()
-        return self.click(c["dock"]["x"] + (4 if "tvs" in c else 6), c["pages"]["settings_row"])
+        return self.header_click("settings")
 
     def quiet_tabs(self, count):
         """Size the primary menu using owned PTYs, independently of Settings."""

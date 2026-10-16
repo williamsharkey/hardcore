@@ -332,6 +332,35 @@ static int chrome_tab_hover(int hit,int row) {
     return (hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_CUTIE || hit==HIT_TABPAGE || hit==HIT_CHROME_INERT) &&
         g_mouse_x>=g_chrome_x && g_mouse_x<g_chrome_x+sidebar_w() && g_mouse_y/CH==row;
 }
+static void chrome_render_header(int hover) {
+    if (!g_chrome.grip_rows) return;
+#ifdef _WIN32
+    chrome_row_fill(g_chrome.top, 0, 0);
+    if (hover == HIT_GRIP || g_chrome_drag)
+        fill_rect((float)CW, row_y(g_chrome.top), (float)(2 * CW), row_y(g_chrome.top + 1), TAB_HOVER, 1);
+    grid_text(L"↕", 1, g_chrome.top, hover == HIT_GRIP || g_chrome_drag ? g_look.text : g_look.detail);
+    grid_text(L"hardcore", 3, g_chrome.top, g_look.detail);
+    chrome_frame(g_chrome.top, g_look.dim);
+#else
+    for (int row = 0; row < g_chrome.grip_rows; row++) {
+        int y = g_chrome.top + row;
+        chrome_row_fill(y, 0, 0);
+        for (int i = 0; i < CHROME_HEADER_CONTROL_COUNT; i++) {
+            const ChromeHeaderControl *c = CHROME_HEADER_CONTROLS + i;
+            if (c->row != row) continue;
+            int highlighted = hover == c->hit || (c->hit == HIT_GRIP && g_chrome_drag);
+            if (highlighted) fill_rect((float)(c->col * CW), row_y(y),
+                (float)((c->col + c->width) * CW), row_y(y + 1), TAB_HOVER, 1);
+            uint32_t color = highlighted ? g_look.text : c->hit == HIT_CAF ?
+                (mac_caf_active() ? AMBER : g_look.dim) : g_look.detail;
+            const wchar_t *label = c->hit == HIT_CAF && !mac_caf_active() ? L"caf" : c->label;
+            grid_text(label, c->col, y, color);
+        }
+        if (!row) chrome_frame(y, g_look.dim);
+        else chrome_sides(y, g_look.dim);
+    }
+#endif
+}
 static void render_tabbar(int win_w, int win_h) {
     int i, idx = -1, hover = HIT_NONE;
     uint16_t drip = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
@@ -352,25 +381,7 @@ static void render_tabbar(int win_w, int win_h) {
         plat_render_title_background(0, row_y(i), (float)chrome_draw_width(), row_y(i + 1), BAR_BG, DEF_BG);
 #endif
     }
-    if (g_chrome.grip_rows) {
-        chrome_row_fill(g_chrome.top, 0, 0);
-        if (hover == HIT_GRIP || g_chrome_drag)
-            fill_rect((float)CW, row_y(g_chrome.top), (float)(2 * CW), row_y(g_chrome.top + 1), TAB_HOVER, 1);
-        grid_text(L"↕", 1, g_chrome.top, hover == HIT_GRIP || g_chrome_drag ? g_look.text : g_look.detail);
-#ifdef _WIN32
-        grid_text(L"hardcore",3,g_chrome.top,g_look.detail);
-#else
-        const wchar_t *labels[]={L"S",L"+",L"W",L"F",mac_caf_active()?L"CAF":L"caf"};
-        const int columns[]={4,8,12,16,21},hits[]={HIT_SETTINGS,HIT_PLUS,HIT_WEB,HIT_FILES,HIT_CAF};
-        for(int n=0;n<5;n++) {
-            if(hover==hits[n])fill_rect((float)((columns[n]-1)*CW),row_y(g_chrome.top),
-                (float)((columns[n]+(n==4?4:2))*CW),row_y(g_chrome.top+1),TAB_HOVER,1);
-            grid_text(labels[n],columns[n],g_chrome.top,hover==hits[n]?g_look.text:
-                n==4?(mac_caf_active()?AMBER:g_look.dim):g_look.detail);
-        }
-#endif
-        chrome_frame(g_chrome.top, g_look.dim);
-    }
+    chrome_render_header(hover);
     for (i = 0; i < g_chrome.tab_count; i++) {
         int tab = g_tab_offset + i, row = g_chrome.tab_row + i, left = 1, right = SB_COLS - 5;
         int active = tab == g_active, hovered = chrome_tab_hover(hover,row);

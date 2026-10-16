@@ -41,8 +41,8 @@ def blank(app):
 
 
 def header(app, local):
-    c = app.chrome()
-    return app.click(c["dock"]["x"] + local, c["dock"]["y"])
+    # Keep call sites readable while sharing the production control table.
+    return app.header_click({4:"settings",8:"term",12:"web",16:"files",21:"caf"}[local])
 
 
 def close_tv(app, name):
@@ -55,7 +55,7 @@ def close_tv(app, name):
 def test_controls(app):
     c = blank(app)
     primary = c["dock"]
-    assert primary["height"] == 2, "primary chrome should contain one header and one tab"
+    assert primary["height"] == 3, "primary chrome should contain two header rows and one tab"
     assert not c["settings_open"] and not c["caf_active"]
     c = app.open_settings()
     settings = app.tv(c, "settings")
@@ -134,7 +134,7 @@ def test_header_actions(app):
     assert "files.py" in args and str(app.root) in args, args
     app.snap("header-opened-files")
     assert len(app.state()["tabs"]) == 4
-    print("PASS: +, W and F header controls open an owned shell, native browser and real Files tab")
+    print("PASS: +term, +www and files header controls open an owned shell, native browser and real Files tab")
 
 
 def test_pixels(app):
@@ -213,6 +213,9 @@ def test_composed_reflow(app):
         for row in range(2, c["rows"]-2, 3):
             lines[row] = line
         c = app.feed(lines)
+        # Per-cell IPC probes span several frames. Hold the layout while
+        # checking one snapshot, rather than racing CAF's normal relocation.
+        c = app.hover(*app.header_point(c, "move"))
         valid_geometry(c)
         assert [row.rstrip() for row in c["source"]] == lines
         assert words(c["display"]) == words(c["source"]), "multiple surfaces dropped, duplicated or reordered words"
@@ -384,7 +387,7 @@ def test_opposite_hover(app):
 def test_joined_pixels(app):
     blank(app)
     app.quiet_tabs(7)
-    c = resize_grid(app, 50, 23)
+    c = resize_grid(app, 50, 24)
     c = app.feed([""]*c["rows"])
     cw, ch = c["cell"]["width"], c["cell"]["height"]
     x = int((c["dock"]["x"]+1.5)*cw)

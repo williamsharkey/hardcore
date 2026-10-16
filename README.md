@@ -129,16 +129,25 @@ the large **●** marks the selected tab. A spinner or **!** can replace these
 markers while a program is busy or needs attention. Native browser tabs preview
 their cached text projection without navigating or moving keyboard focus.
 
-The macOS header uses the selected bitmap font for all its controls:
+The macOS header uses two rows of controls in the selected bitmap font:
 
 | Control | Action |
 |---|---|
-| **↕** | Drag the tab menu |
-| **S** | Toggle Settings |
-| **+** | New terminal in the current folder |
-| **W** | Open a new website tab |
-| **F** | Open the current folder in the bundled file browser |
-| **caf / CAF** | Toggle display and system sleep prevention |
+| **↕ move** | Drag the tab menu |
+| **⚙** | Toggle Settings |
+| **caf / CAF** | Toggle display and system sleep prevention; uppercase and amber when active |
+| **+term** | New terminal in the current folder |
+| **+www** | Open a new website tab |
+| **files** | Open the current folder in the bundled file browser |
+
+The move handle, settings, and CAF occupy the first row; new-tab actions occupy
+the second. Gaps between controls are inert. Drag the normal window title band
+to move the app window; its pointer stays an arrow.
+
+Isolated right-aligned status lines can slide into blank space on their own
+row to expose the menu or a TV, preserving colors, links, and spacing. They
+prefer a two-character gutter and use a flush fit when needed. Cursor rows,
+code, and aligned tables remain fixed.
 
 Settings and CAF appear in separate small panels called TVs. They prefer a
 two-row gap below the tab menu, can join it when space is tight, and consider
@@ -1132,7 +1141,7 @@ If your login shell is zsh or fish, the tab still opens bash.
 
 ## Settings
 
-On macOS, click **S** in the tab-menu header; on Windows, click **Settings**
+On macOS, click **⚙** in the tab-menu header; on Windows, click **Settings**
 beneath the tabs. The compact **Font / Theme**
 strip selects the list below it; a light underline marks the active section.
 Tabs and settings use pages when they cannot
@@ -1217,10 +1226,11 @@ comparison.
 
 - `make reflow-test` exercises local word wrapping, both dock directions,
   source-cell mapping, paragraph boundaries, protected terminal content, menu
-  word packing, shaded panels, literal continuation chains, secondary-TV
+  word packing, horizontal status shifts, shaded panels, literal continuation chains, secondary-TV
   composition, bounded placement, stale hit maps, and the placement/fade state machines.
 - `make chrome-test` (macOS desktop) checks native menu layout, pagination,
-  both underlays, whole-menu hover, reflow, opaque cutouts, and timed atomic
+  both underlays, two-row header actions, title-band cursors, whole-menu hover,
+  reflow, opaque cutouts, and timed atomic
   relocation using isolated terminal windows. Complex fixtures also verify
   process columns, shaded input, and the actual mapped cursor pixels. TV tests
   cover separate controls, corner/edge pixels, countdown, and CAF placement;

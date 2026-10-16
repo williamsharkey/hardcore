@@ -1745,6 +1745,33 @@ static void view_px(NSEvent *e, int *x, int *y) {
     *y = (int)(p.y * s);
 }
 
+/* Cursor rectangles used to register an I-beam across the title band, racing
+   mouseMoved's arrow. All cursor-update, motion and modifier paths now agree
+   on the same geometry. Native WebKit retains ownership of its page body. */
+static void mac_pointer_cursor_at(int x,int y,NSEventModifierFlags flags) {
+    if(g_tv_drag_slot>=0){[(g_tv_drag_mode?mac_tv_resize_cursor():[NSCursor closedHandCursor]) set];return;}
+    if(g_chrome_drag){[[NSCursor closedHandCursor] set];return;}
+    int w,h;plat_client_size(&w,&h);
+    if(x<0 || y<0 || x>=w || y>=h)return;
+    if(over_chrome(x,y) || chrome_any_tv_contains(x,y)) {
+        int idx=-1,hit=hit_tabbar(x,y,&idx);
+        [(hit==HIT_TV_RESIZE?mac_tv_resize_cursor():
+          (hit==HIT_TV_GRIP || hit==HIT_GRIP)?[NSCursor openHandCursor]:
+          tabbar_action(x,y)?[NSCursor pointingHandCursor]:[NSCursor arrowCursor]) set];
+        return;
+    }
+    if(mac_browser_ui_move(x,y))return;
+    if(mac_title_contains(x,y) && !g_sel_drag && !g_sb_drag) {[[NSCursor arrowCursor] set];return;}
+    Tab *tb=active_tab();
+    if(tb && tb->kind==TK_BROWSER && tb->browser_native && !chrome_preview_active())return;
+    int col,row;char url[2048];mouse_cell(x,y,&col,&row);
+    if(tb && tb->kind==TK_BROWSER && col>=0 && col<tb->t.cols && row>=0 && row<tb->t.rows && tb->t.row[0][row][col].link) {
+        [[NSCursor pointingHandCursor] set];return;
+    }
+    if((flags&NSEventModifierFlagCommand) && link_at(col,row,url,sizeof(url))) [[NSCursor pointingHandCursor] set];
+    else [[NSCursor IBeamCursor] set];
+}
+
 /* A view tracking area alone misses motion delivered to the native buttons.
    A local monitor observes the same window's events before AppKit routes them,
    including traffic-light views, without capturing events from other apps. */
@@ -1809,6 +1836,8 @@ static NSEvent *mac_title_event(NSEvent *e) {
                 if ([e type]==NSEventTypeLeftMouseUp) g_browser_native_drag=0;
                 if([e type]==NSEventTypeLeftMouseDown && mac_browser_nav_editing() && !mac_title_contains(x,y))mac_browser_ui_mouse(x,y);
                 mac_title_hover_at(x, y);
+                if([e type]==NSEventTypeMouseMoved || [e type]==NSEventTypeMouseEntered)
+                    mac_pointer_cursor_at(x,y,[e modifierFlags]);
                 if (tb && tb->kind==TK_BROWSER && tb->browser_native && !g_sel_drag) {
                     int before=chrome_hovered() || chrome_any_tv_hovered();
                     g_mouse_x=x; g_mouse_y=y;
@@ -1933,8 +1962,14 @@ static int plain_layout(void) {
 }
 
 - (void)resetCursorRects {
-    NSRect b = [self bounds];
-    [self addCursorRect:b cursor:[NSCursor IBeamCursor]];
+    /* Dynamic cursorUpdate tracking owns the cursor, including the title band.
+       Do not reintroduce a full-view I-beam rectangle here. */
+}
+
+- (void)cursorUpdate:(NSEvent *)e {
+    int x,y;view_px(e,&x,&y);
+    mac_title_hover_at(x,y);
+    mac_pointer_cursor_at(x,y,[e modifierFlags]);
 }
 
 - (void)updateTrackingAreas {
@@ -1943,6 +1978,11 @@ static int plain_layout(void) {
                                                          options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited |
                                                                  NSTrackingActiveAlways | NSTrackingInVisibleRect
                                                            owner:self userInfo:nil] autorelease]];
+    /* Cursor tracking cannot use NSTrackingActiveAlways. Keep background
+       hover/preview tracking separate from AppKit's key-window cursor path. */
+    [self addTrackingArea:[[[NSTrackingArea alloc] initWithRect:[self bounds]
+        options:NSTrackingCursorUpdate | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
+        owner:self userInfo:nil] autorelease]];
     [super updateTrackingAreas];
 }
 
@@ -2150,13 +2190,11 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     /* Cmd held over a link: the pointing hand */
     NSPoint p = [self convertPoint:[g_win mouseLocationOutsideOfEventStream] fromView:nil];
     CGFloat s = [g_win backingScaleFactor];
-    int col, row;
-    char url[2048];
-    if (!NSPointInRect(p, [self bounds]) || over_chrome((int)(p.x * s), (int)(p.y * s))) return;
-    mouse_cell((int)(p.x * s), (int)(p.y * s), &col, &row);
-    if(mac_browser_hover_link()){[[NSCursor pointingHandCursor] set];return;}
-    if (([e modifierFlags] & NSEventModifierFlagCommand) && link_at(col, row, url, sizeof(url))) [[NSCursor pointingHandCursor] set];
-    else [[NSCursor IBeamCursor] set];
+    int x=(int)(p.x*s),y=(int)(p.y*s);
+    /* The isolated test channel supplies a coordinate-bearing pointer event. */
+    if([e type]!=NSEventTypeFlagsChanged)view_px(e,&x,&y);
+    mac_title_hover_at(x,y);
+    mac_pointer_cursor_at(x,y,[e modifierFlags]);
 }
 
 /* NSTextInputClient: what text the keys (and input methods) produced */
@@ -2227,17 +2265,13 @@ static int key_mods(NSEventModifierFlags f, int meta) {
         return;
     }
     hit = hit_tabbar(mx, my, &idx);
-    if(hit!=HIT_NONE && hit!=HIT_BAR){g_cutie_mouse_consumed=1;g_cutie_mouse_id=0;}
+    if(hit!=HIT_NONE){g_cutie_mouse_consumed=1;g_cutie_mouse_id=0;}
     if (hit == HIT_CUTIE) { g_cutie_mouse_consumed=1;g_cutie_mouse_id=0;if(idx>=0 && idx<g_ntabs){int slot=cutie_slot_for(g_tabs[idx]->id);if(slot>=0){mac_cutie_blur();chrome_tv_close_slot(slot);}else if(chrome_tv_open_tab(g_tabs[idx]->id)<0)NSBeep();} return; }
     if (hit == HIT_TAB) { activate(idx); return; }
     if (hit == HIT_CLOSE) { user_close_tab(idx); return; }
     if (mac_header_action(hit)) return;
     if (chrome_setting_hit(hit)) { settings_click(mx, my); return; }
-    if (hit == HIT_BAR) {        /* the tab column's empty part is the title bar */
-        if ([e clickCount] == 2) [g_win performZoom:nil];
-        else [g_win performWindowDragWithEvent:e];
-        return;
-    }
+    if (hit == HIT_BAR || hit == HIT_CHROME_INERT) return;
     plat_client_size(&w, &h);
     if (tb && mx >= term_ox() + tb->t.cols * CW - SCROLLBAR_W && mx < term_ox() + tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
         g_sb_drag = 1;
@@ -2364,18 +2398,9 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     g_mouse_y = my;
     chrome_preview_pointer(mx,my);
     if (was_bar || on_bar) plat_invalidate();    if (was_bar || on_bar) settings_point();
-    if(mac_browser_ui_move(mx,my))return;
-    if(tb && tb->kind==TK_BROWSER) {
-        plat_invalidate();
-        if(mac_browser_hover_link()){[[NSCursor pointingHandCursor] set];return;}
-    }
-    if (g_mac_title_hover) { [[NSCursor arrowCursor] set]; return; }
-    if (on_bar) {                /* a hand on what clicks, an open hand where the window drags, as on a web page */
-        int idx = -1, hit = hit_tabbar(mx, my, &idx);
-        [(hit==HIT_TV_RESIZE?mac_tv_resize_cursor():(hit==HIT_TV_GRIP || hit==HIT_GRIP || hit==HIT_BAR)?[NSCursor openHandCursor]:tabbar_action(mx,my)?[NSCursor pointingHandCursor]:[NSCursor arrowCursor]) set];
-    }
-    if (!on_bar && tb && tb->t.m_mouse == 1003) mouse_report(3, 1, 1, mx, my, ev_mods(e));
-    if (!on_bar) [self flagsChanged:e];
+    mac_pointer_cursor_at(mx,my,[e modifierFlags]);
+    if(tb && tb->kind==TK_BROWSER)plat_invalidate();
+    if (!on_bar && !mac_title_contains(mx,my) && tb && tb->t.m_mouse == 1003) mouse_report(3, 1, 1, mx, my, ev_mods(e));
 }
 
 - (void)mouseEntered:(NSEvent *)e { [self mouseMoved:e]; }
@@ -2704,6 +2729,30 @@ static void ctl_chrome(const char *path) {
     state[@"titlebar"] = @{@"height":@(mac_title_height()), @"hovered":@(g_mac_title_hover),
         @"buttons_visible":@(![[g_win standardWindowButton:NSWindowCloseButton] isHidden]),
         @"button_rects":button_rects, @"selection_drag":@(g_sel_drag), @"selection_on":@(g_sel_on)};
+    NSCursor *pointer=[NSCursor currentCursor];
+    state[@"pointer_cursor"]=pointer==[NSCursor arrowCursor]?@"arrow":
+        pointer==[NSCursor IBeamCursor]?@"ibeam":pointer==[NSCursor openHandCursor]?@"open-hand":
+        pointer==[NSCursor closedHandCursor]?@"closed-hand":pointer==[NSCursor pointingHandCursor]?@"pointing-hand":
+        pointer==mac_tv_resize_cursor()?@"resize":@"other";
+    NSMutableArray *header_controls=[NSMutableArray array],*header_hits=[NSMutableArray array];
+    for(int i=0;i<CHROME_HEADER_CONTROL_COUNT;i++) {
+        const ChromeHeaderControl *c=CHROME_HEADER_CONTROLS+i;
+        if(c->row>=g_chrome.grip_rows)continue;
+        const wchar_t *text=c->hit==HIT_CAF && !mac_caf_active()?L"caf":c->label;
+        NSString *label=[[[NSString alloc] initWithBytes:text length:wcslen(text)*sizeof(*text)
+            encoding:NSUTF32LittleEndianStringEncoding] autorelease];
+        [header_controls addObject:@{@"name":@(c->name),@"label":label?:@"",@"row":@(c->row),
+            @"col":@(c->col),@"width":@(c->width),@"hit":@(c->hit)}];
+    }
+    for(int row=0;row<g_chrome.grip_rows;row++) {
+        NSMutableArray *hits=[NSMutableArray array];
+        for(int col=0;col<SB_COLS;col++) {
+            int index=-1;
+            [hits addObject:@(hit_tabbar(sidebar_x()+col*CW+CW/2,(g_chrome.top+row)*CH+CH/2,&index))];
+        }
+        [header_hits addObject:hits];
+    }
+    state[@"header_controls"]=header_controls;state[@"header_hits"]=header_hits;
     int cursor_col, cursor_row;
     display_cursor_position(t, &cursor_col, &cursor_row);
     state[@"cursor"] = @{@"source":@[@(t->cx), @(t->cy)],
@@ -2891,7 +2940,7 @@ static void ctl_line(char *s) {
                                    !strcmp(action,"middle-up")?NSEventTypeOtherMouseUp:
                                    !strcmp(action, "down") ? NSEventTypeLeftMouseDown :
                                    (!strcmp(action, "drag") || !strcmp(action,"monitor-drag")) ? NSEventTypeLeftMouseDragged :
-                                   (!strcmp(action,"move") || !strcmp(action,"monitor")) ? NSEventTypeMouseMoved : NSEventTypeLeftMouseUp;
+                                   (!strcmp(action,"move") || !strcmp(action,"monitor") || !strcmp(action,"cursor") || !strcmp(action,"flags")) ? NSEventTypeMouseMoved : NSEventTypeLeftMouseUp;
                 CGFloat scale = [g_win backingScaleFactor];
                 NSPoint p = [(NSView *)g_view convertPoint:NSMakePoint(x/scale, y/scale) toView:nil];
                 NSEvent *e = [NSEvent mouseEventWithType:kind location:p modifierFlags:0 timestamp:0
@@ -2900,7 +2949,10 @@ static void ctl_line(char *s) {
                     g_mac_test_monitor_consumed=mac_title_event(e)==nil;return;
                 }
                 if(kind==NSEventTypeMouseMoved) {
-                    if(!strcmp(action,"monitor"))mac_title_event(e);else[g_view mouseMoved:e];
+                    if(!strcmp(action,"monitor"))mac_title_event(e);
+                    else if(!strcmp(action,"cursor"))[g_view cursorUpdate:e];
+                    else if(!strcmp(action,"flags"))[g_view flagsChanged:e];
+                    else[g_view mouseMoved:e];
                     return; /* Exercise real invalidation; do not mask a missed hover-exit redraw. */
                 }
                 /* Allow grid controls at the top edge, but never enter AppKit's

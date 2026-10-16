@@ -34,7 +34,7 @@ typedef struct ChromeReflow {
 enum { CR_BLANK, CR_PROSE, CR_PROTECTED, CR_RECORD };
 enum { CR_RECORD_NONE, CR_RECORD_CODE, CR_RECORD_PATH, CR_RECORD_TREE, CR_RECORD_COMMAND, CR_RECORD_FOOTER,
        CR_RECORD_CONTINUATION, CR_RECORD_STATUS };
-enum { CR_REASON_OTHER, CR_REASON_LIST, CR_REASON_UNSAFE };
+enum { CR_REASON_OTHER, CR_REASON_LIST, CR_REASON_UNSAFE, CR_REASON_FLOAT };
 typedef struct {
     int type, reason, indent, body, end, words, bullet, command, record, join;
 } ChromeReflowRow;
@@ -575,6 +575,27 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
         if (info[row].type == CR_PROSE) total_words += (size_t)info[row].words;
     }
     cr_classify_records(info, input, cols, rows, protected_rows);
+    /* Right-aligned statuses and explicit floating badges do not need new
+     * rows: use their own blank margin before trying paragraph wrapping.
+     * Keep unknown multi-row aligned structures and all protected rows fixed. */
+    fenced = 0;
+    for (row = 0; row < rows; row++) {
+        int left, right, badge_left, badge_right;
+        ChromeReflowRow *r = info+row;
+        int fence = cr_fence(input+row*cols, r->indent, r->end);
+        int safe = !fenced && !fence && !(protected_rows && protected_rows[row]) &&
+                   r->record == CR_RECORD_NONE;
+        if (fence) fenced = !fenced;
+        if (!safe || !chrome_float_span(input, cols, row, &left, &right)) continue;
+        if (!chrome_badge_span(input, cols, row, &badge_left, &badge_right)) {
+            int aligned = 0;
+            for (int neighbor = row-1; neighbor <= row+1; neighbor += 2)
+                if (neighbor >= 0 && neighbor < rows && info[neighbor].end > info[neighbor].indent &&
+                    abs(info[neighbor].indent-r->indent) <= 2) aligned = 1;
+            if (aligned) continue;
+        }
+        r->type = CR_PROTECTED; r->reason = CR_REASON_FLOAT;
+    }
     if (total_words) {
         if (total_words > SIZE_MAX / sizeof(*words)) goto fail;
         words = (ChromeReflowWord *)malloc(total_words * sizeof(*words));
@@ -721,6 +742,13 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
         for (y = top; y < top+affected; y++) cr_restore_badge(out, input, y);
         out->changed++;
         if (top+used_rows > row) row = top+used_rows;
+    }
+    /* Prose may borrow a badge row's blank left wing. Give it that bounded
+     * space first, then shift only if the resulting row still has room. */
+    for (row = 0; row < rows; row++) if (info[row].reason == CR_REASON_FLOAT && cr_in_band(row, dock_y, dock_height)) {
+        int left, right;
+        if (chrome_float_span(input, cols, row, &left, &right))
+            chrome_float_shift(out, input, row, left, right, side, dock_x, dock_width);
     }
     free(info);
     free(words);

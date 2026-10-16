@@ -307,10 +307,12 @@ reflow-test:
 	cc -std=c99 -O2 -Wall -Wextra tests/test_reflow_records.c -o build/test-reflow-records
 	build/test-reflow-records
 	python3 tests/test_reflow_panels.py
+	python3 tests/test_reflow_float.py
 	cc -std=c99 -O2 -Wall -Wextra tests/test_chrome_motion.c -o build/test-chrome-motion
 	build/test-chrome-motion
 	python3 tests/test_chrome_pack.py
 	python3 tests/test_chrome_edges.py
+	python3 tests/test_chrome_header.py
 	python3 tests/test_chrome_capture.py
 	python3 tests/test_chrome_search.py
 	python3 tests/test_tv.py
@@ -323,6 +325,8 @@ reflow-test:
 	build/test-tab-preview
 
 chrome-test: $(APP)
+	python3 tests/test_header_cursor_mac.py
+	python3 tests/test_chrome_float_mac.py
 	python3 tests/test_chrome_mac.py
 	python3 tests/test_chrome_adaptive_mac.py
 	python3 tests/test_chrome_complex_mac.py

@@ -37,6 +37,31 @@ typedef struct {
     int top, grip_rows, tab_row, tab_capacity, tab_count;
     int settings_row, section_row, list_row, list_capacity, list_count, bottom;
 } ChromeLayout;
+#ifndef _WIN32
+/* Label and hit geometry share one definition. Rows are relative to the
+   primary menu top; padding belongs to its control, and gaps stay inert. */
+typedef struct {
+    const char *name;
+    const wchar_t *label;
+    int row, col, width, hit;
+} ChromeHeaderControl;
+static const ChromeHeaderControl CHROME_HEADER_CONTROLS[] = {
+    {"move", L"↕ move", 0, 1, 7, HIT_GRIP},
+    {"settings", L"⚙", 0, 11, 3, HIT_SETTINGS},
+    {"caf", L"CAF", 0, 21, 4, HIT_CAF},
+    {"term", L"+term", 1, 1, 7, HIT_PLUS},
+    {"web", L"+www", 1, 10, 6, HIT_WEB},
+    {"files", L"files", 1, 19, 7, HIT_FILES},
+};
+#define CHROME_HEADER_CONTROL_COUNT ((int)(sizeof(CHROME_HEADER_CONTROLS) / sizeof(CHROME_HEADER_CONTROLS[0])))
+static int chrome_header_hit(int row, int col) {
+    for (int i = 0; i < CHROME_HEADER_CONTROL_COUNT; i++) {
+        const ChromeHeaderControl *c = CHROME_HEADER_CONTROLS + i;
+        if (row == c->row && col >= c->col && col < c->col + c->width) return c->hit;
+    }
+    return HIT_CHROME_INERT;
+}
+#endif
 static ChromeLayout g_chrome;
 static float g_chrome_motion_alpha = 1;
 #include "hardcore_chrome_pack.h"
@@ -139,9 +164,17 @@ static ChromeLayout chrome_primary_measure(int rows,int lights,int tabs,int open
 #ifdef _WIN32
     return chrome_measure(rows,lights,tabs,open,underlay,dock,items);
 #else
-    ChromeLayout a=chrome_measure(rows,lights,tabs,0,underlay,dock,0);
-    a.settings_row=-1; a.bottom=a.tab_row+a.tab_count;
-    (void)open;(void)items;
+    ChromeLayout a;
+    memset(&a, 0, sizeof(a));
+    a.settings_row = a.section_row = a.list_row = -1;
+    if (rows < 1) return a;
+    a.grip_rows = chrome_min(2, rows);
+    int minimum_height = a.grip_rows + (tabs > 0);
+    a.top = underlay ? chrome_min(chrome_max(dock, 0), chrome_max(0, rows - minimum_height)) : 0;
+    a.tab_row = a.top + a.grip_rows;
+    a.tab_capacity = a.tab_count = chrome_min(tabs, rows - a.tab_row);
+    a.bottom = a.tab_row + a.tab_count;
+    (void)lights;(void)open;(void)items;
     return a;
 #endif
 }
@@ -227,13 +260,12 @@ static int hit_tabbar(int mx, int my, int *idx) {
         if (original < 0) { UI_DONE; return HIT_NONE; }
         col = original;
     }
+#ifdef _WIN32
     if (row == g_chrome.top && col == 1) { UI_DONE; return HIT_GRIP; }
-#ifndef _WIN32
-    if(row==g_chrome.top) {
-        int hit=col>=3&&col<=5?HIT_SETTINGS:col>=7&&col<=9?HIT_PLUS:
-            col>=11&&col<=13?HIT_WEB:col>=15&&col<=17?HIT_FILES:
-            col>=20&&col<=24?HIT_CAF:HIT_BAR;
-        UI_DONE;return hit;
+#else
+    if (row >= g_chrome.top && row < g_chrome.tab_row) {
+        int hit = chrome_header_hit(row - g_chrome.top, col);
+        UI_DONE; return hit;
     }
 #endif
     for (i = 0; i < g_chrome.tab_count; i++) {
@@ -418,6 +450,6 @@ static int unit_chrome(FILE *f) {
     fails += chrome_page_hit(next_col, 8, 4, 10, 0, &direction) != 1 || direction != 1;
     fails += chrome_page_hit(6, 8, 4, 10, 0, &direction) != 0;
     fails += chrome_page_hit(counter_col, 8, 4, 10, 0, &direction) != 2;
-    fprintf(f, "%s chrome: single-row grip, bounded drag and lists, stable pages, independent arrow targets\n", fails ? "FAIL" : "ok  ");
+    fprintf(f, "%s chrome: bounded headers, drag and lists, stable pages, independent arrow targets\n", fails ? "FAIL" : "ok  ");
     return fails;
 }
