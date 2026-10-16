@@ -149,7 +149,7 @@ build/hardcore.metallib: hardcore.metal
 build/browser.inc: tools/embed_browser.py browser/project.js browser/welcome.html $(wildcard browser/adapters/*.js)
 	python3 tools/embed_browser.py
 
-build/hardcore: build/browser.inc hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_tmux_metadata.m
+build/hardcore: build/browser.inc hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
 
 build/hardcore.icns: tools/gen_icon.py
@@ -180,6 +180,8 @@ mac-test: build/hardcore reflow-test browser-test
 	python3 tests/test_mac_import_resize.py
 	python3 tests/test_mac_frame_order.py
 	python3 tests/test_mac_dock.py
+	python3 tests/test_mac_bridge_activation.py
+	python3 tests/test_mac_bridge_refresh.py
 	python3 tests/test_mac_terminal.py
 	python3 tests/test_mac_tmux_metadata.py
 	python3 tests/test_mac_slurp_report.py
@@ -218,6 +220,7 @@ mac-offline-test: mac-release reflow-test browser-test
 	python3 tests/test_default_theme.py
 	$(MAKE) claude-adapter-test
 	python3 tests/test_mac_dock.py
+	python3 tests/test_mac_bridge_refresh.py
 	python3 tests/test_mac_terminal.py
 	python3 tests/test_mac_tmux_metadata.py
 	python3 tests/test_mac_slurp_report.py
@@ -254,6 +257,7 @@ mac-takeover-test: build/hardcore
 	python3 tests/test_mac_takeover.py --repeat $(TAKEOVER_REPEAT)
 
 mac-integration-test: mac-release
+	python3 tests/test_mac_bridge_activation.py
 	$(MAKE) mac-pty-lifetime-test
 	$(MAKE) mac-exit-watch-test
 	python3 tests/test_mac_update.py

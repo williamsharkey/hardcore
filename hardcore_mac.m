@@ -661,6 +661,7 @@ static void tab_write(Tab *tb, const void *s, int n) {
     char *copy;
     int fd = tb->fd, off = 0;
     if (!tb->wq || fd < 0 || n <= 0) return;   /* no shell (a --replay terminal, or it's gone) */
+    tb->write_seq++;
     if (!__atomic_load_n(tb->wpending, __ATOMIC_ACQUIRE)) {
         while (off < n) {
             ssize_t w = write(fd, (const char *)s + off, (size_t)(n - off));
@@ -783,7 +784,8 @@ static void child_env(void) {
                                  "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
                                  "CLAUDE_CODE_MESSAGING_TOKEN", "OLDPWD",
                                  /* our own test knobs */
-                                 "HARDCORE_CTL", "HARDCORE_NO_ACTIVATE", "HARDCORE_SHELL", "HARDCORE_MAC_ROLLBACK", "HARDCORE_TEST_CONFIG"};
+                                 "HARDCORE_CTL", "HARDCORE_NO_ACTIVATE", "HARDCORE_SHELL", "HARDCORE_MAC_ROLLBACK", "HARDCORE_TEST_CONFIG",
+                                 "HARDCORE_BRIDGE_READY_FD"};
     size_t i;
     for (i = 0; i < sizeof(drop) / sizeof(drop[0]); i++) unsetenv(drop[i]);
     const char *path = getenv("PATH");

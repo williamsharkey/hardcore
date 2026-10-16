@@ -505,6 +505,7 @@ typedef struct Tab {
     void *psrc;                  /* dispatch source: shell exit */
     void *wq;                    /* serial queue for writes the pty can't take right away */
     int *wpending;               /* writes waiting on that queue (atomic; the queue frees it last) */
+    unsigned long long write_seq; /* main-queue writes; maintenance refuses input during staging */
     int exited;
     int claude_guard, claude_released, claude_cursor_sent;
     DWORD claude_guard_at;       /* bounded input hold while the adapter restores its draft */

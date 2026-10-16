@@ -58,6 +58,7 @@ static int mac_spawn(NSString *exe, NSArray *args, int fd, int detached, pid_t *
 }
 static NSDictionary *mac_info(void) { return @{@"protocol": @1, @"tabs": @[]}; }
 static NSDictionary *mac_claude_receipt(NSDictionary *request) { return @{@"fixture": request[@"op"]}; }
+static NSDictionary *mac_bridge_refresh(NSDictionary *request) { return @{@"fixture": request[@"op"]}; }
 static NSDictionary *mac_browser_request(NSDictionary *request) {
     if ([request[@"op"] isEqual:@"throw"]) [NSException raise:@"fixture" format:@"malformed"];
     return @{@"ok": @YES, @"request": request, @"touched": @(touched), @"spawned": @(spawned)};

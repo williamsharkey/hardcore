@@ -522,6 +522,8 @@ shows its activity or attention state, with a count when there are multiple
 tabs. Switching tabs or foreground programs updates the summary, including
 while the window is minimized. Each window runs in its own process and
 updates its application's Dock tile.
+Terminal bridge helpers run in the background and do not add Dock icons of
+their own; their tabs belong to the receiving Hardcore window.
 
 The tile uses the window's theme colors and the selected bitmap font,
 including Hairline and both Courier sizes. Theme previews appear in the Dock

@@ -6,8 +6,10 @@
  */
 #import <ApplicationServices/ApplicationServices.h>
 #include <libproc.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <time.h>
 
 static int mac_terminal_valid_tty(NSString *tty) {
     if (![tty isKindOfClass:[NSString class]] || ![tty hasPrefix:@"/dev/ttys"] || tty.length <= 9 || tty.length > 64) return 0;
@@ -276,7 +278,64 @@ static size_t mac_terminal_input(pid_t pid, const unsigned char *s, size_t n, in
     return i;
 }
 
+static int mac_terminal_bridge_background(void) {
+    /* The bridge executes the app's binary but owns no window. AppleScript
+       and CoreGraphics can register it with Launch Services, so establish its
+       background role before either framework creates an extra Dock item. */
+    ProcessSerialNumber self = {0, kCurrentProcess};
+    OSStatus status = TransformProcessType(&self, kProcessTransformToBackgroundApplication);
+    if (status != noErr) {
+        fprintf(stderr, "hardcore: cannot start Terminal bridge in the background (macOS error %d)\n", (int)status);
+        return 0;
+    }
+    return 1;
+}
+
+static int mac_terminal_bridge_ready_fd(void) {
+    const char *value = getenv("HARDCORE_BRIDGE_READY_FD");
+    if (!value) return -1;
+    char *end = NULL;
+    errno = 0;
+    long number = strtol(value, &end, 10);
+    int valid = !errno && end != value && !*end && number >= 3 && number <= INT_MAX;
+    unsetenv("HARDCORE_BRIDGE_READY_FD");
+    if (valid) {
+        int fd = (int)number, type = 0, flags = fcntl(fd, F_GETFD);
+        socklen_t size = sizeof(type);
+        if (flags >= 0 && !getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &size) &&
+            type == SOCK_STREAM && !fcntl(fd, F_SETFD, flags | FD_CLOEXEC)) return fd;
+    }
+    fprintf(stderr, "hardcore: invalid Terminal bridge readiness socket\n");
+    return -2;
+}
+
+static int mac_terminal_bridge_ready(int fd) {
+    /* An owned replacement may inspect the source, but must not forward any
+       input until its parent has checked the original tab and committed it. */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double deadline = now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0 + 10000.0;
+    int ok = write(fd, "R", 1) == 1;
+    while (ok) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double remaining = deadline - (now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0);
+        if (remaining <= 0) { ok = 0; break; }
+        struct pollfd socket = {fd, POLLIN, 0};
+        int ready = poll(&socket, 1, (int)remaining + 1);
+        if (ready < 0 && errno == EINTR) continue;
+        char go = 0;
+        ok = ready > 0 && (socket.revents & POLLIN) && read(fd, &go, 1) == 1 && go == 'G';
+        break;
+    }
+    close(fd);
+    if (!ok) fprintf(stderr, "hardcore: Terminal bridge replacement was not committed\n");
+    return ok;
+}
+
 static int mac_terminal_bridge(const char *device, const char *window_arg) {
+    int ready_fd = mac_terminal_bridge_ready_fd();
+    if (ready_fd == -2) return 2;
+    if (!mac_terminal_bridge_background()) return 1;
     NSString *tty = @(device);
     if (!mac_terminal_valid_tty(tty)) return 2;
     int window = atoi(window_arg); pid_t host = 0;
@@ -307,6 +366,11 @@ static int mac_terminal_bridge(const char *device, const char *window_arg) {
         NSAppleEventDescriptor *screen = mac_terminal_script(mac_terminal_target(tty,window,
             [resize stringByAppendingString:@"return contents of (contents of t)"]),1);
         if (!screen) { status=1; break; }
+        if (ready_fd >= 0) {
+            int committed = mac_terminal_bridge_ready(ready_fd);
+            ready_fd = -1;
+            if (!committed) { status=1; break; }
+        }
         NSString *text=screen.stringValue ?: @"";
         if (![text isEqual:previous]) {
             [previous release]; previous=[text copy];
@@ -334,6 +398,7 @@ static int mac_terminal_bridge(const char *device, const char *window_arg) {
             [input replaceBytesInRange:NSMakeRange(0,used) withBytes:NULL length:0];
         }
     } }
+    if (ready_fd >= 0) close(ready_fd);
     [previous release];
     tcsetattr(STDIN_FILENO,TCSANOW,&saved);
     printf("\033[?25h\r\nTerminal bridge detached. The original tab was left running.\r\n");
