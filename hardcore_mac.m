@@ -38,6 +38,14 @@ static int mac_camera_mouse(NSEvent *,int,int);
 static int mac_camera_cursor(int,int);
 static NSDictionary *mac_camera_metadata(void);
 static NSDictionary *mac_camera_status(void);
+static void mac_music_toggle(void);
+static int mac_music_mouse(NSEvent *,int,int);
+static int mac_music_cursor(int,int);
+static void mac_music_cancel_press(void);
+static void mac_music_play_pause(void);
+static void mac_music_next(int);
+static void mac_music_stop(void);
+static NSDictionary *mac_music_panel_status(void);
 static int mac_record_active(void);
 static void mac_record_start(void);
 static void mac_record_pause(void);
@@ -1575,6 +1583,11 @@ static int mac_header_action(int hit) {
     else if(hit==HIT_WEB)mac_browser_open_welcome();
     else if(hit==HIT_FILES)mac_files_new();
     else if(hit==HIT_CAMERA)mac_camera_toggle();
+    else if(hit==HIT_MUSIC)mac_music_toggle();
+    else if(hit==HIT_MUSIC_PLAY)mac_music_play_pause();
+    else if(hit==HIT_MUSIC_PREV)mac_music_next(-1);
+    else if(hit==HIT_MUSIC_NEXT)mac_music_next(1);
+    else if(hit==HIT_MUSIC_STOP)mac_music_stop();
     else if(hit==HIT_CAF) {
         int on=mac_caf_toggle();
         if(on>0)hc_tv_open(&g_tvs[HC_TV_CAF].state,GetTickCount());
@@ -1785,6 +1798,7 @@ static void view_px(NSEvent *e, int *x, int *y) {
    mouseMoved's arrow. All cursor-update, motion and modifier paths now agree
    on the same geometry. Native WebKit retains ownership of its page body. */
 static void mac_pointer_cursor_at(int x,int y,NSEventModifierFlags flags) {
+    if(mac_music_cursor(x,y))return;
     if(mac_camera_cursor(x,y))return;
     if(g_tv_drag_slot>=0){[(g_tv_drag_mode?mac_tv_resize_cursor():[NSCursor closedHandCursor]) set];return;}
     if(g_chrome_drag){[[NSCursor closedHandCursor] set];return;}
@@ -1827,6 +1841,7 @@ static NSEvent *mac_title_event(NSEvent *e) {
                 int x, y;
                 view_px(e, &x, &y);
                 mac_record_event(e,x,y);
+                if(mac_music_mouse(e,x,y))return nil;
                 if(mac_camera_mouse(e,x,y))return nil;
                 Tab *tb=active_tab();
                 if([e type]==NSEventTypeLeftMouseDown && cutie_at(x,y)<0)mac_cutie_blur();
@@ -2560,6 +2575,9 @@ static void record_jobs_changed(void) {update_busy(0);plat_invalidate();}
 #include "hardcore_recording_jobs.m"
 #include "hardcore_recording_library.m"
 #include "hardcore_camera_panel.m"
+static void mac_music_changed(void) {update_busy(0);plat_invalidate();}
+#include "hardcore_mac_music.m"
+#include "hardcore_music_panel.m"
 
 /* ── window and app ────────────────────────────────────────────────── */
 
@@ -2567,7 +2585,7 @@ static void focus_changed(int focused) {
     Tab *tb = input_tab();
     int cutie_reports_out=g_cutie_focus_id && tb!=active_tab();
     g_focused = focused;
-    if(!focused){mac_camera_cancel_press();mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
+    if(!focused){mac_music_cancel_press();mac_camera_cancel_press();mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
     if (g_focused && tb) tb->attention = 0;
     if (tb && tb->t.m_focus && (g_focused || !cutie_reports_out)) tab_write(tb, g_focused ? "\x1b[I" : "\x1b[O", 3);
     mac_dock_update(0);
@@ -2580,7 +2598,7 @@ static void focus_changed(int focused) {
 @implementation HCDelegate
 - (void)applicationWillFinishLaunching:(NSNotification *)n { (void)n; trace("applicationWillFinishLaunching"); }
 - (void)applicationDidFinishLaunching:(NSNotification *)n { (void)n; trace("applicationDidFinishLaunching"); }
-- (void)windowWillMiniaturize:(NSNotification *)n {(void)n;mac_camera_cancel_press();mac_record_hide_pointer();mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
+- (void)windowWillMiniaturize:(NSNotification *)n {(void)n;mac_music_cancel_press();mac_camera_cancel_press();mac_record_hide_pointer();mac_tv_drag_end();mac_cutie_blur();chrome_preview_cancel();g_mouse_x=g_mouse_y=-1;settings_point();}
 - (void)windowDidBecomeKey:(NSNotification *)n { (void)n; trace("window key"); focus_changed(1); }
 - (void)windowDidResignKey:(NSNotification *)n { (void)n;mac_record_hide_pointer(); if (g_chrome_drag) chrome_drag_end(); focus_changed(0); }
 - (void)windowDidEnterFullScreen:(NSNotification *)n {
@@ -2617,6 +2635,7 @@ static void focus_changed(int focused) {
     }
     if (!g_quitting && !confirm_close(-1)) return NSTerminateCancel;
     trace("confirmed");
+    mac_music_shutdown();
     /* Gone now: AppKit's own teardown took ~60 ms (measured), for nothing a
        terminal needs, and the window server drops a dead process's windows
        faster than an orderOut round trip. The window's frame is saved
@@ -2800,6 +2819,11 @@ static void ctl_chrome(const char *path) {
         [header_controls addObject:@{@"name":@(c->name),@"label":label?:@"",@"row":@(c->row),
             @"col":@(c->col),@"width":@(c->width),@"hit":@(c->hit)}];
     }
+    if(mac_music_menu_visible() && g_chrome.grip_rows>2)for(int i=0;i<CHROME_MUSIC_CONTROL_COUNT;i++) {
+        const ChromeHeaderControl *c=CHROME_MUSIC_CONTROLS+i;
+        [header_controls addObject:@{@"name":[@"music_" stringByAppendingString:@(c->name)],@"row":@(c->row),
+            @"col":@(c->col),@"width":@(c->width),@"hit":@(c->hit)}];
+    }
     for(int row=0;row<g_chrome.grip_rows;row++) {
         NSMutableArray *hits=[NSMutableArray array];
         for(int col=0;col<SB_COLS;col++) {
@@ -2862,6 +2886,7 @@ static void ctl_chrome(const char *path) {
     state[@"input_tab_id"]=@(input_tab()?input_tab()->id:0);
     state[@"tvs"]=tvs;state[@"caf_active"]=@(mac_caf_active());
     state[@"camera"]=mac_camera_status();state[@"exports"]=mac_record_jobs();
+    state[@"music"]=mac_music_panel_status();
     Tab *selected=active_tab(),*shown=display_tab();
     state[@"preview"]=@{@"active_id":@(selected?selected->id:0),@"display_id":@(shown?shown->id:0),
         @"preview_id":@(g_tab_preview.target_id)};
@@ -2909,6 +2934,7 @@ static void ctl_line(char *s) {
         const char *c = s + 4;
         if(!strncmp(c,"record-fixture ",15))mac_record_fixture([NSString stringWithUTF8String:c+15]);
         else if(!strcmp(c,"clips"))mac_record_library();
+        else if(!strcmp(c,"music"))mac_music_toggle();
         else if(!strncmp(c,"focus ",6))focus_changed(atoi(c+6));
         else if(!strcmp(c,"preview-cancel"))chrome_preview_cancel();
         else if(!strncmp(c,"preview-event ",14)) {
@@ -3423,6 +3449,7 @@ int main(int argc, char **argv) {
     }
     if (!getenv("HARDCORE_NO_ACTIVATE") && (!g_mac_adopt || [g_mac_adopt[@"focused"] boolValue])) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
     mac_adopt_ready();
+    if(g_mac_adopt)mac_music_view_restore(g_mac_adopt[@"music"]);
     mac_refresh_programs();
     g_mac_dock_ready = 1;
     mac_dock_update(1);

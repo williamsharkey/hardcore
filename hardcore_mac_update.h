@@ -203,6 +203,7 @@ static int mac_reload(int ack, char *why, size_t cap) {
         @"focused": @([NSApp isActive]), @"miniaturized": @([g_win isMiniaturized]),
         @"fullscreen": @(([g_win styleMask] & NSWindowStyleMaskFullScreen) != 0),
         @"settings_open": @(g_settings_open), @"settings_tab": @(g_settings_tab),
+        @"music": mac_music_view_pack(),
         @"tab_offset": @(g_tab_offset),
         @"setting_offsets": @[@(g_setting_offset[0]), @(g_setting_offset[1]), @(g_setting_offset[2])],
         @"exe": g_mac_exe, @"target": g_mac_target

@@ -459,6 +459,7 @@ static void mac_server(void) {
                         NSString *op = req[@"op"];
                         if ([op isEqual:@"list"]) mac_send(peer, mac_info());
                         else if ([op isEqual:@"camera-status"]) mac_send(peer, mac_camera_status());
+                        else if ([op isEqual:@"music-status"]) mac_send(peer, mac_music_panel_status());
                         else if ([op isEqual:@"claude-receipt"] || [op isEqual:@"claude-cursor"] || [op isEqual:@"claude-release"] || [op isEqual:@"claude-guard"]) mac_send(peer, mac_claude_receipt(req));
                         else if ([op isEqual:@"take"]) { if (mac_export(peer)) { close(peer); mac_retire(); } }
                         else if ([op isEqual:@"reload"]) {

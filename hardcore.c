@@ -4057,6 +4057,10 @@ static int caption_btn_w(void) { return 46 * g_scale; }
 static int mac_caf_active(void);
 static int mac_record_active(void);
 static int mac_record_exports_active(void);
+static int mac_music_menu_visible(void);
+static int mac_music_playing(void);
+static int mac_music_loading(void);
+static void mac_music_compact_label(wchar_t *,int);
 static int mac_caf_toggle(void);
 static double mac_caf_elapsed(void);
 static const char *mac_caf_power(void);
@@ -4196,6 +4200,8 @@ static void plat_render_title_underlay(void);
 static void plat_render_title_overlay(void);
 static void mac_camera_draw(void);
 static void mac_camera_layout(Term *t);
+static void mac_music_draw(void);
+static void mac_music_layout(Term *t);
 #endif
 static int chrome_intrusion_span(int row, int *left, int *right);
 static int chrome_intrusion_span_at(int row,int dock,int top,int bottom,int *left,int *right);
@@ -4397,12 +4403,13 @@ static void render(void) {
     }
 #ifndef _WIN32
     if (tb && tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active()) {
-        chrome_tv_clock();tab_layout();chrome_tv_prepare(&tb->t);mac_camera_layout(&tb->t);
+        chrome_tv_clock();tab_layout();chrome_tv_prepare(&tb->t);mac_camera_layout(&tb->t);mac_music_layout(&tb->t);
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
         mac_browser_draw_overlay();
         render_cuties(r.right);
         mac_camera_draw();
+        mac_music_draw();
         plat_render_title_overlay();
         return;
     }
@@ -4543,6 +4550,7 @@ static void render(void) {
     mac_browser_draw_overlay();
     render_cuties(r.right);
     mac_camera_draw();
+    mac_music_draw();
     plat_render_title_overlay();
 #endif
 }
@@ -4736,6 +4744,7 @@ static void update_busy(int tick) {
     }
 #ifndef _WIN32
     any |= mac_record_exports_active();
+    any |= mac_music_loading();
 #endif
     if (any && !g_throb_on) plat_timer(TIMER_THROB, DRIP_MS);
     if (!any && g_throb_on) plat_kill_timer(TIMER_THROB);

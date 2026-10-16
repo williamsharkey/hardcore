@@ -345,6 +345,32 @@ static void chrome_render_header(int hover) {
     for (int row = 0; row < g_chrome.grip_rows; row++) {
         int y = g_chrome.top + row;
         chrome_row_fill(y, 0, 0);
+        if (row == 2 && mac_music_menu_visible()) {
+            for (int i = 0; i < CHROME_MUSIC_CONTROL_COUNT; i++) {
+                const ChromeHeaderControl *c = CHROME_MUSIC_CONTROLS + i;
+                int highlighted = hover == c->hit;
+                if (highlighted) fill_rect((float)(c->col * CW), row_y(y),
+                    (float)((c->col + c->width) * CW), row_y(y + 1), TAB_HOVER, 1);
+                wchar_t status[12] = {0}, drip[2] = {0};
+                const wchar_t *label = c->label;
+                uint32_t color = highlighted ? g_look.text : g_look.detail;
+                if (c->hit == HIT_MUSIC_PLAY) {
+                    label = mac_music_playing() ? L"Ⅱ" : L"▶";
+                    if (mac_music_playing()) color = AMBER;
+                    if (mac_music_loading()) {
+                        drip[0] = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
+                        label = drip; color = AMBER;
+                    }
+                } else if (c->col == 16) {
+                    mac_music_compact_label(status, sizeof(status) / sizeof(status[0]));
+                    status[c->width] = 0;
+                    label = status;
+                }
+                grid_text(label, c->col, y, color);
+            }
+            chrome_sides(y, g_look.dim);
+            continue;
+        }
         for (int i = 0; i < CHROME_HEADER_CONTROL_COUNT; i++) {
             const ChromeHeaderControl *c = CHROME_HEADER_CONTROLS + i;
             if (c->row != row) continue;

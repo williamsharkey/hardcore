@@ -54,6 +54,9 @@ static int chrome_min(int a, int b) { return a < b ? a : b; }
 static int chrome_max(int a, int b) { return a > b ? a : b; }
 static int first_row(void) { return 0; }
 static int chrome_item_total(void) { return fixture_items; }
+/* Playback is off in these placement fixtures; dynamic transport geometry
+ * is exercised independently by test_chrome_header.py. */
+static int chrome_header_rows(void) { return 2; }
 static uint32_t GetTickCount(void) { tick += tick_step; return tick; }
 static int chrome_background_safe(const Cell *c) { return !c->bg; }
 static uint32_t chrome_panel_background(const Cell *c) { return c->bg; }

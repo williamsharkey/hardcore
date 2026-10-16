@@ -343,6 +343,7 @@ static void chrome_prepare_display(Term *t) {
 #ifndef _WIN32
     chrome_tv_prepare(t);
     mac_camera_layout(t);
+    mac_music_layout(t);
 #endif
 }
 

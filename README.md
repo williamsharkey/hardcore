@@ -348,6 +348,28 @@ Fresh terminal tabs show `folder:<new>`. After command activity they show
 `folder:term`, or the foreground program name when one is running. The state
 survives a live update.
 
+## Music for Programming on macOS
+
+Click **♪mus** in the tab-menu header to open a music TV in Hardcore's current
+font and theme. It lists mixes from the official
+[Music for Programming feed](https://musicforprogramming.net/rss.xml).
+Opening the list does not start audio; click a mix or **Play** to stream it.
+The player includes pause, previous/next, stop, a seek bar, and a scrollable
+episode list. **Refresh** updates the list; **Site** opens the original website
+in a Hardcore browser tab.
+
+Drag the title row to move the TV, or its bottom-right grip to resize it.
+**−** minimizes it while playback continues. A single transport row stays in
+the tab menu with previous, play/pause, next, stop, and the episode/time;
+click the note or episode/time to reopen the TV. Previous/next follows the
+list's newest-first order and preserves whether playback is paused. Playback
+automatically advances at the end of a mix. Live updates preserve the selection,
+position, and play/pause state, with a brief buffering interruption possible.
+
+`make music-test` checks catalog handling and panel interactions offline.
+`make music-native-test` also exercises real controls, muted local playback,
+and a live reload in an isolated window.
+
 ## Camera recordings on macOS
 
 Click **cam** to open a camera TV. It prefers the front-facing or built-in

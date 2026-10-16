@@ -4,7 +4,8 @@ enum {
     HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT,
     HIT_SCHEME, HIT_STAB, HIT_SCLOSE, HIT_UNDERLAY, HIT_TABPAGE, HIT_SETPAGE,
     HIT_REFLOW, HIT_REFLOW_DEBUG, HIT_DOCK_ROW, HIT_CHROME_INERT, HIT_GRIP,
-    HIT_WEB, HIT_FILES, HIT_CAF, HIT_CAMERA, HIT_TV, HIT_TV_CLOSE, HIT_CUTIE, HIT_TV_GRIP, HIT_TV_RESIZE, HIT_TV_EXPAND
+    HIT_WEB, HIT_FILES, HIT_CAF, HIT_CAMERA, HIT_TV, HIT_TV_CLOSE, HIT_CUTIE, HIT_TV_GRIP, HIT_TV_RESIZE, HIT_TV_EXPAND,
+    HIT_MUSIC, HIT_MUSIC_PREV, HIT_MUSIC_PLAY, HIT_MUSIC_NEXT, HIT_MUSIC_STOP
 };
 static int plat_lights_bottom(void);
 static void plat_settings_shown(void);
@@ -50,15 +51,32 @@ static const ChromeHeaderControl CHROME_HEADER_CONTROLS[] = {
     {"settings", L"⚙config", 0, 9, 8, HIT_SETTINGS},
     {"camera", L"cam", 0, 18, 4, HIT_CAMERA},
     {"caf", L"CAF", 0, 24, 3, HIT_CAF},
-    {"term", L"+term", 1, 1, 7, HIT_PLUS},
-    {"web", L"+www", 1, 10, 6, HIT_WEB},
-    {"files", L"files", 1, 19, 7, HIT_FILES},
+    {"term", L"+term", 1, 1, 6, HIT_PLUS},
+    {"web", L"+www", 1, 8, 5, HIT_WEB},
+    {"files", L"files", 1, 14, 6, HIT_FILES},
+    {"music", L"♪mus", 1, 21, 6, HIT_MUSIC},
 };
 #define CHROME_HEADER_CONTROL_COUNT ((int)(sizeof(CHROME_HEADER_CONTROLS) / sizeof(CHROME_HEADER_CONTROLS[0])))
+static const ChromeHeaderControl CHROME_MUSIC_CONTROLS[] = {
+    {"music", L"♪", 2, 1, 2, HIT_MUSIC},
+    {"previous", L"|‹", 2, 4, 2, HIT_MUSIC_PREV},
+    {"play", L"▶", 2, 7, 2, HIT_MUSIC_PLAY},
+    {"next", L"›|", 2, 10, 2, HIT_MUSIC_NEXT},
+    {"stop", L"■", 2, 13, 2, HIT_MUSIC_STOP},
+    {"track", L"", 2, 16, 11, HIT_MUSIC},
+};
+#define CHROME_MUSIC_CONTROL_COUNT ((int)(sizeof(CHROME_MUSIC_CONTROLS) / sizeof(CHROME_MUSIC_CONTROLS[0])))
+static int chrome_header_rows(void) { return 2 + !!mac_music_menu_visible(); }
 static int chrome_header_hit(int row, int col) {
     for (int i = 0; i < CHROME_HEADER_CONTROL_COUNT; i++) {
         const ChromeHeaderControl *c = CHROME_HEADER_CONTROLS + i;
         if (row == c->row && col >= c->col && col < c->col + c->width) return c->hit;
+    }
+    if (mac_music_menu_visible() && row == 2) {
+        for (int i = 0; i < CHROME_MUSIC_CONTROL_COUNT; i++) {
+            const ChromeHeaderControl *c = CHROME_MUSIC_CONTROLS + i;
+            if (col >= c->col && col < c->col + c->width) return c->hit;
+        }
     }
     return HIT_CHROME_INERT;
 }
@@ -169,7 +187,7 @@ static ChromeLayout chrome_primary_measure(int rows,int lights,int tabs,int open
     memset(&a, 0, sizeof(a));
     a.settings_row = a.section_row = a.list_row = -1;
     if (rows < 1) return a;
-    a.grip_rows = chrome_min(2, rows);
+    a.grip_rows = chrome_min(chrome_header_rows(), rows);
     int minimum_height = a.grip_rows + (tabs > 0);
     a.top = underlay ? chrome_min(chrome_max(dock, 0), chrome_max(0, rows - minimum_height)) : 0;
     a.tab_row = a.top + a.grip_rows;
@@ -314,7 +332,8 @@ static int chrome_setting_hit(int hit) {
 static int tabbar_action(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
     return (chrome_setting_hit(hit) && hit != HIT_CHROME_INERT) || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_CUTIE ||
-        hit == HIT_WEB || hit == HIT_FILES || hit == HIT_CAF || hit == HIT_CAMERA || hit == HIT_TAB || hit == HIT_TV_EXPAND;
+        hit == HIT_WEB || hit == HIT_FILES || hit == HIT_CAF || hit == HIT_CAMERA || hit == HIT_TAB || hit == HIT_TV_EXPAND ||
+        hit == HIT_MUSIC || hit == HIT_MUSIC_PREV || hit == HIT_MUSIC_PLAY || hit == HIT_MUSIC_NEXT || hit == HIT_MUSIC_STOP;
 }
 static void resize_all(void);
 static void settings_point(void) {
