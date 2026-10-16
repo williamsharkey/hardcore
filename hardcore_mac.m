@@ -46,6 +46,10 @@
 #include <math.h>
 
 @class HCView;
+static char g_mac_exe_path[MAX_PATH];
+#ifndef HARDCORE_BUILD
+#define HARDCORE_BUILD "unknown"
+#endif
 static NSWindow *g_win;
 static HCView *g_view;
 static int g_gfx_ready;          /* Metal device and shaders are up */
@@ -80,6 +84,102 @@ static int mac_browser_copy_edit(void);
 
 static char g_mac_bin_dir[4096];
 static const char *g_shell;      /* your login shell */
+
+#include "hardcore_mac_dock.m"
+
+/* A Dock tile summarizes metadata, never terminal output or command arguments.
+   Both the tab model and AppKit live on the main thread. Rendering is bounded
+   independently of terminal frames, including during output floods/resizing. */
+static int g_mac_dock_summary = 1, g_mac_dock_ready;
+static HCDockSummaryView *g_mac_dock_view;
+static double g_mac_dock_last_check = -1000;
+
+static NSString *mac_dock_text(const char *text, NSString *fallback) {
+    return hc_dock_label(text ? [NSString stringWithUTF8String:text] : nil, fallback);
+}
+
+/* Reuse the terminal's native bitmap lookup, including its Unicode fallback.
+   The Dock scales these pixels to its tile; it never substitutes a system font.
+   This callback is only used while drawing, not when polling unchanged tabs. */
+static int mac_dock_glyph(NSString *fontKey, uint32_t cp, unsigned char *pixels, int stride) {
+    const Font *font = font_by_key([fontKey length] ? [fontKey characterAtIndex:0] : 0);
+    if (!font) font = FONTS;
+    if (cp_width(cp) <= 0) return 0;
+    if (cp == ' ') return font->w; /* blank cells aren't stored in fonts.bin */
+    unsigned char bitmap[SLOT * SLOT] = {0};
+    int width = glyph_bits(font, cp, bitmap);
+    for (int y = 0; y < font->h; y++)
+        memcpy(pixels + y * stride, bitmap + y * SLOT, (size_t)MIN(width, stride));
+    return width;
+}
+
+static NSDictionary *mac_dock_appearance(void) {
+    /* g_shown/g_look also follow hover previews, just like the window. g_font
+       is the selected font; g_cf is temporary state used by chrome drawing. */
+    return @{@"fontKey":[NSString stringWithFormat:@"%c", g_font->key],
+             @"fontWidth":@(g_font->w), @"fontHeight":@(g_font->h),
+             @"themeKey":[NSString stringWithFormat:@"%c", g_shown->key],
+             @"bg":@(g_look.bg), @"fg":@(g_look.fg), @"accent":@(g_look.accent),
+             @"bar":@(g_look.bar), @"hover":@(g_look.hover), @"dim":@(g_look.dim),
+             @"red":@(g_shown->pal[9]), @"yellow":@(g_shown->pal[11]),
+             @"green":@(g_shown->pal[10]), @"blue":@(g_shown->pal[12])};
+}
+
+static NSDictionary *mac_dock_summary(void) {
+    Tab *tb = active_tab();
+    NSString *folder = @"no tabs", *program = @"hardcore", *status = @"no tabs";
+    if (tb && tb->kind == TK_BROWSER) {
+        NSString *host = [[NSURL URLWithString:[NSString stringWithUTF8String:tb->browser_url] ?: @""] host];
+        folder = mac_dock_text(tb->browser_site, host.length ? host : @"Browser");
+        NSString *title = [[[NSString alloc] initWithBytes:tb->t.title
+            length:wcslen(tb->t.title) * sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding] autorelease];
+        program = hc_dock_label(title, @"Web page");
+        status = tb->busy ? @"loading" : tb->browser_native ? @"native web" : @"web";
+    } else if (tb) {
+        const char *dir = tb->t.cwd[0] ? tb->t.cwd : tb->start_dir;
+        NSString *path = dir[0] ? [NSString stringWithUTF8String:dir] : nil;
+        folder = mac_dock_text([[path lastPathComponent] UTF8String], @"~");
+        program = mac_dock_text(tb->program, mac_dock_text(g_shell, @"shell").lastPathComponent);
+        status = tb->program[0] ? @"running" : @"ready";
+        if (tb->t.ps_state == PS_IDLE || tb->t.ps_state == PS_DONE) status = @"ready";
+        if (tb->busy) status = @"busy";
+        if (tb->attention || tb->t.ps_state == PS_BLOCKED) status = @"needs you";
+        if (tb->t.ps_state == PS_ERROR) status = @"error";
+        if (!strncmp(tb->run, "terminal:", 9)) status = @"bridge";
+        if (tb->help) { program = @"help"; status = @"help"; }
+        if (tb->exited) { program = @"exited"; status = @"exited"; }
+    }
+    return @{@"folder":folder, @"program":program, @"status":status, @"tabs":@(g_ntabs),
+             @"appearance":mac_dock_appearance()};
+}
+
+static void mac_dock_update(int force) {
+    if (!g_mac_dock_ready || !NSApp) return; /* early shell/title setup precedes AppKit */
+    double now = uptime_ms();
+    if (!force && now - g_mac_dock_last_check < 250) return;
+    g_mac_dock_last_check = now;
+    NSDockTile *tile = [NSApp dockTile];
+    if (!g_mac_dock_summary) {
+        if (g_mac_dock_view) {
+            if ([tile contentView] == g_mac_dock_view) {
+                [tile setContentView:nil]; /* AppKit resumes the installed application icon */
+                [tile display];
+            }
+            [g_mac_dock_view release]; g_mac_dock_view = nil;
+        }
+        return;
+    }
+    BOOL installed = NO;
+    hc_dock_read_glyph = mac_dock_glyph;
+    if (!g_mac_dock_view) {
+        g_mac_dock_view = [[HCDockSummaryView alloc] initWithFrame:NSMakeRect(0, 0, 128, 128)];
+        [g_mac_dock_view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    }
+    if ([tile contentView] != g_mac_dock_view) {
+        [tile setContentView:g_mac_dock_view]; installed = YES;
+    }
+    if ([g_mac_dock_view setSummary:mac_dock_summary()] || installed) [tile display];
+}
 
 /* ── platform layer ─────────────────────────────────────────────────── */
 
@@ -128,6 +228,7 @@ static void plat_set_title(const wchar_t *title) {
     s = [[NSString alloc] initWithBytes:title length:wcslen(title) * sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding];
     [g_win setTitle:s ? s : @"hardcore"];
     [s release];
+    mac_dock_update(0);
 }
 
 static void plat_close_window(void) {
@@ -230,6 +331,8 @@ typedef struct Frame {
     int n, cap, w, h;
     int transparent;
     int snap;                    /* test channel: write this frame to snap_path */
+    int handoff, painted;        /* receipt belongs only to this exact frame */
+    uint64_t serial;             /* main-thread submission order */
     char snap_path[MAX_PATH];
     double lat_key, lat_out, lat_down, lat_written;   /* HARDCORE_LAT, for the key this frame answers */
     int trace_tab;               /* HARDCORE_TRACE: the new tab's first frame */
@@ -239,6 +342,8 @@ static Frame *g_build;           /* being built by render() */
 static Frame *g_pending;         /* built, waiting for the render thread */
 static pthread_mutex_t g_fmx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_fcv = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_draw_mx = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_frame_serial, g_last_draw_serial;
 
 static void frame_free(Frame *f) {
     if (!f) return;
@@ -289,9 +394,11 @@ static void write_bmp(const char *path, const void *px, int w, int h) {
     fclose(f);
 }
 
-/* Encodes and presents one frame; on the render thread, or on the main
-   thread during a live resize (presentsWithTransaction wants that). */
-static void draw_frame(Frame *f) {
+/* Encodes and presents on the render thread, including during live resize.
+   Only explicit test snapshots draw synchronously on the main thread. */
+static int g_handoff_paint, g_handoff_painted;
+
+static void draw_frame_contents(Frame *f) {
     id<CAMetalDrawable> d = [g_layer nextDrawable];
     id<MTLCommandBuffer> cb;
     id<MTLRenderCommandEncoder> enc;
@@ -352,13 +459,11 @@ static void draw_frame(Frame *f) {
             if (dd.presentedTime > 0) fprintf(stderr, "%8.2f ms  frame %d on screen\n", dd.presentedTime * 1000.0 - g_t_exec, k);
         }];
     }
-    if (g_layer.presentsWithTransaction) {   /* live resize: land with the window's new size, not before */
-        [cb commit];
-        [cb waitUntilScheduled];
-        [d present];
-    } else {
-        [cb presentDrawable:d];
-        [cb commit];
+    [cb presentDrawable:d];
+    [cb commit];
+    if (f->handoff) {
+        [cb waitUntilCompleted];
+        f->painted = cb.status == MTLCommandBufferStatusCompleted && w == f->w && h == f->h;
     }
     if (snap) {
         [cb waitUntilCompleted];
@@ -367,11 +472,25 @@ static void draw_frame(Frame *f) {
     }
 }
 
+/* Synchronous receipts and worker frames share one presentation order. A
+   worker may already hold an old frame when the main thread paints a receipt;
+   it must never present that stale frame afterward or certify the receipt. */
+static void draw_frame(Frame *f) {
+    pthread_mutex_lock(&g_draw_mx);
+    if (f->serial > g_last_draw_serial) {
+        g_last_draw_serial = f->serial;
+        draw_frame_contents(f);
+    }
+    pthread_mutex_unlock(&g_draw_mx);
+}
+
 static void r_present(void) {
     Frame *f;
     r_flush();
     if (!(f = g_build)) return;
     g_build = NULL;
+    f->serial = ++g_frame_serial;
+    f->handoff = g_handoff_paint;
     if (g_lat && g_lat_key && g_lat_out) {
         f->lat_key = g_lat_key;
         f->lat_out = g_lat_out;
@@ -384,8 +503,9 @@ static void r_present(void) {
         trace("new tab's first frame with its prompt, handed to the render thread");
         f->trace_tab = 1;
     }
-    if (g_layer.presentsWithTransaction || f->snap) {   /* in step with a live resize; or a test wants the file now */
+    if (f->snap || f->handoff) {   /* snapshot or the first frame before acknowledging a handoff */
         @autoreleasepool { draw_frame(f); }
+        if (f->handoff) g_handoff_painted = f->painted;
         frame_free(f);
         return;
     }
@@ -532,6 +652,11 @@ static void schedule_output(void) {
    pty can't take right now (a big paste into a busy program) goes to the tab's
    serial queue, which waits for room; later writes queue behind it so the
    order holds. The window never blocks on a child that isn't reading. */
+static int mac_input_held(Tab *tb) {
+    return tb && tb->claude_guard && !tb->claude_released && !tb->exited &&
+           (DWORD)(GetTickCount() - tb->claude_guard_at) < 120000;
+}
+
 static void tab_write(Tab *tb, const void *s, int n) {
     char *copy;
     int fd = tb->fd, off = 0;
@@ -646,6 +771,11 @@ static int tab_drain(Tab *tb) {
 static void child_env(void) {
     static const char *drop[] = {"TERM_SESSION_ID", "ITERM_SESSION_ID", "ITERM_PROFILE", "LC_TERMINAL", "LC_TERMINAL_VERSION",
                                  "WT_SESSION", "VTE_VERSION", "TMUX", "TMUX_PANE", "STY",
+                                 /* A launcher/agent's output policy is not this new terminal's
+                                    capability. In particular NO_COLOR=1 hides TUI colors even
+                                    with COLORTERM=truecolor. Shell startup files run afterward
+                                    and may still set an intentional per-shell color preference. */
+                                 "NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE",
                                  /* started from inside Claude Code: its session markers would make every
                                     claude in our tabs a "child session" (no transcripts, wrong session id) */
                                  "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT", "CLAUDE_CODE_ENTRYPOINT",
@@ -665,6 +795,7 @@ static void child_env(void) {
     setenv("TERM", "xterm-256color", 1);
     setenv("COLORTERM", "truecolor", 1);
     setenv("TERM_PROGRAM", "hardcore", 1);
+    { char pid[32]; snprintf(pid, sizeof(pid), "%d", getppid()); setenv("HARDCORE_WINDOW_PID", pid, 1); }
     setenv("TERM_PROGRAM_VERSION", HARDCORE_VERSION, 1);
     setenv("FORCE_HYPERLINK", "1", 1);
     setenv("BASH_SILENCE_DEPRECATION_WARNING", "1", 1);   /* macOS bash 3.2's "now zsh" nag */
@@ -715,11 +846,15 @@ static void exec_shell(const char *dir, int spare, int tab_id) {
     _exit(127);
 }
 
-/* Reinstall dispatch watchers after spawn or an exec-based live update. */
-static void mac_watch_tab(Tab *tb) {
+static void tab_start_io(Tab *tb) {
     int fd = tb->fd, id = tb->id;
     pid_t pid = tb->pid;
     dispatch_source_t r, p;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);    /* later tabs' shells mustn't hold this one open */
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    tb->fd = fd;
+    tb->pid = pid;
+    tb->born = GetTickCount();
     tb->wpending = (int *)calloc(1, sizeof(int));
     tb->wq = dispatch_queue_create("hardcore.tab.write",
                                    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
@@ -736,16 +871,21 @@ static void mac_watch_tab(Tab *tb) {
     p = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)pid, DISPATCH_PROC_EXIT, dispatch_get_main_queue());
     dispatch_source_set_event_handler(p, ^{
         int st = 0, code;
-        if (waitpid(pid, &st, WNOHANG) == 0) return;
+        pid_t waited = waitpid(pid, &st, WNOHANG);
+        if (waited == 0) return;
+        /* A transferred shell is no longer our child. The process source still
+           reports its exit; waitpid then returns ECHILD. */
         code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+        Tab *t = tab_by_id(id);
+        if (!t && g_spare && g_spare->id == id) t = g_spare;
+        if (t) t->psrc = NULL;
         dispatch_source_cancel(p);
         dispatch_release(p);
         on_tab_exited(id, code);
     });
+    tb->psrc = p;
     dispatch_resume(p);
-
 }
-
 static int tab_spawn(Tab *tb) {
     struct winsize ws;
     pid_t pid;
@@ -762,13 +902,29 @@ static int tab_spawn(Tab *tb) {
         term_message(&tb->t, msg);
         return 0;
     }
-    if (pid == 0) exec_shell(tb->start_dir, tb->spare, tb->id);
-    fcntl(fd, F_SETFD, FD_CLOEXEC);    /* later tabs' shells mustn't hold this one open */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    if (pid == 0) {
+        if (!strncmp(tb->run, "claude-wait:", 12)) {
+            child_env();
+            execl("/usr/bin/env", "env", "python3", "-B", tb->hist, "wait", "--request", tb->run + 12, (char *)NULL);
+            _exit(127);
+        }
+        if (!strncmp(tb->run, "terminal:", 9)) {
+            child_env();
+            execl(g_mac_exe_path, "hardcore", "--terminal-bridge", tb->run + 9, tb->hist, (char *)NULL);
+            _exit(127);
+        }
+        if (tb->run[0]) {   /* tmux slurp: argv only, never shell-evaluate a session name */
+            child_env();
+            signal(SIGPIPE, SIG_DFL);
+            if (tb->hist[0]) execl("/usr/bin/env", "env", "tmux", "-S", tb->hist, "attach-session", "-t", tb->run, (char *)NULL);
+            else execl("/usr/bin/env", "env", "tmux", "attach-session", "-t", tb->run, (char *)NULL);
+            _exit(127);
+        }
+        exec_shell(tb->start_dir, tb->spare, tb->id);
+    }
     tb->fd = fd;
     tb->pid = pid;
-    tb->born = GetTickCount();
-    mac_watch_tab(tb);
+    tab_start_io(tb);
     return 1;
 }
 
@@ -813,12 +969,20 @@ static int tab_busy_program(Tab *tb, char *name, int cap) {
 
 /* Read argv without consulting titles. JS launchers often keep "node" as
    their process name; their script gives us "codex", "claude", or "grok". */
+static NSString *mac_terminal_known_program(NSString *path);
 static void mac_foreground_name(Tab *tb, char *out, int cap) {
     out[0] = 0;
     if (tb->fd < 0 || tb->exited) return;
     pid_t fg = tcgetpgrp(tb->fd);
     if (fg <= 0 || fg == tb->pid) return;
     if (proc_name(fg, out, (uint32_t)cap) <= 0) return;
+    /* Native Claude's process name is its release number (e.g. 2.1.301).
+       Use the same kernel executable-path classifier as source sessions. */
+    char executable[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    if (proc_pidpath(fg, executable, sizeof(executable)) > 0) {
+        NSString *known = mac_terminal_known_program([NSString stringWithUTF8String:executable] ?: @"");
+        if (known) { snprintf(out, cap, "%s", known.UTF8String); return; }
+    }
     if (strcmp(out,"node") && strcmp(out,"bun") && strcmp(out,"deno")) return;
     int mib[3] = {CTL_KERN, KERN_PROCARGS2, fg};
     size_t n = 1024 * 1024;
@@ -844,13 +1008,54 @@ static void mac_foreground_name(Tab *tb, char *out, int cap) {
     }
     free(data);
 }
+static NSDictionary *mac_terminal_metadata(NSString *tty);
+static NSDictionary *mac_tmux_metadata(NSString *session, NSString *socket);
+
+/* External views own a local client PTY, but their labels belong to the source
+   session. Do not let the helper's HOME/cwd or process name replace that source. */
+static int mac_apply_session_metadata(Tab *tb, NSDictionary *metadata) {
+    if (!metadata) return 0;
+    int changed = 0;
+    NSString *cwd = metadata[@"cwd"], *program = metadata[@"program"];
+    if ([cwd isKindOfClass:[NSString class]] && [cwd hasPrefix:@"/"] &&
+        [cwd lengthOfBytesUsingEncoding:NSUTF8StringEncoding] < sizeof(tb->t.cwd) &&
+        strcmp(tb->t.cwd, cwd.UTF8String)) {
+        set_cwd(&tb->t, cwd.UTF8String);
+        changed = 1;
+    }
+    if ([program isKindOfClass:[NSString class]]) {
+        char name[sizeof(tb->program)];
+        const char *utf8 = program.UTF8String ?: "";
+        size_t length = MIN(strlen(utf8), sizeof(name) - 1);
+        while (length && ((unsigned char)utf8[length] & 0xc0) == 0x80) length--;
+        memcpy(name, utf8, length); name[length] = 0;
+        if (strcmp(name, tb->program)) {
+            snprintf(tb->program, sizeof(tb->program), "%s", name);
+            changed = 1;
+        }
+    }
+    return changed;
+}
+
 static void mac_refresh_programs(void) {
     int changed = 0;
     for (int i=0;i<g_ntabs;i++) {
-        if (g_tabs[i]->kind==TK_BROWSER) continue;
-        char name[64]; mac_foreground_name(g_tabs[i],name,sizeof(name));
-        if (strcmp(name,g_tabs[i]->program)) {
-            snprintf(g_tabs[i]->program,sizeof(g_tabs[i]->program),"%s",name);
+        Tab *tb = g_tabs[i];
+        if (tb->kind == TK_BROWSER) continue;
+        if (tb->run[0] && !tb->exited) {
+            if (!strncmp(tb->run, "terminal:", 9))
+                changed |= mac_apply_session_metadata(tb, mac_terminal_metadata(@(tb->run + 9)));
+            else if (strncmp(tb->run, "claude-wait:", 12))
+                changed |= mac_apply_session_metadata(tb, mac_tmux_metadata(@(tb->run), tb->hist[0] ? @(tb->hist) : nil));
+            else if (strcmp(tb->program, "claude")) {
+                snprintf(tb->program, sizeof(tb->program), "claude");
+                changed = 1;
+            }
+            continue;
+        }
+        char name[64]; mac_foreground_name(tb,name,sizeof(name));
+        if (strcmp(name,tb->program)) {
+            snprintf(tb->program,sizeof(tb->program),"%s",name);
             changed = 1;
         }
     }
@@ -951,11 +1156,17 @@ static void on_tab_exited(int id, int code) {
     }
     tab_drain(tb);
     tb->exited = 1;
-    if (code != 0 && GetTickCount() - tb->born < 3000 && !tb->help) {
+    int claude_receiver = !strncmp(tb->run, "claude-wait:", 12);
+    if (code != 0 && (claude_receiver || GetTickCount() - tb->born < 3000) && !tb->help) {
         tb->help = HELP_FAILED;
         tb->t.m_cursor_vis = 0;
-        snprintf(buf, sizeof(buf), "\r\n\x1b[2m%s exited right away (code %d).\x1b[0m\r\n\r\n"
-                                   "  \x1b[38;2;255;166;13mEnter\x1b[0m  try again\r\n", g_shell, code);
+        if (claude_receiver)
+            snprintf(buf, sizeof(buf), "\r\n\x1b[2mClaude attachment ended (code %d).\x1b[0m\r\n"
+                     "The conversation may still be available in claude agents.\r\n\r\n"
+                     "  \x1b[38;2;255;166;13mEnter\x1b[0m  open a shell\r\n", code);
+        else
+            snprintf(buf, sizeof(buf), "\r\n\x1b[2m%s exited right away (code %d).\x1b[0m\r\n\r\n"
+                                       "  \x1b[38;2;255;166;13mEnter\x1b[0m  try again\r\n", g_shell, code);
         term_message(&tb->t, buf);
         plat_invalidate();
         return;
@@ -984,6 +1195,7 @@ static void config_load(void) {
         while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
         if (!strcmp(line, "dir") && *v) expand_home(v, g_start_dir, sizeof(g_start_dir));
         else if (!strcmp(line, "last")) snprintf(g_last_dir, sizeof(g_last_dir), "%s", v);
+        else if (!strcmp(line, "dock_summary")) g_mac_dock_summary = strcmp(v, "0") != 0;
         else config_look(line, v);
     }
     fclose(f);
@@ -999,6 +1211,7 @@ static void config_save(void) {
     fprintf(f, "dir=%s\n", g_cfg_dir_line);
     fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
     fprintf(f, "last=%s\n", g_last_dir);
+    fprintf(f, "# macOS Dock icon: 1=active folder/program summary, 0=standard icon\ndock_summary=%d\n", g_mac_dock_summary);
     config_look_save(f);
     fclose(f);
 }
@@ -1015,6 +1228,7 @@ static void plat_settings_tell(void) {
 
 /* the window's background shows while resizing, and the title bar's buttons follow light or dark */
 static void plat_settings_shown(void) {
+    mac_dock_update(1);
     if (!g_win) return;
     [g_win setBackgroundColor:[NSColor colorWithSRGBRed:((DEF_BG >> 16) & 255) / 255.0 green:((DEF_BG >> 8) & 255) / 255.0
                                                    blue:(DEF_BG & 255) / 255.0 alpha:1]];
@@ -1056,8 +1270,11 @@ static void mac_title_sync_buttons(void) {
 }
 
 static void mac_title_hover_at(int x, int y) {
-    int hover = !g_sel_drag && !g_sb_drag && !g_browser_native_drag && mac_title_contains(x, y);
-    if (g_mac_title_drag || mac_browser_nav_editing()) hover = 1;
+    int chrome = over_chrome(x, y);
+    int hover = !g_chrome_drag && !chrome && !g_sel_drag && !g_sb_drag && !g_browser_native_drag && mac_title_contains(x, y);
+    /* An explicitly focused address editor remains visible until committed or
+       dismissed, even if the pointer happens to cross the menu. */
+    if ((g_mac_title_drag || mac_browser_nav_editing()) && !g_chrome_drag) hover = 1;
     if (hover == g_mac_title_hover) return;
     g_mac_title_hover = hover;
     mac_title_sync_buttons();
@@ -1153,7 +1370,7 @@ static void plat_render_title_underlay(void) {
 }
 
 static void plat_render_title_overlay(void) {
-    if (!g_mac_title_hover || g_sel_drag || g_sb_drag) return;
+    if (!g_mac_title_hover || g_sel_drag || g_sb_drag || g_chrome_drag) return;
     int w, h, clip = g_clip_w;
     plat_client_size(&w, &h);
     g_clip_w = w; /* The native title band covers even a partial rightmost cell. */
@@ -1233,6 +1450,7 @@ static int paste_image(NSPasteboard *pb) {
 
 /* Text pastes as text; files as their paths; an image as a saved PNG's path. */
 static void paste(void) {
+    if (mac_input_held(active_tab())) { NSBeep(); return; }
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
     NSString *s;
     if (paste_file_urls(pb)) return;
@@ -1385,6 +1603,18 @@ static void mac_title_track_events(void) {
                     }
                     return e;
                 }
+                /* The grid handle owns its drag even where native title controls
+                   or a WKWebView would otherwise receive the pointer event. */
+                if ([e type] == NSEventTypeLeftMouseDown && chrome_drag_begin(x, y)) {
+                    mac_title_hover_at(x, y); [[NSCursor closedHandCursor] set]; return nil;
+                }
+                if ([e type] == NSEventTypeLeftMouseDragged && g_chrome_drag) {
+                    chrome_drag_move(x, y); [[NSCursor closedHandCursor] set]; return nil;
+                }
+                if ([e type] == NSEventTypeLeftMouseUp && g_chrome_drag) {
+                    chrome_drag_move(x, y); chrome_drag_end(); mac_title_hover_at(x, y);
+                    [[NSCursor openHandCursor] set]; return nil;
+                }
                 if ([e type]==NSEventTypeLeftMouseDown && tb && tb->kind==TK_BROWSER && tb->browser_native)
                     g_browser_native_drag=!over_chrome(x,y) && !mac_title_contains(x,y);
                 if ([e type]==NSEventTypeLeftMouseUp) g_browser_native_drag=0;
@@ -1455,6 +1685,7 @@ static int plain_layout(void) {
     l.framebufferOnly = NO;      /* the test channel's snapshot reads it back */
     l.maximumDrawableCount = 2;  /* one on screen, one on its way: a third only adds a frame of queue */
     l.displaySyncEnabled = NO;   /* present now: display sync measured ~4 ms slower at p50 */
+    l.presentsWithTransaction = NO; /* keep drawable/GPU waits off AppKit's resize event loop */
     l.opaque = YES;
     l.colorspace = cs;           /* the palette is sRGB, as on Windows */
     l.contentsGravity = kCAGravityTopLeft;   /* mid-resize, never stretch the old frame */
@@ -1473,16 +1704,17 @@ static int plain_layout(void) {
     layer_fit();
     resize_all();
     t1 = g_lat ? uptime_ms() : 0;
-    /* during a live resize, draw now and land with the window's new frame */
-    g_layer.presentsWithTransaction = [self inLiveResize];
+    /* Build the latest frame now, but let the render thread acquire/present
+       its drawable. A transaction-synchronous draw here can stall AppKit for
+       nextDrawable's one-second timeout during a drag. Pending frames coalesce. */
     paint_view_now();
-    /* the main thread's whole step, and of it the reflow (the rest is drawing, and waiting for the display) */
+    /* Main-thread time: reflow plus building/enqueuing the frame, never GPU waits. */
     if (g_lat) fprintf(stderr, "resize %dx%d %.3f %.3f\n", g_cols, g_rows, uptime_ms() - t0, t1 - t0);
 }
 
 - (void)viewDidEndLiveResize {
     [super viewDidEndLiveResize];
-    g_layer.presentsWithTransaction = NO;
+    paint_view_now();   /* enqueue the final size even if the last drag frame was replaced */
 }
 
 - (void)viewDidChangeBackingProperties {
@@ -1663,6 +1895,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
         }
         return;
     }
+    if (mac_input_held(tb)) { NSBeep(); return; }
     if ([self specialKey:e] || [self controlKey:e]) return;
     /* Plain typing on a plain keyboard layout goes straight out: the text-input
        system (interpretKeyEvents) costs a few ms at p90, measured. Dead keys
@@ -1748,8 +1981,9 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     int mx, my, idx = -1, col, row, hit, w, h, mods = ev_mods(e);
     Tab *tb = active_tab();
     view_px(e, &mx, &my);
+    if (chrome_drag_begin(mx, my)) { mac_title_hover_at(mx, my); [[NSCursor closedHandCursor] set]; return; }
     mac_title_hover_at(mx, my);
-    if(mac_browser_ui_mouse(mx,my))return;
+    if((!over_chrome(mx,my) || mac_browser_nav_editing()) && mac_browser_ui_mouse(mx,my))return;
     if (g_mac_title_hover && mac_title_contains(mx,my)) {
         if ([e clickCount] == 2) [g_win performZoom:nil];
         else {
@@ -1808,6 +2042,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     g_mouse_x = mx;
     g_mouse_y = my;
     mac_title_hover_at(mx, my);
+    if (g_chrome_drag) { chrome_drag_move(mx, my); [[NSCursor closedHandCursor] set]; return; }
     if (g_sb_drag) { scrollbar_set(my); return; }
     if (g_sel_drag && tb) {
         mouse_cell(mx, my, &col, &row);
@@ -1824,6 +2059,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 
 - (void)mouseUp:(NSEvent *)e {
     int mx, my;
+    if (g_chrome_drag) { view_px(e, &mx, &my); chrome_drag_move(mx, my); chrome_drag_end(); [[NSCursor openHandCursor] set]; return; }
     if (g_sb_drag || g_sel_drag) {
         g_sb_drag = g_sel_drag = 0;
         return;
@@ -1891,7 +2127,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (g_mac_title_hover) { [[NSCursor arrowCursor] set]; return; }
     if (on_bar) {                /* a hand on what clicks, an open hand where the window drags, as on a web page */
         int idx = -1, hit = hit_tabbar(mx, my, &idx);
-        [(tabbar_action(mx, my) ? [NSCursor pointingHandCursor] : hit == HIT_BAR ? [NSCursor openHandCursor] : [NSCursor arrowCursor]) set];
+        [(tabbar_action(mx, my) ? [NSCursor pointingHandCursor] : (hit == HIT_GRIP || hit == HIT_BAR) ? [NSCursor openHandCursor] : [NSCursor arrowCursor]) set];
     }
     if (!on_bar && tb && tb->t.m_mouse == 1003) mouse_report(3, 1, 1, mx, my, ev_mods(e));
     if (!on_bar) [self flagsChanged:e];
@@ -1924,6 +2160,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (tb->t.m_mouse && !(ev_mods(e) & M_SHIFT)) {
         for (i = 0; i < abs(lines); i++) mouse_report(lines > 0 ? 64 : 65, 1, 0, mx, my, ev_mods(e));
     } else if (tb->t.alt) {
+        if (mac_input_held(tb)) return;
         /* alternate scroll: less, man, git log scroll with the wheel */
         const char *seq = lines > 0 ? (tb->t.m_appcursor ? "\x1bOA" : "\x1b[A") : (tb->t.m_appcursor ? "\x1bOB" : "\x1b[B");
         for (i = 0; i < abs(lines); i++) tab_write(tb, seq, 3);
@@ -1973,12 +2210,21 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (void)jumpAttention:(id)sender { (void)sender; jump_to_attention(); }
 - (void)prevMark:(id)sender { (void)sender; jump_mark(-1); }
 - (void)nextMark:(id)sender { (void)sender; jump_mark(1); }
+- (void)toggleDockSummary:(id)sender {
+    (void)sender;
+    g_mac_dock_summary = !g_mac_dock_summary;
+    mac_dock_update(1);
+    config_save();
+    plat_settings_tell();
+}
 
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
     if ([item action] == @selector(copy:)) return g_sel_on || mac_browser_editing() || (active_tab() && active_tab()->kind==TK_BROWSER && active_tab()->browser_native);
     if ([item action] == @selector(browserMode:) || [item action] == @selector(browserBack:) ||
         [item action] == @selector(browserForward:) || [item action] == @selector(browserReload:))
         return active_tab() && active_tab()->kind==TK_BROWSER;
+    if ([item action] == @selector(toggleDockSummary:))
+        [item setState:g_mac_dock_summary ? NSControlStateValueOn : NSControlStateValueOff];
     return YES;
 }
 
@@ -1993,6 +2239,7 @@ static void focus_changed(int focused) {
     g_focused = focused;
     if (g_focused && tb) tb->attention = 0;
     if (tb && tb->t.m_focus) tab_write(tb, g_focused ? "\x1b[I" : "\x1b[O", 3);
+    mac_dock_update(0);
     plat_invalidate();
 }
 
@@ -2003,7 +2250,7 @@ static void focus_changed(int focused) {
 - (void)applicationWillFinishLaunching:(NSNotification *)n { (void)n; trace("applicationWillFinishLaunching"); }
 - (void)applicationDidFinishLaunching:(NSNotification *)n { (void)n; trace("applicationDidFinishLaunching"); }
 - (void)windowDidBecomeKey:(NSNotification *)n { (void)n; trace("window key"); focus_changed(1); }
-- (void)windowDidResignKey:(NSNotification *)n { (void)n; focus_changed(0); }
+- (void)windowDidResignKey:(NSNotification *)n { (void)n; if (g_chrome_drag) chrome_drag_end(); focus_changed(0); }
 - (void)windowDidEnterFullScreen:(NSNotification *)n {
     (void)n; g_mac_title_hover = 0; mac_title_sync_buttons(); plat_invalidate();
 }
@@ -2107,6 +2354,8 @@ static void build_menus(void) {
     menu_item(win, @"Minimize", @selector(performMiniaturize:), @"m", C);
     menu_item(win, @"Zoom", @selector(performZoom:), @"", 0);
     menu_item(win, @"Enter Full Screen", @selector(toggleFullScreen:), @"f", C | NSEventModifierFlagControl);
+    [win addItem:[NSMenuItem separatorItem]];
+    menu_item(win, @"Show Active Tab in Dock Icon", @selector(toggleDockSummary:), @"", 0);
     [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:browser];
     menu_item(browser,@"New Browser Tab",@selector(newBrowser:),@"b",CS);
     menu_item(browser,@"Open Address…",@selector(browserAddress:),@"l",C);
@@ -2181,7 +2430,7 @@ static void ctl_chrome(const char *path) {
                   @"height":@(chrome_bottom_row()-chrome_top_row())},
         @"cell":@{@"width":@(CW), @"height":@(CH)}, @"scale":@(g_scale), @"hovered":@(chrome_hovered()),
         @"settings_open":@(g_settings_open), @"settings_tab":@(g_settings_tab),
-        @"reflow_enabled":@(g_chrome_reflow), @"reflow_changed":@(g_display.changed),
+        @"reflow_enabled":@(g_chrome_reflow), @"reflow_markers":@(g_chrome_debug), @"reflow_changed":@(g_display.changed),
         @"source":source, @"display":display, @"markers":markers, @"tab_rows":tab_rows
     } mutableCopy];
     NSMutableArray *button_rects = [NSMutableArray array];
@@ -2200,6 +2449,23 @@ static void ctl_chrome(const char *path) {
         @"settings":@{@"offset":@(g_setting_offset[g_settings_tab]), @"capacity":@(g_chrome.list_capacity), @"total":@(chrome_item_total()), @"row":@(g_chrome.list_row)},
         @"settings_row":@(g_chrome.settings_row), @"section_row":@(g_chrome.section_row)
     };
+    NSMutableArray *font_buttons = [NSMutableArray array];
+    if (g_settings_open && g_settings_tab == 0) {
+        for (int n = 0; n < g_chrome.list_count; n++) {
+            const FontMenuRow *row = &g_font_menu_rows[g_setting_offset[0] + n];
+            for (int i = 0; i < row->count; i++) {
+                const FontMenuSize *size = &row->sizes[i];
+                const Font *font = &FONTS[size->font];
+                [font_buttons addObject:@{
+                    @"fontkey":[NSString stringWithFormat:@"%c", font->key],
+                    @"name":[NSString stringWithUTF8String:font->name],
+                    @"width":@(cell_w(font)), @"height":@(cell_h(font)),
+                    @"row":@(g_chrome.list_row + n), @"left":@(size->left), @"right":@(size->right)
+                }];
+            }
+        }
+    }
+    state[@"font_buttons"] = font_buttons;
     NSData *data = [NSJSONSerialization dataWithJSONObject:state options:0 error:nil];
     [data writeToFile:[NSString stringWithUTF8String:path] atomically:YES];
     [state release];
@@ -2216,7 +2482,7 @@ static void ctl_line(char *s) {
             else *o++ = *p;
         }
         if (tb->help) { int at; for (at = 0; at < g_ntabs; at++) if (g_tabs[at] == tb) { replace_tab(at); break; } }
-        else tab_write(tb, s, (int)(o - s));
+        else if (!mac_input_held(tb)) tab_write(tb, s, (int)(o - s));
     } else if (!strncmp(s, "cmd ", 4)) {
         const char *c = s + 4;
         if (!strcmp(c, "newtab")) { g_trace_tab_t = uptime_ms(); trace("ctl newtab"); new_tab_mac(); }
@@ -2280,9 +2546,11 @@ static void ctl_line(char *s) {
                 NSPoint p = [(NSView *)g_view convertPoint:NSMakePoint(x/scale, y/scale) toView:nil];
                 NSEvent *e = [NSEvent mouseEventWithType:kind location:p modifierFlags:0 timestamp:0
                     windowNumber:[g_win windowNumber] context:nil eventNumber:0 clickCount:1 pressure:1];
-                /* A synthetic titlebar down would enter AppKit's modal window-drag
-                   loop. This hook exercises selection drags starting in content. */
-                if (kind == NSEventTypeLeftMouseDown && !mac_title_contains(x, y)) [g_view mouseDown:e];
+                /* Allow grid controls at the top edge, but never enter AppKit's
+                   modal window-drag loop from a synthetic titlebar down. */
+                int idx = -1, hit = hit_tabbar(x, y, &idx);
+                if (kind == NSEventTypeLeftMouseDown && hit != HIT_BAR &&
+                    (!mac_title_contains(x, y) || hit != HIT_NONE)) [g_view mouseDown:e];
                 else if (kind == NSEventTypeLeftMouseDragged) [g_view mouseDragged:e];
                 else if (kind == NSEventTypeLeftMouseUp) [g_view mouseUp:e];
             }
@@ -2465,8 +2733,6 @@ static int replay(const char *out_path, int cols, int rows, char **files, int nf
     return 0;
 }
 
-#include "hardcore_mac_update.h"
-#include "hardcore_browser_cli.h"
 
 /* ── startup ───────────────────────────────────────────────────────── */
 
@@ -2508,6 +2774,14 @@ static void trace_init(void) {
     g_t_exec -= (now.tv_sec - kp.kp_proc.p_starttime.tv_sec) * 1000.0 + (now.tv_usec - kp.kp_proc.p_starttime.tv_usec) / 1000.0;
 }
 
+static int mac_update_cmd(int argc, char **argv);
+static int mac_reload_windows(void);
+static int mac_reload(int ack, char *why, size_t cap);
+static int mac_browser_cli(int argc, char **argv);
+#include "hardcore_mac_transfer.m"
+#include "hardcore_mac_update.h"
+#include "hardcore_browser_cli.h"
+
 int main(int argc, char **argv) {
     int i;
     char selftest_out[MAX_PATH] = "";
@@ -2518,27 +2792,6 @@ int main(int argc, char **argv) {
 
     mac_executable_init();
     if (argc == 2 && !strcmp(argv[1], "--mac-update-protocol")) { if (!mtl_init()) return 1; puts("hardcore-mac-reload-1"); return 0; }
-    if (argc == 2 && !strcmp(argv[1], "--version")) { printf("hardcore %s (build %s)\n", HARDCORE_VERSION, HARDCORE_BUILD); return 0; }
-    if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
-        puts("hardcore [DIR]                         open a terminal\n"
-             "hardcore update                        install latest macOS release and reload live tabs\n"
-             "hardcore update --from PATH             install a local app bundle (or bare binary)\n"
-             "hardcore browser open [URL]            new live browser tab (Hardcore grid by default)\n"
-             "hardcore browser --help                 browser commands and tab targeting\n"
-             "hardcore slurp                         unsupported on macOS (Windows/WSL only)\n"
-             "hardcore --reload                      reload windows using the installed executable\n"
-             "hardcore --version                     print version and build");
-        return 0;
-    }
-    if (argc > 1 && !strcmp(argv[1], "slurp")) {
-        fprintf(stderr, "hardcore: slurp is not implemented on macOS; it currently supports Windows/WSL only.\n"
-                        "Existing sessions in other Mac terminals cannot be imported by this build.\n"
-                        "To open a directory named slurp, use hardcore ./slurp.\n");
-        return 1;
-    }
-    if (argc > 1 && !strcmp(argv[1], "browser")) return mac_browser_cli(argc-2,argv+2);
-    if (argc > 1 && !strcmp(argv[1], "update")) return mac_update_cmd(argc - 2, argv + 2);
-    if (argc == 2 && !strcmp(argv[1], "--reload")) return mac_reload_windows();
     if (argc == 4 && !strcmp(argv[1], "--mac-adopt")) {
         g_mac_state_fd = atoi(argv[2]); g_mac_ack_fd = atoi(argv[3]);
     }
@@ -2547,6 +2800,8 @@ int main(int argc, char **argv) {
     g_lat = getenv("HARDCORE_LAT") != NULL;
     g_reflow_all = getenv("HARDCORE_REFLOW_ALL") != NULL;   /* bench: every resize step rewraps all history, as before */
     signal(SIGPIPE, SIG_IGN);    /* a write to a pty whose shell just died returns EIO instead */
+    int cli_status = mac_cli(argc, argv);
+    if (cli_status >= 0) return cli_status;
     palette_init();
     drip_init();
     config_load();
@@ -2555,7 +2810,7 @@ int main(int argc, char **argv) {
         struct stat st;
         if (g_last_dir[0] && stat(g_last_dir, &st) == 0 && S_ISDIR(st.st_mode)) snprintf(g_start_dir, sizeof(g_start_dir), "%s", g_last_dir);
     }
-    for (i = g_mac_state_fd >= 0 ? argc : 1; i < argc; i++) {
+    for (i = g_mac_state_fd >= 0 ? argc : 1; i < argc && strcmp(argv[1], "--adopt-fd") && strcmp(argv[1], "--slurp-window") && strcmp(argv[1], "--claude-window"); i++) {
         if ((!strcmp(argv[i], "--cd") || !strcmp(argv[i], "-d")) && i + 1 < argc) {
             snprintf(g_start_dir, sizeof(g_start_dir), "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--unit") && i + 1 < argc) {
@@ -2580,11 +2835,14 @@ int main(int argc, char **argv) {
     if (!g_start_dir[0]) snprintf(g_start_dir, sizeof(g_start_dir), "%s", getenv("HOME") ? getenv("HOME") : "/");
     write_rc();
     if (selftest_out[0]) return selftest(selftest_out);
+    int importing;
+    @autoreleasepool { importing = mac_prepare(argc, argv); }
+    if (importing < 0) return 1;
     /* The first shell starts before AppKit does (that's ~60 ms of loading and
        launching): its grid comes from where the window was last time, and the
        display's scale, both known without AppKit. If the window comes up a
        different size, resize_all sends the shell a SIGWINCH. */
-    {
+    if (!importing) {
         NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"NSWindow Frame hardcore"];
         CGDisplayModeRef mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
         int w = 0, h = 0;
@@ -2624,8 +2882,9 @@ int main(int argc, char **argv) {
                                                   NSWindowStyleMaskResizable | NSWindowStyleMaskFullSizeContentView
                                           backing:NSBackingStoreBuffered defer:NO];
     [g_win center];
-    [g_win setFrameAutosaveName:@"hardcore"];   /* size and place come back next time */
+    [g_win setFrameAutosaveName:@"hardcore"];
     if (g_mac_adopt) [g_win setFrame:NSRectFromString(g_mac_adopt[@"frame"]) display:NO];
+    else if (g_mac_placement) [g_win setFrame:NSRectFromString(g_mac_placement[@"frame"]) display:NO];
     g_scale = (int)([g_win backingScaleFactor] + 0.5);
     if (g_scale < 1) g_scale = 1;
     /* Full-size terminal canvas; native controls are revealed by top-band hover. */
@@ -2670,23 +2929,31 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_layer.device = g_mtl;
+    if (g_mac_imports.count) g_handoff_paint = 1;
     render_thread_start();
     layer_fit();
     resize_all();
     mac_browser_sync();
-    first_prompt_now(40);
+    if (!importing && !g_mac_adopt) first_prompt_now(40);
     trace("first prompt read");
     [g_win makeKeyAndOrderFront:nil];
     /* on screen now, not after AppKit finishes launching (~30 ms more) */
     [CATransaction flush];
     paint_view_now();
     trace("window shown");
+    if (!mac_commit_imports()) return 1;
+    mac_server();
+    if (g_mac_ready_fd >= 0) {
+        mac_send(g_mac_ready_fd, mac_slurp_result());
+        close(g_mac_ready_fd); g_mac_ready_fd = -1;
+    }
     if (!getenv("HARDCORE_NO_ACTIVATE") && (!g_mac_adopt || [g_mac_adopt[@"focused"] boolValue])) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
-    mac_update_listen();
     mac_adopt_ready();
     mac_refresh_programs();
+    g_mac_dock_ready = 1;
+    mac_dock_update(1);
     NSTimer *program_timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-        (void)t; mac_refresh_programs();
+        (void)t; mac_refresh_programs(); mac_dock_update(0);
     }];
     [[NSRunLoop currentRunLoop] addTimer:program_timer forMode:NSEventTrackingRunLoopMode];
     [NSApp run];

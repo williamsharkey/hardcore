@@ -3,7 +3,7 @@
 enum {
     HIT_NONE, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_BAR, HIT_SETTINGS, HIT_FONT,
     HIT_SCHEME, HIT_STAB, HIT_SCLOSE, HIT_UNDERLAY, HIT_TABPAGE, HIT_SETPAGE,
-    HIT_REFLOW, HIT_REFLOW_DEBUG, HIT_DOCK_ROW, HIT_CHROME_INERT
+    HIT_REFLOW, HIT_REFLOW_DEBUG, HIT_DOCK_ROW, HIT_CHROME_INERT, HIT_GRIP
 };
 static int plat_lights_bottom(void);
 static void plat_settings_shown(void);
@@ -21,8 +21,9 @@ static int first_row(void) {
 }
 
 static int g_row_y[MAX_TABS + 2]; /* invisible tabs are -1; visible values are pixels */
-static int g_settings_open, g_settings_tab; /* Font, Theme, Layout */
-static int g_tab_offset, g_setting_offset[3];
+static int g_settings_open, g_settings_tab; /* Font, Theme */
+static int g_tab_offset, g_setting_offset[3]; /* third slot retained for snapshot compatibility */
+static int g_chrome_drag, g_chrome_drag_grab, g_chrome_drag_height;
 static int g_layout_active = -1, g_layout_ntabs = -1;
 static const struct { const char *name; char dark, light; } FAMILIES[] = {
     {"hardcore", 'h', 0}, {"Dracula", 'd', 0}, {"Monokai", 'm', 0}, {"Nord", 'n', 0},
@@ -30,7 +31,6 @@ static const struct { const char *name; char dark, light; } FAMILIES[] = {
     {"Tokyo Night", 'k', 'K'}, {"Rose Pine", 'r', 'R'},
 };
 #define NFAMILIES ((int)(sizeof(FAMILIES) / sizeof(FAMILIES[0])))
-#define CHROME_LAYOUT_ITEMS 4
 
 typedef struct {
     int top, grip_rows, tab_row, tab_capacity, tab_count;
@@ -45,8 +45,30 @@ static int chrome_page_offset(int offset, int total, int capacity) {
     if (offset < 0) offset = 0;
     return chrome_min(offset / capacity, (total - 1) / capacity) * capacity;
 }
+/* The page arrows occupy separate targets on the first selectable row.
+   The counter is inert; tabs keep a close button after it. */
+static int chrome_pager_geometry(int offset, int capacity, int total, int tab,
+                                 int *next_col, int *counter_col) {
+    wchar_t counter[24];
+    if (capacity <= 0 || total <= capacity) return 0;
+    _snwprintf(counter, 24, L"%d/%d", offset / capacity + 1, (total + capacity - 1) / capacity);
+    counter[23] = 0;
+    *counter_col = SB_COLS - (tab ? 3 : 1) - (int)wcslen(counter);
+    *next_col = *counter_col - 4;
+    return 1;
+}
+static int chrome_page_hit(int col, int offset, int capacity, int total, int tab, int *direction) {
+    int next_col, counter_col;
+    if (!chrome_pager_geometry(offset, capacity, total, tab, &next_col, &counter_col)) return 0;
+    if (col >= 1 && col < 5) { *direction = -1; return 1; }
+    if (col >= next_col && col < counter_col) { *direction = 1; return 1; }
+    return col >= counter_col && col < SB_COLS - (tab ? 3 : 1) ? 2 : 0;
+}
+
+#include "hardcore_font_menu.h"
+
 static int chrome_item_total(void) {
-    return g_settings_tab == 0 ? NFONTS : g_settings_tab == 1 ? NFAMILIES : CHROME_LAYOUT_ITEMS;
+    return g_settings_tab == 0 ? g_font_menu_count : NFAMILIES;
 }
 /* Capacity depends on the viewport and complete lists, never the short last
    page. A resize re-aligns each list's offset to the new page boundary. */
@@ -62,7 +84,8 @@ static ChromeLayout chrome_measure(int rows, int lights, int tabs, int open,
        handle actual overflow. Keep enough space for one of each control. */
     minimum_height = 1 + (tabs > 0) + 1 + (open ? 1 + (items > 0) : 0);
     a.top = underlay ? chrome_min(chrome_max(dock, 0), chrome_max(0, rows - minimum_height)) : 0;
-    a.grip_rows = chrome_min(rows - a.top, chrome_max(1, lights - a.top));
+    a.grip_rows = 1;
+    (void)lights; /* The handle always owns one grid row, independent of title controls. */
     available = rows - a.top - a.grip_rows;
     a.tab_capacity = chrome_min(tabs, chrome_max(0, available - 1));
     if (open) {
@@ -93,14 +116,30 @@ static int scheme_index(int key) {
     return s ? (int)(s - SCHEMES) : 0;
 }
 static void tab_layout(void) {
-    int i, win_w, win_h, items = chrome_item_total();
+    int i, win_w, win_h, items;
     UI_FONT;
+    if (g_settings_tab < 0 || g_settings_tab > 1) g_settings_tab = 0;
+    if (!g_settings_tab) font_menu_build(0, 0);
+    items = chrome_item_total();
     plat_client_size(&win_w, &win_h);
 #ifndef _WIN32
     if(active_tab() && active_tab()->kind==TK_BROWSER)win_h=mac_browser_page_rows(active_tab())*CH;
 #endif
     g_chrome = chrome_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
                               g_tab_underlay, g_dock_row, items);
+    if (!g_settings_tab && g_settings_open && g_chrome.list_capacity > 0 && items > g_chrome.list_capacity) {
+        /* Page controls share the first actual row. Pack that row into the
+           same reduced bounds as the arrows, so no size can be covered up.
+           A compact font row is still selectable in a one-row viewport. */
+        int pass;
+        for (pass = 0; pass < NFONTS; pass++) {
+            int previous = items, capacity = g_chrome.list_capacity;
+            items = font_menu_build(capacity, items);
+            g_chrome = chrome_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
+                                      g_tab_underlay, g_dock_row, items);
+            if (items == previous && capacity == g_chrome.list_capacity) break;
+        }
+    }
     if (g_tab_underlay) g_dock_row = g_chrome.top;
     if (g_active != g_layout_active || g_ntabs != g_layout_ntabs) {
         if (g_active >= 0) g_tab_offset = g_active;
@@ -128,29 +167,11 @@ static int chrome_top_row(void) { tab_layout(); return g_chrome.top; }
 static int chrome_bottom_row(void) { tab_layout(); return g_chrome.bottom; }
 static int chrome_hovered(void) {
     if (g_sel_drag) return 0;
+    if (g_chrome_drag) return 1;
     int x = sidebar_x(), cw = cell_w(g_font), ch = cell_h(g_font);
     tab_layout();
     return g_mouse_x >= x && g_mouse_x < x + SB_COLS * cw &&
            g_mouse_y >= g_chrome.top * ch && g_mouse_y < g_chrome.bottom * ch;
-}
-/* The page arrows occupy separate targets on the first selectable row.
-   The counter is inert; tabs keep a close button after it. */
-static int chrome_pager_geometry(int offset, int capacity, int total, int tab,
-                                 int *next_col, int *counter_col) {
-    wchar_t counter[24];
-    if (capacity <= 0 || total <= capacity) return 0;
-    _snwprintf(counter, 24, L"%d/%d", offset / capacity + 1, (total + capacity - 1) / capacity);
-    counter[23] = 0;
-    *counter_col = SB_COLS - (tab ? 3 : 1) - (int)wcslen(counter);
-    *next_col = *counter_col - 4;
-    return 1;
-}
-static int chrome_page_hit(int col, int offset, int capacity, int total, int tab, int *direction) {
-    int next_col, counter_col;
-    if (!chrome_pager_geometry(offset, capacity, total, tab, &next_col, &counter_col)) return 0;
-    if (col >= 1 && col < 5) { *direction = -1; return 1; }
-    if (col >= next_col && col < counter_col) { *direction = 1; return 1; }
-    return col >= counter_col && col < SB_COLS - (tab ? 3 : 1) ? 2 : 0;
 }
 static int hit_tabbar(int mx, int my, int *idx) {
     int col, row, i, page_hit;
@@ -160,6 +181,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
     tab_layout();
     col = mx / CW; row = my / CH;
     if ((g_tab_underlay || (active_tab() && active_tab()->kind == TK_BROWSER)) && (row < g_chrome.top || row >= g_chrome.bottom)) { UI_DONE; return HIT_NONE; }
+    if (row == g_chrome.top && col == 1) { UI_DONE; return HIT_GRIP; }
     for (i = 0; i < g_chrome.tab_count; i++) {
         if (row != g_chrome.tab_row + i) continue;
         if (col == SB_COLS - 2) { *idx = g_tab_offset + i; UI_DONE; return HIT_CLOSE; }
@@ -170,7 +192,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
     }
     if (row == g_chrome.settings_row) { UI_DONE; return col >= SB_COLS - 3 ? HIT_PLUS : HIT_SETTINGS; }
     if (g_settings_open && row == g_chrome.section_row) {
-        *idx = col < 8 ? 0 : col < 16 ? 1 : 2;
+        *idx = col < SB_COLS / 2 ? 0 : 1;
         UI_DONE; return HIT_STAB;
     }
     if (g_settings_open && g_chrome.list_row >= 0 && row >= g_chrome.list_row && row < g_chrome.list_row + g_chrome.list_count) {
@@ -178,7 +200,10 @@ static int hit_tabbar(int mx, int my, int *idx) {
         if (row == g_chrome.list_row && (page_hit = chrome_page_hit(col, g_setting_offset[g_settings_tab], g_chrome.list_capacity, chrome_item_total(), 0, idx))) {
             UI_DONE; return page_hit == 1 ? HIT_SETPAGE : HIT_CHROME_INERT;
         }
-        if (!g_settings_tab) { *idx = item; UI_DONE; return HIT_FONT; }
+        if (!g_settings_tab) {
+            *idx = font_menu_hit(item, col);
+            UI_DONE; return *idx >= 0 ? HIT_FONT : HIT_CHROME_INERT;
+        }
         if (g_settings_tab == 1) {
             /* The last two label cells select the light variant. On a page's
                first row those cells precede the next-page button. */
@@ -187,12 +212,6 @@ static int hit_tabbar(int mx, int my, int *idx) {
             *idx = scheme_index(FAMILIES[item].light && col >= right - 2 ? FAMILIES[item].light : FAMILIES[item].dark);
             UI_DONE; return HIT_SCHEME;
         }
-        if (!item) { *idx = (g_tab_underlay + 1) % 3; UI_DONE; return HIT_UNDERLAY; }
-        if (item == 1) { UI_DONE; return HIT_REFLOW; }
-        if (item == 2) { UI_DONE; return HIT_REFLOW_DEBUG; }
-        { int next_col, counter_col, right = SB_COLS - 1;
-          if (row == g_chrome.list_row && chrome_pager_geometry(g_setting_offset[2], g_chrome.list_capacity, CHROME_LAYOUT_ITEMS, 0, &next_col, &counter_col)) right = next_col;
-          *idx = col >= right - 4 ? 1 : -1; UI_DONE; return HIT_DOCK_ROW; }
     }
     UI_DONE;
     return HIT_BAR;
@@ -200,7 +219,7 @@ static int hit_tabbar(int mx, int my, int *idx) {
 static int over_chrome(int x, int y) { int idx = -1; return hit_tabbar(x, y, &idx) != HIT_NONE; }
 static int chrome_setting_hit(int hit) {
     return hit == HIT_SETTINGS || hit == HIT_STAB || hit == HIT_SCLOSE || hit == HIT_FONT || hit == HIT_SCHEME ||
-           hit == HIT_UNDERLAY || hit == HIT_TABPAGE || hit == HIT_SETPAGE || hit == HIT_REFLOW || hit == HIT_REFLOW_DEBUG || hit == HIT_DOCK_ROW || hit == HIT_CHROME_INERT;
+           hit == HIT_TABPAGE || hit == HIT_SETPAGE || hit == HIT_CHROME_INERT;
 }
 static int tabbar_action(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
@@ -221,32 +240,70 @@ static void settings_apply(void) {
     settings_point();
 }
 static void settings_pick(int hit, int idx) {
-    if (hit == HIT_FONT) g_font = &FONTS[idx];
+    if (hit == HIT_FONT && idx >= 0 && idx < NFONTS) g_font = &FONTS[idx];
     else if (hit == HIT_SCHEME) g_scheme = &SCHEMES[idx];
     else return;
     config_save(); plat_settings_tell(); settings_apply();
 }
 static void settings_click(int mx, int my) {
-    int idx = -1, hit = hit_tabbar(mx, my, &idx), save = 0;
+    int idx = -1, hit = hit_tabbar(mx, my, &idx);
     if (hit == HIT_SETTINGS) g_settings_open = !g_settings_open;
     else if (hit == HIT_SCLOSE) g_settings_open = 0;
-    else if (hit == HIT_STAB) g_settings_tab = idx;
+    else if (hit == HIT_STAB) g_settings_tab = idx == 1 ? 1 : 0;
     else if (hit == HIT_TABPAGE) g_tab_offset = chrome_page_offset(g_tab_offset + idx * g_chrome.tab_capacity, g_ntabs, g_chrome.tab_capacity);
     else if (hit == HIT_SETPAGE) g_setting_offset[g_settings_tab] = chrome_page_offset(g_setting_offset[g_settings_tab] + idx * g_chrome.list_capacity, chrome_item_total(), g_chrome.list_capacity);
-    else if (hit == HIT_UNDERLAY) { g_tab_underlay = idx; g_mouse_x = g_mouse_y = -1; save = 1; }
-    else if (hit == HIT_REFLOW) { g_chrome_reflow = !g_chrome_reflow; save = 1; }
-    else if (hit == HIT_REFLOW_DEBUG) { g_chrome_debug = !g_chrome_debug; save = 1; }
-    else if (hit == HIT_DOCK_ROW) { g_dock_row = chrome_max(0, g_dock_row + idx); tab_layout(); save = 1; }
     else if (hit == HIT_FONT || hit == HIT_SCHEME) settings_pick(hit, idx);
-    if (save) { config_save(); plat_settings_tell(); settings_apply(); }
     settings_point(); plat_invalidate();
+}
+/* A drag keeps the menu's current height, rather than shrinking the visible
+   lists on the way down. Both docks use the terminal's unchanged full grid. */
+static void chrome_drag_position(int mx, int my, int width, int rows, int cell_height,
+                                 int grab, int height, int *side, int *row) {
+    *side = mx < width / 2 ? 2 : 1;
+    *row = chrome_min(chrome_max(0, (my - grab) / chrome_max(1, cell_height)),
+                      chrome_max(0, rows - height));
+}
+static int chrome_drag_begin(int mx, int my) {
+    int idx = -1;
+    if (hit_tabbar(mx, my, &idx) != HIT_GRIP) return 0;
+    g_chrome_drag = 1;
+    g_chrome_drag_grab = my - g_chrome.top * cell_h(g_font);
+    g_chrome_drag_height = g_chrome.bottom - g_chrome.top;
+    g_mouse_x = mx; g_mouse_y = my;
+    plat_invalidate();
+    return 1;
+}
+static int chrome_drag_move(int mx, int my) {
+    int width, height, side, row, changed, cell_height = cell_h(g_font);
+    if (!g_chrome_drag) return 0;
+    g_chrome_drag_height = chrome_max(g_chrome_drag_height, g_chrome.bottom - g_chrome.top);
+    plat_client_size(&width, &height);
+#ifndef _WIN32
+    if (active_tab() && active_tab()->kind == TK_BROWSER)
+        height = mac_browser_page_rows(active_tab()) * cell_height;
+#endif
+    chrome_drag_position(mx, my, width, height / cell_height, cell_height,
+                         g_chrome_drag_grab, g_chrome_drag_height, &side, &row);
+    changed = side != g_tab_underlay || row != g_dock_row;
+    g_tab_underlay = side; g_dock_row = row;
+    g_mouse_x = mx; g_mouse_y = my;
+    if (changed) { tab_layout(); plat_invalidate(); }
+    return changed;
+}
+static void chrome_drag_end(void) {
+    if (!g_chrome_drag) return;
+    g_chrome_drag = 0;
+    tab_layout();
+    config_save(); plat_settings_tell(); plat_invalidate();
 }
 static int unit_chrome(FILE *f) {
     int fails = 0, rows, open, tabs, underlay, next_col, counter_col, direction;
+    fails += unit_font_menu(f);
     for (rows = 1; rows <= 48; rows++) for (open = 0; open <= 1; open++)
         for (tabs = 1; tabs <= MAX_TABS; tabs += 7) for (underlay = 0; underlay <= 2; underlay++) {
             ChromeLayout a = chrome_measure(rows, 2, tabs, open, underlay, 8, NFONTS);
             fails += a.top < 0 || a.bottom > rows || a.bottom < a.top;
+            fails += a.grip_rows != 1;
             fails += a.tab_count < 0 || a.tab_count > a.tab_capacity;
             fails += a.list_count < 0 || a.list_count > a.list_capacity;
             if (a.settings_row >= 0) fails += a.settings_row < a.tab_row + a.tab_count;
@@ -266,6 +323,19 @@ static int unit_chrome(FILE *f) {
         a = chrome_measure(16, 1, 12, 1, 1, 0, 2);
         fails += a.tab_capacity != 11 || a.list_capacity != 2;
     }
+    {
+        int side, row;
+        chrome_drag_position(10, 217, 800, 30, 20, 7, 12, &side, &row);
+        fails += side != 2 || row != 10;
+        chrome_drag_position(799, 999, 800, 30, 20, 7, 12, &side, &row);
+        fails += side != 1 || row != 18;
+        chrome_drag_position(400, -99, 800, 30, 20, 7, 12, &side, &row);
+        fails += side != 1 || row != 0;
+        chrome_drag_position(-20, 99, 800, 1, 20, 7, 12, &side, &row);
+        fails += side != 2 || row != 0;
+        ChromeLayout a = chrome_measure(1, 99, 4, 1, 1, 400, NFAMILIES);
+        fails += a.top != 0 || a.bottom != 1 || a.grip_rows != 1 || a.tab_count || a.list_count;
+    }
     /* Last-page navigation must retain the full capacity, including after a resize. */
     fails += chrome_page_offset(8, 10, 4) != 8;
     fails += chrome_page_offset(12, 10, 4) != 8;
@@ -277,6 +347,6 @@ static int unit_chrome(FILE *f) {
     fails += chrome_page_hit(next_col, 8, 4, 10, 0, &direction) != 1 || direction != 1;
     fails += chrome_page_hit(6, 8, 4, 10, 0, &direction) != 0;
     fails += chrome_page_hit(counter_col, 8, 4, 10, 0, &direction) != 2;
-    fprintf(f, "%s chrome: bounded rows, full-height lists, stable dock and pages, independent arrow targets\n", fails ? "FAIL" : "ok  ");
+    fprintf(f, "%s chrome: single-row grip, bounded drag and lists, stable pages, independent arrow targets\n", fails ? "FAIL" : "ok  ");
     return fails;
 }

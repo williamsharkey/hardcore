@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hardcore · Small font bench</title>
+<style>
+:root{color-scheme:dark;--bg:#0c1015;--surface:#141a21;--line:#2c3541;--text:#e6ebf0;--muted:#9daab9;--accent:#a7dfb2;--terminal:#10161d;--ink:#d8e3ec;--cyan:#84d4e7;--yellow:#e4c480;--green:#a7dfb2;--dim:#8492a2}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif}button,select,input{font:inherit}button,select{background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:7px 10px}button{cursor:pointer}button:hover,select:hover{border-color:var(--accent)}button:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}a{color:var(--accent)}header,main,footer{max-width:1900px;margin:auto;padding:20px 26px}header{padding-bottom:14px}.eyebrow{color:var(--accent);font-size:11px;letter-spacing:2px;font-weight:700}h1{font-size:30px;line-height:1.2;margin:8px 0}p{margin:8px 0;color:var(--muted)}.top{display:flex;justify-content:space-between;gap:24px;align-items:center}.readout{text-align:right;color:var(--muted);font-size:12px}.readout strong{display:block;color:var(--text);font-size:16px;font-weight:500}.toolbar{display:flex;gap:18px;flex-wrap:wrap;align-items:end;margin-top:18px}.toolbar label{display:grid;gap:5px;color:var(--muted);font-size:12px}.toolbar .check{display:flex;align-items:center;gap:7px;align-self:center;margin-top:17px}.check input{accent-color:var(--accent)}.status{color:var(--accent);font-size:12px;margin-top:12px}main{padding-top:0}.gallery{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,550px),1fr));gap:18px;align-items:start}.card{background:var(--surface);border:1px solid var(--line);border-radius:9px;overflow:hidden}.card-top{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:13px 16px 9px}.card h2{font-size:17px;line-height:1.3;margin:0;font-weight:600}.size{font-size:13px;color:var(--accent);white-space:nowrap}.screen-wrap{overflow:auto;background:var(--terminal);padding:12px;min-width:0}.screen{display:block;image-rendering:pixelated;max-width:none;max-height:none;touch-action:pan-x pan-y;cursor:crosshair}.details{padding:9px 16px 12px;display:flex;flex-wrap:wrap;gap:5px 15px;color:var(--muted);font-size:12px}.details button{padding:0;border:0;font-size:12px;background:none;color:var(--accent);margin-left:auto}.tag{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-left:8px}.inspector{margin-top:24px;padding:18px;background:var(--surface);border:1px solid var(--line);border-radius:9px}.inspector h2{font-size:19px;margin:0 0 10px}.inspect-controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center}.inspect-controls label{color:var(--muted)}.inspect-body{display:flex;flex-wrap:wrap;gap:24px;align-items:start;margin-top:18px}.pixel-wrap{overflow:auto;max-width:100%}#pixels{display:block;max-width:none;image-rendering:pixelated}.inspect-text{max-width:650px;color:var(--muted)}.inspect-text strong{color:var(--text);font-weight:500}.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px}.swatch{display:inline-block;width:9px;height:9px;margin-right:5px;background:var(--accent)}.swatch.generated{background:var(--yellow)}.swatch.fallback{background:var(--cyan)}details.sources{margin-top:20px;color:var(--muted)}summary{cursor:pointer;color:var(--text)}.source-entry{margin-top:14px}.source-entry pre{white-space:pre-wrap;max-height:180px;overflow:auto;font-size:11px}footer{font-size:12px;padding-top:0;padding-bottom:28px}.light{color-scheme:light;--bg:#edf0ed;--surface:#fafbf8;--line:#c7cec7;--text:#1c2922;--muted:#52645a;--accent:#226b48;--terminal:#f7f8ef;--ink:#24322d;--cyan:#246d86;--yellow:#816316;--green:#2a6e43;--dim:#68786b}
+@media(max-width:700px){header,main,footer{padding-left:14px;padding-right:14px}.top{display:block}.readout{text-align:left;margin-top:10px}.readout strong{display:inline}h1{font-size:26px}.toolbar{gap:12px}.gallery{grid-template-columns:minmax(0,1fr)}}
+</style>
+<header>
+ <div class="top"><div><div class="eyebrow">HARDCORE / FONT BENCH</div><h1>Small fonts, at actual size.</h1><p>Original bitmap faces for a lower-DPI display. Start with 17–20 px; compare the familiar Terminus 12×24.</p></div><div class="readout" id="display-info"></div></div>
+ <div class="toolbar">
+  <label>Font range<select id="filter"><option value="focus">17–20 px + 24 px reference</option><option value="all">All candidates · 16–24 px</option><option value="one">Only the inspected font</option></select></label>
+  <label>Preview size<select id="scale"><option value="1">1× · actual device pixels</option><option value="2">2× · enlarged for inspection</option></select></label>
+  <label>Background<select id="theme"><option value="dark">Dark terminal</option><option value="light">Light terminal</option></select></label>
+  <label>Sample<select id="sample"><option value="terminal">Terminal + TUI</option><option value="boxes">Box joins + block alignment</option><option value="text">Code + character shapes</option></select></label>
+  <label class="check"><input type="checkbox" id="boxes" checked>Complete missing box shapes</label>
+ </div>
+ <div class="status" id="pixel-status" aria-live="polite"></div>
+</header>
+<main>
+ <div class="gallery" id="gallery"></div>
+ <section class="inspector" aria-label="Glyph pixel inspector">
+  <h2>Look at the pixels</h2>
+  <div class="inspect-controls"><label for="inspect-font">Font</label><select id="inspect-font"></select><label for="glyph">Glyph</label><select id="glyph"></select><span style="color:var(--muted)">Click a character in any preview to inspect it.</span></div>
+  <div class="inspect-body"><div class="pixel-wrap"><canvas id="pixels" aria-label="Enlarged glyph pixel grid"></canvas></div><div class="inspect-text" id="inspect-text"></div></div>
+ </section>
+ <details class="sources"><summary>Sources, licenses, and rendering details</summary><p>Text uses the original font bitmaps. These canvases display pixels exported by Hardcore’s actual C glyph renderer, without antialiasing. The “complete missing box shapes” option uses Hardcore’s existing box generator on the source font’s line centers; it never replaces a native box glyph. Other absent characters use the real Unifont fallback. The inspector identifies each case. All these faces are available in Hardcore’s Font settings.</p><div id="sources"></div></details>
+</main>
+<footer>At 1×, each bitmap pixel occupies one browser device pixel, even when Windows scaling or browser zoom changes. Move this window between displays to compare. The inspector is deliberately enlarged. Cell height includes line spacing; cap height measures the letters themselves.</footer>
+<script>
+'use strict';
+const DATA = /* FONT_DATA */ null;
+const $=id=>document.getElementById(id);
+const state={scale:1,filter:'focus',sample:'terminal',boxes:true,font:DATA.fonts.find(f=>f.height===17)?.id||DATA.fonts[0].id,cp:73};
+const COLORS=()=>{const s=getComputedStyle(document.body);return Object.fromEntries(['terminal','ink','cyan','yellow','green','dim'].map(k=>[k,s.getPropertyValue('--'+k).trim()]));};
+const pad=(s,n)=>Array.from(s).slice(0,n).join('').padEnd(n,' ');
+function sampleLines(kind){
+ const w=48,inside=s=>'│'+pad(s,w-2)+'│';
+ if(kind==='boxes')return [
+  ['LIGHT / HEAVY / DOUBLE · join geometry','cyan'],
+  ['┌──────┬──────┐ ┏━━━━━━┳━━━━━━┓ ╔══════╦══════╗','ink'],
+  ['│  I H │  n m │ ┃  I H ┃  n m ┃ ║  I H ║  n m ║','ink'],
+  ['├──────┼──────┤ ┣━━━━━━╋━━━━━━┫ ╠══════╬══════╣','ink'],
+  ['│  012 │  345 │ ┃  012 ┃  345 ┃ ║  012 ║  345 ║','ink'],
+  ['└──────┴──────┘ ┗━━━━━━┻━━━━━━┛ ╚══════╩══════╝','ink'],
+  ['','ink'],['╭──────────╮ ┌─┬─┬─┐  ────┼────  ━━━━╋━━━━','cyan'],
+  ['│ rounded  │ ├─┼─┼─┤      │          ┃','cyan'],
+  ['╰──────────╯ └─┴─┴─┘  ┄┄┄┄┄┄┄┄┄  ┅┅┅┅┅┅┅┅┅','cyan'],
+  ['','ink'],['BLOCKS  ░░░░ ▒▒▒▒ ▓▓▓▓ ████ ▀▀▀▀ ▄▄▄▄','green'],
+  ['        ░░░░ ▒▒▒▒ ▓▓▓▓ ████ ▄▄▄▄ ▀▀▀▀','green'],
+  ['FILL    ▏▎▍▌▋▊▉█    edges: █│█│█│█','yellow'],
+  ['        └───────────────┬───────────────┘','dim'],
+  ['Adjacent cells share exact integer pixel edges.','dim']];
+ if(kind==='text')return [
+  ['$ rg -n "render" src/terminal.c','green'],['48: static int render(Cell *cells, int width) {','ink'],
+  ['49:     for (int i = 0; i < width; ++i) {','ink'],['50:         draw_glyph(cells[i].codepoint);','cyan'],
+  ['51:     }','ink'],['52:     return 0;','ink'],['53: }','ink'],['','ink'],
+  ['Il1|!  O0Q  rn m  []{}() <> /\\ _-+= ~^`','yellow'],['ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789','ink'],
+  ['abcdefghijklmnopqrstuvwxyz 0123456789','ink'],['I H n m i l f t  e a o s  g j p q y','cyan'],
+  ['The quick brown fox jumps over the lazy dog.','ink'],['Pack my box with five dozen liquor jugs.','ink'],
+  ['user@w11:~/hardcore$ printf "ready\\n"','green'],['ready  _','ink']];
+ return [
+  ['wm@w11:~/hardcore$ make test','green'],['cc -O2 -Wall  terminal.c  -o hardcore','dim'],
+  ['PASS  parser  fonts  box joins  shell I/O','cyan'],['','ink'],
+  ['┌'+'─'.repeat(19)+'┬'+'─'.repeat(26)+'┐','cyan'],[inside(' FILES             │ PREVIEW'),'cyan'],
+  ['├'+'─'.repeat(19)+'┼'+'─'.repeat(26)+'┤','cyan'],
+  [inside(' src/              │ int main(void) {'),'ink'],[inside('   terminal.c      │   return 0;'),'ink'],
+  [inside('   fonts.c         │ }'),'ink'],[inside(' tests/            │ I l 1 |  O 0 Q'),'ink'],
+  ['└'+'─'.repeat(19)+'┴'+'─'.repeat(26)+'┘','cyan'],['CPU [██████░░░░░░] 42%   MEM 128 / 512 MB','yellow'],
+  ['╭──────────╮  ╔══════════╗  ┏━━━━━━━━━━┓','ink'],['│ ready    │  ║ all pass ║  ┃ 17–20 px ┃'.replace('–','-'),'ink'],
+  ['╰──────────╯  ╚══════════╝  ┗━━━━━━━━━━┛','ink']];
+}
+function glyph(f,cp){return (state.boxes?f.completedGlyphs:f.sourceGlyphs)[cp];}
+function origin(f,cp){return cp===32?'space':f.nativeCodepoints.includes(cp)?'native':state.boxes&&f.generated.includes(cp)?'generated':'fallback';}
+function snap(canvas){
+ canvas.style.transform='none';const r=canvas.getBoundingClientRect(),d=devicePixelRatio;
+ const dx=Math.round(r.x*d)/d-r.x,dy=Math.round(r.y*d)/d-r.y;
+ canvas.style.transform=`translate(${dx}px,${dy}px)`;
+}
+function size(canvas,w,h){canvas.width=w;canvas.height=h;canvas.style.width=w/devicePixelRatio+'px';canvas.style.height=h/devicePixelRatio+'px';}
+function draw(canvas,font){
+ const lines=sampleLines(state.sample),scale=state.scale,w=48*font.width,h=lines.length*font.height;
+ size(canvas,w*scale,h*scale);canvas.dataset.font=font.id;
+ const ctx=canvas.getContext('2d',{alpha:false});ctx.imageSmoothingEnabled=false;
+ const colors=COLORS();ctx.fillStyle=colors.terminal;ctx.fillRect(0,0,canvas.width,canvas.height);
+ for(let y=0;y<lines.length;y++){
+  const [line,color]=lines[y];ctx.fillStyle=colors[color];
+  Array.from(line).slice(0,48).forEach((ch,x)=>{
+   const g=glyph(font,ch.codePointAt(0));if(!g)return;
+   g.rows.forEach((row,gy)=>{for(let gx=0;gx<g.width;gx++)if(row&(1<<(g.width-1-gx)))ctx.fillRect((x*font.width+gx)*scale,(y*font.height+gy)*scale,scale,scale);});
+  });
+ }
+ snap(canvas);
+}
+function shownFonts(){
+ let fonts=DATA.fonts.filter(f=>state.filter==='all'||state.filter==='one'&&f.id===state.font||state.filter==='focus'&&((f.height>=17&&f.height<=20&&f.iStemPixels===1)||(f.height===24&&f.name.toLowerCase().includes('terminus'))));
+ if(state.filter==='focus'){
+  const order=['terminus24','terminus18','ttyp017','terminus20','ttyp018','fixed18','tamzen20'];
+  return fonts.sort((a,b)=>order.indexOf(a.id)-order.indexOf(b.id));
+ }
+ return fonts.sort((a,b)=>a.height-b.height||a.name.localeCompare(b.name));
+}
+function render(){
+ const gallery=$('gallery');gallery.replaceChildren();
+ for(const f of shownFonts()){
+  const card=document.createElement('article');card.className='card';
+  const top=document.createElement('div');top.className='card-top';
+  const title=document.createElement('h2');title.textContent=f.name.replace(/\s*\d+\s*[×x]\s*\d+(?:\s+reference)?\s*$/,'');
+  if(f.height===24){const tag=document.createElement('span');tag.className='tag';tag.textContent='reference';title.append(tag);}
+  const dim=document.createElement('span');dim.className='size';dim.textContent=`${f.width} × ${f.height} px`;
+  top.append(title,dim);card.append(top);
+  const wrap=document.createElement('div');wrap.className='screen-wrap';const c=document.createElement('canvas');c.className='screen';c.setAttribute('role','img');c.setAttribute('aria-label',`${f.name}, ${f.width} by ${f.height} device pixels per cell. ${$('sample').selectedOptions[0].textContent}`);wrap.append(c);card.append(wrap);
+  const details=document.createElement('div');details.className='details';
+  for(const text of [`I stem ${f.iStemPixels} px`,`cap ${f.capHeight} · x-height ${f.xHeight}`,`${f.nativeBoxes}/128 native boxes`]){const span=document.createElement('span');span.textContent=text;details.append(span);}
+  const button=document.createElement('button');button.textContent='Inspect I →';button.onclick=()=>inspect(f.id,73,true);details.append(button);card.append(details);gallery.append(card);draw(c,f);
+  c.onclick=e=>{const r=c.getBoundingClientRect();const x=Math.floor((e.clientX-r.left)*devicePixelRatio/(f.width*state.scale)),y=Math.floor((e.clientY-r.top)*devicePixelRatio/(f.height*state.scale));const line=sampleLines(state.sample)[y]?.[0];const ch=Array.from(line||'')[x];if(ch)inspect(f.id,ch.codePointAt(0),true);};
+  wrap.addEventListener('scroll',()=>snap(c),{passive:true});
+ }
+ updateDisplay();drawInspector();
+ // Text and subsequent cards may change layout after an earlier canvas was
+ // drawn. Snap only after the whole final layout exists as well.
+ for(const c of document.querySelectorAll('canvas'))snap(c);
+}
+function updateDisplay(){
+ const d=devicePixelRatio;$('display-info').replaceChildren();const strong=document.createElement('strong');strong.textContent=`${Math.round(screen.width*d)} × ${Math.round(screen.height*d)} device px`;
+ $('display-info').append(strong,document.createTextNode(`Browser DPR ${d.toFixed(2)} · ${state.scale===1?'native size':'2× enlarged'}`));
+ $('pixel-status').textContent=state.scale===1?'1 bitmap pixel = 1 device pixel. No smoothing. Click any glyph to inspect its source.':'Enlarged preview: 1 bitmap pixel = 2 × 2 device pixels. Switch to 1× to judge reading size.';
+}
+function inspect(id,cp,scroll=false){state.font=id;state.cp=cp;$('inspect-font').value=id;const key=String(cp);if(!Array.from($('glyph').options).some(o=>o.value===key)){const o=new Option(`${String.fromCodePoint(cp)} · U+${cp.toString(16).toUpperCase().padStart(4,'0')}`,key);$('glyph').add(o);}$('glyph').value=key;drawInspector();if(state.filter==='one')render();if(scroll)$('pixels').closest('section').scrollIntoView({behavior:'smooth',block:'center'});}
+function drawInspector(){
+ const f=DATA.fonts.find(f=>f.id===state.font),g=glyph(f,state.cp);if(!g)return;
+ const zoom=10,c=$('pixels'),colors=COLORS();size(c,g.width*zoom+1,f.height*zoom+1);const ctx=c.getContext('2d',{alpha:false});ctx.imageSmoothingEnabled=false;ctx.fillStyle=colors.terminal;ctx.fillRect(0,0,c.width,c.height);
+ const kind=origin(f,state.cp);ctx.fillStyle=kind==='generated'?colors.yellow:kind==='fallback'?colors.cyan:colors.green;
+ g.rows.forEach((row,y)=>{for(let x=0;x<g.width;x++)if(row&(1<<(g.width-1-x)))ctx.fillRect(x*zoom+1,y*zoom+1,zoom-1,zoom-1);});
+ ctx.fillStyle=colors.dim;for(let x=0;x<=g.width;x++)ctx.fillRect(x*zoom,0,1,c.height);for(let y=0;y<=f.height;y++)ctx.fillRect(0,y*zoom,c.width,1);snap(c);
+ const boxKind=kind==='native'?'Original source bitmap. Every visible pixel comes from this font.':kind==='generated'?`Completed by Hardcore’s box generator, on column ${f.center[0]}, row ${f.center[1]} (zero-based). Native box glyphs are retained.`:kind==='space'?'A blank cell.':'Unifont fallback through Hardcore’s actual renderer, fitted to this cell. This is not a native glyph from the selected font.';
+ const text=$('inspect-text');text.replaceChildren();const p=document.createElement('p');const strong=document.createElement('strong');strong.textContent=`${f.name} · ${String.fromCodePoint(state.cp)} · U+${state.cp.toString(16).toUpperCase().padStart(4,'0')}`;p.append(strong);text.append(p);const desc=document.createElement('p');desc.textContent=boxKind;text.append(desc);const metric=document.createElement('p');metric.textContent=`Cell ${f.width} × ${f.height} device px · I body ${f.iStemPixels} px · cap height ${f.capHeight} px · lowercase x-height ${f.xHeight} px. One inspector square is one original pixel.`;text.append(metric);
+ const legend=document.createElement('div');legend.className='legend';for(const [k,l]of [['native','Original'],['generated','Generated box'],['fallback','Fallback']]){const span=document.createElement('span'),sw=document.createElement('i');sw.className='swatch '+k;span.append(sw,document.createTextNode(l));legend.append(span);}text.append(legend);
+}
+function verifyPixels(){
+ const colors=COLORS(),probe=document.createElement('canvas').getContext('2d');const rgb=c=>{probe.fillStyle=c;probe.fillRect(0,0,1,1);return [...probe.getImageData(0,0,1,1).data].slice(0,3);};const palette=Object.fromEntries(Object.entries(colors).map(([k,v])=>[k,rgb(v)]));let checked=0,errors=[];
+ for(const c of document.querySelectorAll('canvas.screen')){
+  const f=DATA.fonts.find(f=>f.id===c.dataset.font),actual=c.getContext('2d').getImageData(0,0,c.width,c.height).data,lines=sampleLines(state.sample);
+  for(let py=0;py<c.height;py++)for(let px=0;px<c.width;px++){
+   const x=Math.floor(px/state.scale),y=Math.floor(py/state.scale),col=Math.floor(x/f.width),row=Math.floor(y/f.height),line=lines[row],ch=Array.from(line[0])[col]||' ',g=glyph(f,ch.codePointAt(0)),on=g&&(g.rows[y%f.height]&(1<<(g.width-1-(x%f.width))));const want=palette[on?line[1]:'terminal'],i=4*(py*c.width+px);
+   checked++;if(actual[i]!==want[0]||actual[i+1]!==want[1]||actual[i+2]!==want[2]||actual[i+3]!==255){if(errors.length<10)errors.push({font:f.id,x:px,y:py});}
+  }
+ }
+ return {ok:errors.length===0,checked,errors};
+}
+for(const f of DATA.fonts)$('inspect-font').add(new Option(`${f.name} · ${f.width}×${f.height}`,f.id));
+for(const ch of Array.from('IHnmeafiltgypq01O|┌┐└┘─│┼╔╗╚╝═║╬╭╮╰╯┄━┃╋█▀▄▌░▒▓')){const cp=ch.codePointAt(0);$('glyph').add(new Option(`${ch} · U+${cp.toString(16).toUpperCase().padStart(4,'0')}`,String(cp)));}
+$('inspect-font').value=state.font;$('glyph').value=String(state.cp);
+for(const name of ['filter','scale','sample'])$(name).onchange=()=>{state[name]=name==='scale'?Number($(name).value):$(name).value;render();};
+$('boxes').onchange=()=>{state.boxes=$('boxes').checked;render();};$('theme').onchange=()=>{document.body.classList.toggle('light',$('theme').value==='light');render();};
+$('inspect-font').onchange=()=>inspect($('inspect-font').value,state.cp);$('glyph').onchange=()=>inspect(state.font,Number($('glyph').value));
+for(const f of DATA.fonts){const entry=document.createElement('details');entry.className='source-entry';const summary=document.createElement('summary');summary.textContent=`${f.name} · ${f.width}×${f.height} · ${f.nativeBoxes} native boxes`;const a=document.createElement('a');a.href=f.source_url;a.textContent='Original font source';a.target='_blank';a.rel='noopener';const note=document.createElement('p');note.textContent=Array.isArray(f.observations)?f.observations.join(' '):String(f.observations||'');const pre=document.createElement('pre');pre.textContent=f.licenseText;entry.append(summary,a,note,pre);$('sources').append(entry);}
+const fallback=document.createElement('details'),sum=document.createElement('summary'),pre=document.createElement('pre');sum.textContent='Unifont fallback license';pre.textContent=DATA.unifontLicense;fallback.append(sum,pre);$('sources').append(fallback);
+let resizeTimer;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(render,60);});
+window.addEventListener('scroll',()=>{for(const c of document.querySelectorAll('canvas'))snap(c);},{passive:true});
+function watchDpr(){const query=matchMedia(`(resolution: ${devicePixelRatio}dppx)`);query.addEventListener('change',()=>{render();watchDpr();},{once:true});}watchDpr();
+window.smallFontLab={data:DATA,state,render,inspect,verifyPixels,setScale(n){$('scale').value=String(n);state.scale=n;render();},setTheme(name){$('theme').value=name;document.body.classList.toggle('light',name==='light');render();},setFilter(value){$('filter').value=value;state.filter=value;render();},setBoxes(value){$('boxes').checked=value;state.boxes=value;render();},setSample(value){$('sample').value=value;state.sample=value;render();}};
+render();
+</script>
+</html>

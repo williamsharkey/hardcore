@@ -22,7 +22,7 @@ inputs open a grid editor, selects use a grid picker, and text areas support
 multiple lines (Control-Return applies).
 Tab/Shift-Tab selects visible controls and Return activates them. Wheel, arrows,
 Page Up/Down, Home and End scroll; Shift/Option-drag selects grid text. Native
-mode displays the real page across the full canvas, with a half-opacity menu
+mode displays the real page across the full canvas, with a full-opacity menu
 that comes forward on hover. Switching modes retains the same live document. Right-click opens a grid
 context menu for copying link locations, opening child browser tabs, copying
 selection, navigation, and inspecting elements. **Inspect element** splits off
@@ -66,6 +66,11 @@ extensions (including Claude's Chrome extension), and an agent DOM/MCP API are
 not implemented. Browser layout, projection, command validation and reload
 metadata have headless tests; native rendering/input still need desktop review.
 
+Cross-window transfers (`slurp --pid` and `reload --exe`) currently leave a
+source window containing browser tabs open and report that it cannot transfer.
+Use `hardcore reload` for an in-place update of that window; browser tabs and
+terminal sessions are preserved together.
+
 Website-specific helpers live in `browser/adapters/*.js`. Each registers with
 `globalThis.hardcoreSiteAdapters.push({matches(host,path), root(document),
 skip(element), project(document, context)})`; specific matches precede the generic fallback. The optional
@@ -97,21 +102,24 @@ geography, mathematics, population data, prose history and complex spans; they
 are not live-page screenshots. `python3 tools/capture_wikipedia.py --representative`
 can capture original article HTML and provenance when network access is available.
 
-Settings → **Layout** chooses a fixed left **Sidebar**, **Right underlay**,
-or **Left underlay**. Both underlays give the terminal its full width. The dim
-menu sits beneath terminal cells; hovering anywhere in its bounds brings the
-entire menu forward. Tabs occupy one row each, sharing a single device-pixel
-separator. Settings options use highlights without horizontal row borders;
+Drag the single **↕** handle beside **hardcore** to position the menu. It snaps
+to the nearer left or right edge and follows the pointer vertically, keeping
+the terminal's full width. The menu uses full opacity wherever content fits
+around it; rows covered by unreflowable text recede beneath that text. Hovering
+anywhere in its bounds brings the entire menu forward. Tabs occupy one row each
+without horizontal separators; their close button appears only on hover.
+Settings options use highlights without horizontal row borders;
 the right dock extends offscreen with no outside border. Lists use all available
 height and paginate only when needed. Harmless styles on blank cells, such as
 dim text after Codex’s “(^t to expand)”, do not obscure the menu.
 
-All three layouts use one font-sized grid from the drawable origin (0, 0),
+Both docks use one font-sized grid from the drawable origin (0, 0),
 with no padding or reserved scrollbar strip. Only incomplete cells at the
 right and bottom remain background.
 
-The optional **Local reflow** checkbox rearranges recognizable prose around
-an underlay for display only. It first uses spare space in the paragraph's
+Local reflow is always enabled and its debug markers are always hidden. It
+rearranges recognizable prose around the menu for display only, using spare
+space in the paragraph's
 existing rows, then at most three following blank rows. Prose words stay whole and
 later text stays on its original row. A left dock shifts only the rows beside
 the menu; other rows retain the full width. Foreground colors, bold/dim/italic
@@ -160,11 +168,11 @@ shared by every window.
   desktop or taskbar with no saved tabs, a new window starts in the folder the
   last window closed in. The very first time it's `/mnt/c/Users/<you>` (your
   `%USERPROFILE%`), not `~` inside the distro.
-- **Tabs run down the left edge**, like Chrome's vertical tabs: tabs, then
+- **Tabs dock on either edge**: tabs, then
   **Settings** and **+**. The tab column is 28 cells wide and sits on the terminal's own text
-  grid, so each of its rows lines up with a terminal row. Row 0 is a grip of
-  dim braille dots: drag the window there. Each tab is a status cell, then the
-  folder's name. The active tab is marked by a one-pixel amber line down its
+  grid, so each of its rows lines up with a terminal row. Drag the header's
+  single ↕ handle to move the menu between edges or up and down. Each tab is a status cell, then the
+  folder's name. The active tab is marked by a one-pixel line in the theme's cursor color down its
   left edge, drawn over the status cell rather than taking a column. Min/max/close float over the terminal's top-right corner on smoked
   glass. Text runs underneath and only the mouse belongs to them, so no row
   is lost to a title bar. The whole top line works as a title bar: point at
@@ -207,7 +215,7 @@ shared by every window.
   Full numbers and the method are in [bench/RESULTS.md](bench/RESULTS.md).
 - **Bitmap fonts on the pixel grid.** GNU Unifont 18 at an integer scale
   picked from the monitor's DPI: 115k glyphs, every emoji, and hand-drawn
-  Powerline symbols. Or one of seven hand-drawn bitmap fonts (see
+  Powerline symbols. Or one of ten alternative bitmap fonts (see
   [Settings](#settings)), with Unifont filling in whatever they lack. On a
   Retina or 200% screen, box-drawing lines are 1 device pixel thin.
 - **One static `.exe`** (about 8 MB) with the fonts, Windows Terminal's own
@@ -248,6 +256,9 @@ shows that screen: **More info → Run anyway**. Or build it yourself (see
 [Build](#build)); `make install` adds the shortcuts.
 
 ### Update
+
+The release download and ConPTY handoff described here apply to Windows.
+For Mac live updates and Terminal slurp, see [macOS](#macos).
 
 From any shell:
 
@@ -304,69 +315,11 @@ tabs come back through [sessions](#sessions). Copies left behind by earlier
 updates are deleted on the next update. `--force` reinstalls the latest
 release even if this one isn't older.
 
-### macOS live updates
-
-On a Mac, `hardcore update` downloads the latest release's
-`hardcore-macos.zip`, verifies GitHub's SHA-256 digest and the app's code
-signature, and replaces the app bundle. Each window running that installation
-then reloads in place. The shell and foreground programs keep their PIDs and
-PTYs; they are never restarted. The window, active tab, both terminal screens,
-scrollback, scroll position, and partial terminal escape sequences are carried
-over to the new executable. The Cocoa window may briefly disappear while it
-is rebuilt; jobs continue throughout.
-
-New macOS tabs export the app's executable directory on `PATH` and reassert
-it after shell startup. CLI programs launched in these tabs inherit it; no
-per-agent alias, plugin, or shell function is needed. In Claude Code, Codex,
-Grok, and Antigravity CLI (AGY), use `!hardcore --version` to check command
-access, then `!hardcore update`. The `!` is the CLI's shell-mode shortcut;
-at a regular shell prompt, omit it.
-
-`make install` also creates `~/.local/bin/hardcore`, pointing at the installed
-app, so shells outside Hardcore can find it when that directory is on their
-`PATH`. Merely copying the app does not install that external launcher.
-Existing app bundles are kept as backups, and supported running windows
-reload after installation. For an old session or a tool that resets `PATH`,
-use `~/Applications/hardcore.app/Contents/MacOS/hardcore update` (adjust the
-path for another install location). A remote shell or container needs its own
-installation; a CLI sandbox must allow the update's network and app-file access.
-
-The macOS live-update implementation is currently a development build feature;
-the public shell installer still directs Mac users to build from source.
-`hardcore update` follows published GitHub releases, not unpublished branch
-commits.
-
-For a locally built version, without waiting for a release:
-
-```sh
-make hardcore.app
-~/Applications/hardcore.app/Contents/MacOS/hardcore update --from "$PWD/hardcore.app"
-```
-
-`hardcore --reload` reloads windows from the executable already installed.
-`hardcore --version` reports the release and build. A bare development binary
-can use `update --from /path/to/new/binary`; release downloads require an app
-bundle. The checkbox, font, theme and shared grid work in either case.
-
-The replacement is checked for protocol compatibility and Metal startup before
-installation. A pending paste postpones a window's reload. If `exec` fails,
-that window keeps running. The previous installation is kept beside the app
-as `hardcore.app.previous`; an adoption or Metal initialization failure can
-fall back to that executable. The updater reports any window that did not
-acknowledge a successful reload.
-
-**Bootstrap:** older Mac builds have no live-update listener. Install this
-support and restart those windows once; subsequent supported updates can
-preserve running sessions. The automatic download path also needs a release
-containing `hardcore-macos.zip`. `make release-mac` prepares that universal app
-archive; building it does not publish a release. `make mac-update-test` runs
-GUI/PTY integration tests using disposable installations on a logged-in Mac.
-
 ### Slurp: attach running sessions
 
-**Windows/WSL only.** macOS does not yet support importing live sessions from
-other terminals. On macOS, `hardcore slurp` exits with an explanatory error;
-live updating preserves Hardcore’s own sessions but does not import others.
+**Windows and WSL:** the following attachment paths apply to Windows builds.
+For Hardcore windows, Terminal.app, tmux, and Claude handoff on a Mac, see
+[Slurp on macOS](#slurp-on-macos).
 
 `hardcore slurp` discovers sessions and adds them to an existing Hardcore
 window, or opens a new window. A **slurp** tab reports candidates and skipped
@@ -563,14 +516,356 @@ The same terminal runs natively on a Mac: same parser, tab column, Unifont
 and Claude Code integration, on Cocoa, `forkpty` and Metal instead of
 Win32, ConPTY and Direct3D. It's one universal (arm64 + x86_64) app.
 
+While running, the Dock icon is a small terminal showing the active
+tab's folder and foreground program, such as `wm` / `codex`. The lower line
+shows its activity or attention state, with a count when there are multiple
+tabs. Switching tabs or foreground programs updates the summary, including
+while the window is minimized. Each window runs in its own process and
+updates its application's Dock tile.
+
+The tile uses the window's theme colors and the selected bitmap font,
+including Hairline and both Courier sizes. Theme previews appear in the Dock
+too. Glyphs come from the same font tables as the terminal and are fitted to
+the tile; their physical size depends on your Dock size. Fresh installs start
+with **Gruvbox Dark (`g`)**, and the installed app icon uses its cream and dark
+gray colors. Existing saved theme choices are preserved.
+
+**Window → Show Active Tab in Dock Icon** toggles the summary and saves the
+choice across windows; `dock_summary=0` in the Mac `config.ini` restores the
+standard icon (`1` enables the summary, the default). The tile uses folder and
+program metadata, not terminal contents or command arguments. Long labels
+are shortened to fit. Updates are checked at most four times per second and
+the Dock only redraws when the summary, font, or theme changes; no Dock
+animation runs for every terminal output chunk.
+
+### Build and install on macOS
+
 ```bash
 make            # → hardcore.app (needs the Xcode command line tools and python3;
                 #   with full Xcode the shader is compiled ahead of time)
-make install    # → ~/Applications/hardcore.app
-make test       # unit tests, xterm.js fixtures, headless forkpty + shell selftest
+make install    # → ~/Applications/hardcore.app + ~/.local/bin/hardcore
+make test       # unit, xterm.js, PTY import-size regression, and shell selftest
 ```
 
-What's different on the Mac:
+After installing, run `hardcore` (or `hardcore DIR` to open a folder).
+The command is a symlink to the installed app's executable. If `~/.local/bin`
+isn't on your PATH, the installer prints the command to enable it in your
+current shell and instructions to make it persistent; shell dotfiles are never
+edited automatically. With the default install location, enable the command in
+the current zsh/bash shell with `export PATH="$HOME/.local/bin:$PATH"`; add that
+line to your shell startup file to keep it available in future shells. You can
+also launch with `open "$HOME/Applications/hardcore.app"`.
+Override the destinations with `make install APPDIR=/path/to/apps BINDIR=/path/to/bin`.
+An existing unrelated `hardcore` command at the destination is never overwritten.
+
+### Live updates on macOS
+
+On a Mac, `hardcore update` downloads the latest release's
+`hardcore-macos.zip`, verifies GitHub's SHA-256 digest and the app's code
+signature, and replaces the app bundle. Each window running that installation
+then reloads in place by executing the new binary in the same Hardcore process.
+The shell and foreground programs keep their PIDs and PTYs; they are never
+restarted. The window, active tab, both terminal screens,
+scrollback, scroll position, and partial terminal escape sequences are carried
+over to the new executable. The Cocoa window may briefly disappear while it
+is rebuilt; jobs continue throughout.
+
+New macOS tabs export the app's executable directory on `PATH` and reassert
+it after shell startup. CLI programs launched in these tabs inherit it; no
+per-agent alias, plugin, or shell function is needed. In Claude Code, Codex,
+Grok, and Antigravity CLI (AGY), use `!hardcore --version` to check command
+access, then `!hardcore update`. The `!` is the CLI's shell-mode shortcut;
+at a regular shell prompt, omit it.
+
+New tabs advertise `TERM=xterm-256color` and `COLORTERM=truecolor`. They clear
+inherited `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` so an
+automation tool's plain-output settings do not disable an interactive TUI's
+colors. Shell startup files can still set an intentional color preference.
+Live updates preserve existing processes and their environment: a program
+already started with color disabled needs to be restarted with those overrides
+unset (resume its saved session where supported).
+
+`make install` also creates `~/.local/bin/hardcore`, pointing at the installed
+app, so shells outside Hardcore can find it when that directory is on their
+`PATH`. Merely copying the app does not install that external launcher.
+Existing app bundles are kept as backups, and supported running windows
+reload after installation. For an old session or a tool that resets `PATH`,
+use `~/Applications/hardcore.app/Contents/MacOS/hardcore update` (adjust the
+path for another install location). A remote shell or container needs its own
+installation; a CLI sandbox must allow the update's network and app-file access.
+
+The macOS live-update implementation is currently a development build feature;
+the public shell installer still directs Mac users to build from source.
+`hardcore update` follows published GitHub releases, not unpublished branch
+commits.
+
+For a locally built version, without waiting for a release:
+
+```sh
+make hardcore.app
+~/Applications/hardcore.app/Contents/MacOS/hardcore update --from "$PWD/hardcore.app"
+```
+
+`hardcore reload`, `hardcore --reload`, and `hardcore update --local` reload
+windows from the executable already installed without downloading a release.
+`hardcore --version` reports the release and build. A bare development binary
+can use `update --from /path/to/new/binary`; release downloads require an app
+bundle. Font, theme, layout, and shared-grid settings work in either case.
+
+The replacement is checked for protocol compatibility and Metal startup before
+installation. A pending paste postpones a window's reload. If `exec` fails,
+that window keeps running. The previous installation is kept beside the app
+as `hardcore.app.previous`; an adoption or Metal initialization failure can
+fall back to that executable. The updater reports any window that did not
+acknowledge a successful reload.
+
+**Bootstrap:** older Mac builds have no live-update listener. Install this
+support and restart those windows once; subsequent supported updates can
+preserve running sessions. The automatic download path also needs a release
+containing `hardcore-macos.zip`. `make release-mac` (also `make mac-release`)
+prepares that universal app archive; building it does not publish a release. `make mac-update-test` runs
+GUI/PTY integration tests using disposable installations on a logged-in Mac.
+
+### Slurp on macOS
+
+Run `hardcore slurp` to discover sessions and use the available transfer route.
+It transfers native Hardcore tabs, attaches portable hosts and eligible tmux
+sessions, and prepares a cooperative handoff for supported Claude sessions
+already running in Terminal. For an eligible Claude source, it installs the
+project adapter if needed and queues a request for that exact source session.
+A first-time adapter still needs one
+`/reload-plugins` in the existing Claude session, then a safely completed turn.
+The command reports this pending state; queuing a request is not a completed move.
+
+| Source | Current behavior | Can the source close? |
+| --- | --- | --- |
+| Hardcore window | Transfers its live PTYs and terminal state. | Donor closes after verified handoff. |
+| Ordinary Terminal.app tab | Reports that direct transfer is unavailable; `--bridge` explicitly opens a plain-text view. | Keep Terminal open. |
+| Claude already running in Terminal | Installs the adapter if needed and queues a cooperative conversation handoff; see below. | Keep the original shell and Terminal open. |
+| `hardcore host` or tmux | Attaches another client to the existing tmux session. | The original client can detach after attachment. |
+| Plain iTerm2 or other terminal | Direct takeover is not implemented. | No automatic closure. |
+
+```sh
+hardcore slurp --list                 # preview sources
+hardcore slurp --terminal /dev/ttys003 # select one Terminal.app source
+hardcore slurp --pid 12345            # transfer one Hardcore window
+hardcore slurp                        # discover and prepare eligible transfers
+hardcore slurp --tmux session-name    # attach a live tmux session explicitly
+hardcore slurp --bridge --terminal /dev/ttys003 # explicit plain-text bridge
+```
+
+**Plain-text bridges require `--bridge`.** Default slurp leaves unsupported
+sources alone and explains what is unavailable. In a bridge, the original tab
+and programs remain running; keep Terminal open. Hardcore displays the tab's
+live plain text and forwards keyboard input to that specific tab. Closing the
+Hardcore tab detaches the bridge without terminating the original job. The
+bridge requires macOS Automation permission to read Terminal and Accessibility
+permission to forward input. If denied, the command explains the permission
+needed. It does not restart the session.
+
+Terminal's scripting interface does not expose cell colours or cursor
+position, so these are not preserved in the bridge. It polls screen text,
+resizes the source grid to match, and selects the source tab when forwarding
+input. This is less faithful than a native Hardcore PTY transfer, especially
+for full-screen applications. Avoid typing into the source tab concurrently.
+Bridge tabs show `folder:program [bridge]`, using the source process's working
+directory and foreground program instead of the receiving helper's home
+directory. tmux tabs likewise follow their active pane's directory and program.
+An idle shell clears the previous foreground-program label.
+
+**Hardcore-to-Hardcore slurp transfers live PTYs** to a receiving window,
+including scrollback, both screens, cursor, modes, prompt marks and partial
+escape/UTF-8 sequences. The donor windows close only after the new
+window is ready. Windows without handoff support are not eligible.
+
+**tmux sessions stay alive in their tmux server.** Default slurp attaches detached
+ordinary tmux sessions and portable `hardcore host` sessions, including hosts
+with a connected Terminal client. `--tmux NAME` can also attach an already attached session;
+other clients remain connected. `--tmux-socket PATH` selects a nondefault
+server. This also works for tmux sessions used in Terminal or iTerm2. Direct
+attachment to plain iTerm2 sessions is not implemented yet.
+
+### Portable sessions on macOS
+
+For portable Claude Code, Codex, Grok, or Antigravity sessions, start the
+conversation in Terminal with `hardcore host` (requires `tmux` on PATH):
+
+```sh
+hardcore host claude                 # also: codex, grok, agy
+# Later, from another terminal:
+hardcore slurp --list
+hardcore slurp --terminal /dev/ttys003
+```
+
+`host` runs the command in a private tmux server. Slurp recognizes that
+Terminal tab and attaches its live session in Hardcore, preserving the agent,
+child processes, PTY, screen and keyboard modes. After attachment, the original
+Terminal tab can close; the session also survives Hardcore reloads. This does
+not use debugger access or modify signed executables. `hardcore host` without
+a command starts a shell. These sessions appear as portable hosts in the slurp
+list; a detached host can be attached by its unique session name with
+`hardcore slurp --tmux hardcore-…`. Closing a client detaches it; exit the job
+inside the session to end it.
+
+`host` must be used **before starting the conversation**. It cannot retrofit
+an already-running plain Terminal job. The installed signed Claude Code,
+Codex, Grok and Antigravity binaries tested on this Mac deny debugger attach.
+
+### Claude conversation handoff on macOS
+
+Use the same `hardcore slurp` command for an existing Claude conversation in
+Terminal; the adapter can be installed after Claude starts:
+
+```sh
+hardcore slurp
+# Or select one existing Terminal tab:
+hardcore slurp --terminal /dev/ttys003
+```
+
+Slurp discovers the project's live Claude session, installs both adapter
+plugins for that project if needed, and queues a request bound to the exact
+session and process identity. If this running session has not loaded the
+adapter, run `/reload-plugins` once in Claude. The queued request then reaches
+the adapter without a second slurp command or a `/hardcore-slurp` command.
+Installation alone does not activate plugins inside an already-running Claude
+session. Hardcore does not type a reload command over an unsent draft.
+
+The adapter waits to observe a normally completed turn with no background work,
+scheduled tasks or active agents. It prepares a receiving Hardcore window,
+checks readiness again, and asks Claude
+to background the conversation. The destination restores its title and
+acknowledges readiness before Hardcore attaches that exact session.
+`/hardcore-slurp status` explains any wait; `/hardcore-slurp cancel`
+cancels it. A late-loaded idle conversation needs its next ordinary turn before
+readiness can be established; the adapter never sends a model prompt itself.
+
+For diagnosis or selecting a source by Claude's session ID, the lower-level
+commands remain available:
+
+```sh
+claude agents --json --all --cwd "$PWD" # find the interactive source sessionId
+hardcore claude move SESSION_ID         # optional: --project /path/to/project
+hardcore claude status                  # inspect this project's adapter installation
+```
+
+`move` uses the same project installation, exact-source verification and
+one-hour request queue as generic slurp. `/hardcore-slurp wait` also requests
+a handoff from within Claude. All routes use the same readiness checks.
+Text drafts transfer without being submitted, including multiline
+Unicode text and a cursor in the middle. The receiver temporarily holds input
+while restoring and checking the exact text and cursor. It also checks a SHA-256
+digest of Claude's available rich conversation blocks, including image,
+document, tool and thinking blocks, then emits a unique receipt over its
+attached PTY. Hardcore verifies the matching tab, PID and TTY and completes
+a rendered frame before recording attachment verification and releasing input.
+The guard has a deadline and releases on restoration failure. Collapsed paste
+and image placeholders refuse before moving because their hidden payloads
+cannot be captured through the draft API.
+
+Saved handoffs remain inspectable after a failed attachment:
+
+```sh
+hardcore claude moves
+hardcore claude inspect REQUEST_ID
+hardcore claude recover REQUEST_ID --export-draft saved-draft.json
+```
+
+The listing reports saved status; `inspect` separately checks whether the
+original source, destination, receiving client and window still exist.
+`recover` creates a private JSON file containing the saved draft and cursor,
+refusing existing files. These commands do not submit text or restart a job.
+
+This experimental adapter requires the **running source Claude process** to be
+version 2.1.300 or newer. Updating the installed `claude` command does not upgrade
+an existing process. Slurp reports a known older source version and leaves that
+session running without installing or queueing its adapter.
+The adapter installs two project-scoped plugins using the official CLI; both must remain enabled during
+handoff. It uses Claude's shared plugin cache but does not enable the plugins
+in other projects. Managed settings that suppress user-installed hooks can
+prevent readiness. See [adapter details](plugins/hardcore-slurp/README.md).
+
+The Claude route preserves the conversation by creating and attaching a new
+Claude session. It does not preserve the original Claude PID or transplant its
+PTY. Active work finishes before handoff; the adapter does not kill and replay
+commands or guess their exit status. It leaves the original Terminal window
+open, so it does not trigger Terminal's terminate-processes dialog. If the
+receiving client fails after backgrounding, `claude agents` lists the background
+session for recovery with `claude attach ID`.
+
+This is not yet automatic Terminal retirement. Claude's message API provides
+at most 4096 messages from normalized current context, excluding older compacted
+history and system configuration. The draft API does not expose all attachments
+or hidden stashes. Terminal's plain-text scrollback,
+styled screen/cursor state, shell variables, aliases, jobs and unflushed shell
+history are not transferred by this route. A verified Claude attachment is
+therefore insufficient to close the source window. The separate retirement
+verifier rejects closure under its default full-shell requirement and rejects
+remaining source TTY users, including detached jobs holding the slave open.
+
+### Verify macOS slurp
+
+From the repository, a single command runs without input prompts:
+
+```sh
+python3 tools/verify_mac_slurp.py
+```
+
+For a build and the full deterministic Mac test set without live shell-clone
+or GUI probes, run `make mac-offline-test`. It also prepares the signed app
+and release archive; it does not install or publish them.
+
+`verify_mac_slurp.py` runs archive and handoff regression tests, Unicode/RTF robustness cases,
+replays the latest valid saved Terminal fixture when available, and exercises
+shell cloning and a disposable Hardcore receiver window. Each live probe owns
+its test shells and PTYs. The native probe uses `build/hardcore`; build it first
+with `make` if the report identifies a missing executable.
+
+The native check compares the complete visible Unicode draft and cursor before
+the source test shell exits, then verifies an edit at the preserved cursor in
+Hardcore. It also requires the shell, kernel PTY, and Hardcore grid to agree on
+dimensions, and compares captured shell memory and unflushed history exactly.
+The companion shell tests cover editor state, undo/redo, and isolated Apple
+session-history paths. These checks passed in the
+[audited live run](bench/RESULTS-mac.md#verified-live-native-draft-cursor-and-geometry).
+
+Results go into a new private temporary directory with `report.json`,
+`SUMMARY.txt`, and individual logs. Failures, timeouts and skipped checks are
+reported separately. `--offline` selects the tests and saved-file replay that
+do not launch the shell/GUI probes; `--capture CAPTURE_DIRECTORY` selects a
+particular saved fixture. Replaying a prior Terminal copy is historical
+evidence, not a new capture of Terminal's current state. Full-state migration
+and automatic source-window closure remain outside this verification's proof.
+
+### Remaining Mac transfer research
+
+A separate owned-PTY experiment found that stock macOS `zsh/clone` can copy a
+running shell's memory and ZLE draft onto a new PTY after launch. Existing jobs
+remain in the original shell, and extra file descriptors need special handling,
+so this is not enabled as automatic Terminal slurp. See the
+[shell-preservation research](bench/RESEARCH-mac-zsh-clone.md).
+Further tests cover Apple session-history collisions, exit hooks and editor
+undo/redo in the [shell-state follow-up](bench/RESEARCH-mac-zsh-clone-state.md).
+The owned fixtures now also verify a working controlling terminal and native
+receiver. They do not account for every existing job, descriptor, shell plugin,
+or Terminal presentation state, so full-shell takeover remains experimental.
+
+There is a separate, promising route for **ordinary Codex sessions using its
+default shared daemon**: a new frontend can attach to the same live thread.
+An opt-in research probe (`python3 tests/probe_mac_agent_attach.py`) has kept
+an active tool running after terminating the original Terminal frontend, then
+accepted another prompt in Hardcore. This replaces the frontend, not the
+original PTY or shell. It is not yet wired into `hardcore slurp`; safe discovery
+of the exact source thread and a graceful detach handshake are still needed.
+It does not cover `codex --no-daemon`. See the
+[unprepared-session results](bench/RESULTS-mac.md#unprepared-agent-session-attachment-2026-10-14)
+for the other agents and limitations.
+
+Additional manual Terminal fixtures, hosted-agent checks, and the debugger-based
+experimental takeover suite are documented in
+[Mac slurp validation](slurp/README.md#macos-validation-and-research).
+
+### Mac behavior and keys
+
 - **Your login shell, not bash.**
   - zsh tabs get two hooks (prompt marks and the folder) through a
     `ZDOTDIR` that hands straight back to your own `.zshenv`, `.zprofile`,
@@ -637,6 +932,10 @@ closing its original ConPTY; it never attaches to your existing sessions.
 windows, transfers them, checks input and state, and closes its fixtures. It
 requires Windows Terminal and uses whichever tested applications are installed.
 See the [test coverage and remaining work](slurp/README.md#application-matrix).
+`make font-settings-test` is an opt-in Windows desktop check that clicks every
+font size, verifies its saved setting and native cell dimensions, captures D3D
+screenshots, and walks the grouped menu in a short window. It uses a disposable
+process with private settings and shell history.
 
 ## Keys
 
@@ -690,42 +989,62 @@ If your login shell is zsh or fish, the tab still opens bash.
 
 ## Settings
 
-Click **Settings** beneath the tabs. The compact **Font / Theme / Layout**
-strip selects the list below it. Tabs and settings use pages when they cannot
+Click **Settings** beneath the tabs. The compact **Font / Theme**
+strip selects the list below it; a light underline marks the active section.
+Tabs and settings use pages when they cannot
 fit. Back/forward buttons and the page count share the first actual item row;
 the label between them still selects that item. Fonts, themes, and tabs keep
 independent page positions. Menu lists do not scroll.
 
-- **font**: a row per font, its letter, name and cell size in device pixels
-  (the 2×-scaled ones are listed at their doubled size):
+- **font**: sizes are grouped beside their family name. Click a size to apply
+  it; the selected size has an amber background. The menu shows width × height
+  when the family fits, or just heights in compact rows. Long families continue
+  on the next row, and repeat their name at a page boundary. Every size remains
+  selectable when the menu is paginated. Sizes reflect device pixels, including
+  the current display scale for the three legacy scaled cuts.
 
-  | Letter | Font | Cell |
+  | Family | Cells, in size order | Saved preference keys |
   |---|---|---|
-  | `U` | GNU Unifont 18 (the default) | 8×16, scaled |
-  | `Z` | Tamzen 8×15 | 8×15, scaled |
-  | `F` | misc-fixed 7×13 (X11's "fixed") | 7×13, scaled |
-  | `t` | Terminus 24 | 12×24, 1:1 |
-  | `Y` | Sony 12×24 (X11) | 12×24, 1:1 |
-  | `E` | ETL 24 (GNU intlfonts) | 12×24, 1:1 |
-  | `M` | Terminus 28 | 14×28, 1:1 |
-  | `T` | Terminus 32 | 16×32, 1:1 |
+  | GNU Unifont 18 (default) | 8×16, scaled | `U` |
+  | Tamzen | 8×15 scaled; 8×16; 10×20 | `Z`, `z`, `x` |
+  | Fixed (X11) | 7×13 scaled; 9×18; 10×20 | `F`, `f`, `g` |
+  | Terminus | 8×16; 10×18; 10×20; 11×22; 12×24; 14×28; 16×32 | `a`, `b`, `c`, `d`, `t`, `M`, `T` |
+  | Sony (X11) | 12×24 | `Y` |
+  | ETL (GNU intlfonts) | 12×24 | `E` |
+  | Courier (X11) | 15×24; 20×29 | `C`, `R` |
+  | Hairline (Terminus-derived) | 12×26 | `H` |
+  | UW ttyp0 | 9×17; 9×18 | `p`, `q` |
 
   "Scaled" fonts are multiplied by the display scale like Unifont is: each
   pixel is 2×2 on a Retina screen. The 1:1 ones were drawn for the screen's
   own pixels. Sony and ETL only cover Latin-1, so the rest comes from
   Terminus 24, then Unifont.
+  All ten smaller comparison cuts are included at 1:1 device pixels, including
+  the heavier Fixed 10×20. Existing saved font keys keep their meanings. See
+  [small font sources and rendering](font/small-fonts.md) for exact metrics,
+  native box coverage, fallback behavior, and licenses.
+  Courier's native bitmap strokes stay one device pixel wide in straight
+  letter stems and bars, even on Retina displays. Curves, serifs, and joins
+  can be wider. Its missing or overhanging glyphs use Unifont fitted to the
+  selected cell; the 20×29 font also supports 40-pixel-wide Unicode fallback.
+  Hairline is the saved Terminus-derived design with lowercase x-height +2,
+  capital/digit height +3, and a 26-pixel cell. It preserves one-pixel strokes
+  and the original `f` hook, and fills the taller cell with continuous box and
+  block graphics. Select **H · Hairline · 12×26** in the font menu, or use
+  `font=H` in `config.ini`. Other source letters and punctuation retain their
+  original contours; only ASCII letters and digits have enlarged bodies.
 - **theme**: a row per family, with the dark scheme's letter and, for the
   families that have one, the light one's: `h` hardcore (Campbell with an
-  amber cursor, the default), `d` Dracula, `m` Monokai, `n` Nord, `g`/`G`
-  Gruvbox, `s`/`S` Solarized, `o`/`O` One Dark/Light, `c`/`C` Catppuccin
+  amber cursor), `d` Dracula, `m` Monokai, `n` Nord, `g`/`G`
+  Gruvbox (**`g` Gruvbox Dark is the default**), `s`/`S` Solarized,
+  `o`/`O` One Dark/Light, `c`/`C` Catppuccin
   Mocha/Latte, `k`/`K` Tokyo Night/Day, `r`/`R` Rosé Pine/Dawn. Pointing at
   the row tries the dark one; at the light letter, the light one.
 
 Pointing at a scheme previews it on the whole window. Fonts apply on click,
 keeping the terminal and tab controls on the same grid at all times.
-Clicking picks it for every hardcore window at once. **Layout** contains the
-sidebar/right/left selector, the **Local reflow** and **Reflow markers** checkboxes,
-and controls for the underlay's vertical position. The dock stays at the chosen
+Clicking picks it for every hardcore window at once. Drag the header's **↕**
+handle to choose the dock's side and vertical position. The dock stays at the chosen
 row, clamped to fit the window; it does not chase terminal output. Complex text
 that cannot safely reflow continues to cover the dim menu until hover.
 
@@ -740,10 +1059,8 @@ distro=          # WSL distro; empty = default
 shell=           # powershell = PowerShell tabs instead of WSL
 width=… height=… # last window size
 font=U           # a font's letter
-theme=h          # a color scheme's letter
-tab_underlay=0   # 0=sidebar, 1=right underlay, 2=left underlay
-chrome_reflow=1  # display-only prose reflow beside an underlay
-chrome_debug=0   # arrows in existing indentation
+theme=g          # a color scheme's letter; default is Gruvbox Dark
+tab_underlay=1   # 1=right underlay, 2=left underlay; legacy 0 becomes left
 dock_row=0       # desired underlay top row (clamped to fit)
 ```
 
@@ -817,6 +1134,10 @@ The other fonts are BDFs in `font/`, packed by `tools/gen_fonts.py` into
   Its 28 and 32 sizes draw box lines 2 pixels wide, so their box drawing is
   redrawn from the Unicode names with 1-pixel lines on Terminus's own center
   lines.
+- Hairline 12×26 (`font/hairline/`, SIL OFL 1.1), a modified Terminus 24
+  with the selected +2 lowercase / +3 capitals design and adapted terminal
+  graphics. It uses a distinct family name, retains the original attribution,
+  and embeds the complete OFL notice. See its [design and regeneration notes](font/hairline/README.md).
 - Tamzen 8×15 by Suraj N. Kurapati, from Tamsyn by Scott Fial (`font/tamzen/`,
   free to use, copy, modify and distribute).
 - misc-fixed 7×13 from X.Org (`font/misc-fixed/`, public domain).
@@ -824,6 +1145,23 @@ The other fonts are BDFs in `font/`, packed by `tools/gen_fonts.py` into
   notice).
 - ETL 24 Latin-1 from GNU intlfonts 1.4.2 (`font/etl/`, Electrotechnical
   Laboratory, freely usable).
+- X11 Courier regular from X.Org's Adobe 75dpi and 100dpi fonts
+  (`font/courier/`, Adobe/DEC permission notice). These are native 15×24 and
+  20×29 line cells. The latter BDF's nominal `PIXEL_SIZE` is 34; its ascent
+  and descent total 29. Native pixels are retained; glyphs that would be
+  clipped by the cell are omitted so the normal Unicode fallback can draw
+  the complete character.
+
+The separate [Hairline Lab](experiments/font-lab/README.md) compares these
+bitmaps and experiments with taller Terminus-derived ASCII contours. Its
+per-glyph expansion controls do not change the installed fonts.
+
+The [Small Font Lab](experiments/small-font-lab/README.md) compares 11 original
+bitmap faces at native device size, focusing on 17–20 px cells for lower-DPI
+displays. It includes smaller Terminus, UW ttyp0, X11 Fixed, and Tamzen faces,
+terminal/code samples, box-join tests, and a pixel inspector that distinguishes
+native glyphs, generated boxes, and Unicode fallback. Build its self-contained
+preview with `python3 experiments/small-font-lab/build.py`.
 
 At scale 2, the scaled fonts' box drawing (U+2500–257F) is redrawn with
 1-pixel lines as it's drawn: each lit pixel of the glyph becomes a point,

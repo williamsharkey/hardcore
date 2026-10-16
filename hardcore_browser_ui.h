@@ -56,7 +56,9 @@ static void browser_ui_begin_edit(HCBrowser *b,int kind,NSString *value) {
     [b->editText release];b->editText=[[NSMutableString alloc] initWithString:value ?: @""];
     b->editKind=kind;b->editCaret=(int)b->editText.length;b->editAll=1;
     browser_ui_menu_clear(b);[g_win makeFirstResponder:g_view];
-    if(kind==1)mac_title_hover_at(0,0);plat_invalidate();
+    /* Programmatic navigation focus has no pointer target: (0,0) may now be
+       occupied by the docked menu, which correctly suppresses title hover. */
+    if(kind==1)mac_title_hover_at(-1,-1);plat_invalidate();
 }
 static void mac_browser_begin_control(Tab *tb,int node,int revision,int documentEpoch,NSDictionary *info) {
     HCBrowser *b=browser_for(tb);if(!b)return;

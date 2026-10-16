@@ -234,8 +234,8 @@ typedef struct {
     uint32_t text, text_lo, busy_lo, dim, detail, detail_ask, red;
 } Look;
 static Look g_look;
-static const Scheme *g_scheme = SCHEMES;     /* the scheme you picked, for every window */
-static const Scheme *g_shown = SCHEMES;      /* the one on screen: g_scheme, or one you're pointing at */
+static const Scheme *g_scheme = &SCHEMES[4]; /* Gruvbox Dark until a saved theme= is read */
+static const Scheme *g_shown = &SCHEMES[4];  /* the one on screen: g_scheme, or one you're pointing at */
 
 #define AMBER (g_look.accent)    /* the cursor and the marks: dumbterm's phosphor amber in hardcore's scheme */
 #define DEF_FG (g_look.fg)
@@ -263,9 +263,11 @@ static uint32_t mix(uint32_t a, uint32_t b, float t) {
 
 static char g_start_dir[1024];   /* Windows or Linux path */
 static char g_last_dir[1024];    /* where the last window closed: the next one opens there */
+#ifdef _WIN32
 static int g_shell_ps;           /* shell=powershell in config.ini: tabs run PowerShell, not WSL */
 static int g_no_bash;            /* the distro has no bash: run its default shell, without rc.bash */
 static int g_have_distro = 1;    /* any WSL distro registered for this user (HKCU\...\Lxss) */
+#endif
 static char g_mnt_root[64] = "/mnt/";   /* where Windows drives appear in WSL (wsl.conf automount root) */
 static char g_cfg_dir_line[1100];   /* dir= as config.ini had it, written back unchanged */
 #ifdef _WIN32
@@ -354,15 +356,15 @@ static void palette_init(void) {
     }
 }
 
-static int g_tab_underlay; /* 0: sidebar, 1: right underlay, 2: left underlay */
+static int g_tab_underlay = 1; /* 1: right underlay, 2: left underlay */
 static int g_chrome_reflow = 1, g_chrome_debug, g_dock_row;
 
 /* config.ini's font= and theme=: a letter each */
 static void config_look(const char *key, const char *v) {
     if (!strcmp(key, "font") && font_by_key(v[0])) g_font = g_tfont = g_cf = font_by_key(v[0]);
-    else if (!strcmp(key, "tab_underlay")) g_tab_underlay = !strcmp(v, "2") ? 2 : !strcmp(v, "1");
-    else if (!strcmp(key, "chrome_reflow")) g_chrome_reflow = !strcmp(v, "1");
-    else if (!strcmp(key, "chrome_debug")) g_chrome_debug = !strcmp(v, "1");
+    else if (!strcmp(key, "tab_underlay")) g_tab_underlay = !strcmp(v, "2") || !strcmp(v, "0") ? 2 : 1;
+    else if (!strcmp(key, "chrome_reflow")) g_chrome_reflow = 1; /* migrate old preferences */
+    else if (!strcmp(key, "chrome_debug")) g_chrome_debug = 0;
     else if (!strcmp(key, "dock_row")) { g_dock_row = atoi(v); if (g_dock_row < 0) g_dock_row = 0; if (g_dock_row > 499) g_dock_row = 499; }
     else if (!strcmp(key, "theme") && scheme_by_key(v[0])) look_set(g_scheme = scheme_by_key(v[0]));
 }
@@ -373,9 +375,8 @@ static void config_look_save(FILE *f) {
     for (i = 0; i < NFONTS; i++) fprintf(f, " %c=%s %dx%d", FONTS[i].key, FONTS[i].name, cell_w(&FONTS[i]), cell_h(&FONTS[i]));
     fprintf(f, "\nfont=%c\n#", g_font->key);
     for (i = 0; i < NSCHEMES; i++) fprintf(f, " %c=%s", SCHEMES[i].key, SCHEMES[i].name);
-    fprintf(f, "\ntheme=%c\n# 0=sidebar, 1=right underlay, 2=left underlay\ntab_underlay=%d\n"
-               "chrome_reflow=%d\nchrome_debug=%d\ndock_row=%d\n",
-            g_scheme->key, g_tab_underlay, g_chrome_reflow, g_chrome_debug, g_dock_row);
+    fprintf(f, "\ntheme=%c\n# 1=right underlay, 2=left underlay; drag the menu handle to place it\ntab_underlay=%d\n"
+               "dock_row=%d\n", g_scheme->key, g_tab_underlay, g_dock_row);
 }
 
 /* wcwidth from Unicode 17 (tools/gen_width.py → build/width.inc): the same
@@ -501,9 +502,12 @@ typedef struct Tab {
     int fd;                      /* pty master, -1 = none */
     pid_t pid;
     void *rsrc;                  /* dispatch source: output ready */
+    void *psrc;                  /* dispatch source: shell exit */
     void *wq;                    /* serial queue for writes the pty can't take right away */
     int *wpending;               /* writes waiting on that queue (atomic; the queue frees it last) */
     int exited;
+    int claude_guard, claude_released, claude_cursor_sent;
+    DWORD claude_guard_at;       /* bounded input hold while the adapter restores its draft */
 #endif
     char *in;
     int in_n, in_cap;
@@ -602,6 +606,7 @@ static void mac_browser_draw_tile(Tab *tb,const Cell *cell,int x,int y);
 static int mac_browser_hover_link(void);
 static int mac_browser_page_rows(Tab *tb);
 static void mac_browser_tab_label(Tab *tb,wchar_t *out,int cap,int cols);
+static int mac_input_held(Tab *tb);
 #endif
 
 /* ── platform layer: Win32 in this file, macOS in hardcore_mac.m ───── */
@@ -950,7 +955,6 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
         {
             int len = acc_n, pos = 0;
             while (len > 0 && row_is_blank_default(&acc[len - 1])) len--;
-            if (cur_line == 1 && len < cur_off) len = len;   /* cursor may sit past the text */
             do {
                 int take = len - pos > cols ? cols : len - pos;
                 if (take == cols && acc[pos + take - 1].wflag == W_WIDE) take--;  /* don't split a wide char */
@@ -2001,6 +2005,7 @@ static void sgr_color(char *o, size_t cap, uint32_t spec, int bg) {
 
 static int utf8_encode(uint32_t cp, char *o);
 
+#ifdef _WIN32
 static void term_dump(Term *t, FILE *f, int max_rows) {
     static const int abit[8] = {1, 2, 3, 4, 5, 7, 8, 9};     /* A_BOLD.. A_STRIKE → SGR */
     int alt = t->alt, last, L, first, total;
@@ -2042,6 +2047,8 @@ static void term_dump(Term *t, FILE *f, int max_rows) {
     }
     t->alt = alt;
 }
+
+#endif
 
 /* ── a terminal's whole state as text ──────────────────────────────────
    For handing a tab to a newer hardcore without stopping what runs in it:
@@ -2607,6 +2614,8 @@ static void to_windows_dir(const char *p, wchar_t *out, int cap) {
    same two things rc.bash does for bash. Your profile still loads. */
 static void powershell_cmd(wchar_t *out, int cap) {
     static const char hook[] =
+        "if ($env:HARDCORE_TEST_CONFIG) { try { Set-PSReadLineOption -HistorySaveStyle SaveNothing "
+        "-HistorySavePath (Join-Path $env:HARDCORE_TEST_CONFIG 'history.txt') } catch {} }\n"
         "$global:__hc_prompt = $function:prompt\n"
         "function global:prompt { $e = [char]27; "
         "[Console]::Write(\"$e]9;9;$($executionContext.SessionState.Path.CurrentLocation.ProviderPath)$e\\$e]133;A$e\\\"); "
@@ -2632,7 +2641,8 @@ static void powershell_cmd(wchar_t *out, int cap) {
         GetSystemDirectoryW(sys, MAX_PATH);
         _snwprintf(exe, MAX_PATH, L"%ls\\WindowsPowerShell\\v1.0\\powershell.exe", sys);
     }
-    _snwprintf(out, cap, L"\"%ls\" -NoLogo -NoExit -EncodedCommand %hs", exe, b64);
+    _snwprintf(out, cap, L"\"%ls\" -NoLogo -NoExit %ls-EncodedCommand %hs", exe,
+               _wgetenv(L"HARDCORE_TEST_CONFIG") ? L"-NoProfile " : L"", b64);
     out[cap - 1] = 0;
 }
 
@@ -2848,10 +2858,11 @@ static void tab_destroy_async(Tab *tb) {
 static void config_path(wchar_t *out) { _snwprintf(out, MAX_PATH, L"%ls\\config.ini", g_cfg_dir); out[MAX_PATH - 1] = 0; }
 
 static void config_load(void) {
-    wchar_t path[MAX_PATH], *la = _wgetenv(L"LOCALAPPDATA");
+    wchar_t path[MAX_PATH], *la = _wgetenv(L"LOCALAPPDATA"), *test = _wgetenv(L"HARDCORE_TEST_CONFIG");
     char line[1200];
     FILE *f;
-    _snwprintf(g_cfg_dir, MAX_PATH, L"%ls\\hardcore", la ? la : L".");
+    if (test) _snwprintf(g_cfg_dir, MAX_PATH, L"%ls", test);
+    else _snwprintf(g_cfg_dir, MAX_PATH, L"%ls\\hardcore", la ? la : L".");
     g_cfg_dir[MAX_PATH - 1] = 0;
     CreateDirectoryW(g_cfg_dir, NULL);
     config_path(path);
@@ -2960,7 +2971,7 @@ static int sidebar_x(void) {
 static int in_sidebar(int x) { return x >= sidebar_x() && x < sidebar_x() + sidebar_w(); }
 /* (0,0) is the native drawable surface, inside any system-owned border.
    Rounded corners may obscure cells; they never shift the grid. */
-static int term_ox(void) { return g_tab_underlay || (active_tab() && active_tab()->kind == TK_BROWSER) ? 0 : sidebar_w(); }
+static int term_ox(void) { return 0; }
 static int term_oy(void) { return 0; }
 
 static void compute_grid(int w, int h, int *cols, int *rows) {
@@ -3089,6 +3100,9 @@ static void sel_copy(void) {
 static void send_to_active(const char *s, int n) {
     Tab *tb = active_tab();
     if (!tb) return;
+#ifndef _WIN32
+    if (mac_input_held(tb)) return;
+#endif
     if (tb->t.view) {
         tb->t.view = 0;
         plat_invalidate();
@@ -3266,11 +3280,12 @@ static void paste(void) {
 
 #endif /* _WIN32: drops, clipboard formats */
 
-/* ── glyph atlas: on-demand 32×32 slots in one texture ─────────────── */
+/* ── glyph atlas: on-demand 40×40 slots in one texture ─────────────── */
 
 /* A slot holds one glyph in its font's pixels (the GPU scales those up to
-   the cell), or, for box drawing redrawn with thin lines, in the display's. */
-#define SLOT 32
+   the cell), or, for box drawing redrawn with thin lines, in the display's.
+   Courier's 20-pixel cell needs 40 pixels for a two-cell Unifont fallback. */
+#define SLOT 40
 #define ATLAS 4096
 #define ATLAS_S "4096.0"
 #define SLOTS_PER_ROW (ATLAS / SLOT)
@@ -3889,6 +3904,12 @@ static void tab_label_fit(Tab *tb, wchar_t *out, int cap, int cols) {
         utf8_to_wide(app, out+n, cap-n);
     }
     (void)cols;
+#ifndef _WIN32
+    if (!strncmp(tb->run, "terminal:", 9)) {
+        n = (int)wcslen(out);
+        if (n + 9 < cap) wcscpy(out+n, L" [bridge]");
+    }
+#endif
 }
 static void tab_label(Tab *tb, wchar_t *out, int cap) { tab_label_fit(tb,out,cap,cap-1); }
 
@@ -3913,6 +3934,13 @@ static int unit_tab_labels(FILE *f) {
     fails += wcscmp(label,L"hardcore:codex") != 0;
     tb->program[0] = tb->t.cmd[0] = 0; tab_label(tb,label,256);
     fails += wcscmp(label,L"hardcore") != 0;
+#ifndef _WIN32
+    snprintf(tb->run, sizeof(tb->run), "terminal:/dev/ttys123");
+    snprintf(tb->t.cwd, sizeof(tb->t.cwd), "/work/ruffian");
+    snprintf(tb->program, sizeof(tb->program), "claude");
+    tab_label(tb,label,256);
+    fails += wcscmp(label,L"ruffian:claude [bridge]") != 0;
+#endif
     free(tb);
     fprintf(f,"%s folder:program tab labels\n",fails ? "FAIL" : "ok  ");
     return fails;
@@ -4072,6 +4100,7 @@ static void plat_render_title_background(float x0, float y0, float x1, float y1,
 static void plat_render_title_underlay(void);
 static void plat_render_title_overlay(void);
 #endif
+static float chrome_row_alpha(int row);
 #include "hardcore_chrome_draw.h"
 
 /* Foreground owns its complete cell so chrome cannot cross glyph margins.
@@ -4084,6 +4113,14 @@ static int cell_covers_chrome(const Cell *c) {
     cell_colors(c, &fg, &bg);
     if (fg == bg) return 0;
     return !space || (c->wflag & 8) || c->wflag == W_CONT || (c->attr & (A_UNDER | A_STRIKE)) || c->link;
+}
+
+static float chrome_overlap_alpha(const Cell *cells, int n, int left, int right, int raised) {
+    if (raised) return 1;
+    if (left < 0) left = 0;
+    if (right > n) right = n;
+    for (int x = left; x < right; x++) if (cell_covers_chrome(&cells[x])) return .38f;
+    return 1;
 }
 
 static int unit_underlay(FILE *f) {
@@ -4109,6 +4146,14 @@ static int unit_underlay(FILE *f) {
     fails += cell_covers_chrome(&blank);
     blank.ch = 'X'; blank.attr = A_HIDDEN; fails += cell_covers_chrome(&blank);
     blank.ch = 0xA0; blank.attr = A_DIM; fails += cell_covers_chrome(&blank);
+    {
+        Cell row[4] = {{' ', 0, C_PAL(2)}, {' ', 0, C_PAL(2)}, {'X'}, {' '}};
+        fails += chrome_overlap_alpha(row, 4, 0, 2, 0) != 1;
+        fails += chrome_overlap_alpha(row, 4, 2, 4, 0) != .38f;
+        fails += chrome_overlap_alpha(row, 4, 2, 4, 1) != 1;
+        row[2].attr = A_HIDDEN;
+        fails += chrome_overlap_alpha(row, 4, 2, 4, 0) != 1;
+    }
 #ifndef _WIN32
     /* There must be no invisible midpoint, nor an excessive shift, on any
        gray background. Sample the RGB cube too, including saturated colors. */
@@ -4139,8 +4184,10 @@ static int unit_underlay(FILE *f) {
     }
     g_cf = saved_font;
     config_look("tab_underlay", "0");
-    compute_grid(sidebar_w() + 120 * CW, 24 * CH, &cols, &rows);
-    fails += cols != 120 || rows != 24 || term_ox() != sidebar_w();
+    compute_grid(120 * CW, 24 * CH, &cols, &rows);
+    fails += g_tab_underlay != 2 || cols != 120 || rows != 24 || term_ox() != 0;
+    config_look("chrome_reflow", "0"); config_look("chrome_debug", "1");
+    fails += !g_chrome_reflow || g_chrome_debug;
     config_look("tab_underlay", "2");
     compute_grid(120 * CW, 24 * CH, &cols, &rows);
     fails += g_tab_underlay != 2 || cols != 120 || rows != 24 || term_ox() != 0 || sidebar_x() != 0;
@@ -4179,6 +4226,20 @@ static int unit_underlay(FILE *f) {
 
 static void r_begin(int w, int h);
 #include "hardcore_display.h"
+
+/* Clear rows use the theme's full contrast. Only a row whose foreground still
+   occupies the dock lane recedes; hovering or dragging brings all rows forward. */
+static float chrome_row_alpha(int row) {
+    Tab *tb = active_tab();
+    const Cell *cells;
+    int n, left = sidebar_x()/CW;
+    int raised = g_chrome_drag || (!g_sel_drag && g_mouse_x >= left*CW &&
+        g_mouse_x < (left+SB_COLS)*CW && g_mouse_y >= g_chrome.top*CH &&
+        g_mouse_y < g_chrome.bottom*CH);
+    if (!tb || tb->browser_native || row < 0 || row >= tb->t.rows || raised) return 1;
+    display_line(&tb->t, row, &cells, &n);
+    return chrome_overlap_alpha(cells, n, left, left + SB_COLS, 0);
+}
 
 /* Terminal fills are below the quiet chrome, while terminal foreground cells
    are above it. This lets the menu show through a highlighted row's blank
@@ -4220,7 +4281,6 @@ static void render(void) {
     r_begin(r.right, r.bottom);
 #ifndef _WIN32
     if (tb && tb->kind == TK_BROWSER && tb->browser_native) {
-        g_draw_alpha = chrome_hovered() ? 1 : .5f;
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
         mac_browser_draw_overlay();
@@ -4240,7 +4300,6 @@ static void render(void) {
     chrome_prepare_display(t);
     render_terminal_backgrounds(t, ox, oy);
     if (overlay) {
-        g_draw_alpha = .38f;
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
     } else render_tabbar(r.right, r.bottom);
@@ -4354,12 +4413,13 @@ static void render(void) {
         fill_rect(bx, track_top + pos * (track_h - bar_h), bx + SCROLLBAR_W - 2 * g_scale,
                   track_top + pos * (track_h - bar_h) + bar_h, AMBER, t->view ? 0.8f : 0.3f);
     }
-    if (overlay && chrome_hovered()) render_tabbar(r.right, r.bottom);
 #ifdef _WIN32
     if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
         fill_rect(0, 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
-    render_caption_buttons(r.right);   /* last: glass over whatever is under it */
+    render_caption_buttons(r.right);
+    if (overlay && chrome_hovered()) render_tabbar(r.right, r.bottom);
 #else
+    if (overlay && chrome_hovered()) render_tabbar(r.right, r.bottom);
     mac_browser_draw_overlay();
     plat_render_title_overlay();
 #endif
@@ -5428,6 +5488,9 @@ static int mouse_report(int button, int press, int motion, int mx, int my, int m
     char buf[64];
     int col, row, b = button, n;
     if (!tb || !tb->t.m_mouse || (mods & M_SHIFT)) return 0;
+#ifndef _WIN32
+    if (mac_input_held(tb)) return 1;
+#endif
     if (motion && tb->t.m_mouse != 1003 && !(tb->t.m_mouse == 1002 && button != 3)) return 1;
     if (motion && tb->t.m_mouse == 9) return 1;
     mouse_cell(mx, my, &col, &row);
@@ -5965,7 +6028,52 @@ static BOOL CALLBACK tell_window(HWND h, LPARAM unused) {
     if (h != g_hwnd && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"hardcore")) PostMessageW(h, WM_APP_SETTINGS, 0, 0);
     return TRUE;
 }
-static void plat_settings_tell(void) { EnumWindows(tell_window, 0); }
+static void plat_settings_tell(void) {
+    if (_wgetenv(L"HARDCORE_TEST_CONFIG")) return;
+    EnumWindows(tell_window, 0);
+}
+
+/* Geometry inspection for an explicitly isolated GUI test. The controls and
+   screenshot channel still exercise the normal native renderer and input. */
+static int font_menu_test_state(const char *path) {
+    wchar_t wide[MAX_PATH];
+    FILE *f;
+    int n, i, comma = 0;
+    if (!_wgetenv(L"HARDCORE_TEST_CONFIG") ||
+        !MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH)) return 0;
+    tab_layout();
+    f = _wfopen(wide, L"wb");
+    if (!f) return 0;
+    fprintf(f, "{\"fontkey\":\"%c\",\"settings_open\":%d,\"settings_tab\":%d,\"scale\":%d,"
+               "\"cell\":{\"width\":%d,\"height\":%d},\"dock\":{\"x\":%d,\"width\":%d},"
+               "\"pages\":{\"settings_row\":%d,\"section_row\":%d,"
+               "\"settings\":{\"row\":%d,\"offset\":%d,\"capacity\":%d,\"total\":%d}},\"fonts\":[",
+            g_font->key, g_settings_open, g_settings_tab, g_scale,
+            cell_w(g_font), cell_h(g_font), sidebar_x() / cell_w(g_font), SB_COLS,
+            g_chrome.settings_row, g_chrome.section_row, g_chrome.list_row,
+            g_setting_offset[g_settings_tab], g_chrome.list_capacity, chrome_item_total());
+    for (i = 0; i < NFONTS; i++) {
+        const Font *font = &FONTS[i];
+        fprintf(f, "%s{\"fontkey\":\"%c\",\"name\":\"%s\",\"width\":%d,\"height\":%d,\"dev\":%d}",
+                i ? "," : "", font->key, font->name, cell_w(font), cell_h(font), font->dev);
+    }
+    fputs("],\"font_buttons\":[", f);
+    if (g_settings_open && g_settings_tab == 0) {
+        for (n = 0; n < g_chrome.list_count; n++) {
+            const FontMenuRow *row = &g_font_menu_rows[g_setting_offset[0] + n];
+            for (i = 0; i < row->count; i++) {
+                const FontMenuSize *size = &row->sizes[i];
+                const Font *font = &FONTS[size->font];
+                fprintf(f, "%s{\"fontkey\":\"%c\",\"name\":\"%s\",\"width\":%d,\"height\":%d,"
+                           "\"row\":%d,\"left\":%d,\"right\":%d}",
+                        comma++ ? "," : "", font->key, font->name, cell_w(font), cell_h(font),
+                        g_chrome.list_row + n, size->left, size->right);
+            }
+        }
+    }
+    fputs("]}\n", f);
+    return fclose(f) == 0;
+}
 
 static void tab_set_size(Tab *tb, int cols, int rows) {
     COORD sz;
@@ -6212,6 +6320,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_mouse_x = atoi(buf + 6);
                 g_mouse_y = strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1;
                 settings_point();
+            } else if (!strncmp(buf, "fontmenu ", 9)) {
+                return font_menu_test_state(buf + 9);
             } else if (!strncmp(buf, "click ", 6)) {
                 settings_click(atoi(buf + 6), strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1);
             } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);
@@ -6251,13 +6361,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit != HTCLIENT) return hit;
         ScreenToClient(hwnd, &pt);
         GetClientRect(hwnd, &r);
+        int chrome_hit = hit_tabbar(pt.x, pt.y, &idx);
+        if (g_chrome_drag || (chrome_hit != HIT_NONE && chrome_hit != HIT_BAR)) return HTCLIENT;
         if (!IsZoomed(hwnd) && pt.y < 5 * g_scale) {
             int corner = 16 * g_scale;
             return pt.x < corner ? HTTOPLEFT : pt.x >= r.right - corner ? HTTOPRIGHT : HTTOP;
         }
+        if (chrome_hit == HIT_BAR) return HTCAPTION;
         if ((cap = caption_hit(pt.x, pt.y))) return cap;
         if (in_top_line(pt.x, pt.y)) return HTCAPTION;
-        if (hit_tabbar(pt.x, pt.y, &idx) == HIT_BAR) return HTCAPTION;
         return HTCLIENT;
     }
     case WM_NCMOUSEMOVE: {
@@ -6322,7 +6434,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetCursorPos(&pt);
             ScreenToClient(hwnd, &pt);
             mouse_cell(pt.x, pt.y, &col, &row);
-            if (over_chrome(pt.x, pt.y)) SetCursor(LoadCursorW(NULL, (LPCWSTR)(tabbar_action(pt.x, pt.y) ? IDC_HAND : IDC_ARROW)));
+            int idx = -1, hit = hit_tabbar(pt.x, pt.y, &idx);
+            if (g_chrome_drag || hit == HIT_GRIP) SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL));
+            else if (over_chrome(pt.x, pt.y)) SetCursor(LoadCursorW(NULL, (LPCWSTR)(tabbar_action(pt.x, pt.y) ? IDC_HAND : IDC_ARROW)));
             else if ((GetKeyState(VK_CONTROL) & 0x8000) && link_at(col, row, url, sizeof(url)))
                 SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
             else SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM));
@@ -6523,6 +6637,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_nc_hover) { g_nc_hover = 0; InvalidateRect(hwnd, NULL, FALSE); }
         if (was_bar || on_bar) InvalidateRect(hwnd, NULL, FALSE);
         if (was_bar || on_bar) settings_point();
+        if (g_chrome_drag) { chrome_drag_move(mx, my); return 0; }
         if (g_sb_drag) { scrollbar_set(my); return 0; }
         if (g_sel_drag && tb) {
             mouse_cell(mx, my, &col, &row);
@@ -6550,6 +6665,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), idx = -1, col, row, hit;
         RECT r;
         Tab *tb = active_tab();
+        if (chrome_drag_begin(mx, my)) { SetCapture(hwnd); return 0; }
         hit = hit_tabbar(mx, my, &idx);
         if (hit == HIT_TAB) { activate(idx); return 0; }
         if (hit == HIT_CLOSE) { close_tab(idx); return 0; }
@@ -6583,7 +6699,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
+    case WM_CAPTURECHANGED:
+        if (g_chrome_drag) chrome_drag_end();
+        return 0;
     case WM_LBUTTONUP:
+        if (g_chrome_drag) {
+            chrome_drag_move(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); chrome_drag_end(); ReleaseCapture(); return 0;
+        }
         if (g_sb_drag || g_sel_drag) {
             g_sb_drag = g_sel_drag = 0;
             ReleaseCapture();

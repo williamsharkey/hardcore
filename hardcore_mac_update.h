@@ -13,7 +13,6 @@
 static NSString *g_mac_exe, *g_mac_target;
 static NSDictionary *g_mac_adopt;
 static int g_mac_state_fd = -1, g_mac_ack_fd = -1;
-static char g_mac_socket[104];
 
 static void mac_executable_init(void) {
     char path[4096], real[4096]; uint32_t n = sizeof(path);
@@ -65,18 +64,7 @@ static int mac_write_all(int fd, const void *bytes, size_t n) {
 /* Only the owning user can discover or contact these sockets. The peer UID
    is also checked on both ends. A request can reload only the server's own
    executable, never an arbitrary path supplied over IPC. */
-static NSString *mac_runtime_dir(void) {
-    NSString *path = [NSString stringWithFormat:@"/tmp/hardcore-%u", getuid()];
-    struct stat st;
-    if (mkdir([path fileSystemRepresentation], 0700) && errno != EEXIST) return nil;
-    if (lstat([path fileSystemRepresentation], &st) || !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 077)) return nil;
-    return path;
-}
-static int mac_peer_ok(int fd) {
-    uid_t uid; gid_t gid;
-    return !getpeereid(fd, &uid, &gid) && uid == getuid();
-}
-static void mac_socket_cleanup(void) { if (*g_mac_socket) unlink(g_mac_socket); }
+static NSString *mac_runtime_dir(void) { return mac_runtime(); }
 
 #define MAC_TERM_NUMBERS(X) \
     X(st) X(esc_which) X(np) X(priv) X(inter) X(utf8_need) X(utf8_acc) X(osc_n) \
@@ -97,6 +85,10 @@ static NSDictionary *mac_pack_tab(Tab *tb) {
         @"view": @(t->view), @"activity": @(tb->activity), @"attention": @(tb->attention),
         @"exited": @(tb->exited), @"help": @(tb->help), @"born": @(tb->born),
         @"dir": [NSString stringWithUTF8String:tb->start_dir] ?: @"",
+        @"run": [NSString stringWithUTF8String:tb->run] ?: @"",
+        @"hist": [NSString stringWithUTF8String:tb->hist] ?: @"",
+        @"claude_guard": @(tb->claude_guard), @"claude_released": @(tb->claude_released),
+        @"claude_cursor_sent": @(tb->claude_cursor_sent), @"claude_guard_at": @(tb->claude_guard_at),
         @"snapshot": [NSData dataWithBytes:snap.p length:snap.n],
         @"title": @""
     }];
@@ -175,6 +167,12 @@ static Tab *mac_unpack_tab(NSDictionary *d) {
     tb->activity = [d[@"activity"] intValue]; tb->attention = [d[@"attention"] intValue];
     tb->born = [d[@"born"] unsignedIntValue];
     snprintf(tb->start_dir, sizeof(tb->start_dir), "%s", [d[@"dir"] UTF8String] ?: "");
+    snprintf(tb->run, sizeof(tb->run), "%s", [d[@"run"] UTF8String] ?: "");
+    snprintf(tb->hist, sizeof(tb->hist), "%s", [d[@"hist"] UTF8String] ?: "");
+    tb->claude_guard = [d[@"claude_guard"] intValue];
+    tb->claude_released = [d[@"claude_released"] intValue];
+    tb->claude_cursor_sent = [d[@"claude_cursor_sent"] intValue];
+    tb->claude_guard_at = [d[@"claude_guard_at"] unsignedIntValue];
     return tb;
 }
 
@@ -183,6 +181,9 @@ static int mac_reload(int ack, char *why, size_t cap) {
     /* A blocked paste may wait indefinitely. Do not discard it or freeze UI. */
     for (int i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
+        if (mac_input_held(tb)) {
+            snprintf(why, cap, "a Claude draft is still being restored; retry after verification"); return 0;
+        }
         if (tb->wpending && __atomic_load_n(tb->wpending, __ATOMIC_ACQUIRE)) {
             snprintf(why, cap, "a paste is still pending; try again when it finishes"); return 0;
         }
@@ -194,6 +195,7 @@ static int mac_reload(int ack, char *why, size_t cap) {
     }
     NSDictionary *state = @{
         @"protocol": @1, @"tabs": tabs, @"active": @(g_active), @"frame": NSStringFromRect([g_win frame]),
+        @"spare_pid": @(g_spare ? g_spare->pid : 0),
         @"focused": @([NSApp isActive]), @"miniaturized": @([g_win isMiniaturized]),
         @"fullscreen": @(([g_win styleMask] & NSWindowStyleMaskFullScreen) != 0),
         @"settings_open": @(g_settings_open), @"settings_tab": @(g_settings_tab),
@@ -250,15 +252,25 @@ static int mac_adopt_read(void) {
     g_active = [state[@"active"] intValue];
     if (g_active < 0 || g_active >= g_ntabs) g_active = 0;
     g_settings_open = [state[@"settings_open"] boolValue]; g_settings_tab = [state[@"settings_tab"] intValue];
-    if (g_settings_tab < 0 || g_settings_tab > 2) g_settings_tab = 0;
+    if (g_settings_tab < 0 || g_settings_tab > 1) g_settings_tab = 0;
     g_tab_offset = [state[@"tab_offset"] intValue];
     NSArray *offsets = state[@"setting_offsets"];
     if ([offsets isKindOfClass:[NSArray class]] && [offsets count] == 3)
         for (int i = 0; i < 3; i++) g_setting_offset[i] = [offsets[i] intValue];
     g_layout_active = g_active; g_layout_ntabs = g_ntabs;
     g_mac_exe = [state[@"exe"] copy]; g_mac_target = [state[@"target"] copy];
+    /* A rollback runs the .previous image, but still belongs to the original
+       installation for subsequent discovery and another reload attempt. */
+    [g_mac_install_exe release]; g_mac_install_exe = [g_mac_exe copy];
     snprintf(g_mac_bin_dir, sizeof(g_mac_bin_dir), "%s", [[g_mac_exe stringByDeletingLastPathComponent] fileSystemRepresentation]);
-    for (int i = 0; i < g_ntabs; i++) if (g_tabs[i]->fd >= 0) mac_watch_tab(g_tabs[i]);
+    for (int i = 0; i < g_ntabs; i++) if (g_tabs[i]->fd >= 0) {
+        DWORD born = g_tabs[i]->born;
+        tab_start_io(g_tabs[i]);
+        g_tabs[i]->born = born;
+        /* A failed renderer may still exec the previous image. Keep every
+           inherited PTY through that fallback until mac_adopt_ready commits. */
+        fcntl(g_tabs[i]->fd, F_SETFD, 0);
+    }
     return 1;
 }
 static void mac_adopt_failure(const char *why) {
@@ -272,8 +284,30 @@ static void mac_adopt_failure(const char *why) {
     }
     if (g_mac_ack_fd >= 0) { dprintf(g_mac_ack_fd, "error %s\n", why); close(g_mac_ack_fd); }
 }
+/* exec closes the unused spare's CLOEXEC master, but the child still belongs
+   to this PID. Preserve its identity so the replacement reaps it as well. */
+static void mac_reap_previous_spare(pid_t pid) {
+    if (pid <= 1) return;
+    int status;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, WNOHANG); } while (waited < 0 && errno == EINTR);
+    if (waited != 0) return;
+    dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)pid,
+        DISPATCH_PROC_EXIT, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    if (!source) return;
+    dispatch_source_set_event_handler(source, ^{
+        pid_t result;
+        do { result = waitpid(pid, NULL, WNOHANG); } while (result < 0 && errno == EINTR);
+        if (result == 0) return;
+        dispatch_source_cancel(source);
+        dispatch_release(source);
+    });
+    dispatch_resume(source);
+}
+
 static void mac_adopt_ready(void) {
     if (!g_mac_adopt) return;
+    mac_reap_previous_spare([g_mac_adopt[@"spare_pid"] intValue]);
     for (int i = 0; i < g_ntabs; i++) if (g_tabs[i]->fd >= 0) fcntl(g_tabs[i]->fd, F_SETFD, FD_CLOEXEC);
     close(g_mac_state_fd); g_mac_state_fd = -1;
     if ([g_mac_adopt[@"miniaturized"] boolValue]) [g_win miniaturize:nil];
@@ -284,51 +318,6 @@ static void mac_adopt_ready(void) {
     }
     unsetenv("HARDCORE_MAC_ROLLBACK");
     update_title(); update_busy(1); schedule_spare();
-}
-static void mac_update_listen(void) {
-    NSString *dir = mac_runtime_dir();
-    if (!dir) return;
-    snprintf(g_mac_socket, sizeof(g_mac_socket), "%s/%d.sock", [dir fileSystemRepresentation], getpid());
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return;
-    fcntl(fd, F_SETFD, FD_CLOEXEC); fcntl(fd, F_SETFL, O_NONBLOCK);
-    struct sockaddr_un addr = {0}; addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", g_mac_socket);
-    unlink(g_mac_socket);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) || listen(fd, 8)) { close(fd); return; }
-    atexit(mac_socket_cleanup);
-    dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0, dispatch_get_main_queue());
-    dispatch_source_set_event_handler(source, ^{
-        int client = accept(fd, NULL, NULL);
-        if (client < 0) return;
-        fcntl(client, F_SETFD, FD_CLOEXEC);
-        /* BSD accept inherits O_NONBLOCK: wait for the request bytes after
-           accepting, bounded by SO_RCVTIMEO below. */
-        fcntl(client, F_SETFL, fcntl(client, F_GETFL) & ~O_NONBLOCK);
-        struct timeval timeout = {1, 0}; setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        char cmd[32768] = {0}; size_t got = 0;
-        if (mac_peer_ok(client)) while (got < sizeof(cmd)-1) {
-            ssize_t n = read(client, cmd+got, 1);
-            if (n < 0 && errno == EINTR) continue;
-            if (n != 1 || cmd[got++] == '\n') break;
-        }
-        if (!strcmp(cmd, "info\n")) {
-            NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"exe":g_mac_exe, @"pid":@(getpid()), @"browser_protocol":@1} options:0 error:nil];
-            mac_write_all(client, [json bytes], [json length]);
-        } else if (got>9 && cmd[got-1]=='\n' && !strncmp(cmd,"browser ",8)) {
-            NSData *data=[NSData dataWithBytes:cmd+8 length:got-9];
-            id request=[NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            NSDictionary *reply=[request isKindOfClass:NSDictionary.class] ? mac_browser_request(request) :
-                @{@"ok":@NO,@"error":@"Invalid browser request."};
-            NSData *json=[NSJSONSerialization dataWithJSONObject:reply options:0 error:nil];
-            mac_write_all(client,json.bytes,json.length);
-        } else if (!strcmp(cmd, "reload\n")) {
-            char why[256]; mac_reload(client, why, sizeof(why));
-            dprintf(client, "error %s\n", why); /* only reached when exec failed */
-        }
-        close(client);
-    });
-    dispatch_resume(source);
 }
 static NSData *mac_request(NSString *socket_path, const char *command, int seconds) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -356,7 +345,22 @@ static int mac_reload_windows(void) {
         NSString *path = [dir stringByAppendingPathComponent:name];
         NSData *info = mac_request(path, "info\n", 2);
         NSDictionary *d = info ? [NSJSONSerialization JSONObjectWithData:info options:0 error:nil] : nil;
-        if (![d isKindOfClass:[NSDictionary class]] || ![d[@"exe"] isEqualToString:g_mac_exe]) continue;
+        if (![d isKindOfClass:[NSDictionary class]]) {
+            /* Early slurp-enabled builds only understand plist/FD handoff.
+               Reload those once through their original safe transfer path. */
+            int peer = mac_connect(path);
+            NSDictionary *legacy = peer >= 0 && mac_send(peer, @{@"op": @"list"}) ? mac_recv(peer) : nil;
+            if (peer >= 0) close(peer);
+            if ([legacy[@"protocol"] intValue] != MAC_HANDOFF_VERSION ||
+                ![legacy[@"exe"] isEqual:g_mac_exe] || ![legacy[@"tabs"] count]) continue;
+            peer = mac_connect(path);
+            NSDictionary *result = peer >= 0 && mac_send(peer, @{@"op": @"reload", @"exe": g_mac_exe}) ? mac_recv(peer) : nil;
+            if (peer >= 0) close(peer);
+            if ([result[@"ok"] boolValue]) ok++;
+            else { bad++; fprintf(stderr, "hardcore: legacy window %s did not reload; check the original window\n", [name UTF8String]); }
+            continue;
+        }
+        if (![d[@"exe"] isEqualToString:g_mac_exe]) continue;
         NSData *reply = mac_request(path, "reload\n", 30);
         NSString *s = reply ? [[[NSString alloc] initWithData:reply encoding:NSUTF8StringEncoding] autorelease] : nil;
         if ([s isEqualToString:@"ok\n"]) ok++;
@@ -469,6 +473,10 @@ static int mac_update_unit(FILE *f) {
         vt_feed(&a->t, (const unsigned char *)alt, (int)strlen(alt));
         vt_feed(&a->t, (const unsigned char *)tails[k], (int)strlen(tails[k]));
         snprintf(a->t.cwd, sizeof(a->t.cwd), "/tmp/space here");
+        snprintf(a->run, sizeof(a->run), "claude-wait:/tmp/café/request.json");
+        snprintf(a->hist, sizeof(a->hist), "/tmp/handoff helper.py");
+        a->claude_guard = 1; a->claude_released = 1; a->claude_cursor_sent = 1;
+        a->claude_guard_at = 12345; a->born = 100;
         a->t.view = 2; a->t.marks[a->t.nmarks++] = a->t.hpushed - 3;
         NSData *data = [NSPropertyListSerialization dataWithPropertyList:mac_pack_tab(a) format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
         NSDictionary *decoded = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:nil];
@@ -477,7 +485,9 @@ static int mac_update_unit(FILE *f) {
         if (b) {
             ok = b->id == a->id && b->t.view == a->t.view && b->t.hcount == a->t.hcount && b->t.st == a->t.st &&
                  b->t.utf8_need == a->t.utf8_need && b->t.m_bracketed && b->t.m_mouse == 1000 &&
-                 b->t.hpushed-b->t.marks[0] == a->t.hpushed-a->t.marks[0] && !strcmp(a->t.cwd,b->t.cwd);
+                 b->t.hpushed-b->t.marks[0] == a->t.hpushed-a->t.marks[0] && !strcmp(a->t.cwd,b->t.cwd) &&
+                 !strcmp(a->run, b->run) && !strcmp(a->hist, b->hist) && b->born == a->born &&
+                 b->claude_guard && b->claude_released && b->claude_cursor_sent && b->claude_guard_at == a->claude_guard_at;
             vt_feed(&a->t, (const unsigned char *)rest[k], (int)strlen(rest[k]));
             vt_feed(&b->t, (const unsigned char *)rest[k], (int)strlen(rest[k]));
             ok = ok && a->t.st == b->t.st && a->t.cx == b->t.cx && !wcscmp(a->t.title,b->t.title);

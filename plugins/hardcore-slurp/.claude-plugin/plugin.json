@@ -1,0 +1,15 @@
+{
+  "name": "hardcore-slurp",
+  "version": "0.3.0",
+  "description": "Guarded cooperative handoff of a settled Claude Code session into Hardcore",
+  "author": {"name": "Hardcore"},
+  "license": "MIT",
+  "userConfig": {
+    "executable": {
+      "type": "string",
+      "title": "Hardcore executable",
+      "description": "Installed Hardcore command, or its absolute path",
+      "default": "hardcore"
+    }
+  }
+}

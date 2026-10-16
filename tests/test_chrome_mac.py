@@ -69,14 +69,14 @@ class Bitmap:
 class NativeApp:
     def __init__(self, root, mode, artifacts):
         self.root = root
-        self.mode = mode
+        self.mode = 2 if mode == 0 else mode
         self.artifacts = artifacts
         self.sequence = 0
         self.pids = set()
         cfg = root / "config"
         cfg.mkdir(parents=True)
         (cfg / "config.ini").write_text(
-            f"font=t\ntab_underlay={mode}\nchrome_reflow=1\nchrome_debug=1\n")
+            f"font=t\ntheme=h\ntab_underlay={mode}\nchrome_reflow=0\nchrome_debug=1\n")
         self.fifo = root / "control"
         self.log = open(root / "app.log", "w+")
         install = root / "hardcore.app"
@@ -338,7 +338,7 @@ def test_pagination(app):
     c = app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
     assert c["settings_open"] and c["settings_tab"] == 0, c
     assert c["pages"]["settings"]["capacity"] == c["pages"]["settings"]["total"], "roomy font list unnecessarily paginated"
-    c = app.click(c["dock"]["x"] + 10, c["pages"]["section_row"])
+    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
     assert c["pages"]["settings"]["capacity"] == c["pages"]["settings"]["total"], "roomy theme list unnecessarily paginated"
     app.snap("sidebar-full-settings")
     c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
@@ -349,11 +349,13 @@ def test_pagination(app):
     app.send("cmd resize 1001,160")
     c = walk_pages(app, "settings")
     before_font = c["fontkey"]
-    c = app.click(c["dock"]["x"] + 8, c["pages"]["settings"]["row"])
-    assert c["fontkey"] != before_font, "first paginated option row did not select its font"
+    button = next(button for button in c["font_buttons"] if button["fontkey"] != before_font)
+    c = app.click(c["dock"]["x"] + button["left"], button["row"])
+    assert c["fontkey"] == button["fontkey"], "font size button selected the wrong font"
+    assert c["cell"] == {"width": button["width"], "height": button["height"]}, c
     font_offset = c["pages"]["settings"]["offset"]
     app.snap("sidebar-font-last-page")
-    c = app.click(c["dock"]["x"] + 10, c["pages"]["section_row"])
+    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
     assert c["settings_tab"] == 1, c
     c = walk_pages(app, "settings")
     before_scheme = c["schemekey"]
@@ -369,34 +371,10 @@ def test_pagination(app):
     app.snap("sidebar-tab-last-page")
     print("PASS: font/theme/tab pages reach every option and return from partial last pages; option rows remain selectable and tabs occupy one row")
 
-    # Exercise the native Layout controls, including actual mode changes.
-    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
-    assert c["settings_tab"] == 2, c
-    widths = {}
-    for expected in (1, 2, 0):
-        c = app.click(c["dock"]["x"] + 8, c["pages"]["settings"]["row"])
-        assert c["mode"] == expected, c
-        widths[expected] = c["cols"]
-    assert widths[1] == widths[2] > widths[0], widths
-    c = app.click(c["dock"]["x"] + 8, c["pages"]["settings"]["row"] + 1)
-    assert not c["reflow_enabled"], c
-    c = app.click(c["dock"]["x"] + 8, c["pages"]["settings"]["row"] + 1)
-    assert c["reflow_enabled"], c
-    c = app.click(c["dock"]["x"] + 8, c["pages"]["settings"]["row"])
-    assert c["mode"] == 1, c
-    top = c["dock"]["y"]
-    c = app.click(c["dock"]["x"] + c["dock"]["width"] - 3, c["pages"]["settings"]["row"] + 3)
-    assert c["dock"]["y"] == top + 1, c
-    config = (app.root / "config/config.ini").read_text()
-    assert "tab_underlay=1" in config and "chrome_reflow=1" in config and f"dock_row={top + 1}" in config, config
-    app.snap("right-settings-layout")
-    print("PASS: Layout controls switch all modes, toggle reflow, move the dock by a grid row and persist settings")
-
-    # Reload only this disposable install, preserving the actual process and
-    # independent page positions. In particular Layout is index 2, not a bool.
+    # Reload preserves independent Font and Theme page positions.
     c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
     font_offset = c["pages"]["settings"]["offset"]
-    c = app.click(c["dock"]["x"] + 11, c["pages"]["section_row"])
+    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
     theme_offset = c["pages"]["settings"]["offset"]
     c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
     keys = ("mode", "settings_open", "settings_tab", "fontkey", "schemekey", "reflow_enabled", "dock", "pages")
@@ -409,9 +387,9 @@ def test_pagination(app):
     assert {key: c[key] for key in keys} == before, (before, c)
     c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
     assert c["settings_tab"] == 0 and c["pages"]["settings"]["offset"] == font_offset, c
-    c = app.click(c["dock"]["x"] + 11, c["pages"]["section_row"])
+    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
     assert c["settings_tab"] == 1 and c["pages"]["settings"]["offset"] == theme_offset, c
-    print("PASS: in-place reload preserves Layout selection, dock settings, independent Font/Theme pages and app PID")
+    print("PASS: in-place reload preserves dock settings, independent Font/Theme pages and app PID")
 
 
 def pixel(bitmap, x, y):
@@ -465,7 +443,7 @@ def test_visible_whitespace_and_rules(app):
     lines[row] = "\x1b[48;2;60;70;80m" + " " * c["cols"] + "\x1b[0m"
     app.feed(lines)
     shaded = app.snap("codex-meaningful-background")
-    assert shaded.crop(*box) != dim.crop(*box), "highlighted background was lost"
+    assert shaded.crop(*box) == dim.crop(*box), "clear menu row is not fully opaque over highlighted blank space"
     interior = shaded.crop(box[0] + cell["width"], box[1] + 2, box[2] - 3*cell["width"], box[3] - 4)
     assert len({interior[i:i+3] for i in range(0, len(interior), 4)}) > 1, "highlighted blank cells still hide the menu text"
     # Terminal text owns its whole cell even over the colored background.
@@ -501,7 +479,6 @@ def test_title_underlay(app):
     title = c["titlebar"]
     assert 0 < title["height"] < 5 * c["cell"]["height"], title
     assert not title["hovered"] and not title["buttons_visible"], title
-    assert min(r for r in c["tab_rows"] if r >= 0) >= title["height"], "title hover obscures a clickable tab"
     cw, ch = c["cell"]["width"], c["cell"]["height"]
     title_rows = (title["height"] + ch - 1) // ch
 
@@ -592,6 +569,55 @@ def test_title_underlay(app):
     print("PASS: top hover smokes full width; upward selection keeps traffic lights beneath text, controls hidden and scrolling active")
 
 
+def test_drag_and_quiet_tabs(app):
+    c = app.chrome()
+    if c["settings_open"]:
+        c = app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
+    app.send("cmd newtab")
+    wait_for(lambda: len(app.state()["tabs"]) == 2, description="second drag-test tab")
+    app.send("type sleep 600\\n")
+    wait_for(lambda: app.state()["tabs"][1]["program"] == "sleep", description="second quiet PTY")
+    c = app.feed([""] * app.chrome()["rows"])
+    cols = c["cols"]
+    for side, target_col, target_row in ((2, 1, 5), (1, cols - 2, 0)):
+        cw, ch = c["cell"]["width"], c["cell"]["height"]
+        handle_x = int((c["dock"]["x"] + 1.5) * cw)
+        handle_y = int((c["dock"]["y"] + .5) * ch)
+        target_x, target_y = int((target_col + .5) * cw), int((target_row + .5) * ch)
+        app.send(f"cmd pointer down {handle_x},{handle_y}")
+        app.send(f"cmd pointer drag {target_x},{target_y}")
+        app.send(f"cmd pointer up {target_x},{target_y}")
+        c = app.chrome()
+        assert c["mode"] == side and c["dock"]["y"] == target_row and c["cols"] == cols, c
+        assert not c["reflow_markers"] and c["reflow_enabled"], c
+        app.snap(f"drag-dock-{side}-row-{target_row}")
+    config = (app.root / "config/config.ini").read_text()
+    assert "tab_underlay=1" in config and "dock_row=0" in config, config
+    assert "chrome_reflow=" not in config and "chrome_debug=" not in config, config
+
+    row = c["pages"]["tabs"]["row"]
+    app.hover(-1, -1)
+    quiet = app.snap("tabs-without-close-or-separators")
+    close_x = (c["dock"]["x"] + c["dock"]["width"] - 2) * cw
+    close_box = (close_x, row * ch, cw, ch)
+    pixels = quiet.crop(*close_box)
+    # First tab has a top section rule, so inspect the glyph interior only.
+    interior = quiet.crop(close_x, row * ch + 2, cw, ch - 4)
+    assert len({interior[i:i+3] for i in range(0, len(interior), 4)}) == 1, "close glyph visible without hover"
+    boundary = (row + 1) * ch
+    x = (c["dock"]["x"] + c["dock"]["width"]) * cw - 2
+    assert pixel(quiet, x, boundary) == pixel(quiet, x, boundary + 1), "tab separator remains"
+    c = app.hover(c["dock"]["x"] + 6, row)
+    assert not c["titlebar"]["hovered"], "top titlebar obscures hovered tab"
+    pointed = app.snap("hovered-tab-close")
+    assert pointed.crop(*close_box) != pixels, "close glyph did not appear"
+    x, y = int((c["dock"]["x"] + 6.5) * cw), int((row + .5) * ch)
+    app.send(f"cmd pointer down {x},{y}")
+    app.send(f"cmd pointer up {x},{y}")
+    assert app.state()["active"] == 0, "titlebar intercepted tab selection"
+    print("PASS: native handle snaps to both edges and row zero; tabs hide close buttons and separators; top tab remains clickable")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, default=ROOT / "build/chrome-native")
@@ -604,7 +630,7 @@ def main():
         for mode in (0, 1, 2):
             with NativeApp(Path(tmp) / f"mode-{mode}", mode, args.artifacts) as app:
                 c = app.chrome()
-                assert c["mode"] == mode, c
+                assert c["mode"] == app.mode and c["reflow_enabled"] and not c["reflow_markers"], c
                 columns[mode] = c["cols"]
                 if mode:
                     test_reflow(app)
@@ -613,11 +639,13 @@ def main():
                         test_visible_whitespace_and_rules(app)
                         test_title_underlay(app)
                     test_hover(app)
+                    if mode == 1:
+                        test_drag_and_quiet_tabs(app)
                 else:
                     app.snap("sidebar")
                     test_pagination(app)
-        assert columns[1] == columns[2] > columns[0], columns
-        print("PASS: both underlays use equal full terminal width; sidebar reserves only its actual grid width")
+        assert columns[1] == columns[2] == columns[0], columns
+        print("PASS: both underlays and migrated sidebar settings use the same full terminal width")
     print(f"Native chrome screenshots: {args.artifacts}")
 
 

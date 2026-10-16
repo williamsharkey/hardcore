@@ -1,0 +1,539 @@
+<div id="hardcore-font-lab">
+  <style>
+    #hardcore-font-lab { container-type: inline-size; color: var(--foreground); }
+    #hardcore-font-lab .fl-head { padding-right: 94px; margin-bottom: 18px; }
+    #hardcore-font-lab .fl-head h2 { margin: 0 0 6px; }
+    #hardcore-font-lab .fl-toolbar { display: flex; flex-wrap: wrap; gap: 16px; align-items: end; margin-bottom: 16px; }
+    #hardcore-font-lab .fl-font-field { flex: 1 1 280px; min-width: 0; }
+    #hardcore-font-lab .fl-scale-field { flex: 0 1 150px; }
+    #hardcore-font-lab .fl-adjustments { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 18px; margin-bottom: 12px; }
+    #hardcore-font-lab .fl-range-heading { display: flex; justify-content: space-between; gap: 10px; }
+    #hardcore-font-lab .fl-box-option { margin-bottom: 18px; }
+    #hardcore-font-lab .fl-pair { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 20px; align-items: start; }
+    #hardcore-font-lab .fl-pane { min-width: 0; }
+    #hardcore-font-lab .fl-pane-heading { margin-bottom: 8px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; align-items: baseline; }
+    #hardcore-font-lab .fl-name { font-weight: 500; }
+    #hardcore-font-lab .fl-screen { display: block; image-rendering: pixelated; max-width: none; max-height: none; }
+    #hardcore-font-lab .fl-screen-wrap { min-height: 1px; }
+    #hardcore-font-lab .fl-source { margin-top: 8px; }
+    #hardcore-font-lab .fl-status { margin: 12px 0 22px; }
+    #hardcore-font-lab .fl-inspector-head { display: flex; align-items: end; flex-wrap: wrap; gap: 14px; margin: 16px 0 14px; }
+    #hardcore-font-lab .fl-inspector-title { flex: 1 1 180px; }
+    #hardcore-font-lab .fl-inspector-title h3 { margin: 0 0 5px; }
+    #hardcore-font-lab .fl-glyph-field { width: 100px; }
+    #hardcore-font-lab .fl-seam-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin-bottom: 10px; }
+    #hardcore-font-lab .fl-seam-field { flex: 1 1 150px; min-width: 0; }
+    #hardcore-font-lab .fl-seam-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    #hardcore-font-lab .fl-seam-status { margin: 0 0 16px; }
+    #hardcore-font-lab .fl-settings { margin-top: 20px; }
+    #hardcore-font-lab .fl-settings-row { display: flex; flex-wrap: wrap; align-items: end; gap: 16px; margin-top: 10px; }
+    #hardcore-font-lab .fl-settings-text { margin-top: 12px; }
+    #hardcore-font-lab .fl-glyph-area { display: flex; flex-wrap: wrap; gap: 14px; align-items: start; }
+    #hardcore-font-lab .fl-grid { display: block; max-width: none; max-height: none; }
+    #hardcore-font-lab .fl-metrics { display: grid; gap: 7px; padding-top: 5px; }
+    #hardcore-font-lab .fl-metric { display: flex; align-items: center; gap: 7px; }
+    #hardcore-font-lab .fl-mark { display: inline-block; width: 14px; height: 2px; }
+    #hardcore-font-lab .fl-cap { background: var(--blue); }
+    #hardcore-font-lab .fl-x { background: var(--orange); }
+    #hardcore-font-lab .fl-baseline { background: var(--green); }
+    #hardcore-font-lab .fl-sources { margin-top: 20px; }
+    #hardcore-font-lab .fl-source-list { display: grid; gap: 10px; margin-top: 10px; }
+    #hardcore-font-lab [hidden] { display: none !important; }
+    @container (max-width: 580px) {
+      #hardcore-font-lab .fl-pair { grid-template-columns: minmax(0,1fr); gap: 20px; }
+      #hardcore-font-lab .fl-adjustments { grid-template-columns: minmax(0,1fr); gap: 10px; }
+      #hardcore-font-lab .fl-head { padding-right: 90px; }
+    }
+  </style>
+
+  <div class="fl-head">
+    <h2>Hairline font bench</h2>
+    <div class="text-small text-muted">Actual bitmap pixels</div>
+  </div>
+
+  <div class="fl-toolbar">
+    <label class="form-label fl-font-field" for="fl-comparison">Compare with
+      <select id="fl-comparison" class="form-select"></select>
+    </label>
+    <label class="form-label fl-scale-field" for="fl-scale">Preview scale
+      <select id="fl-scale" class="form-select">
+        <option value="1">1× device pixels</option>
+        <option value="2">2× enlarged</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="fl-adjustments" id="fl-adjustments">
+    <label class="form-label" for="fl-x-height">
+      <span class="fl-range-heading"><span>Lowercase x-height</span><output id="fl-x-value" class="tabular-nums" for="fl-x-height">+2 px</output></span>
+      <input id="fl-x-height" class="form-range" type="range" min="0" max="6" value="2" step="1">
+    </label>
+    <label class="form-label" for="fl-cap-height">
+      <span class="fl-range-heading"><span>Cap height / digits</span><output id="fl-cap-value" class="tabular-nums" for="fl-cap-height">+2 px</output></span>
+      <input id="fl-cap-height" class="form-range" type="range" min="0" max="6" value="2" step="1">
+    </label>
+    <label class="form-label" for="fl-cell-height">
+      <span class="fl-range-heading"><span>Cell / line height</span><output id="fl-cell-value" class="tabular-nums" for="fl-cell-height">26 px</output></span>
+      <input id="fl-cell-height" class="form-range" type="range" min="24" max="32" value="26" step="1">
+    </label>
+  </div>
+  <div class="fl-box-option" id="fl-box-option">
+    <label class="form-check"><input id="fl-boxes" type="checkbox" class="form-check-input" checked><span class="form-check-label">Extend box strokes to cell edges</span></label>
+  </div>
+
+  <div class="fl-pair">
+    <section class="fl-pane" aria-label="Original font terminal preview">
+      <div class="fl-pane-heading"><span class="fl-name">Original Terminus</span><span class="text-small text-muted tabular-nums" id="fl-original-size">12 × 24</span></div>
+      <div class="fl-screen-wrap" id="fl-original-wrap"><canvas id="fl-original" class="fl-screen" role="img" aria-label="Sample terminal interface rendered in the original Terminus bitmap"></canvas></div>
+      <div id="fl-original-note" class="fl-source text-small text-muted"></div>
+    </section>
+    <section class="fl-pane" aria-label="Comparison font terminal preview">
+      <div class="fl-pane-heading"><span class="fl-name" id="fl-comparison-name">Hairline Lab</span><span class="text-small text-muted tabular-nums" id="fl-comparison-size">12 × 26</span></div>
+      <div class="fl-screen-wrap" id="fl-comparison-wrap"><canvas id="fl-comparison-canvas" class="fl-screen" role="img" aria-label="The same terminal interface in the selected font"></canvas></div>
+      <div id="fl-comparison-note" class="fl-source text-small text-muted"></div>
+    </section>
+  </div>
+  <div class="fl-status text-small text-muted tabular-nums" id="fl-pixel-status" aria-live="polite"></div>
+
+  <hr>
+  <div class="fl-inspector-head">
+    <div class="fl-inspector-title"><h3>Inspect a glyph</h3><div class="text-small text-muted">One square = one bitmap pixel</div></div>
+    <label class="form-label fl-glyph-field" for="fl-glyph">Character
+      <select id="fl-glyph" class="form-select">
+        <optgroup label="Lowercase"><option>a</option><option>b</option><option>c</option><option>d</option><option>e</option><option>f</option><option>g</option><option>h</option><option>i</option><option>j</option><option>k</option><option>l</option><option>m</option><option>n</option><option>o</option><option>p</option><option>q</option><option>r</option><option>s</option><option>t</option><option>u</option><option>v</option><option>w</option><option>x</option><option>y</option><option>z</option></optgroup>
+        <optgroup label="Uppercase"><option>A</option><option>B</option><option>C</option><option>D</option><option>E</option><option>F</option><option>G</option><option>H</option><option selected>I</option><option>J</option><option>K</option><option>L</option><option>M</option><option>N</option><option>O</option><option>P</option><option>Q</option><option>R</option><option>S</option><option>T</option><option>U</option><option>V</option><option>W</option><option>X</option><option>Y</option><option>Z</option></optgroup>
+        <optgroup label="Digits"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></optgroup>
+        <optgroup label="Box strokes"><option>│</option><option>─</option><option>┌</option><option>┐</option><option>└</option><option>┘</option><option>├</option><option>┤</option><option>┬</option><option>┴</option><option>┼</option></optgroup>
+      </select>
+    </label>
+  </div>
+  <div id="fl-seam-editor">
+    <div class="fl-seam-controls">
+      <label for="fl-insertion" class="form-label fl-seam-field">Expansion arrow
+        <select id="fl-insertion" class="form-select"></select>
+      </label>
+      <div class="fl-seam-actions">
+        <button id="fl-insertion-up" type="button" class="btn" aria-label="Move selected expansion arrow up to the next safe row">↑ Move up</button>
+        <button id="fl-insertion-down" type="button" class="btn" aria-label="Move selected expansion arrow down to the next safe row">↓ Move down</button>
+        <button id="fl-insertion-auto" type="button" class="btn btn-ghost">Automatic placement</button>
+      </div>
+    </div>
+    <div id="fl-seam-status" class="fl-seam-status text-small text-muted" aria-live="polite"></div>
+  </div>
+  <div class="fl-pair">
+    <section class="fl-pane" aria-label="Original glyph pixel grid">
+      <div class="fl-pane-heading"><span class="fl-name">Original</span><span id="fl-original-glyph-size" class="text-small text-muted tabular-nums"></span></div>
+      <div class="fl-glyph-area"><canvas id="fl-glyph-original" class="fl-grid" role="img" aria-label="Original glyph pixel grid"></canvas><div class="fl-metrics text-small tabular-nums" id="fl-metrics-original"></div></div>
+    </section>
+    <section class="fl-pane" aria-label="Comparison glyph pixel grid">
+      <div class="fl-pane-heading"><span class="fl-name" id="fl-glyph-comparison-name">Hairline Lab</span><span id="fl-comparison-glyph-size" class="text-small text-muted tabular-nums"></span></div>
+      <div class="fl-glyph-area"><canvas id="fl-glyph-comparison" class="fl-grid" role="img" aria-label="Comparison glyph pixel grid"></canvas><div class="fl-metrics text-small tabular-nums" id="fl-metrics-comparison"></div></div>
+    </section>
+  </div>
+  <details class="fl-settings">
+    <summary>Save or load tuning</summary>
+    <div class="fl-settings-row">
+      <button id="fl-settings-export" class="btn" type="button">Show tuning JSON</button>
+      <button id="fl-settings-import" class="btn" type="button">Load tuning JSON</button>
+    </div>
+    <div class="fl-settings-text">
+      <label for="fl-settings-json" class="form-label">Tuning JSON</label>
+      <textarea id="fl-settings-json" class="form-control" rows="8" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="fl-settings-hint"></textarea>
+      <div id="fl-settings-hint" class="text-small text-muted">Copy this JSON to keep or share a design.</div>
+    </div>
+    <div id="fl-settings-status" class="text-small text-muted" aria-live="polite"></div>
+  </details>
+  <details class="fl-sources text-small">
+    <summary>Font sources and licenses</summary>
+    <div id="fl-source-list" class="fl-source-list"></div>
+  </details>
+  <div id="fl-error" class="text-destructive" role="alert" hidden></div>
+</div>
+
+<!--FONTLAB_DATA-->
+<!--FONTLAB_ENGINE-->
+<script>
+(() => {
+  "use strict";
+  const root = document.getElementById("hardcore-font-lab");
+  const el = id => root.querySelector("#" + id);
+  const data = globalThis.fontLabData;
+  if (!data || !Array.isArray(data.fonts) || !data.fonts.length || !globalThis.HairlineVariant) {
+    el("fl-error").hidden = false;
+    el("fl-error").textContent = "Font data could not be loaded.";
+    return;
+  }
+  const fonts = data.fonts;
+  const base = fonts.find(font => font.id === "terminus24") || fonts[0];
+  const defaults = {fontId:"experiment", xHeightDelta:2, capHeightDelta:2, cellHeight:26, scale:1, glyph:"e", redrawBoxes:true, glyphSeams:{}, selectedInsertion:0};
+  let state = {...defaults};
+  let rendered = {};
+  let renderPending = false;
+  let currentPlan = null;
+  const allowedGlyphs = Array.from(el("fl-glyph").options, option => option.value);
+  const integer = (value, low, high, fallback) => Number.isInteger(Number(value)) ? Math.min(high,Math.max(low,Number(value))) : fallback;
+  function cleanState(value) {
+    if (!value || typeof value !== "object") return {...defaults};
+    const glyphSeams = {};
+    if (value.glyphSeams && typeof value.glyphSeams === "object" && !Array.isArray(value.glyphSeams)) {
+      for (const character of "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") {
+        const cp = String(character.codePointAt(0)), seams = value.glyphSeams[cp];
+        if (Array.isArray(seams) && seams.length && seams.length<=6 && seams.every(y=>Number.isInteger(y) && y>=0 && y<=24)) glyphSeams[cp]=seams.slice();
+      }
+    }
+    return {
+      fontId: value.fontId === "experiment" || fonts.some(f => f.id === value.fontId) ? value.fontId : defaults.fontId,
+      xHeightDelta: integer(value.xHeightDelta,0,6,defaults.xHeightDelta),
+      capHeightDelta: integer(value.capHeightDelta,0,6,defaults.capHeightDelta),
+      cellHeight: integer(value.cellHeight,24,32,defaults.cellHeight),
+      scale: value.scale === 2 ? 2 : 1,
+      glyph: allowedGlyphs.includes(value.glyph) ? value.glyph : defaults.glyph,
+      redrawBoxes: typeof value.redrawBoxes === "boolean" ? value.redrawBoxes : true,
+      glyphSeams,
+      selectedInsertion: integer(value.selectedInsertion,0,5,0)
+    };
+  }
+  function applyStored(value) {
+    const choices = value && (value.modelContent || value.privateContent || value);
+    if (choices) state = cleanState(choices);
+  }
+  applyStored(window.openai && window.openai.widgetState);
+  function remember() {
+    if (window.openai && typeof window.openai.setWidgetState === "function") {
+      const result = window.openai.setWidgetState({modelContent:{...state},privateContent:null});
+      if (result && typeof result.catch === "function") result.catch(() => {});
+    }
+  }
+  const experimentOption = document.createElement("option");
+  experimentOption.value = "experiment";
+  experimentOption.textContent = "Hairline Lab · derived from Terminus";
+  el("fl-comparison").append(experimentOption);
+  const thinGroup = document.createElement("optgroup");
+  thinGroup.label = "Single-pixel stem candidates";
+  const referenceGroup = document.createElement("optgroup");
+  referenceGroup.label = "Heavier bitmap references";
+  el("fl-comparison").append(thinGroup,referenceGroup);
+  for (const font of fonts) {
+    const option = document.createElement("option");
+    option.value = font.id;
+    option.textContent = font.name + (font.stemPixels > 1 ? " · heavier reference" : "");
+    (font.stemPixels > 1 ? referenceGroup : thinGroup).append(option);
+    const row = document.createElement("div");
+    const name = document.createElement(font.source ? "a" : "span");
+    name.textContent = font.name;
+    if (font.source) {
+      const link = typeof font.source === "string" ? font.source : font.source.url;
+      if (/^https:\/\//.test(link || "")) { name.href = link; name.target = "_blank"; name.rel = "noopener noreferrer"; }
+    }
+    row.append(name, document.createTextNode(" — " + (font.license || "See upstream license")));
+    el("fl-source-list").append(row);
+  }
+  function bitmap(font, character) {
+    return font.glyphs[String(character.codePointAt(0))] || font.glyphs[character] || null;
+  }
+  function bounds(font, character) {
+    const rows = bitmap(font,character) || [];
+    let top = font.height, bottom = -1;
+    rows.forEach((mask,y) => { if (mask) {top=Math.min(top,y);bottom=y;} });
+    return {top: bottom < 0 ? 0 : top, bottom};
+  }
+  function metrics(font) {
+    const cap = bounds(font,"H"), lower = bounds(font,"x");
+    return {
+      baseline: font.metrics?.baseline ?? (cap.bottom + 1),
+      capTop: font.metrics?.capTop ?? cap.top,
+      xTop: font.metrics?.xTop ?? lower.top
+    };
+  }
+  function syncControls() {
+    el("fl-comparison").value = state.fontId;
+    el("fl-scale").value = String(state.scale);
+    el("fl-x-height").value = String(state.xHeightDelta);
+    el("fl-cap-height").value = String(state.capHeightDelta);
+    el("fl-cell-height").value = String(state.cellHeight);
+    el("fl-glyph").value = state.glyph;
+    el("fl-boxes").checked = state.redrawBoxes;
+    el("fl-x-value").value = "+" + state.xHeightDelta + " px";
+    el("fl-cap-value").value = "+" + state.capHeightDelta + " px";
+    el("fl-cell-value").value = state.cellHeight + " px";
+    el("fl-adjustments").hidden = state.fontId !== "experiment";
+    el("fl-box-option").hidden = state.fontId !== "experiment";
+  }
+  function selectedFont() {
+    if (state.fontId === "experiment") return HairlineVariant.makeFont(base,state);
+    return fonts.find(font => font.id === state.fontId) || base;
+  }
+  function insertionPlan(font) {
+    if (state.fontId !== "experiment") return {seams:[],safeBoundaries:[]};
+    const cp=String(state.glyph.codePointAt(0));
+    return {seams:font.experiment?.placements?.[cp] || [],safeBoundaries:font.experiment?.safeBoundaries?.[cp] || []};
+  }
+  function updateInsertionControls(font) {
+    currentPlan=insertionPlan(font);
+    const seams=currentPlan.seams;
+    state.selectedInsertion=Math.min(state.selectedInsertion,Math.max(0,seams.length-1));
+    el("fl-seam-editor").hidden=state.fontId!=="experiment";
+    const select=el("fl-insertion");
+    select.replaceChildren();
+    if (!seams.length) {
+      const option=document.createElement("option");option.value="0";option.textContent="No inserted rows";select.append(option);
+    }
+    seams.forEach((seam,index)=>{
+      const option=document.createElement("option");option.value=String(index);
+      option.textContent="Arrow "+(index+1)+" · source row "+seam.actual;
+      select.append(option);
+    });
+    select.value=String(state.selectedInsertion);
+    select.disabled=!seams.length;
+    const selected=seams[state.selectedInsertion], cp=String(state.glyph.codePointAt(0));
+    const safe=currentPlan.safeBoundaries;
+    el("fl-insertion-up").disabled=!selected || !safe.some(y=>y<selected.actual);
+    el("fl-insertion-down").disabled=!selected || !safe.some(y=>y>selected.actual);
+    el("fl-insertion-auto").disabled=!Object.prototype.hasOwnProperty.call(state.glyphSeams,cp);
+    const alphanumeric=/^[a-zA-Z0-9]$/.test(state.glyph);
+    const mode=Object.prototype.hasOwnProperty.call(state.glyphSeams,cp) ? "Custom placement" : "Balanced placement";
+    el("fl-seam-status").textContent=!alphanumeric ? "Box strokes follow the cell height." : !seams.length ? "Increase "+(/[a-z]/.test(state.glyph)?"x-height":"cap height")+" to add expansion arrows to "+state.glyph+"." :
+      mode+" · "+seams.length+" inserted row"+(seams.length===1?"":"s")+" · arrows move between safe stroke rows";
+  }
+  function moveInsertion(direction) {
+    if (!currentPlan) return;
+    const selected=currentPlan.seams[state.selectedInsertion];
+    if (!selected) return;
+    const candidates=currentPlan.safeBoundaries.filter(y=>direction<0 ? y<selected.actual : y>selected.actual);
+    if (!candidates.length) return;
+    const next=direction<0 ? Math.max(...candidates) : Math.min(...candidates);
+    const cp=String(state.glyph.codePointAt(0));
+    const overrides=(state.glyphSeams[cp] || []).slice();
+    for(let index=0;index<currentPlan.seams.length;index++) if(!Number.isInteger(overrides[index])) overrides[index]=currentPlan.seams[index].actual;
+    overrides[state.selectedInsertion]=next;
+    state.glyphSeams={...state.glyphSeams,[cp]:overrides};
+    render();remember();
+  }
+  function terminalRows(columns) {
+    const inner = columns - 2;
+    const fit = text => Array.from(text).slice(0,inner).join("").padEnd(inner," ");
+    const row = (text,tone="fg") => ({text:"│"+fit(text)+"│",tone});
+    const edge = (left,right,title="") => ({text:left+Array.from(title).slice(0,inner).join("").padEnd(inner,"─")+right,tone:"edge"});
+    const compact = columns < 28;
+    const rows = [edge("┌","┐",compact ? " hardcore " : " hardcore / src/font.c "),
+      row(compact ? " branch: main" : " branch: main    modified: font.c","dim"),
+      edge("├","┤"),
+      row(compact ? " int line = 1;" : " 12  int line = 1;"),
+      row(compact ? " if (ready) {" : " 13  if (ready) {"),
+      row(compact ? "   draw(0);" : " 14      draw_glyph('I', 0);","accent"),
+      row(compact ? " }" : " 15  }"),
+      edge("├","┤"),
+      row(" I H n x a e g 0 1 8")];
+    for (const group of ["abcdefghijklmnopqrstuvwxyz","ABCDEFGHIJKLMNOPQRSTUVWXYZ","0123456789 !? [] {} () /\\"]) {
+      const limit = Math.max(1,inner-2);
+      for (let i=0;i<group.length;i+=limit) rows.push(row(" "+group.slice(i,i+limit)));
+    }
+    rows.push(edge("├","┤"),row(compact ? " $ make test" : " $ make test     71 passed","accent"),edge("└","┘"));
+    return rows;
+  }
+  function setupCanvas(canvas,width,height,dpr) {
+    canvas.width = width;
+    canvas.height = height;
+    canvas.style.width = (width/dpr)+"px";
+    canvas.style.height = (height/dpr)+"px";
+    canvas.style.transform = "none";
+    const context = canvas.getContext("2d",{alpha:false});
+    context.imageSmoothingEnabled = false;
+    return context;
+  }
+  function snapOrigin(canvas,dpr) {
+    canvas.style.transform = "none";
+    const bounds = canvas.getBoundingClientRect();
+    const dx = (Math.round(bounds.left*dpr)-bounds.left*dpr)/dpr;
+    const dy = (Math.round(bounds.top*dpr)-bounds.top*dpr)/dpr;
+    canvas.style.transform = `translate(${dx}px,${dy}px)`;
+  }
+  function drawTerminal(canvas,font,rows,columns,dpr) {
+    const zoom = state.scale;
+    const ctx = setupCanvas(canvas,columns*font.width*zoom,rows.length*font.height*zoom,dpr);
+    ctx.fillStyle = "#0c0c0c";
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    const palette = {fg:"#dedede",dim:"#a6a6a6",edge:"#a39a88",accent:"#e8c77a"};
+    const missing = new Set();
+    rows.forEach((row,line) => {
+      Array.from(row.text).forEach((character,column) => {
+        let bits = bitmap(font,character);
+        if (!bits) { missing.add(character);bits=bitmap(font,"?") || []; }
+        ctx.fillStyle = palette[row.tone];
+        bits.forEach((mask,y) => {
+          for (let x=0;x<font.width;x++) if ((mask >>> (font.width-1-x)) & 1) {
+            ctx.fillRect((column*font.width+x)*zoom,(line*font.height+y)*zoom,zoom,zoom);
+          }
+        });
+      });
+    });
+    snapOrigin(canvas,dpr);
+    return Array.from(missing);
+  }
+  function themeColor(token) {
+    const swatch = document.createElement("span");
+    swatch.style.color = "var("+token+")";
+    swatch.style.display = "none";
+    root.append(swatch);
+    const color = getComputedStyle(swatch).color;
+    swatch.remove();
+    return color;
+  }
+  function drawGlyph(canvas,font,metricTarget,dpr,colors,isOriginal) {
+    const bits = bitmap(font,state.glyph) || [];
+    const step = Math.max(3,Math.round(6*dpr));
+    const originX=3*step;
+    const ctx = setupCanvas(canvas,(font.width+4)*step,(font.height+2)*step,dpr);
+    ctx.fillStyle = colors.bg;
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = colors.grid;
+    for (let x=0;x<=font.width;x++) ctx.fillRect(originX+x*step,step,1,font.height*step);
+    for (let y=0;y<=font.height;y++) ctx.fillRect(originX,(y+1)*step,font.width*step,1);
+    ctx.fillStyle = colors.fg;
+    bits.forEach((mask,y) => {
+      for (let x=0;x<font.width;x++) if ((mask >>> (font.width-1-x)) & 1) ctx.fillRect(originX+x*step+1,(y+1)*step+1,step-1,step-1);
+    });
+    const m = metrics(font);
+    for (const [height,color] of [[m.capTop,colors.cap],[m.xTop,colors.x],[m.baseline,colors.baseline]]) {
+      ctx.fillStyle = color;
+      ctx.fillRect(originX,(height+1)*step,font.width*step,Math.max(1,Math.round(dpr)));
+    }
+    const seams=(currentPlan?.seams || []).map((seam,index)=>({...seam,index}));
+    seams.sort((a,b)=>(a.index===state.selectedInsertion)-(b.index===state.selectedInsertion));
+    for(const seam of seams) {
+      const y=Math.round((isOriginal ? seam.actual+1 : seam.targetRow+1.5)*step);
+      ctx.fillStyle=seam.index===state.selectedInsertion ? colors.fg : colors.arrow;
+      const unit=Math.max(1,Math.round(dpr));
+      ctx.fillRect(0,y-unit,Math.max(unit,originX-5*unit),2*unit);
+      for(let i=0;i<4;i++) ctx.fillRect(originX-(5-i)*unit,y-(4-i)*unit,unit,(8-2*i)*unit);
+    }
+    metricTarget.replaceChildren();
+    const fields = [["cap","Cap height",m.baseline-m.capTop],["x","x-height",m.baseline-m.xTop],["baseline","Baseline",m.baseline]];
+    for (const [kind,label,value] of fields) {
+      const line = document.createElement("div");
+      line.className = "fl-metric";
+      const mark = document.createElement("span");
+      mark.className = "fl-mark fl-"+kind;
+      mark.setAttribute("aria-hidden","true");
+      line.append(mark,document.createTextNode(label+" "+value+" px"));
+      metricTarget.append(line);
+    }
+    canvas.setAttribute("aria-label",state.glyph+" in "+font.name+", "+font.width+" by "+font.height+" pixels; cap height "+(m.baseline-m.capTop)+", x-height "+(m.baseline-m.xTop));
+    snapOrigin(canvas,dpr);
+  }
+  function render() {
+    renderPending = false;
+    syncControls();
+    const font = selectedFont();
+    updateInsertionControls(font);
+    if(state.fontId==="experiment" && font.height!==state.cellHeight) el("fl-cell-value").value=state.cellHeight+" → "+font.height+" px";
+    const dpr = Math.max(0.5,window.devicePixelRatio || 1);
+    const paneWidth = Math.min(el("fl-original-wrap").clientWidth,el("fl-comparison-wrap").clientWidth);
+    const columns = Math.min(64,Math.max(3,Math.floor((paneWidth-1)*dpr/(Math.max(base.width,font.width)*state.scale))));
+    const rows = terminalRows(columns);
+    const originalMissing = drawTerminal(el("fl-original"),base,rows,columns,dpr);
+    const comparisonMissing = drawTerminal(el("fl-comparison-canvas"),font,rows,columns,dpr);
+    const label = state.fontId === "experiment" ? "Hairline Lab" : font.name;
+    el("fl-comparison-name").textContent = label;
+    el("fl-glyph-comparison-name").textContent = label;
+    el("fl-original-size").textContent = base.width+" × "+base.height;
+    el("fl-comparison-size").textContent = font.width+" × "+font.height;
+    el("fl-original-note").textContent = base.note || "Single-pixel main stems";
+    const sizeNote=state.fontId==="experiment" && font.height!==state.cellHeight ? " · "+font.height+" px needed for taller letters" : "";
+    const changed = state.fontId === "experiment" ? "a–z, A–Z, 0–9; "+(state.redrawBoxes ? "box strokes extended" : "original box glyphs")+sizeNote : (font.note || "Original bitmap strike");
+    const boxNote = font.syntheticCodepoints?.length ? " · box strokes: generated fallback" : "";
+    el("fl-comparison-note").textContent = changed + boxNote + (comparisonMissing.length ? " · missing: "+comparisonMissing.join(" ") : "");
+    el("fl-pixel-status").textContent = state.scale+"×: 1 bitmap pixel = "+state.scale+" device pixel"+(state.scale>1?"s":"")+" · DPR "+Number(dpr.toFixed(3))+" · "+columns+" columns";
+    const colors = {fg:themeColor("--foreground"),bg:themeColor("--background"),grid:themeColor("--border"),cap:themeColor("--blue"),x:themeColor("--orange"),baseline:themeColor("--green"),arrow:themeColor("--muted-foreground")};
+    drawGlyph(el("fl-glyph-original"),base,el("fl-metrics-original"),dpr,colors,true);
+    drawGlyph(el("fl-glyph-comparison"),font,el("fl-metrics-comparison"),dpr,colors,false);
+    el("fl-original-glyph-size").textContent = base.width+" × "+base.height;
+    el("fl-comparison-glyph-size").textContent = font.width+" × "+font.height;
+    for (const id of ["fl-original","fl-comparison-canvas","fl-glyph-original","fl-glyph-comparison"]) snapOrigin(el(id),dpr);
+    const canvasInfo = id => {
+      const canvas = el(id), rect = canvas.getBoundingClientRect();
+      return {id,width:canvas.width,height:canvas.height,cssWidth:rect.width,cssHeight:rect.height,
+        physicalLeft:rect.left*dpr,physicalTop:rect.top*dpr,
+        aligned:Math.abs(rect.left*dpr-Math.round(rect.left*dpr))<0.02 && Math.abs(rect.top*dpr-Math.round(rect.top*dpr))<0.02};
+    };
+    rendered = {columns,rows:rows.length,dpr,fontId:state.fontId,fontWidth:font.width,fontHeight:font.height,originalMissing,comparisonMissing,
+      devicePixelsPerBitmapPixel:state.scale,placements:currentPlan.seams.map(seam=>({...seam})),safeBoundaries:currentPlan.safeBoundaries.slice(),requestedCellHeight:state.cellHeight,
+      canvases:["fl-original","fl-comparison-canvas","fl-glyph-original","fl-glyph-comparison"].map(canvasInfo)};
+  }
+  function scheduleRender() {
+    if (!renderPending) {renderPending=true;requestAnimationFrame(render);}
+  }
+  for (const [id,key] of [["fl-x-height","xHeightDelta"],["fl-cap-height","capHeightDelta"],["fl-cell-height","cellHeight"],["fl-scale","scale"]]) {
+    el(id).addEventListener("input",event => {state[key]=Number(event.target.value);render();remember();});
+  }
+  el("fl-comparison").addEventListener("change",event => {state.fontId=event.target.value;render();remember();});
+  el("fl-glyph").addEventListener("change",event => {state.glyph=event.target.value;render();remember();});
+  el("fl-boxes").addEventListener("change",event => {state.redrawBoxes=event.target.checked;render();remember();});
+  el("fl-insertion").addEventListener("change",event=>{state.selectedInsertion=Number(event.target.value);render();remember();});
+  el("fl-insertion-up").addEventListener("click",()=>moveInsertion(-1));
+  el("fl-insertion-down").addEventListener("click",()=>moveInsertion(1));
+  el("fl-insertion-auto").addEventListener("click",()=>{
+    const overrides={...state.glyphSeams};delete overrides[String(state.glyph.codePointAt(0))];
+    state.glyphSeams=overrides;render();remember();
+  });
+  el("fl-settings-export").addEventListener("click",()=>{
+    el("fl-settings-json").value=JSON.stringify({format:"hardcore-hairline-design",version:1,settings:state},null,2)+"\n";
+    el("fl-settings-status").textContent="Current tuning is ready to copy.";
+    el("fl-error").hidden=true;
+  });
+  el("fl-settings-import").addEventListener("click",()=>{
+    try {
+      const text=el("fl-settings-json").value;
+      if(text.length>32768 || new TextEncoder().encode(text).length>32768) throw new Error("Tuning JSON must be no larger than 32 KB.");
+      let design;
+      try {design=JSON.parse(text);} catch {throw new Error("Paste valid Hairline Lab tuning JSON before loading.");}
+      if(design?.format!=="hardcore-hairline-design" || design.version!==1 || !design.settings || typeof design.settings!=="object" || Array.isArray(design.settings)) throw new Error("Use Hairline Lab tuning JSON, version 1.");
+      const settings=design.settings;
+      const known=new Set(Object.keys(defaults));
+      if(Object.keys(settings).some(key=>!known.has(key))) throw new Error("The tuning JSON contains unsupported settings.");
+      for(const [key,min,max] of [["xHeightDelta",0,6],["capHeightDelta",0,6],["cellHeight",24,32]]) {
+        if(!Number.isInteger(settings[key]) || settings[key]<min || settings[key]>max) throw new Error(key+" must be an integer from "+min+" to "+max+".");
+      }
+      if(settings.fontId!=="experiment" && !fonts.some(font=>font.id===settings.fontId)) throw new Error("The tuning JSON names an unavailable font.");
+      if(![1,2].includes(settings.scale) || !allowedGlyphs.includes(settings.glyph) || typeof settings.redrawBoxes!=="boolean") throw new Error("The tuning JSON contains an invalid scale, glyph, or box setting.");
+      if(settings.selectedInsertion!==undefined && (!Number.isInteger(settings.selectedInsertion) || settings.selectedInsertion<0 || settings.selectedInsertion>5)) throw new Error("The selected expansion arrow must be from 0 to 5.");
+      if(settings.glyphSeams!==undefined) {
+        const seams=settings.glyphSeams;
+        const allowed=new Set(Array.from("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",character=>String(character.codePointAt(0))));
+        if(!seams || typeof seams!=="object" || Array.isArray(seams) || Object.entries(seams).some(([key,rows])=>!allowed.has(key) || !Array.isArray(rows) || rows.length>6 || rows.some(y=>!Number.isInteger(y) || y<0 || y>24))) throw new Error("Each letter or digit may have up to six expansion rows from 0 to 24.");
+      }
+      state=cleanState(settings);render();remember();
+      el("fl-settings-status").textContent="Tuning loaded · "+Object.keys(state.glyphSeams).length+" custom glyphs";
+      el("fl-error").hidden=true;
+    } catch(error) {
+      el("fl-error").textContent=error.message;el("fl-error").hidden=false;
+      el("fl-settings-status").textContent="Tuning was not loaded; the preview and JSON are unchanged.";
+    }
+  });
+  window.addEventListener("openai:set_globals",event => {
+    if (event.detail?.globals?.widgetState) {applyStored(event.detail.globals.widgetState);render();}
+  });
+  window.addEventListener("resize",scheduleRender);
+  new ResizeObserver(scheduleRender).observe(root);
+  new MutationObserver(scheduleRender).observe(document.documentElement,{attributes:true,attributeFilter:["class","style","data-theme"]});
+  if (window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change",scheduleRender);
+  let resolutionQuery;
+  function watchResolution() {
+    if (!window.matchMedia) return;
+    if (resolutionQuery) resolutionQuery.removeEventListener("change",resolutionChanged);
+    resolutionQuery = window.matchMedia("(resolution: "+(window.devicePixelRatio || 1)+"dppx)");
+    resolutionQuery.addEventListener("change",resolutionChanged);
+  }
+  function resolutionChanged() {watchResolution();scheduleRender();}
+  watchResolution();
+  window.fontLab = {
+    get state() {return JSON.parse(JSON.stringify(state));},
+    getRenderInfo:() => ({...rendered}),
+    getDesign:()=>({format:"hardcore-hairline-design",version:1,settings:JSON.parse(JSON.stringify(state))}),
+    render,
+    setState:changes => {state=cleanState({...state,...changes});render();remember();},
+    selectFont:id => {state=cleanState({...state,fontId:id});render();remember();}
+  };
+  render();
+})();
+</script>
