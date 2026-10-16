@@ -5423,7 +5423,8 @@ static void mouse_cell(int mx, int my, int *col, int *row) {
 }
 
 /* Run the real VT -> display adapter without AppKit/Win32 window creation.
-   This screenshot paragraph needs one following blank row at the dock width. */
+   Include the styled Codex records from the real dock-overlap report: their
+   expansion footers and hashes must move with them, never disappear. */
 static int unit_chrome_display(FILE *f) {
     static const char paragraph[] =
         "\x1b[2;1H  Build and non-GUI tests pass. The disposable test app crashed during macOS registration, before rendering. Current sandbox restrictions prevent GUI"
@@ -5432,53 +5433,114 @@ static int unit_chrome_display(FILE *f) {
     static const char diff[] =
         "\x1b[2;1H\x1b[48;2;24;64;32m  5313 +    int result = snprintf(buffer, sizeof(buffer), \"/Users/example/Library/Support/hardcore/preferences/profile.json\", mouse_modes[mouse]);\x1b[K\x1b[0m"
         "\x1b[3;1H  + Show details\x1b[5;1H456\x1b[8;1H";
-    static const char *const fixtures[] = {paragraph, diff};
+    static const char command[] =
+        "\x1b[2;1H\x1b[32m•\x1b[0m Ran \x1b[36mhardcore\x1b[0m \x1b[31m--version\x1b[0m && codesign --verify --deep --strict "
+        "\x1b]8;;file:///Users/wm/Applications/hardcore.app\x1b\\/Users/wm/Applications/hardcore.app\x1b]8;;\x1b\\ && git status --sho…"
+        "\x1b[3;1H\x1b[2m  └ ## main...origin/main"
+        "\x1b[4;1H    db1eefd120ebb6a3b3090ab988593954a9d37ae9"
+        "\x1b[5;1H    db1eefd120ebb6a3b3090ab988593954a9d37ae9"
+        "\x1b[6;1H    + 1 line (⌃t to expand)\x1b[0m"
+        "\x1b[8;1H456\x1b[12;1H";
+    static const char verification[] =
+        "\x1b[2;1H\x1b[32m•\x1b[0m Ran \x1b[36mpython3\x1b[0m - <<'PY' …"
+        "\x1b[3;1H\x1b[2m  └ Installed executable inode: 215350339"
+        "\x1b[4;1H    Verification records: \x1b]8;;file:///var/folders/k9/z44_w2td7p19nrwm8gztmcc80000gn/T/hc-update-verification-8rcflsus\x1b\\"
+        "/var/folders/k9/z44_w2td7p19nrwm8gztmcc80000gn/T/hc-update-verification-8rcflsus\x1b]8;;\x1b\\"
+        "\x1b[5;1H    843:    g_mac_image = [mac_hash(@(g_mac_exe_path)) retain];"
+        "\x1b[6;1H    + 3 lines (⌃t to expand)\x1b[0m"
+        "\x1b[8;1H456\x1b[12;1H";
+    static const char command_above[] =
+        "\x1b[1;1H123\x1b[4;1H\x1b[32m•\x1b[0m Ran \x1b[36mhardcore\x1b[0m \x1b[31m--version\x1b[0m && codesign --verify --deep --strict "
+        "\x1b]8;;file:///Users/wm/Applications/hardcore.app\x1b\\/Users/wm/Applications/hardcore.app\x1b]8;;\x1b\\ && git status --sho…"
+        "\x1b[5;1H\x1b[2m  └ ## main...origin/main"
+        "\x1b[6;1H    db1eefd120ebb6a3b3090ab988593954a9d37ae9"
+        "\x1b[7;1H    db1eefd120ebb6a3b3090ab988593954a9d37ae9"
+        "\x1b[8;1H    + 1 line (⌃t to expand)\x1b[0m"
+        "\x1b[9;1H456\x1b[12;1H";
+    static const struct {
+        const char *name, *text;
+        int cols, rows, sentinel, dock_y, dock_height, above_row;
+    } fixtures[] = {
+        {"paragraph", paragraph, 152, 8, 4, 1, 4, -1},
+        {"diff", diff, 152, 8, 4, 1, 4, -1},
+        {"Codex command", command, 120, 12, 7, 1, 6, -1},
+        {"Codex verification", verification, 120, 12, 7, 1, 6, -1},
+        {"Codex preceding blanks", command_above, 120, 12, 8, 1, 7, 3},
+    };
     Tab *tb = (Tab *)calloc(1, sizeof(*tb)), *saved_tab = g_tabs[0];
     int saved_ntabs = g_ntabs, saved_active = g_active, saved_mode = g_tab_underlay, saved_reflow = g_chrome_reflow;
     ChromeReflow saved_display = g_display;
     const Term *saved_display_term = g_display_term;
     int saved_view = g_display_view, saved_hcount = g_display_hcount, fails = 0;
-    if (!tb || !term_init(&tb->t, 152, 8)) { free(tb); return 1; }
+    if (!tb) return 1;
     memset(&g_display, 0, sizeof(g_display)); g_display_term = NULL;
     g_tabs[0] = tb; g_ntabs = 1; g_active = 0; g_chrome_reflow = 1;
     static const int mouse_modes[] = {0, 1000, 1002, 1003};
-    for (int fixture = 0; fixture < 2; fixture++)
-    for (int side = 1; side <= 2; side++) for (int mouse = 0; mouse < 4; mouse++) {
-        char modes[64];
-        int n = snprintf(modes, sizeof(modes), "\x1b" "c\x1b[?25l\x1b[?%dh\x1b[?1006h", mouse ? mouse_modes[mouse] : 1000);
-        vt_feed(&tb->t, (const unsigned char *)modes, n);
-        if (!mouse) vt_feed(&tb->t, (const unsigned char *)"\x1b[?1000l", 8);
-        vt_feed(&tb->t, (const unsigned char *)fixtures[fixture], (int)strlen(fixtures[fixture]));
-        g_tab_underlay = side;
-        int dock = side == 1 ? 124 : 0, mode = tb->t.m_mouse;
-        Cell before[152*8];
-        for (int y = 0; y < 8; y++) memcpy(before+y*152, tb->t.row[0][y], 152*sizeof(Cell));
-        chrome_prepare_display_at(&tb->t, dock, 1, 4);
-        fails += g_display_term != &tb->t || !g_display.changed;
-        fails += mode != mouse_modes[mouse] || tb->t.m_mouse != mode || !tb->t.m_mouse_sgr;
-        for (int y = 0; y < 8; y++) {
-            fails += memcmp(before+y*152, tb->t.row[0][y], 152*sizeof(Cell)) != 0;
-            if (!g_display.cells) continue;
-            for (int x = 0; x < 152; x++) {
-                const Cell *c = g_display.cells+y*152+x;
-                if (y >= 1 && y < 4 && x >= dock && x < dock+28) fails += !cr_space(c->ch);
-                if (!cr_space(c->ch)) {
-                    int col, row, source = g_display.source[y*152+x];
-                    mouse_cell(x*CW+CW/2, y*CH+CH/2, &col, &row);
-                    fails += row*152+col != source;
-                    fails += memcmp(c, before+source, sizeof(Cell)) != 0;
+    for (int fixture = 0; fixture < (int)(sizeof(fixtures)/sizeof(fixtures[0])); fixture++) {
+        int cols = fixtures[fixture].cols, rows = fixtures[fixture].rows;
+        if (!term_init(&tb->t, cols, rows)) { fails++; break; }
+        for (int side = 1; side <= 2; side++) for (int mouse = 0; mouse < 4; mouse++) {
+            char modes[64];
+            int n = snprintf(modes, sizeof(modes), "\x1b" "c\x1b[?25l\x1b[?%dh\x1b[?1006h", mouse ? mouse_modes[mouse] : 1000);
+            vt_feed(&tb->t, (const unsigned char *)modes, n);
+            if (!mouse) vt_feed(&tb->t, (const unsigned char *)"\x1b[?1000l", 8);
+            vt_feed(&tb->t, (const unsigned char *)fixtures[fixture].text, (int)strlen(fixtures[fixture].text));
+            g_tab_underlay = side;
+            int dock = side == 1 ? cols-28 : 0, mode = tb->t.m_mouse;
+            int seen[152*12] = {0}, above = 0, links = 0, dim = 0, initial_fails = fails;
+            Cell before[152*12];
+            for (int y = 0; y < rows; y++) memcpy(before+y*cols, tb->t.row[0][y], cols*sizeof(Cell));
+            chrome_prepare_display_at(&tb->t, dock, fixtures[fixture].dock_y, fixtures[fixture].dock_height);
+            fails += g_display_term != &tb->t || !g_display.changed;
+            fails += mode != mouse_modes[mouse] || tb->t.m_mouse != mode || !tb->t.m_mouse_sgr;
+            for (int y = 0; y < rows; y++) {
+                fails += memcmp(before+y*cols, tb->t.row[0][y], cols*sizeof(Cell)) != 0;
+                if (!g_display.cells) continue;
+                for (int x = 0; x < cols; x++) {
+                    const Cell *c = g_display.cells+y*cols+x;
+                    if (y >= fixtures[fixture].dock_y && y < fixtures[fixture].sentinel &&
+                        y < fixtures[fixture].dock_y+fixtures[fixture].dock_height) {
+                        int begin = side == 1 ? dock-2 : dock, end = side == 1 ? dock+28 : dock+30;
+                        if (x >= begin && x < end) fails += !cr_space(c->ch);
+                    }
+                    if (!cr_space(c->ch)) {
+                        int col, row, source = g_display.source[y*cols+x];
+                        if (source < 0 || source >= cols*rows) { fails++; continue; }
+                        mouse_cell(x*CW+CW/2, y*CH+CH/2, &col, &row);
+                        fails += row*cols+col != source;
+                        fails += memcmp(c, before+source, sizeof(Cell)) != 0;
+                        seen[source]++;
+                        links += c->link != 0;
+                        dim += !!(c->attr & A_DIM);
+                        above |= source/cols == fixtures[fixture].above_row && y < source/cols;
+                    }
                 }
             }
+            for (int i = 0; i < cols*rows; i++)
+                if (!cr_space(before[i].ch)) fails += seen[i] != 1;
+            if (g_display.cells) {
+                fails += g_display.cells[fixtures[fixture].sentinel*cols].ch != '4';
+                if (fixtures[fixture].above_row >= 0) {
+                    fails += !above || g_display.cells[0].ch != '1';
+                } else if (fixture >= 2) {
+                    /* Following blanks win; an earlier blank must stay unused. */
+                    for (int x = 0; x < cols; x++) fails += !cr_space(g_display.cells[x].ch);
+                }
+            }
+            if (fixture >= 2) fails += !links || !dim;
+            if (fails != initial_fails)
+                fprintf(f, "FAIL chrome display fixture %s, side %d, mouse %d: %d checks\n",
+                        fixtures[fixture].name, side, mouse_modes[mouse], fails-initial_fails);
         }
-        if (g_display.cells) fails += g_display.cells[4*152].ch != '4';
+        term_free(&tb->t);
     }
     chrome_reflow_free(&g_display);
     g_display = saved_display; g_display_term = saved_display_term;
     g_display_view = saved_view; g_display_hcount = saved_hcount;
     g_tabs[0] = saved_tab; g_ntabs = saved_ntabs; g_active = saved_active;
     g_tab_underlay = saved_mode; g_chrome_reflow = saved_reflow;
-    term_free(&tb->t); free(tb);
-    fprintf(f, "%s chrome display: prose/styled diffs/paths, both docks, mouse reporting, source coordinates and terminal preserved\n", fails ? "FAIL" : "ok  ");
+    free(tb);
+    fprintf(f, "%s chrome display: styled Codex records/footers/links, adjacent blanks, menu padding, both docks, mouse/source cells preserved\n", fails ? "FAIL" : "ok  ");
     return fails;
 }
 

@@ -46,19 +46,15 @@ static int cr_record_cut(const Cell *line, int from, int end, int capacity) {
     return boundary > from ? boundary : -1;
 }
 
-static int cr_reflow_records(ChromeReflow *out, const Cell *input, const ChromeReflowRow *info,
-                             int start, int cols, int rows, int side, int dock_x, int dock_y,
-                             int dock_width, int dock_height, int max_blank) {
-    int end = start, blanks = 0, used = 0, changes = 0;
-    while (end < rows && info[end].type == CR_RECORD) {
-        int footer = info[end++].record == CR_RECORD_FOOTER;
-        if (footer) break;
-    }
-    if (!cr_overlap(input, cols, start, end, dock_x, dock_y, dock_width, dock_height)) return end;
-    while (blanks < max_blank && end+blanks < rows && info[end+blanks].type == CR_BLANK) blanks++;
-    int budget = end-start+blanks;
-    ChromeRecordFragment *plan = (ChromeRecordFragment *)malloc((size_t)budget*sizeof(*plan));
-    if (!plan) return end;
+/* Plan before changing output. Try the original start with a two-cell gap,
+ * then flush to the menu. Only an incomplete fit warrants borrowing above.
+ * A failed record remains literal; compare complete plans so padding cannot
+ * hide another record that would have fitted without it. */
+static int cr_plan_records(ChromeRecordFragment *plan, const Cell *input, const ChromeReflowRow *info,
+                           int start, int end, int top, int bottom, int cols, int side, int dock_x,
+                           int dock_y, int dock_width, int dock_height, int gap, int *failed, int *changes) {
+    int used = 0, budget = bottom-top;
+    *failed = *changes = 0;
     for (int row = start; row < end; row++) {
         const Cell *line = input+row*cols;
         const ChromeReflowRow *r = info+row;
@@ -67,12 +63,9 @@ static int cr_reflow_records(ChromeReflow *out, const Cell *input, const ChromeR
            A single long record cannot consume the next number or diff sign. */
         int available = budget-(end-row-1);
         while (fit && from < r->end && used < available) {
-            int y = start+used, offset = 0, limit = cols;
+            int y = top+used, offset, limit;
             int indent = used == first ? 0 : r->body;
-            if (cr_in_band(y, dock_y, dock_height)) {
-                if (side == 2) offset = cr_bound((long long)dock_x+dock_width, cols);
-                else limit = cr_bound(dock_x, cols);
-            }
+            cr_lane(y, cols, side, dock_x, dock_y, dock_width, dock_height, gap, &offset, &limit);
             int cut = cr_record_cut(line, from, r->end, limit-offset-indent);
             if (cut < 0 || (used == first && cut <= r->body) ||
                 (r->record == CR_RECORD_FOOTER && cut != r->end)) { fit = 0; break; }
@@ -86,15 +79,47 @@ static int cr_reflow_records(ChromeReflow *out, const Cell *input, const ChromeR
                when this one has a long identifier or no continuation room. */
             used = first;
             plan[used++] = (ChromeRecordFragment){row, 0, cols, 0, 0, cols, 0};
-        } else if (used-first > 1 || plan[first].offset) changes++;
+            (*failed)++;
+        } else if (used-first > 1 || plan[first].offset) (*changes)++;
     }
+    if (top != start && !*changes) *changes = 1;
+    return used;
+}
+
+static int cr_reflow_records(ChromeReflow *out, const Cell *input, const ChromeReflowRow *info,
+                             int start, int cols, int rows, int side, int dock_x, int dock_y,
+                             int dock_width, int dock_height, int max_blank) {
+    int end = start, below = 0, above = 0, used = 0, changes = 0, top = start;
+    while (end < rows && info[end].type == CR_RECORD) {
+        int footer = info[end++].record == CR_RECORD_FOOTER;
+        if (footer) break;
+    }
+    if (!cr_needs_layout(input, cols, start, end, side, dock_x, dock_y, dock_width, dock_height)) return end;
+    while (below < max_blank && end+below < rows && cr_available_blank(out, info, end+below)) below++;
+    while (above < max_blank && start-above > 0 && cr_available_blank(out, info, start-above-1)) above++;
+    int budget = end-start+below+above, best_failed = INT_MAX;
+    ChromeRecordFragment *plan = (ChromeRecordFragment *)malloc((size_t)budget*sizeof(*plan));
+    ChromeRecordFragment *candidate = (ChromeRecordFragment *)malloc((size_t)budget*sizeof(*candidate));
+    if (!plan || !candidate) { free(plan); free(candidate); return end; }
+    for (int up = 0; up <= above && best_failed; up++) {
+        for (int gap = 2; gap >= 0 && best_failed; gap -= 2) {
+            int failed, changed;
+            int n = cr_plan_records(candidate, input, info, start, end, start-up, end+below,
+                                    cols, side, dock_x, dock_y, dock_width, dock_height, gap, &failed, &changed);
+            if (failed < best_failed) {
+                memcpy(plan, candidate, (size_t)n*sizeof(*plan));
+                used = n; top = start-up; changes = changed; best_failed = failed;
+            }
+        }
+    }
+    free(candidate);
     if (!changes) { free(plan); return end; }
     Cell empty;
     memset(&empty, 0, sizeof(empty)); empty.ch = ' ';
-    int affected = used > end-start ? used : end-start;
+    int bottom = top+used > end ? top+used : end;
     int endpoint = (end-1)*cols + info[end-1].end;
     if (endpoint >= rows*cols) endpoint = rows*cols-1;
-    for (int y = start; y < start+affected; y++) {
+    for (int y = top; y < bottom; y++) {
         out->markers[y] = -1;
         for (int x = 0; x < cols; x++) {
             out->cells[y*cols+x] = empty;
@@ -105,7 +130,7 @@ static int cr_reflow_records(ChromeReflow *out, const Cell *input, const ChromeR
         const ChromeRecordFragment *p = plan+i;
         const ChromeReflowRow *r = info+p->row;
         const Cell *line = input+p->row*cols;
-        int base = (start+i)*cols;
+        int base = (top+i)*cols;
         int boundary = p->row*cols+p->from;
         /* A diff's background is row styling, so it follows continuations.
            Underline/link/strike belong only to their actual source cells. */
@@ -124,9 +149,9 @@ static int cr_reflow_records(ChromeReflow *out, const Cell *input, const ChromeR
             out->source[base+x] = p->row*cols+(p->to < cols ? p->to : cols-1);
         int marker = p->continuation ? p->begin-1 : p->offset+r->indent-1;
         if (marker >= 0 && marker < cols && cr_space(out->cells[base+marker].ch) &&
-            memcmp(out->cells+base, input+base, (size_t)cols*sizeof(Cell))) out->markers[start+i] = marker;
+            memcmp(out->cells+base, input+base, (size_t)cols*sizeof(Cell))) out->markers[top+i] = marker;
     }
     out->changed += changes;
     free(plan);
-    return start+affected;
+    return bottom;
 }

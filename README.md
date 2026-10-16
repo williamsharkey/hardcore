@@ -119,10 +119,13 @@ right and bottom remain background.
 
 Local reflow is always enabled and its debug markers are always hidden. It
 rearranges recognizable prose around the menu for display only, using spare
-space in the paragraph's
-existing rows, then at most three following blank rows. Prose words stay whole and
-later text stays on its original row. A left dock shifts only the rows beside
-the menu; other rows retain the full width. Foreground colors, bold/dim/italic
+space in the paragraph's existing rows, then at most three following blank rows.
+If that cannot fit, it can also borrow up to three immediately preceding blank
+rows. It prefers a two-character gap beside the menu, falling back to a flush
+fit before moving a block upward. Rows with meaningful backgrounds, active input,
+or earlier reflowed content cannot be borrowed. Prose words stay whole and
+unrelated text stays on its original row. A left dock shifts only the rows beside the menu; other rows retain the
+full width. Foreground colors, bold/dim/italic
 text, ordinary Unicode punctuation, and prose bullets retain their styling and
 hanging indentation. Codex “• Ran …” summaries may wrap at existing word spaces
 when local space permits. Numbered source/diff rows, file paths, and tool-output
@@ -130,7 +133,9 @@ trees also wrap as separate literal records. Numbers and diff signs stay on
 their own first row; continuations align with that record's code or output.
 Paths can break after `/`, and argument lists after unquoted commas or semicolons.
 Original glyphs, colors, diff backgrounds, and link identities are preserved.
-A local record block can borrow blank rows after its details footer; when only
+A local record block moves its output and details footer together, including
+Codex's `+ 1 line (⌃t to expand)` and `+ N lines (⌃t to expand)` footers, so blank
+rows after the footer are available for continuations. When only
 some records fit, the others retain their complete text beneath the menu.
 Boxes, tables, fenced code, wide/combining text, and input rows remain protected.
 Unrecognized prose backgrounds also keep their original layout.
@@ -140,7 +145,6 @@ dim menu above its background, while terminal glyphs cover it. When there is no 
 fit, terminal content continues to cover the underlay until hover. The original
 terminal data, scrollback, and PTY dimensions are unchanged; selection maps
 displayed characters back to their source cells.
-**Reflow markers** adds a small arrow in existing indentation for inspection.
 
 A terminal for WSL on Windows 11, built for running Claude Code. It also runs
 natively on macOS (see [macOS](#macos)). Font, theme, and layout settings are

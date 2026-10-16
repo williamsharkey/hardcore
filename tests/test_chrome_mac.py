@@ -225,9 +225,9 @@ def test_reflow(app):
     for row in (start, start + 1):
         line = c["display"][row].rstrip()
         if app.mode == 1:
-            assert len(line) <= dock["x"], (dock, line)
+            assert len(line) <= dock["x"] - 2, (dock, line)
         else:
-            assert len(line) - len(line.lstrip()) == dock["width"] + 2, (dock, line)
+            assert len(line) - len(line.lstrip()) == dock["width"] + 4, (dock, line)
     assert_mapping(app, c)
     after = app.chrome()
     assert after["source"] == c["source"] and after["display"] == c["display"], "render mutated terminal or drifted"
@@ -422,6 +422,74 @@ def test_codex_prose(app):
     app.hover(-1, -1)
     app.snap(f"mode-{app.mode}-codex-prose")
     print(f"PASS: styled Codex prose, Unicode punctuation and hanging bullet reflow around dock {app.mode}")
+
+
+def test_codex_records(app):
+    """The two styled records from the reported screenshot, at its grid width."""
+    c = app.chrome()
+    app.send(f"cmd resize {120 * c['cell']['width'] // c['scale']},591")
+    c = app.chrome()
+    assert c["cols"] == 120, c
+    if not c["settings_open"]:
+        c = app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
+    # A tall real menu places the entire output block in the obstruction band.
+    c = app.click(c["dock"]["x"] + 20, c["pages"]["section_row"])
+    start, boundary = c["dock"]["y"] + 2, c["dock"]["y"] + 8
+    assert boundary <= c["dock"]["y"] + c["dock"]["height"] < c["rows"], c
+    path = "/Users/wm/Applications/hardcore.app"
+    records = "/var/folders/k9/z44_w2td7p19nrwm8gztmcc80000gn/T/hc-update-verification-8rcflsus"
+
+    def link(value):
+        return f"\x1b]8;;file://{value}\x1b\\{value}\x1b]8;;\x1b\\"
+
+    fixtures = {
+        "command": [
+            "\x1b[32m•\x1b[0m Ran \x1b[36mhardcore\x1b[0m \x1b[31m--version\x1b[0m && codesign --verify --deep --strict "
+            + link(path) + " && git status --sho…",
+            "\x1b[2m  └ ## main...origin/main\x1b[0m",
+            "\x1b[2m    db1eefd120ebb6a3b3090ab988593954a9d37ae9\x1b[0m",
+            "\x1b[2m    db1eefd120ebb6a3b3090ab988593954a9d37ae9\x1b[0m",
+            "\x1b[2m    + 1 line (⌃t to expand)\x1b[0m",
+        ],
+        "verification": [
+            "\x1b[32m•\x1b[0m Ran \x1b[36mpython3\x1b[0m - <<'PY' …",
+            "\x1b[2m  └ Installed executable inode: 215350339\x1b[0m",
+            "\x1b[2m    Verification records: " + link(records) + "\x1b[0m",
+            "\x1b[2m    843:    g_mac_image = [mac_hash(@(g_mac_exe_path)) retain];\x1b[0m",
+            "\x1b[2m    + 3 lines (⌃t to expand)\x1b[0m",
+        ],
+    }
+    ansi = re.compile(r"\x1b\]8;[^\x1b]*\x1b\\|\x1b\[[0-?]*[ -/]*[@-~]")
+    try:
+        for name, block in fixtures.items():
+            lines = [""] * c["rows"]
+            lines[start:start + len(block)] = block
+            lines[boundary] = "123"
+            lines[-2] = "456"
+            c = app.feed(lines, "\x1b[?1003h\x1b[?1006h")
+            expected = [ansi.sub("", line) for line in lines]
+            assert [line.rstrip() for line in c["source"]] == expected, name
+            assert c["reflow_changed"], (name, "styled record did not reflow")
+            # A path may split after a slash; no nonblank character may be lost,
+            # repeated, or reordered, including either expansion annotation.
+            assert "".join("".join(c["display"]).split()) == "".join("".join(c["source"]).split()), name
+            footer = expected[start + len(block) - 1].strip()
+            assert c["display"][boundary - 1].strip() == footer, (name, c["display"])
+            assert c["display"][boundary].rstrip() == "123" and c["display"][-2].rstrip() == "456", name
+            for row in range(start, boundary):
+                line, dock = c["display"][row], c["dock"]
+                gap = line[dock["x"] - 2:] if app.mode == 1 else line[:dock["x"] + dock["width"] + 2]
+                assert not gap.strip(), (name, row, "missing two-cell menu gap", line)
+            assert_mapping(app, c)
+            app.hover(-1, -1)
+            app.snap(f"mode-{app.mode}-codex-{name}-records")
+        print(f"PASS: dock {app.mode} reflows styled Codex commands and paths with two-cell padding, retaining footers, boundaries and source coordinates")
+    finally:
+        c = app.chrome()
+        c = app.click(c["dock"]["x"] + 3, c["pages"]["section_row"])
+        if c["settings_open"]:
+            app.click(c["dock"]["x"] + 6, c["pages"]["settings_row"])
+        app.send("cmd resize 1001,591")
 
 
 def test_visible_whitespace_and_rules(app):
@@ -635,6 +703,7 @@ def main():
                 if mode:
                     test_reflow(app)
                     test_codex_prose(app)
+                    test_codex_records(app)
                     if mode == 1:
                         test_visible_whitespace_and_rules(app)
                         test_title_underlay(app)

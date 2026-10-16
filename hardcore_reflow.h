@@ -1,8 +1,8 @@
 /* Display-only local prose reflow. Include after the terminal's Cell type.
  *
  * This deliberately recognizes a small, safe subset of terminal output. A
- * paragraph keeps its own rows and may borrow immediately following empty
- * rows; subsequent text never moves. Text outside the dock's vertical band
+ * paragraph keeps its own rows and may borrow adjacent empty rows, preferring
+ * those below it; unrelated text never moves. Text outside the dock's vertical band
  * uses the full terminal width. The source terminal is never modified.
  *
  * source[display_index] maps each displayed character to its original cell.
@@ -178,13 +178,14 @@ static ChromeReflowRow cr_classify(const Cell *line, int cols, int protected_row
     r.record = cr_record_shape(line, &r);
     if (!r.record && tree_indent >= 0 && r.indent >= tree_indent && r.end > r.indent && !r.bullet) {
         r.record = CR_RECORD_TREE;
-        r.body = r.indent+2;
+        r.body = r.indent;
     }
     if (r.record) {
         for (x = 0; x < cols; x++) {
             const Cell *c = line+x;
             if ((c->attr & (16u | 64u)) || c->wflag || (r.record == CR_RECORD_TREE && c->ch == '|') ||
-                (!cr_space(c->ch) && !cr_prose_character(c->ch) && !(x == r.indent && c->ch == 0x2514))) {
+                (!cr_space(c->ch) && !cr_prose_character(c->ch) && !(x == r.indent && c->ch == 0x2514) &&
+                 !(r.record == CR_RECORD_FOOTER && c->ch == 0x2303))) {
                 r.reason = CR_REASON_UNSAFE;
                 return r;
             }
@@ -292,9 +293,37 @@ static int cr_overlap(const Cell *input, int cols, int first, int last,
     return 0;
 }
 
+/* Also consider text touching the preferred gap, even if it already clears
+ * the menu itself. Bound before narrowing to int for offscreen geometry. */
+static int cr_needs_layout(const Cell *input, int cols, int first, int last, int side,
+                           int dock_x, int dock_y, int dock_width, int dock_height) {
+    int begin = cr_bound((long long)dock_x-(side == 1 ? 2 : 0), cols);
+    int end = cr_bound((long long)dock_x+dock_width+(side == 2 ? 2 : 0), cols);
+    return cr_overlap(input, cols, first, last, begin, dock_y, end-begin, dock_height);
+}
+
 static int cr_source_after(const ChromeReflowWord *word, int cols) {
     int last = word->source + word->length - 1;
     return last % cols + 1 < cols ? last + 1 : last;
+}
+
+/* Blank source rows can already contain an earlier block's continuation.
+ * Only borrow untouched, safe rows; never erase previously placed output. */
+static int cr_available_blank(const ChromeReflow *out, const ChromeReflowRow *info, int row) {
+    if (info[row].type != CR_BLANK) return 0;
+    for (int x = 0; x < out->cols; x++) {
+        int i = row*out->cols+x;
+        if (!cr_space(out->cells[i].ch) || out->source[i] != i) return 0;
+    }
+    return 1;
+}
+
+static void cr_lane(int row, int cols, int side, int dock_x, int dock_y,
+                    int dock_width, int dock_height, int gap, int *offset, int *limit) {
+    *offset = 0; *limit = cols;
+    if (!cr_in_band(row, dock_y, dock_height)) return;
+    if (side == 2) *offset = cr_bound((long long)dock_x+dock_width+gap, cols);
+    else *limit = cr_bound((long long)dock_x-gap, cols);
 }
 
 #include "hardcore_structured_reflow.h"
@@ -325,7 +354,7 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
     for (row = 0; row < (int)count; row++) out->source[row] = row;
     for (row = 0; row < rows; row++) out->markers[row] = -1;
     if ((side != 1 && side != 2) || dock_width <= 0 || dock_height <= 0 ||
-        !cr_overlap(input, cols, 0, rows, dock_x, dock_y, dock_width, dock_height)) return 1;
+        !cr_needs_layout(input, cols, 0, rows, side, dock_x, dock_y, dock_width, dock_height)) return 1;
     info = (ChromeReflowRow *)malloc((size_t)rows * sizeof(*info));
     placement = (ChromeReflowPlacement *)malloc((size_t)rows * sizeof(*placement));
     if (!info || !placement) goto fail;
@@ -350,8 +379,8 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
     if (max_blank < 0) max_blank = 0;
     if (max_blank > rows) max_blank = rows;
     for (row = 0; row < rows;) {
-        int start, end, indent, hanging, bullet, source_rows, blank_rows, word_count = 0;
-        int y, x, word, used_rows, fit, affected;
+        int start, end, indent, hanging, bullet, source_rows, blank_rows, above, top, word_count = 0;
+        int y, x, word, used_rows = 0, fit, affected;
         if (info[row].type == CR_RECORD && info[row].record != CR_RECORD_FOOTER) {
             row = cr_reflow_records(out, input, info, row, cols, rows, side,
                                     dock_x, dock_y, dock_width, dock_height, max_blank);
@@ -387,10 +416,12 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
             info[start - 1].end > info[start - 1].indent) continue;
         if (end < rows && info[end].reason == CR_REASON_UNSAFE &&
             info[end].indent == hanging && info[end].end > hanging) continue;
-        if (!cr_overlap(input, cols, start, end, dock_x, dock_y, dock_width, dock_height)) continue;
+        if (!cr_needs_layout(input, cols, start, end, side, dock_x, dock_y, dock_width, dock_height)) continue;
         blank_rows = 0;
         while (blank_rows < max_blank && end + blank_rows < rows &&
-               info[end + blank_rows].type == CR_BLANK) blank_rows++;
+               cr_available_blank(out, info, end + blank_rows)) blank_rows++;
+        above = 0;
+        while (above < max_blank && start-above > 0 && cr_available_blank(out, info, start-above-1)) above++;
         for (y = start; y < end; y++) {
             for (x = info[y].indent; x < info[y].end;) {
                 ChromeReflowWord *w = words + word_count++;
@@ -400,38 +431,42 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
                 while (x < info[y].end && cr_space(input[y * cols + x].ch)) x++;
             }
         }
-        word = used_rows = 0;
-        fit = 1;
-        /* Greedy wrapping is identical for each larger local row budget, so
-         * one pass finds the smallest number of following blanks needed. */
-        while (word < word_count && used_rows < source_rows + blank_rows) {
-            int offset = 0, limit = cols, used = 0, first = word;
-            int row_indent = used_rows ? hanging : indent;
-            ChromeReflowPlacement *p = placement + used_rows;
-            y = start + used_rows;
-            if (cr_in_band(y, dock_y, dock_height)) {
-                if (side == 2) offset = cr_bound((long long)dock_x + dock_width, cols);
-                else limit = cr_bound(dock_x, cols);
+        fit = 0; top = start;
+        /* Prefer a two-cell gap, allowing a flush fit before borrowing above.
+         * Replan at each earlier start: crossing the dock's top/bottom changes
+         * the width, so merely shifting a previous plan is not sufficient. */
+        for (int up = 0; up <= above && !fit; up++)
+        for (int gap = 2; gap >= 0 && !fit; gap -= 2) {
+            word = used_rows = 0;
+            top = start-up;
+            while (word < word_count && used_rows < source_rows + blank_rows + up) {
+                int offset = 0, limit = cols, used = 0, first = word;
+                int row_indent = used_rows ? hanging : indent;
+                ChromeReflowPlacement *p = placement + used_rows;
+                y = top + used_rows;
+                cr_lane(y, cols, side, dock_x, dock_y, dock_width, dock_height, gap, &offset, &limit);
+                while (word < word_count) {
+                    int next = words[word].length + (word != first);
+                    if (next > limit - offset - row_indent - used) break;
+                    used += next;
+                    word++;
+                }
+                /* Keep the bullet and at least its first word together. */
+                if (word == first || (bullet && !used_rows && word == 1)) break;
+                p->first = first;
+                p->count = word - first;
+                p->offset = offset;
+                p->indent = row_indent;
+                used_rows++;
             }
-            while (word < word_count) {
-                int next = words[word].length + (word != first);
-                if (next > limit - offset - row_indent - used) break;
-                used += next;
-                word++;
-            }
-            /* Keep the bullet and at least its first word together. */
-            if (word == first || (bullet && !used_rows && word == 1)) { fit = 0; break; }
-            p->first = first;
-            p->count = word - first;
-            p->offset = offset;
-            p->indent = row_indent;
-            used_rows++;
+            fit = word == word_count && used_rows > 0;
         }
-        if (!fit || word != word_count) continue;
-        affected = source_rows > used_rows ? source_rows : used_rows;
+        if (!fit) continue;
+        affected = end-top > used_rows ? end-top : used_rows;
         for (y = 0; y < affected; y++) {
-            int base = (start + y) * cols;
+            int base = (top + y) * cols;
             int endpoint = cr_source_after(words + word_count - 1, cols);
+            out->markers[top+y] = -1;
             for (x = 0; x < cols; x++) {
                 out->cells[base + x] = blank;
                 out->source[base + x] = endpoint;
@@ -439,7 +474,7 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
         }
         for (y = 0; y < used_rows; y++) {
             const ChromeReflowPlacement *p = placement + y;
-            int base = (start + y) * cols, first_source = words[p->first].source;
+            int base = (top + y) * cols, first_source = words[p->first].source;
             int last_word = p->first + p->count - 1;
             int endpoint = cr_source_after(words + last_word, cols);
             int begin = p->offset + p->indent;
@@ -475,10 +510,10 @@ static int chrome_reflow_build_checked(ChromeReflow *out, const Cell *input,
             }
             while (x < cols) out->source[base + x++] = endpoint;
             if (p->indent && memcmp(out->cells + base, input + base, (size_t)cols * sizeof(Cell)))
-                out->markers[start + y] = begin - 1;
+                out->markers[top + y] = begin - 1;
         }
         out->changed++;
-        if (used_rows > source_rows) row += used_rows - source_rows;
+        if (top+used_rows > row) row = top+used_rows;
     }
     free(info);
     free(words);

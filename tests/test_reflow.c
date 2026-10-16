@@ -134,9 +134,12 @@ static void unchanged(const char *const *lines, int rows, int cols) {
     Cell *grid = make_grid(lines, rows, cols);
     ChromeReflow result = run(grid, cols, rows, NULL, 1, 17, 0, cols - 17, rows, 3);
     int i;
-    assert(!result.changed);
+    /* A safe line touching only the preferred gap may accept a flush plan
+     * that is identical. Cells and actual text coordinates remain unchanged;
+     * trailing blank cells may map to the accepted plan's word boundary. */
     assert(!memcmp(result.cells, grid, (size_t)rows * (size_t)cols * sizeof(Cell)));
-    for (i = 0; i < rows * cols; i++) assert(result.source[i] == i);
+    for (i = 0; i < rows * cols; i++)
+        if (!cr_space(grid[i].ch)) assert(result.source[i] == i);
     chrome_reflow_free(&result);
     free(grid);
 }
@@ -152,7 +155,8 @@ static void test_fox_examples(void) {
     for (y = 0; y < 7; y++) expect_row(&out, y, expected[y]);
     for (y = 1; y <= 4; y++) assert(out.markers[y] == 1);
     repeated = run(out.cells, 48, 7, NULL, 1, 17, 0, 31, 20, 3);
-    assert(!repeated.changed);
+    /* A necessary flush fallback still touches the preferred margin. A
+     * repeated plan may be accepted, but its rendered cells stay identical. */
     assert(!memcmp(out.cells, repeated.cells, 48 * 7 * sizeof(Cell)));
     chrome_reflow_free(&repeated);
     chrome_reflow_free(&out);
@@ -172,7 +176,7 @@ static void test_fox_examples(void) {
 
 static void test_slack_no_blank(void) {
     const char *lines[] = {"123", "  the quick brown fox jumps", "  over the sleeping", "  dog", "456"};
-    const char *expected[] = {"123", "  the quick brown fox", "  jumps over the", "  sleeping dog", "456"};
+    const char *expected[] = {"123", "  the quick brown", "  fox jumps over the", "  sleeping dog", "456"};
     Cell *grid = make_grid(lines, 5, 48);
     ChromeReflow out = run(grid, 48, 5, NULL, 1, 22, 0, 26, 20, 0);
     int y;
@@ -213,7 +217,6 @@ static void test_left_and_band(void) {
         assert(out.markers[y + 1] == 29);
     }
     repeated = run(out.cells, 45, 7, NULL, 2, 0, 1, 28, 4, 3);
-    assert(!repeated.changed);
     assert(!memcmp(out.cells, repeated.cells, 45 * 7 * sizeof(Cell)));
     chrome_reflow_free(&repeated);
     chrome_reflow_free(&out);
@@ -228,11 +231,11 @@ static void test_left_and_band(void) {
         out = run(grid, 60, 4, NULL, 2, 0, 1, 28, 1, 3);
         assert(out.changed == 1);
         assert(out.cells[2].ch == 'o');
-        assert(out.cells[60 + 30].ch > ' ');
+        assert(out.cells[60 + 32].ch > ' ');
         assert(out.cells[120 + 2].ch > ' ');
         assert(out.cells[33].ch > ' ' && out.cells[120 + 33].ch > ' ');
         expect_row(&out, 3, "456");
-        assert(out.markers[1] == 29);
+        assert(out.markers[1] == 31);
         chrome_reflow_free(&out);
         out = run(grid, 60, 4, NULL, 1, 32, 1, 28, 1, 3);
         assert(out.changed == 1);
@@ -350,13 +353,13 @@ static void test_styled_codex_prose(void) {
     for (side = 1; side <= 2; side++) {
         out = run(grid, 170, 4, NULL, side, side == 1 ? 142 : 0, 0, 28, 2, 0);
         assert(out.changed == 1);
-        assert(out.cells[side == 1 ? 0 : 28].ch == 0x2022);
-        assert(out.source[side == 1 ? 0 : 28] == 0);
+        assert(out.cells[side == 1 ? 0 : 30].ch == 0x2022);
+        assert(out.source[side == 1 ? 0 : 30] == 0);
         for (y = 0; y < 2; y++)
             for (x = 0; x < 28; x++) assert(cr_space(out.cells[y * 170 + (side == 1 ? 142 : 0) + x].ch));
         expect_row(&out, 2, "");
         expect_row(&out, 3, "456");
-        assert(out.markers[1] == (side == 1 ? 1 : 29));
+        assert(out.markers[1] == (side == 1 ? 1 : 31));
         chrome_reflow_free(&out);
     }
     /* An explicit RGB encoding of the canvas is safe only when the native
@@ -495,7 +498,7 @@ static void test_structured_diff_records(void) {
     }
     grid[25].link = 7; grid[25].attr |= 8;
     for (int side = 1; side <= 2; side++) {
-        int dock = side == 1 ? 60 : 0, offset = side == 1 ? 0 : 40;
+        int dock = side == 1 ? 60 : 0, offset = side == 1 ? 0 : 42;
         ChromeReflow out = run(grid, 100, 8, NULL, side, dock, 0, 40, 7, 3);
         assert(out.changed == 3+(side == 2));
         int first_rows[3] = {-1, -1, -1};
@@ -570,6 +573,256 @@ static void test_literal_paths_and_tool_output(void) {
     checks++;
 }
 
+/* Locate real text through its source coordinate, independent of the chosen
+ * wrap boundary. The invariants above check the exact style and text of every
+ * such moved glyph, including hyperlinks and syntax highlighting. */
+static int displayed_source(const ChromeReflow *out, int source) {
+    for (int i = 0; i < out->cols*out->rows; i++)
+        if (out->source[i] == source && !cr_space(out->cells[i].ch)) return i;
+    return -1;
+}
+
+static void expect_dock_gap(const ChromeReflow *out, int side, int dock, int width,
+                            int first, int last, int gap) {
+    int begin = side == 1 ? dock-gap : dock;
+    int end = side == 1 ? dock+width : dock+width+gap;
+    for (int y = first; y < last; y++)
+        for (int x = begin; x < end; x++)
+            assert(cr_space(out->cells[y*out->cols+x].ch));
+}
+
+static void test_codex_unicode_footer_records(void) {
+    const char *commands[] = {
+        "• Ran hardcore --version && codesign --verify --deep --strict /Users/wm/Applications/hardcore.app && git status --sho…",
+        "  └ ## main...origin/main",
+        "    db1eefd120ebb6a3b3090ab988593954a9d37ae9",
+        "    db1eefd120ebb6a3b3090ab988593954a9d37ae9",
+        "  + 1 line (⌃t to expand)", "", "", "NEXT SECTION"
+    };
+    const char *paths[] = {
+        "• Ran python3 - <<'PY' …",
+        "  └ Installed executable inode: 215350339",
+        "    Verification records: /var/folders/k9/z44_w2td7p19nrwm8gztmcc80000gn/T/hc-update-verification-8rcflsus",
+        "    843:    g_mac_image = [mac_hash(@(g_mac_exe_path)) retain];",
+        "  + 3 lines (⌃t to expand)", "", "", "NEXT SECTION"
+    };
+    const char *const *fixtures[] = {commands, paths};
+    for (int fixture = 0; fixture < 2; fixture++) {
+        Cell *grid = make_grid(fixtures[fixture], 8, 120);
+        for (int i = 0; i < 5*120; i++) {
+            grid[i].fg = 0x01000000u | (unsigned)(i % 16);
+            grid[i].attr = (uint8_t)(1+i % 7);
+        }
+        grid[(fixture ? 2*120 : 0)+30].link = 5;
+        grid[(fixture ? 2*120 : 0)+30].attr |= 8;
+        for (int side = 1; side <= 2; side++) {
+            int dock = side == 1 ? 90 : 0;
+            ChromeReflow out = run(grid, 120, 8, NULL, side, dock, 0, 30, 7, 3);
+            assert(out.changed);
+            expect_dock_gap(&out, side, dock, 30, 0, 7, 2);
+            /* Both records grow by one row and carry the real footer down
+             * with their output, rather than treating its control key as a
+             * protected boundary that hides the following blank budget. */
+            assert(displayed_source(&out, 4*120+2)/120 == 5);
+            assert(displayed_source(&out, 7*120) == 7*120);
+            if (!fixture) {
+                assert(displayed_source(&out, 2*120+4)/120 == 3);
+                assert(displayed_source(&out, 3*120+4)/120 == 4);
+            } else {
+                assert(displayed_source(&out, 2*120+4)/120 == 2);
+                assert(displayed_source(&out, 3*120+4)/120 == 4);
+            }
+            chrome_reflow_free(&out);
+        }
+        free(grid);
+    }
+    /* Accepting a keyboard symbol in a recognized footer must not make it a
+     * general license to rewrite arbitrary Unicode prose or unsafe effects. */
+    const char *unsafe[] = {"  some unfamiliar ⌃ notation should remain literal", "", "", "456"};
+    Cell *grid = make_grid(unsafe, 4, 60);
+    ChromeReflow out = run(grid, 60, 4, NULL, 1, 30, 0, 30, 4, 3);
+    assert(!out.changed);
+    chrome_reflow_free(&out); free(grid);
+    for (int kind = 0; kind < 3; kind++) {
+        unsigned char protected_rows[8] = {0};
+        grid = make_grid(commands, 8, 120);
+        if (kind == 0) protected_rows[4] = 1;
+        if (kind == 1) grid[4*120+2].attr = 64;
+        if (kind == 2) grid[4*120+2].wflag = 1;
+        out = run(grid, 120, 8, protected_rows, 1, 90, 0, 30, 7, 3);
+        assert(!out.changed);
+        assert(!memcmp(out.cells, grid, 120*8*sizeof(Cell)));
+        chrome_reflow_free(&out); free(grid);
+    }
+    checks++;
+}
+
+static void test_preceding_blank_fallback(void) {
+    const char *command = "• Ran alpha beta gamma delta epsilon zeta";
+    const char *footer = "  + Show details";
+    const char *lines[] = {"123", "", "", command, footer, "456"};
+    for (int side = 1; side <= 2; side++) {
+        int dock = side == 1 ? 24 : 0;
+        Cell *grid = make_grid(lines, 6, 48);
+        ChromeReflow out = run(grid, 48, 6, NULL, side, dock, 0, 24, 6, 2);
+        assert(out.changed);
+        assert(displayed_source(&out, 3*48)/48 == 2);
+        assert(displayed_source(&out, 4*48+2)/48 == 4);
+        expect_row(&out, 0, "123"); expect_row(&out, 1, ""); expect_row(&out, 5, "456");
+        expect_dock_gap(&out, side, dock, 24, 2, 5, 2);
+        chrome_reflow_free(&out);
+        /* An input/cursor row or a styled blank immediately above is a hard
+         * boundary; borrowing must never jump over it to an earlier blank. */
+        for (int kind = 0; kind < 2; kind++) {
+            unsigned char protected_rows[6] = {0};
+            if (kind == 0) protected_rows[2] = 1;
+            if (kind == 1) grid[2*48+47].bg = 0x02010203;
+            out = run(grid, 48, 6, protected_rows, side, dock, 0, 24, 6, 2);
+            assert(displayed_source(&out, 3*48)/48 == 3);
+            assert(!memcmp(out.cells+2*48, grid+2*48, 48*sizeof(Cell)));
+            chrome_reflow_free(&out);
+            grid[2*48+47].bg = 0;
+        }
+        out = run(grid, 48, 6, NULL, side, dock, 0, 24, 6, 0);
+        assert(displayed_source(&out, 3*48)/48 == 3);
+        chrome_reflow_free(&out); free(grid);
+        /* Downward capacity wins, even with spare blank space above. */
+        const char *below[] = {"123", "", "", command, footer, "", "456"};
+        grid = make_grid(below, 7, 48);
+        out = run(grid, 48, 7, NULL, side, dock, 0, 24, 7, 2);
+        assert(displayed_source(&out, 3*48)/48 == 3);
+        assert(displayed_source(&out, 4*48+2)/48 == 5);
+        expect_row(&out, 2, ""); expect_row(&out, 6, "456");
+        chrome_reflow_free(&out); free(grid);
+    }
+    /* Width is recomputed at the actual destination. An upward move can
+     * leave the dock's vertical band and recover the full row width. */
+    Cell *grid = make_grid(lines, 6, 48);
+    ChromeReflow out = run(grid, 48, 6, NULL, 1, 24, 3, 24, 2, 2);
+    assert(out.changed);
+    expect_row(&out, 2, command);
+    expect_row(&out, 5, "456");
+    chrome_reflow_free(&out); free(grid);
+    checks++;
+}
+
+static void test_preceding_blank_not_reused(void) {
+    const char *lines[] = {
+        "• Ran alpha beta gamma delta epsilon zeta", "  + Show details", "",
+        "• Ran alpha beta gamma delta epsilon zeta", "  + Show details", "456"
+    };
+    for (int side = 1; side <= 2; side++) {
+        Cell *grid = make_grid(lines, 6, 48);
+        ChromeReflow out = run(grid, 48, 6, NULL, side, side == 1 ? 24 : 0, 0, 24, 6, 2);
+        assert(out.changed);
+        /* Row 2 was blank in the source, but now holds the first footer.
+         * The second block must not overwrite it with an upward fallback. */
+        assert(displayed_source(&out, 48+2)/48 == 2);
+        assert(displayed_source(&out, 3*48)/48 == 3);
+        assert(displayed_source(&out, 4*48+2)/48 == 4);
+        expect_row(&out, 5, "456");
+        chrome_reflow_free(&out); free(grid);
+    }
+    checks++;
+}
+
+static void test_preceding_prose_and_two_sided_budget(void) {
+    const char *prose[] = {"123", "", "", "  the quick brown fox jumps over", "456"};
+    const char *both[] = {
+        "123", "", "", "• Ran alpha beta gamma delta epsilon zeta eta theta iota kappa lambda",
+        "  + Show details", "", "456"
+    };
+    for (int side = 1; side <= 2; side++) {
+        Cell *grid = make_grid(prose, 5, 48);
+        ChromeReflow out = run(grid, 48, 5, NULL, side, side == 1 ? 24 : 0, 0, 24, 5, 2);
+        assert(out.changed == 1);
+        assert(displayed_source(&out, 3*48+2)/48 == 2);
+        expect_row(&out, 0, "123"); expect_row(&out, 1, ""); expect_row(&out, 4, "456");
+        expect_dock_gap(&out, side, side == 1 ? 24 : 0, 24, 2, 4, 2);
+        chrome_reflow_free(&out); free(grid);
+        grid = make_grid(both, 7, 80);
+        out = run(grid, 80, 7, NULL, side, side == 1 ? 24 : 0, 0, 56, 7, 2);
+        assert(out.changed);
+        /* Four command rows plus the footer need both preceding blanks and
+         * the following one. The per-side limit permits two above, not just
+         * a total of two across both sides. */
+        assert(displayed_source(&out, 3*80)/80 == 1);
+        assert(displayed_source(&out, 4*80+2)/80 == 5);
+        expect_row(&out, 0, "123"); expect_row(&out, 6, "456");
+        expect_dock_gap(&out, side, side == 1 ? 24 : 0, 56, 1, 6, 2);
+        chrome_reflow_free(&out);
+        out = run(grid, 80, 7, NULL, side, side == 1 ? 24 : 0, 0, 56, 7, 1);
+        assert(displayed_source(&out, 3*80)/80 == 3);
+        expect_row(&out, 1, ""); expect_row(&out, 2, ""); expect_row(&out, 6, "456");
+        chrome_reflow_free(&out); free(grid);
+    }
+    checks++;
+}
+
+static void test_two_cell_gap_and_flush_fallback(void) {
+    const char *lines[] = {"123", "  alpha beta gamma delta epsilon zeta", "", "", "456"};
+    for (int side = 1; side <= 2; side++) {
+        int dock = side == 1 ? 26 : 0;
+        Cell *grid = make_grid(lines, 5, 50);
+        ChromeReflow out = run(grid, 50, 5, NULL, side, dock, 1, 24, 3, 2);
+        assert(out.changed);
+        expect_dock_gap(&out, side, dock, 24, 1, 4, 2);
+        assert(displayed_source(&out, 50+2)%50 == (side == 1 ? 2 : 28));
+        expect_row(&out, 0, "123"); expect_row(&out, 4, "456");
+        chrome_reflow_free(&out); free(grid);
+        const char *flush[] = {"123", "", "• Ran abcdefghijklmnopqrstu", "", "456"};
+        grid = make_grid(flush, 5, 40);
+        dock = side == 1 ? 23 : 0;
+        out = run(grid, 40, 5, NULL, side, dock, 0, 17, 5, 1);
+        assert(out.changed);
+        /* The 21-cell argument cannot fit beside a two-cell margin. Keep
+         * the block anchored and use the flush width before trying blanks
+         * above; do not strand or truncate the argument. */
+        assert(displayed_source(&out, 2*40)/40 == 2);
+        assert(displayed_source(&out, 2*40+6)/40 == 3);
+        assert(out.cells[3*40+(side == 1 ? 22 : 39)].ch == 'u');
+        expect_row(&out, 1, ""); expect_row(&out, 4, "456");
+        chrome_reflow_free(&out); free(grid);
+    }
+    checks++;
+}
+
+static void test_gap_only_overlap(void) {
+    const char *examples[2][2] = {
+        {"  the quick brown fox jumps over the dog", "• Ran alpha beta gamma delta epsilon"},
+        {"          the quick brown fox jumps over lazy dogs", "          • Ran alpha beta gamma delta epsilon eta"}
+    };
+    for (int side = 1; side <= 2; side++) for (int record = 0; record < 2; record++) {
+        const char *lines[] = {"123", examples[side-1][record], "", "456"};
+        int dock = side == 1 ? (record ? 36 : 40) : 0;
+        int width = side == 1 ? 60-dock : 10;
+        int source_col = side == 1 ? (record ? 0 : 2) : 10;
+        Cell *grid = make_grid(lines, 4, 60);
+        /* Nothing lies behind the menu. Its preferred two-cell margin is
+         * the sole trigger, so exercise both the global and block checks. */
+        for (int x = dock; x < dock+width; x++) assert(cr_space(grid[60+x].ch));
+        int margin = side == 1 ? dock-1 : dock+width;
+        assert(!cr_space(grid[60+margin].ch));
+        ChromeReflow out = run(grid, 60, 4, NULL, side, dock, 1, width, 2, 1);
+        assert(out.changed);
+        expect_dock_gap(&out, side, dock, width, 1, 3, 2);
+        assert(displayed_source(&out, 60+source_col)/60 == 1);
+        assert(displayed_source(&out, 60+source_col)%60 == (side == 1 ? source_col : 22));
+        assert(!cr_space(out.cells[2*60+(side == 1 ? 2 : (record ? 24 : 22))].ch));
+        expect_row(&out, 0, "123"); expect_row(&out, 3, "456");
+        chrome_reflow_free(&out);
+        out = run(grid, 60, 4, NULL, side, dock, 1, width, 2, 0);
+        /* No spare row: the original first-row position takes precedence
+         * over padding, and no word is lost merely to make room for a gap. */
+        assert(displayed_source(&out, 60+source_col)/60 == 1);
+        assert(displayed_source(&out, 60+source_col)%60 == (side == 1 ? source_col : 20));
+        expect_row(&out, 2, ""); expect_row(&out, 3, "456");
+        if (side == 1) expect_row(&out, 1, examples[0][record]);
+        chrome_reflow_free(&out); free(grid);
+    }
+    checks++;
+}
+
 static void test_unindented_and_mapping(void) {
     const char *lines[] = {"the quick brown fox jumps", "over the sleeping", "dog", "456"};
     Cell *grid = make_grid(lines, 4, 48);
@@ -577,11 +830,11 @@ static void test_unindented_and_mapping(void) {
     int y;
     assert(out.changed == 1);
     for (y = 0; y < 4; y++) assert(out.markers[y] == -1);
-    expect_row(&out, 0, "the quick brown fox");
-    expect_row(&out, 1, "jumps over the");
+    expect_row(&out, 0, "the quick brown");
+    expect_row(&out, 1, "fox jumps over the");
     expect_row(&out, 2, "sleeping dog");
-    assert(out.source[48] == 20); /* moved j in jumps */
-    assert(out.source[48 + 6] == 48); /* original o in over */
+    assert(out.source[48] == 16); /* moved f in fox */
+    assert(out.source[48 + 10] == 48); /* original o in over */
     assert(out.source[120] >= out.source[96 + 11]); /* trailing space follows last word */
     chrome_reflow_free(&out);
     free(grid);
@@ -717,6 +970,12 @@ int main(void) {
     test_bullet_commands_and_boundaries();
     test_structured_diff_records();
     test_literal_paths_and_tool_output();
+    test_codex_unicode_footer_records();
+    test_preceding_blank_fallback();
+    test_preceding_blank_not_reused();
+    test_preceding_prose_and_two_sided_budget();
+    test_two_cell_gap_and_flush_fallback();
+    test_gap_only_overlap();
     test_row_budget_and_geometry();
     test_unindented_and_mapping();
     test_fixed_following_rows();
