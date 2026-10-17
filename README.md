@@ -779,6 +779,12 @@ make test       # unit, xterm.js, PTY import-size regression, and shell selftest
 ```
 
 After installing, run `hardcore` (or `hardcore DIR` to open a folder).
+It launches a separate app and returns your shell prompt immediately; no `&`
+is needed. Plain `hardcore` uses your current directory. Closing the launching
+terminal leaves the app running. Use `hardcore here` when you want the TUI
+inside your current terminal instead. Commands such as `update`, `slurp`, and
+`--version` still wait and report their results. For debugging the GUI with
+attached output, use `hardcore --foreground [DIR]`.
 The command is a symlink to the installed app's executable. If `~/.local/bin`
 isn't on your PATH, the installer prints the command to enable it in your
 current shell and instructions to make it persistent; shell dotfiles are never

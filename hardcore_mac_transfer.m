@@ -291,10 +291,12 @@ static int mac_spawn(NSString *exe, NSArray *args, int socket_fd, int detached, 
     if (socket_fd >= 0) posix_spawn_file_actions_adddup2(&actions, socket_fd, 198);
     NSUInteger n = args.count;
     char **argv = calloc(n + 2, sizeof(char *));
+    if (!argv) { posix_spawnattr_destroy(&attr); posix_spawn_file_actions_destroy(&actions); errno=ENOMEM; return 0; }
     argv[0] = (char *)exe.fileSystemRepresentation;
     for (NSUInteger i = 0; i < n; i++) argv[i + 1] = (char *)[args[i] UTF8String];
     int rc = posix_spawn(pid, argv[0], &actions, &attr, argv, environ);
     free(argv); posix_spawnattr_destroy(&attr); posix_spawn_file_actions_destroy(&actions);
+    if (rc) errno=rc;
     return rc == 0;
 }
 
@@ -949,7 +951,8 @@ static int mac_cli(int argc, char **argv) {
         printf("hardcore %s (build %s), macOS handoff protocol %d\n", HARDCORE_VERSION, HARDCORE_BUILD, MAC_HANDOFF_VERSION); return 0;
     }
     if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "help") || !strcmp(argv[1], "-h")) {
-        puts("hardcore [DIR]                 open a terminal\n"
+        puts("hardcore [DIR]                 launch the app and return to this prompt\n"
+             "hardcore --foreground [DIR]    keep the GUI attached for debugging\n"
              "hardcore here [-- COMMAND...]   run inside this terminal, without a GUI window\n"
              "hardcore browser open [URL]     new live browser tab (Hardcore grid by default)\n"
              "hardcore browser --help         browser commands and tab targeting\n"

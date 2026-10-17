@@ -3281,6 +3281,7 @@ static int mac_browser_cli(int argc, char **argv);
 #include "hardcore_mac_transfer.m"
 #include "hardcore_mac_update.h"
 #include "hardcore_browser_cli.h"
+#include "hardcore_mac_launch.h"
 
 int main(int argc, char **argv) {
     int i;
@@ -3302,6 +3303,8 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);    /* a write to a pty whose shell just died returns EIO instead */
     int cli_status = mac_cli(argc, argv);
     if (cli_status >= 0) return cli_status;
+    int launch_status = mac_gui_launch(argc, argv);
+    if (launch_status >= 0) return launch_status;
     palette_init();
     drip_init();
     config_load();
