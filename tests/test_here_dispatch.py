@@ -21,6 +21,7 @@ import tempfile
 import termios
 import time
 import unittest
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +57,14 @@ while True:
 '''
 
 
+def tty_settings(fd):
+    value = termios.tcgetattr(fd)
+    # Darwin adds PENDIN itself when restoring ICANON. It is pending-input
+    # bookkeeping, not a user mode; even a bare setraw/tcsetattr pair sets it.
+    value[3] &= ~getattr(termios, 'PENDIN', 0)
+    return value
+
+
 def alive(pid):
     try:
         os.kill(pid, 0)
@@ -69,7 +78,7 @@ class OwnedTerminal:
         self.master, self.slave = pty.openpty()
         self.output = bytearray()
         self.process = None
-        self.original = termios.tcgetattr(self.slave)
+        self.original = tty_settings(self.slave)
         self.size(24, 100)
         try:
             # The fixture retains the host slave for its post-exit termios
@@ -136,7 +145,10 @@ class HereDispatch(unittest.TestCase):
         (contents / "Resources").mkdir()
         self.exe = contents / "MacOS" / "hardcore"
         shutil.copy2(EXE, self.exe)
-        shutil.copy2(HELPER, contents / "Resources" / "here.py")
+        for helper in HELPER.parent.glob("here*.py"):
+            shutil.copy2(helper, contents / "Resources" / helper.name)
+        self.session = "dispatch-" + uuid.uuid4().hex[:12]
+        self.addCleanup(self.stop_session)
         self.cwd = self.root / "child folder's $literal";self.cwd.mkdir()
         self.home = self.root / "private-home";self.home.mkdir()
         self.runtime = self.root / "runtime";self.runtime.mkdir(mode=0o700)
@@ -146,6 +158,11 @@ class HereDispatch(unittest.TestCase):
                         HARDCORE_CTL=str(self.control), HARDCORE_NO_ACTIVATE="1",
                         HARDCORE_RUNTIME_DIR=str(self.runtime),
                         HARDCORE_TEST_CONFIG=str(self.root / "config"))
+
+    def stop_session(self):
+        subprocess.run([str(self.exe), "here", "--stop", self.session], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env,
+                       cwd=self.root, timeout=5)
 
     def no_gui(self):
         self.assertFalse(self.control.exists(), "terminal mode created the GUI test control FIFO")
@@ -179,7 +196,7 @@ class HereDispatch(unittest.TestCase):
         report = self.root / "probe.json"
         arguments = ["a space", "--help", "café 🚀", "$HOME", "$(touch SHOULD_NOT_EXIST)",
                      "semi;colon", "quote'and\"double", "two\nlines", ""]
-        terminal = OwnedTerminal([str(self.exe), "here", "--cwd", str(self.cwd), "--",
+        terminal = OwnedTerminal([str(self.exe), "here", "--session", self.session, "--cwd", str(self.cwd), "--",
             sys.executable, "-u", str(script), str(report), *arguments], self.env, self.root)
         self.addCleanup(terminal.close)
         def current():
@@ -195,11 +212,14 @@ class HereDispatch(unittest.TestCase):
         self.assertEqual(first["argv"], arguments)
         self.assertEqual(first["cwd"], str(self.cwd))
         self.assertEqual(first["tty"], [True,True,True])
-        self.assertEqual(first["size"], [23,100])
+        terminal.wait(lambda: current()["size"] == [23,71], "sidebar-adjusted source PTY size")
+        first = current()
+        self.assertEqual(first["size"], [23,71])
         self.assertEqual((first["term"],first["color"],first["program"]),
                          ("xterm-256color","truecolor","hardcore-here"))
         self.assertNotEqual(first["pid"],terminal.process.pid)
-        self.assertEqual(first["parent"],terminal.process.pid)
+        self.assertNotEqual(first["parent"],terminal.process.pid)
+        self.assertTrue(alive(first["parent"]), "persistent PTY owner missing")
         self.assertFalse((self.cwd / "SHOULD_NOT_EXIST").exists())
         terminal.wait(lambda: b"HERE_COLOR_PROBE" in terminal.output,"source text rendered by terminal frontend")
         self.assertIn(b"38;2;12;34;56;48;2;65;43;21m",terminal.output)
@@ -208,15 +228,18 @@ class HereDispatch(unittest.TestCase):
         self.no_gui()
         return terminal,current,first
 
-    def restored(self, terminal, first):
+    def restored(self, terminal, first, stopped=True):
         self.assertEqual(terminal.exited(),0)
-        self.assertEqual(termios.tcgetattr(terminal.slave),terminal.original,
+        self.assertEqual(tty_settings(terminal.slave),terminal.original,
                          "terminal frontend failed to restore all host termios flags")
         self.assertIn(b"\x1b[?1049l",terminal.output)
         self.assertIn(b"\x1b[?25h",terminal.output)
         self.assertIn(b"\x1b[?1000l",terminal.output)
         self.assertIn(b"\x1b[?2004l",terminal.output)
-        terminal.wait(lambda: not alive(first["pid"]),"owned child process cleanup")
+        if stopped:
+            terminal.wait(lambda: not alive(first["pid"]),"owned child process cleanup")
+        else:
+            self.assertTrue(alive(first["pid"]), "detach killed the owned shell")
         self.no_gui()
 
     def test_packaged_real_pty_preserves_argv_colors_resize_and_quit(self):
@@ -226,19 +249,21 @@ class HereDispatch(unittest.TestCase):
         terminal.wait(lambda: current()["received"]==(payload+b"\x02").hex(),"literal input routed to owned child")
         terminal.size(31,121)
         os.kill(terminal.process.pid,signal.SIGWINCH)
-        resized=terminal.wait(lambda: current() if current()["size"]==[30,121] else None,"host resize propagated to source PTY")
-        self.assertIn([30,121],resized["resizes"])
+        resized=terminal.wait(lambda: current() if current()["size"]==[30,92] else None,"host resize propagated to source PTY")
+        self.assertIn([30,92],resized["resizes"])
         self.assertEqual(resized["pid"],first["pid"])
         terminal.send(b"\x02q")
-        terminal.wait(lambda: b"Quit all tabs? y/N" in terminal.output,"explicit quit confirmation")
+        terminal.wait(lambda: b"End all session processes? y/N" in terminal.output,"explicit quit confirmation")
         terminal.send(b"Y")
         self.restored(terminal,first)
         self.assertEqual(current()["received"],(payload+b"\x02").hex(),"quit shortcut leaked into the source process")
 
-    def test_signal_exit_restores_host_and_reaps_owned_child(self):
+    def test_signal_exit_restores_host_and_detaches_owned_child(self):
         terminal,current,first = self.probe()
         terminal.process.send_signal(signal.SIGTERM)
-        self.restored(terminal,first)
+        self.restored(terminal,first,stopped=False)
+        self.stop_session()
+        terminal.wait(lambda: not alive(first["pid"]), "explicit detached session cleanup")
 
 
 if __name__ == "__main__":

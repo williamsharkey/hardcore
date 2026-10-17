@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run Hardcore's tabbed shells inside the current POSIX terminal.
 
-Ctrl-B then: c new tab, n/p next/previous, 1..9 select, x close, q quit,
-u/d scroll history, ] return live, ? help. Ctrl-B Ctrl-B sends a literal Ctrl-B.
+Ctrl-B then: c new tab, n/p next/previous, s config, / search, D detach,
+R reload UI, x close, q end session, ? help. Ctrl-B Ctrl-B sends a literal Ctrl-B.
 The host terminal supplies fonts and rendering; no GUI or GPU window opens.
 """
 from __future__ import annotations
@@ -28,513 +28,12 @@ import tty
 import unicodedata
 from urllib.parse import urlsplit
 
-MAX_TABS = 16
-MAX_COLS = 500
-MAX_ROWS = 200
-DEFAULT_FG = (235, 219, 178)
-DEFAULT_BG = (40, 40, 40)
-PALETTE = ((40,40,40),(204,36,29),(152,151,26),(215,153,33),(69,133,136),(177,98,134),(104,157,106),(168,153,132),
-           (146,131,116),(251,73,52),(184,187,38),(250,189,47),(131,165,152),(211,134,155),(142,192,124),(235,219,178))
-BOLD, DIM, ITALIC, UNDER, BLINK, INVERSE, HIDDEN, STRIKE = (1 << i for i in range(8))
-DEC_GRAPHICS = dict(zip('`abcdefghijklmnopqrstuvwxyz{|}~', '◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·'))
-BEGIN_PASTE = b'\x1b[200~'
-END_PASTE = b'\x1b[201~'
-
-
-def char_width(char):
-    if unicodedata.combining(char) or char in ('\u200d', '\ufe0e', '\ufe0f'):
-        return 0
-    return 2 if unicodedata.east_asian_width(char) in 'WF' else 1
-
-
-def clean_text(text, columns):
-    result, used = [], 0
-    for char in text:
-        if unicodedata.category(char) in ('Cc', 'Cs', 'Cf'):
-            continue
-        width = char_width(char)
-        if used + width > columns:
-            break
-        if width or result:
-            result.append(char)
-            used += width
-    return ''.join(result)
-
-
-def indexed_color(index):
-    index = max(0, min(255, index))
-    if index < 16:
-        return PALETTE[index]
-    if index >= 232:
-        return (8 + (index-232)*10,) * 3
-    index -= 16
-    levels = (0, 95, 135, 175, 215, 255)
-    return levels[index//36], levels[(index//6)%6], levels[index%6]
-
-
-@dataclass(frozen=True, slots=True)
-class Style:
-    fg: tuple | None = None
-    bg: tuple | None = None
-    flags: int = 0
-    link: str = ''
-
-
-@dataclass(frozen=True, slots=True)
-class Cell:
-    text: str = ' '
-    width: int = 1  # zero denotes the continuation of a double-width glyph
-    style: Style = Style()
-
-
-class Buffer:
-    def __init__(self, cols, rows):
-        self.cols, self.rows = cols, rows
-        self.grid = [[Cell()] * cols for _ in range(rows)]
-        self.x = self.y = 0
-        self.top, self.bottom = 0, rows-1
-        self.wrap = False
-        self.saved = None
-
-    def resize(self, cols, rows):
-        self.grid = [line[:cols] + [Cell()] * max(0, cols-len(line)) for line in self.grid[:rows]]
-        self.grid += [[Cell()] * cols for _ in range(rows-len(self.grid))]
-        self.cols, self.rows = cols, rows
-        for line in self.grid:
-            repair_line(line)
-        self.x, self.y = min(self.x, cols-1), min(self.y, rows-1)
-        self.top, self.bottom, self.wrap = 0, rows-1, False
-
-
-def repair_line(line):
-    for x, cell in enumerate(line):
-        if (cell.width == 2 and (x+1 == len(line) or line[x+1].width != 0)) or \
-           (cell.width == 0 and (x == 0 or line[x-1].width != 2)):
-            line[x] = Cell(style=cell.style)
-
-
-def text_cells(text, columns, style):
-    result=[]
-    for char in clean_text(text,columns):
-        width=char_width(char)
-        if not width:
-            if result:
-                at=len(result)-1 if result[-1].width else len(result)-2
-                if len(result[at].text)<64:result[at]=replace(result[at],text=result[at].text+char)
-        else:
-            result.append(Cell(char,width,style))
-            if width==2:result.append(Cell('',0,style))
-    return result
-
-
-class Terminal:
-    """Bounded VT screen state. Application escape strings never reach the host.
-
-    Standard ANSI/xterm cursor, erase, scroll, style, alternate-screen and mode
-    operations are interpreted. Unknown control strings are discarded through
-    their terminator, including split and oversized OSC/DCS sequences.
-    """
-    def __init__(self, cols, rows, respond=lambda data: None):
-        self.cols, self.rows = cols, rows
-        self.normal, self.alternate = Buffer(cols, rows), Buffer(cols, rows)
-        self.alt = False
-        self.style = Style()
-        self.history = deque(maxlen=max(1, min(1000, 100000//cols)))
-        self.history_pushed = 0
-        self.respond = respond
-        self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
-        self.state, self.control = 'text', ''
-        self.string_esc = False
-        self.string_kind = ''
-        self.title = ''
-        self.cursor_visible, self.cursor_shape = True, 0
-        self.autowrap, self.origin, self.insert = True, False, False
-        self.app_cursor = self.app_keypad = self.bracketed_paste = self.focus = False
-        self.mouse = 0
-        self.mouse_sgr = False
-        self.g0 = self.g1 = 'B'
-        self.charset = 0
-        self.tabstops = set(range(8, cols, 8))
-        self.revision = 0
-
-    @property
-    def screen(self):
-        return self.alternate if self.alt else self.normal
-
-    def resize(self, cols, rows):
-        cols, rows = max(2, min(MAX_COLS, cols)), max(1, min(MAX_ROWS, rows))
-        for buffer in (self.normal, self.alternate):
-            buffer.resize(cols, rows)
-        self.tabstops.update(range(((self.cols+7)//8)*8, cols, 8))
-        self.tabstops = {x for x in self.tabstops if 0 <= x < cols}
-        self.cols, self.rows = cols, rows
-        self.revision += 1
-
-    def blank_line(self):
-        return [Cell(style=self.style)] * self.cols
-
-    def scroll_up(self, count=1):
-        s = self.screen
-        for _ in range(min(max(1, count), s.bottom-s.top+1)):
-            line = s.grid.pop(s.top)
-            if not self.alt and s.top == 0 and s.bottom == self.rows-1:
-                self.history.append(line)
-                self.history_pushed += 1
-            s.grid.insert(s.bottom, self.blank_line())
-
-    def scroll_down(self, count=1):
-        s = self.screen
-        for _ in range(min(max(1, count), s.bottom-s.top+1)):
-            s.grid.pop(s.bottom)
-            s.grid.insert(s.top, self.blank_line())
-
-    def index(self, reverse=False):
-        s = self.screen
-        s.wrap = False
-        if reverse:
-            if s.y == s.top:
-                self.scroll_down()
-            else:
-                s.y = max(0, s.y-1)
-        elif s.y == s.bottom:
-            self.scroll_up()
-        else:
-            s.y = min(self.rows-1, s.y+1)
-
-    def clear_cell(self, line, x):
-        if line[x].width == 0 and x:
-            line[x-1] = Cell(style=self.style)
-        if line[x].width == 2 and x+1 < self.cols:
-            line[x+1] = Cell(style=self.style)
-        line[x] = Cell(style=self.style)
-
-    def put(self, char):
-        s = self.screen
-        if unicodedata.category(char) in ('Cc','Cs','Cf') and char != '\u200d':
-            return
-        if (self.g1 if self.charset else self.g0) == '0':
-            char = DEC_GRAPHICS.get(char, char)
-        width = char_width(char)
-        previous = s.x if s.wrap else s.x-1
-        if previous >= 0:
-            if s.grid[s.y][previous].width == 0:
-                previous -= 1
-            prior = s.grid[s.y][previous]
-            if not width or prior.text.endswith('\u200d'):
-                if len(prior.text)<64:
-                    s.grid[s.y][previous] = replace(prior, text=prior.text+char)
-                return
-        if not width:
-            return
-        if s.wrap and self.autowrap:
-            s.x = 0
-            self.index()
-        s.wrap = False
-        if width == 2 and s.x == self.cols-1:
-            if self.autowrap:
-                s.x = 0
-                self.index()
-            else:
-                char, width = '\ufffd', 1
-        line = s.grid[s.y]
-        if self.insert:
-            line[s.x:s.x] = [Cell(style=self.style)] * width
-            del line[self.cols:]
-            repair_line(line)
-        self.clear_cell(line, s.x)
-        if width == 2:
-            self.clear_cell(line, s.x+1)
-        line[s.x] = Cell(char, width, self.style)
-        if width == 2:
-            line[s.x+1] = Cell('', 0, self.style)
-        if s.x+width >= self.cols:
-            s.x, s.wrap = self.cols-1, True
-        else:
-            s.x += width
-
-    def save(self):
-        s = self.screen
-        s.saved = (s.x, s.y, self.style, s.wrap, self.origin)
-
-    def restore(self):
-        s = self.screen
-        if s.saved:
-            x, y, self.style, s.wrap, self.origin = s.saved
-            s.x, s.y = min(x, self.cols-1), min(y, self.rows-1)
-
-    def position(self, row=1, col=1):
-        s = self.screen
-        low, high = (s.top, s.bottom) if self.origin else (0, self.rows-1)
-        s.y = max(low, min(high, low+row-1))
-        s.x = max(0, min(self.cols-1, col-1))
-        s.wrap = False
-
-    def erase_line(self, mode):
-        s = self.screen
-        left, right = (s.x, self.cols) if mode == 0 else (0, s.x+1) if mode == 1 else (0, self.cols)
-        for x in range(left, right):
-            self.clear_cell(s.grid[s.y], x)
-        s.wrap = False
-
-    def erase_display(self, mode):
-        s = self.screen
-        if mode == 3:
-            self.history.clear()
-            return
-        if mode == 2:
-            s.grid = [self.blank_line() for _ in range(self.rows)]
-        elif mode in (0, 1):
-            self.erase_line(mode)
-            for y in (range(s.y+1, self.rows) if mode == 0 else range(s.y)):
-                s.grid[y] = self.blank_line()
-        s.wrap = False
-
-    def set_mode(self, private, values, enabled):
-        for mode in values:
-            if not private:
-                if mode == 4:
-                    self.insert = enabled
-                continue
-            if mode == 1:
-                self.app_cursor = enabled
-            elif mode == 6:
-                self.origin = enabled
-                self.position()
-            elif mode == 7:
-                self.autowrap = enabled
-            elif mode == 25:
-                self.cursor_visible = enabled
-            elif mode in (47, 1047, 1049):
-                if enabled and not self.alt:
-                    if mode == 1049:
-                        self.save()
-                        self.alternate = Buffer(self.cols, self.rows)
-                    self.alt = True
-                elif not enabled and self.alt:
-                    self.alt = False
-                    if mode == 1049:
-                        self.restore()
-            elif mode == 1048:
-                self.save() if enabled else self.restore()
-            elif mode in (1000, 1002, 1003):
-                self.mouse = mode if enabled else (0 if self.mouse == mode else self.mouse)
-            elif mode == 1006:
-                self.mouse_sgr = enabled
-            elif mode == 1004:
-                self.focus = enabled
-            elif mode == 2004:
-                self.bracketed_paste = enabled
-
-    def sgr(self, raw):
-        # Both semicolon RGB and ISO colon RGB forms (with optional colorspace).
-        raw = re.sub(r'(38|48):2:(?:0)?:', r'\1;2;', raw)
-        raw = raw.replace(':', ';')
-        try:
-            values = [int(x or 0) for x in raw.split(';')]
-        except ValueError:
-            return
-        i = 0
-        while i < len(values):
-            value = values[i]
-            if value == 0:
-                self.style = Style(link=self.style.link)
-            elif value in (1,2,3,4,5,7,8,9):
-                bit = {1:BOLD,2:DIM,3:ITALIC,4:UNDER,5:BLINK,7:INVERSE,8:HIDDEN,9:STRIKE}[value]
-                self.style = replace(self.style, flags=self.style.flags|bit)
-            elif value in (22,23,24,25,27,28,29):
-                bit = {22:BOLD|DIM,23:ITALIC,24:UNDER,25:BLINK,27:INVERSE,28:HIDDEN,29:STRIKE}[value]
-                self.style = replace(self.style, flags=self.style.flags & ~bit)
-            elif value in (39,49):
-                self.style = replace(self.style, **{'fg' if value == 39 else 'bg': None})
-            elif 30 <= value <= 37 or 90 <= value <= 97:
-                self.style = replace(self.style, fg=indexed_color(value-30 if value < 90 else value-90+8))
-            elif 40 <= value <= 47 or 100 <= value <= 107:
-                self.style = replace(self.style, bg=indexed_color(value-40 if value < 100 else value-100+8))
-            elif value in (38,48) and i+1 < len(values):
-                mode = values[i+1]
-                color = None
-                if mode == 5 and i+2 < len(values):
-                    color, i = indexed_color(values[i+2]), i+2
-                elif mode == 2 and i+4 < len(values):
-                    color, i = tuple(max(0,min(255,x)) for x in values[i+2:i+5]), i+4
-                if color is not None:
-                    self.style = replace(self.style, **{'fg' if value == 38 else 'bg': color})
-            i += 1
-
-    def csi(self, sequence):
-        final, raw = sequence[-1], sequence[:-1]
-        private = bool(raw) and raw[0] in '?><='
-        prefix = raw[0] if private else ''
-        if private:
-            raw = raw[1:]
-        intermediate = ''.join(c for c in raw if ' ' <= c <= '/')
-        raw = ''.join(c for c in raw if c not in intermediate) if intermediate else raw
-        if final == 'm' and not private:
-            self.sgr(raw)
-            return
-        try:
-            values = [min(1000000,int(x or 0)) for x in raw.split(';')]
-        except ValueError:
-            return
-        n = max(1, values[0])
-        s = self.screen
-        low, high = (s.top,s.bottom) if self.origin else (0,self.rows-1)
-        if final in 'ABeCDaEFG`Hfd':
-            if final == 'A': s.y = max(low,s.y-n)
-            elif final in 'Be': s.y = min(high,s.y+n)
-            elif final in 'Ca': s.x = min(self.cols-1,s.x+n)
-            elif final == 'D': s.x = max(0,s.x-n)
-            elif final == 'E': s.y,s.x = min(high,s.y+n),0
-            elif final == 'F': s.y,s.x = max(low,s.y-n),0
-            elif final in 'G`': s.x = min(self.cols-1,n-1)
-            elif final == 'd': self.position(n,s.x+1)
-            else: self.position(n,max(1,values[1]) if len(values)>1 else 1)
-            s.wrap = False
-        elif final == 'J': self.erase_display(values[0])
-        elif final == 'K': self.erase_line(values[0])
-        elif final in 'hl': self.set_mode(prefix == '?',values,final == 'h')
-        elif final == 's' and not private: self.save()
-        elif final == 'u' and not private: self.restore()
-        elif final == 'u' and prefix == '?': self.respond(b'\x1b[?0u')
-        elif final == 'r' and not private:
-            top = n-1
-            bottom = (values[1] or self.rows)-1 if len(values)>1 else self.rows-1
-            if 0 <= top < bottom < self.rows:
-                s.top,s.bottom = top,bottom
-                self.position()
-        elif final in 'LM' and s.top <= s.y <= s.bottom:
-            for _ in range(min(n,s.bottom-s.y+1)):
-                if final == 'L': s.grid.pop(s.bottom);s.grid.insert(s.y,self.blank_line())
-                else: s.grid.pop(s.y);s.grid.insert(s.bottom,self.blank_line())
-        elif final in '@PX':
-            n = min(n,self.cols-s.x)
-            line = s.grid[s.y]
-            if final == '@': line[s.x:s.x] = [Cell(style=self.style)]*n;del line[self.cols:]
-            elif final == 'P': del line[s.x:s.x+n];line.extend([Cell(style=self.style)]*n)
-            else:
-                for x in range(s.x,s.x+n): self.clear_cell(line,x)
-            repair_line(line)
-        elif final == 'S': self.scroll_up(n)
-        elif final == 'T': self.scroll_down(n)
-        elif final in 'IZ':
-            stops = sorted(self.tabstops,reverse=final=='Z')
-            for _ in range(min(n,self.cols)):
-                choices = [x for x in stops if x>s.x] if final == 'I' else [x for x in stops if x<s.x]
-                s.x = choices[0] if choices else self.cols-1 if final=='I' else 0
-            s.wrap = False
-        elif final == 'g':
-            if values[0] == 0: self.tabstops.discard(s.x)
-            elif values[0] == 3: self.tabstops.clear()
-        elif final == 'n':
-            if values[0] == 5: self.respond(b'\x1b[0n')
-            elif values[0] == 6:
-                row = s.y-s.top+1 if self.origin else s.y+1
-                self.respond(f'\x1b[{"?" if prefix=="?" else ""}{row};{s.x+1}R'.encode())
-        elif final == 'c':
-            self.respond(b'\x1b[>0;0;0c' if prefix == '>' else b'\x1b[?1;2c')
-        elif final == 'q' and intermediate == ' ': self.cursor_shape = values[0] if 0 <= values[0] <= 6 else 0
-        elif final == 't' and values[0] == 18: self.respond(f'\x1b[8;{self.rows};{self.cols}t'.encode())
-        elif final == 'p' and intermediate == '$' and prefix == '?':
-            self.respond(f'\x1b[?{values[0]};0$y'.encode())
-
-    def osc(self, text):
-        code, _, value = text.partition(';')
-        if code in ('0','2'):
-            self.title = clean_text(value,80)
-        elif code == '8':
-            _, _, url = value.partition(';')
-            try:
-                allowed = urlsplit(url).scheme in ('http','https','mailto','file')
-            except ValueError:
-                allowed = False
-            if len(url)>2048 or any(unicodedata.category(c) in ('Cc','Cs') for c in url): allowed=False
-            self.style = replace(self.style,link=url if allowed else '')
-        elif code in ('10','11') and value == '?':
-            rgb = DEFAULT_FG if code == '10' else DEFAULT_BG
-            color = '/'.join(f'{x*257:04x}' for x in rgb)
-            self.respond(f'\x1b]{code};rgb:{color}\x1b\\'.encode())
-        elif code == '4':
-            parts = value.split(';')
-            if len(parts)==2 and len(parts[0])<=3 and parts[0].isdigit() and parts[1]=='?':
-                rgb=indexed_color(min(255,int(parts[0])))
-                color='/'.join(f'{x*257:04x}' for x in rgb)
-                self.respond(f'\x1b]4;{parts[0]};rgb:{color}\x1b\\'.encode())
-
-    def feed(self, data):
-        text = self.decoder.decode(data)
-        for char in text:
-            code = ord(char)
-            if self.state in ('osc','discard'):
-                if self.string_esc:
-                    self.string_esc = False
-                    if char == '\\':
-                        if self.state == 'osc': self.osc(self.control)
-                        self.state,self.control='text',''
-                        continue
-                if char == '\x1b': self.string_esc=True
-                elif char == '\x07' and self.string_kind == 'osc':
-                    if self.state == 'osc':self.osc(self.control)
-                    self.state,self.control='text',''
-                elif char in ('\x18','\x1a'):
-                    self.state,self.control='text',''
-                elif self.state == 'osc':
-                    if len(self.control)<16384: self.control += char
-                    else: self.state,self.control='discard',''
-                continue
-            if char == '\x1b': self.state,self.control='escape','';continue
-            if char in ('\x18','\x1a'): self.state,self.control='text','';continue
-            if self.state == 'escape_intermediate':
-                if '0' <= char <= '~':self.state='text'
-                continue
-            if self.state == 'csi':
-                if '@' <= char <= '~':
-                    if len(self.control)<256: self.csi(self.control+char)
-                    self.state,self.control='text',''
-                elif len(self.control)<256: self.control+=char
-                continue
-            if self.state == 'charset':
-                if self.control == '(': self.g0=char
-                else: self.g1=char
-                self.state,self.control='text',''
-                continue
-            if self.state == 'escape':
-                self.state='text'
-                if char == '[': self.state='csi'
-                elif char == ']': self.state='osc';self.string_kind='osc';self.string_esc=False
-                elif char in 'PX^_': self.state='discard';self.string_kind='dcs';self.string_esc=False
-                elif char in '()*+': self.state,self.control='charset',char
-                elif ' ' <= char <= '/': self.state='escape_intermediate'
-                elif char == '7': self.save()
-                elif char == '8': self.restore()
-                elif char == 'D': self.index()
-                elif char == 'M': self.index(True)
-                elif char == 'E': self.screen.x=0;self.index()
-                elif char == 'H': self.tabstops.add(self.screen.x)
-                elif char == '=': self.app_keypad=True
-                elif char == '>': self.app_keypad=False
-                elif char == 'c':
-                    respond=self.respond;self.__init__(self.cols,self.rows,respond)
-                continue
-            if char == '\r': self.screen.x=0;self.screen.wrap=False
-            elif char in ('\n','\v','\f'): self.index()
-            elif char == '\b': self.screen.x=max(0,self.screen.x-1);self.screen.wrap=False
-            elif char == '\t':
-                self.screen.x=next((x for x in sorted(self.tabstops) if x>self.screen.x),self.cols-1)
-                self.screen.wrap=False
-            elif char == '\x0e': self.charset=1
-            elif char == '\x0f': self.charset=0
-            elif code>=32 and code!=127: self.put(char)
-        self.revision += 1
-
-    def visible(self, scroll=0):
-        if self.alt or not scroll:
-            return self.screen.grid
-        lines = list(self.history)+self.normal.grid
-        end = len(lines)-min(scroll,len(self.history))
-        result = lines[max(0,end-self.rows):end]
-        view=[line[:self.cols]+[Cell()] * max(0,self.cols-len(line)) for line in result]
-        for line in view:repair_line(line)
-        return view
+# Standalone bundles and tests loaded via importlib need sibling helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from here_terminal import (MAX_TABS, MAX_COLS, MAX_ROWS, DEFAULT_FG, DEFAULT_BG,
+    PALETTE, BOLD, DIM, ITALIC, UNDER, BLINK, INVERSE, HIDDEN, STRIKE,
+    DEC_GRAPHICS, BEGIN_PASTE, END_PASTE, char_width, clean_text, indexed_color,
+    Style, Cell, Buffer, repair_line, text_cells, Terminal, resolve_style)
 
 
 class InputDecoder:
@@ -710,7 +209,8 @@ class Session:
             if self.exited is None:time.sleep(.01)
 
 
-def style_escape(style):
+def style_escape(style, theme=None):
+    if theme is not None:style=resolve_style(style,theme.palette,theme.fg,theme.bg)
     codes=['0']
     for bit,code in ((BOLD,1),(DIM,2),(ITALIC,3),(UNDER,4),(BLINK,5),(INVERSE,7),(HIDDEN,8),(STRIKE,9)):
         if style.flags&bit:codes.append(str(code))
@@ -718,7 +218,7 @@ def style_escape(style):
     return '\x1b['+';'.join(codes)+'m'
 
 
-def render_line(cells):
+def render_line(cells, theme=None):
     result=[];style=None;link=''
     for cell in cells:
         if cell.width==0:continue
@@ -728,7 +228,7 @@ def render_line(cells):
                 if link:result.append('\x1b]8;;\x1b\\')
                 link=style.link
                 if link:result.append('\x1b]8;;'+link+'\x1b\\')
-            result.append(style_escape(style))
+            result.append(style_escape(style,theme))
         result.append(cell.text)
     if link:result.append('\x1b]8;;\x1b\\')
     return ''.join(result)
@@ -997,17 +497,45 @@ class Application:
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--cwd',default=os.getcwd(),help='directory for the first shell and new tabs')
+    parser.add_argument('--cwd',default=os.getcwd(),help='directory for the first shell')
     parser.add_argument('--shell',default=os.environ.get('SHELL') or '/bin/sh',help='interactive shell for new tabs')
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--session',metavar='NAME',help='create or attach a named persistent session')
+    mode.add_argument('--attach',metavar='NAME',help='attach an existing session')
+    mode.add_argument('--list',action='store_true',help='list live terminal-hosted sessions')
+    mode.add_argument('--stop',metavar='NAME',help='end a session and its owned programs')
+    parser.add_argument('--takeover',action='store_true',help='explicitly replace an attached frontend')
     parser.add_argument('command',nargs=argparse.REMAINDER,help='optional command, following --')
     args=parser.parse_args(argv)
-    if not os.isatty(0) or not os.isatty(1):
-        parser.exit(2,'hardcore here needs an interactive terminal on stdin and stdout. Run it directly in Terminal, a Linux terminal, or WSL.\n')
-    cwd=str(Path(args.cwd).expanduser().resolve())
-    if not Path(cwd).is_dir():parser.exit(2,f'hardcore here: not a directory: {cwd}\n')
-    command=args.command[1:] if args.command[:1]==['--'] else args.command
-    try:return Application(args.shell,cwd,command or None).run()
-    except (OSError,ValueError) as error:
+    from here_broker import BrokerClient,BrokerError,start_session,status_session,list_sessions,stop_session
+    from here_frontend import StudioApplication
+    try:
+        if args.list:
+            sessions=list_sessions()
+            for state in sessions:
+                print(f"{state['name']}  {len(state['tabs'])} tabs  "
+                      f"{'attached' if state.get('attached') else 'detached'}")
+            if not sessions:print('No terminal-hosted Hardcore sessions.')
+            return 0
+        if args.stop:stop_session(args.stop);return 0
+        if not os.isatty(0) or not os.isatty(1):
+            parser.exit(2,'hardcore here needs an interactive terminal on stdin and stdout. Run it directly in Terminal, a Linux terminal, or WSL.\n')
+        cwd=str(Path(args.cwd).expanduser().resolve())
+        if not Path(cwd).is_dir():parser.exit(2,f'hardcore here: not a directory: {cwd}\n')
+        command=args.command[1:] if args.command[:1]==['--'] else args.command
+        size=os.get_terminal_size(1)
+        cols=max(2,min(500,size.columns)-(29 if size.columns>=76 else 0))
+        rows=max(1,min(200,size.lines-1))
+        name=args.attach or args.session
+        if name:
+            try:status_session(name)
+            except (FileNotFoundError,ConnectionRefusedError):
+                if args.attach:raise BrokerError(f'Session {name} does not exist')
+                name=start_session(name,shell=args.shell,cwd=cwd,command=command or None,cols=cols,rows=rows)
+        else:name=start_session(shell=args.shell,cwd=cwd,command=command or None,cols=cols,rows=rows)
+        client=BrokerClient(name,takeover=args.takeover)
+        return StudioApplication(client,name).run()
+    except (OSError,ValueError,BrokerError) as error:
         print(f'hardcore here: {error}',file=sys.stderr)
         return 1
 

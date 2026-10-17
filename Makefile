@@ -30,6 +30,7 @@ MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -framework 
 APP        = hardcore.app
 APPDIR    ?= $(HOME)/Applications
 BINDIR    ?= $(HOME)/.local/bin
+HERE_SRC   = $(wildcard tools/here*.py) tools/files.py
 
 .PHONY: all clean selftest install test mac-test slurp-test
 
@@ -128,7 +129,7 @@ bench/termbench.exe: bench/termbench.c
 selftest: hardcore.exe
 	./hardcore.exe --selftest selftest.txt; rc=$$?; cat selftest.txt; exit $$rc
 
-win-install: hardcore.exe tools/here.py
+win-install: hardcore.exe $(HERE_SRC)
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/install.ps1 -Exe "$$(wslpath -w hardcore.exe 2>/dev/null || echo hardcore.exe)" -HereScript "$$(wslpath -w tools/here.py 2>/dev/null || echo tools/here.py)"
 	python3 tools/install_here.py "$(BINDIR)"
 
@@ -166,7 +167,7 @@ build/recording-export: tools/recording_export.m
 	@mkdir -p build
 	clang -O2 -fobjc-arc -mmacosx-version-min=11.0 -arch arm64 -arch x86_64 -framework Foundation -framework AppKit -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework ImageIO $< -o $@
 
-$(APP): build/recording-export $(wildcard recording/*.html recording/*.js recording/*.css) tools/here.py tools/files.py build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
+$(APP): build/recording-export $(wildcard recording/*.html recording/*.js recording/*.css) $(HERE_SRC) build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
 	rm -rf $@
 	mkdir -p $@/Contents/MacOS $@/Contents/Resources
 	cp build/hardcore $@/Contents/MacOS/hardcore
@@ -176,7 +177,7 @@ $(APP): build/recording-export $(wildcard recording/*.html recording/*.js record
 	mkdir -p $@/Contents/Resources/recording
 	cp recording/*.html recording/*.js recording/*.css $@/Contents/Resources/recording/
 	cp tools/update_mac.py $@/Contents/Resources/update_mac.py
-	cp tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py tools/files.py tools/here.py $@/Contents/Resources/
+	cp tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(HERE_SRC) $@/Contents/Resources/
 	mkdir -p $@/Contents/Resources/plugins
 	cp -R plugins/.claude-plugin plugins/hardcore-slurp plugins/hardcore-slurp-driver $@/Contents/Resources/plugins/
 	sed 's/@VERSION@/$(shell sed -n 's/^#define HARDCORE_VERSION "\(.*\)"/\1/p' hardcore.c)/' tools/Info.plist > $@/Contents/Info.plist
@@ -358,11 +359,16 @@ browser-test: build/browser.inc
 
 # Portable terminal-hosted mode, with no graphics or cross compiler required.
 .PHONY: install-here here-test
-install-here:
+install-here: $(HERE_SRC)
 	python3 tools/install_here.py "$(BINDIR)"
 here-test:
 	python3 tests/test_here.py
 	python3 tests/test_here_events.py
+	python3 tests/test_here_terminal.py
+	python3 tests/test_here_settings.py
+	python3 tests/test_here_broker.py
+	python3 tests/test_here_frontend.py
+	python3 tests/test_here_web.py
 	python3 tests/test_here_install.py
 
 .PHONY: mac-here-test

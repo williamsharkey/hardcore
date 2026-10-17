@@ -17,14 +17,24 @@ import time
 from types import SimpleNamespace
 import unittest
 import fcntl
+import uuid
 
 ROOT=Path(__file__).resolve().parents[1]
 SPEC=importlib.util.spec_from_file_location('hc_here',ROOT/'tools/here.py')
 here=importlib.util.module_from_spec(SPEC);sys.modules[SPEC.name]=here;SPEC.loader.exec_module(here)
+import here_broker as broker
 
 
 def rows(term):
     return [''.join(c.text for c in line if c.width) for line in term.screen.grid]
+
+
+def tty_settings(fd):
+    value = termios.tcgetattr(fd)
+    # Darwin adds PENDIN itself when restoring ICANON. It is pending-input
+    # bookkeeping, not a user mode; even a bare setraw/tcsetattr pair sets it.
+    value[3] &= ~getattr(termios, 'PENDIN', 0)
+    return value
 
 
 def wait(check, timeout=5):
@@ -250,15 +260,18 @@ class OwnedPtyTests(unittest.TestCase):
         self.log=self.path/'events.jsonl'
         self.master,self.slave=pty.openpty()
         fcntl.ioctl(self.slave,termios.TIOCSWINSZ,struct.pack('HHHH',14,72,0,0))
-        self.original=termios.tcgetattr(self.slave)
+        self.original=tty_settings(self.slave)
         os.set_blocking(self.master,False)
         self.output=bytearray();self.process=None
+        self.session='test-here-'+uuid.uuid4().hex[:12]
 
     def tearDown(self):
         if self.process and self.process.poll() is None:
             self.process.terminate()
             try:self.process.wait(timeout=4)
             except subprocess.TimeoutExpired:self.process.kill();self.process.wait()
+        try:broker.stop_session(self.session)
+        except (OSError,broker.BrokerError):pass
         os.close(self.master);os.close(self.slave);self.temp.cleanup()
 
     def drain(self):
@@ -274,9 +287,9 @@ class OwnedPtyTests(unittest.TestCase):
 
     def start(self):
         env=dict(os.environ,HARDCORE_CTL='not-a-gui',HARDCORE_WINDOW_PID='123',HARDCORE_TAB_ID='456',NO_COLOR='1')
-        self.process=subprocess.Popen([sys.executable,str(ROOT/'tools/here.py'),'--shell','/bin/sh','--cwd',str(self.path),'--',sys.executable,str(self.worker),str(self.log)],stdin=self.slave,stdout=self.slave,stderr=self.slave,start_new_session=True,env=env)
+        self.process=subprocess.Popen([sys.executable,str(ROOT/'tools/here.py'),'--session',self.session,'--shell','/bin/sh','--cwd',str(self.path),'--',sys.executable,str(self.worker),str(self.log)],stdin=self.slave,stdout=self.slave,stderr=self.slave,start_new_session=True,env=env)
         wait(lambda:any(r['kind']=='ready' for r in self.records()))
-        wait(lambda:b'COLOR_READY' in self.drain())
+        wait(lambda:b'COLOR_READY' in self.drain() and b'\x1b[?1003h' in self.output)
         return next(r['pid'] for r in self.records() if r['kind']=='ready')
 
     def test_real_pty_colors_paste_tabs_resize_and_restoration(self):
@@ -289,7 +302,7 @@ class OwnedPtyTests(unittest.TestCase):
         wait(lambda:expected in b''.join(bytes.fromhex(r['hex']) for r in self.records() if r['kind']=='input'))
         self.assertIsNone(self.process.poll())
         fcntl.ioctl(self.slave,termios.TIOCSWINSZ,struct.pack('HHHH',20,91,0,0));os.kill(self.process.pid,signal.SIGWINCH)
-        wait(lambda:any(r['kind']=='size' and r['value']==[19,91] and r['pid']==pid for r in self.records()))
+        wait(lambda:any(r['kind']=='size' and r['value']==[19,62] and r['pid']==pid for r in self.records()))
         before=b''.join(bytes.fromhex(r['hex']) for r in self.records() if r['kind']=='input')
         os.write(self.master,b'\x02c')
         time.sleep(.1);self.drain()
@@ -298,31 +311,70 @@ class OwnedPtyTests(unittest.TestCase):
         os.write(self.master,b'\x021');time.sleep(.1);self.drain()
         self.assertEqual(before,b''.join(bytes.fromhex(r['hex']) for r in self.records() if r['kind']=='input'))
         os.write(self.master,b'\x02qy')
-        wait(lambda:self.process.poll() is not None)
+        wait(lambda:(self.drain(), self.process.poll() is not None)[1])
         self.assertEqual(self.process.returncode,0,self.drain()[-2000:])
-        self.assertEqual(termios.tcgetattr(self.slave),self.original)
+        self.assertEqual(tty_settings(self.slave),self.original)
         self.assertIn(b'\x1b[?1049l',self.drain())
-        with self.assertRaises(ProcessLookupError):os.kill(pid,0)
+        def gone():
+            try:os.kill(pid,0);return False
+            except ProcessLookupError:return True
+        wait(gone)
 
-    def test_signal_exit_restores_tty_and_terminates_owned_child(self):
+    def test_frontend_reload_and_detach_preserve_process_and_screen(self):
+        pid=self.start()
+        owner=broker.status_session(self.session)['pid']
+        frontend=self.process.pid
+        enters=self.drain().count(b'\x1b[?1049h')
+        os.write(self.master,b'\x02R')
+        wait(lambda:self.drain().count(b'\x1b[?1049h')>enters)
+        self.assertEqual(self.process.pid,frontend)
+        self.assertEqual(broker.status_session(self.session)['pid'],owner)
+        self.assertEqual(broker.status_session(self.session)['tabs'][0]['pid'],pid)
+        os.write(self.master,b'after-reload')
+        wait(lambda:b'after-reload' in b''.join(bytes.fromhex(r['hex']) for r in self.records() if r['kind']=='input'))
+        os.write(self.master,b'\x02D')
+        wait(lambda:(self.drain(),self.process.poll() is not None)[1])
+        self.assertEqual(self.process.returncode,0)
+        self.assertEqual(tty_settings(self.slave),self.original)
+        os.kill(pid,0)
+        wait(lambda:not broker.status_session(self.session)['attached'])
+        self.output.clear()
+        self.process=subprocess.Popen([sys.executable,str(ROOT/'tools/here.py'),'--attach',self.session],
+                                      stdin=self.slave,stdout=self.slave,stderr=self.slave,start_new_session=True)
+        wait(lambda:b'COLOR_READY' in self.drain() and b'\x1b[?1003h' in self.output)
+        self.assertEqual(broker.status_session(self.session)['pid'],owner)
+        self.assertEqual(broker.status_session(self.session)['tabs'][0]['pid'],pid)
+        os.write(self.master,b'after-reattach')
+        wait(lambda:b'after-reattach' in b''.join(bytes.fromhex(r['hex']) for r in self.records() if r['kind']=='input'))
+        os.write(self.master,b'\x02qy')
+        wait(lambda:(self.drain(),self.process.poll() is not None)[1])
+        self.assertEqual(self.process.returncode,0)
+        self.assertEqual(tty_settings(self.slave),self.original)
+
+    def test_signal_exit_restores_tty_and_detaches_owned_child(self):
         pid=self.start();self.process.terminate()
-        wait(lambda:self.process.poll() is not None)
-        self.assertEqual(termios.tcgetattr(self.slave),self.original)
-        with self.assertRaises(ProcessLookupError):os.kill(pid,0)
+        wait(lambda:(self.drain(), self.process.poll() is not None)[1])
+        self.assertEqual(tty_settings(self.slave),self.original)
+        os.kill(pid,0)  # The owned process survives frontend termination.
+        broker.stop_session(self.session)
+        def gone():
+            try:os.kill(pid,0);return False
+            except ProcessLookupError:return True
+        wait(gone)
 
     @unittest.skipUnless(Path('/bin/zsh').exists(),'zsh not installed')
     def test_real_clean_zsh_prompt_and_fullscreen_escape_defaults(self):
-        self.process=subprocess.Popen([sys.executable,str(ROOT/'tools/here.py'),'--cwd',str(self.path),'--','/bin/zsh','-f','-i'],
+        self.process=subprocess.Popen([sys.executable,str(ROOT/'tools/here.py'),'--session',self.session,'--cwd',str(self.path),'--','/bin/zsh','-f','-i'],
                                       stdin=self.slave,stdout=self.slave,stderr=self.slave,start_new_session=True)
-        wait(lambda:b'hardcore' in self.drain())
+        wait(lambda:b'\x1b[?1003h' in self.drain())
         os.write(self.master,b"printf '\\033[?1049h\\033[H\\033[J\\033[31m'; printf ZSH_SCREEN_READY\r")
         wait(lambda:b'ZSH_SCREEN_READY' in self.drain())
         self.assertIsNone(self.process.poll())
         os.write(self.master,b"printf '\\033[m\\033[?1049l'; printf ZSH_RESTORED\r")
         wait(lambda:b'ZSH_RESTORED' in self.drain())
-        os.write(self.master,b'\x02qy');wait(lambda:self.process.poll() is not None)
+        os.write(self.master,b'\x02qy');wait(lambda:(self.drain(), self.process.poll() is not None)[1])
         self.assertEqual(self.process.returncode,0,self.drain()[-1000:])
-        self.assertEqual(termios.tcgetattr(self.slave),self.original)
+        self.assertEqual(tty_settings(self.slave),self.original)
 
     def test_cleanup_includes_owned_background_process_groups(self):
         log=self.path/'background.pid'

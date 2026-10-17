@@ -11,6 +11,8 @@ import tempfile
 
 MARKER = b"# HARDCORE_TERMINAL_LAUNCHER_V1"
 LAUNCHER_HEADER = b"#!/usr/bin/env python3\n" + MARKER + b"\n"
+REQUIRED_FILES = ('here.py', 'here_frontend.py', 'here_settings.py', 'here_broker.py',
+                  'here_terminal.py', 'here_web.py', 'files.py')
 
 
 def owned_launcher(path):
@@ -71,8 +73,16 @@ def install(bindir, native=None):
         native = str(Path(native).expanduser().resolve())
         if native == str(target) or not Path(native).is_file() or not os.access(native, os.X_OK):
             raise ValueError("native fallback must name a different, existing executable")
-    source = Path(__file__).with_name("here.py")
-    atomic(data / "here.py", source.read_bytes())
+    source = Path(__file__).resolve().parent
+    # Preflight the entire runtime before touching an existing installation.
+    # The entry point now imports siblings, and Files is launched by path.
+    missing = [name for name in REQUIRED_FILES if not (source / name).is_file()]
+    if missing:
+        raise ValueError("incomplete terminal runtime: missing " + ", ".join(missing))
+    resources = {path.name:path.read_bytes() for path in sorted(source.glob('here*.py'))}
+    resources['files.py'] = (source / 'files.py').read_bytes()
+    for name, payload in resources.items():
+        atomic(data / name, payload)
     atomic(config, (json.dumps({"native": native}) + "\n").encode())
     launcher = f'''#!/usr/bin/env python3
 # HARDCORE_TERMINAL_LAUNCHER_V1

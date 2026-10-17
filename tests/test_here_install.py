@@ -20,7 +20,12 @@ class InstallHere(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="hc here install ")
         self.root = Path(self.tmp.name)
         source = self.root/"source";source.mkdir()
-        (source/"here.py").write_text("import json,sys; print(json.dumps(['here', *sys.argv[1:]]))\n")
+        for name in installer.REQUIRED_FILES:
+            (source/name).write_text("RESOURCE = " + repr(name) + "\n")
+        (source/"here.py").write_text("import here_frontend,here_settings,here_broker,here_terminal,here_web\n"
+                                    "from pathlib import Path\n"
+                                    "assert Path(__file__).with_name('files.py').is_file()\n"
+                                    "import json,sys; print(json.dumps(['here', *sys.argv[1:]]))\n")
         self.file_patch = patch.object(installer, "__file__", str(source/"install_here.py"))
         self.native_patch = patch.object(installer, "native_candidate", return_value=None)
         self.file_patch.start();self.native_patch.start()
@@ -44,6 +49,31 @@ class InstallHere(unittest.TestCase):
         self.assertEqual(self.run_command(command, "here", *args), ["here", *args])
         self.assertEqual(self.run_command(command, "--help"), ["here", "--help"])
         self.assertTrue(os.access(command, os.X_OK))
+
+    def test_installed_package_is_self_contained_and_includes_future_helpers(self):
+        source=Path(installer.__file__).parent
+        (source/'here_extra.py').write_text('EXTRA = 42\n')
+        expected={p.name:p.read_bytes() for p in source.glob('*.py')}
+        command=installer.install(self.bindir)
+        installed=self.bindir.parent/'share/hardcore-terminal'
+        for name,payload in expected.items():
+            self.assertEqual((installed/name).read_bytes(),payload)
+        # A source checkout is not required once installed; sibling imports
+        # must resolve beside the installed entry point, including spaces.
+        source.rename(source.with_name('removed source'))
+        self.assertEqual(self.run_command(command,'here','--help'),['here','--help'])
+
+    def test_incomplete_runtime_does_not_touch_existing_installation(self):
+        command=installer.install(self.bindir)
+        installed=self.bindir.parent/'share/hardcore-terminal'
+        before={p.name:p.read_bytes() for p in installed.iterdir() if p.is_file()}
+        old_launcher=command.read_bytes()
+        source=Path(installer.__file__).parent
+        (source/'here_terminal.py').unlink()
+        (source/'here.py').write_text('raise Exception("partial update")\n')
+        with self.assertRaisesRegex(ValueError,'here_terminal.py'):installer.install(self.bindir)
+        self.assertEqual(command.read_bytes(),old_launcher)
+        self.assertEqual({p.name:p.read_bytes() for p in installed.iterdir() if p.is_file()},before)
 
     def test_existing_native_symlink_survives_as_fallback_and_reinstall(self):
         native = self.native();self.bindir.mkdir(parents=True)
