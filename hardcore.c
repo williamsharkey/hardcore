@@ -200,7 +200,7 @@ static PFN_ClosePC  pClosePC;
 #define HIST_LINES   20000
 #define MAX_TABS     64
 #define MAX_PARAMS   32
-#define OSC_MAX      8192
+#define OSC_MAX      (4 << 20)   /* longest OSC kept (an OSC 52 copy); longer ones are dropped whole */
 
 /* the release: `hardcore update` compares it with the latest tag, and the Mac
    build reads it into Info.plist (keep this line exactly as it is) */
@@ -408,11 +408,25 @@ static int in_ranges(uint32_t cp, const uint32_t (*r)[2], int n) {
     return 0;
 }
 
-static int cp_width(uint32_t cp) {
-    if (cp < 0x300) return 1;
+static int cp_width_search(uint32_t cp) {
     if (in_ranges(cp, W0, (int)(sizeof(W0) / sizeof(W0[0])))) return 0;
     if (in_ranges(cp, W2, (int)(sizeof(W2) / sizeof(W2[0])))) return 2;
     return 1;
+}
+
+static int cp_width(uint32_t cp) {
+    /* The BMP's widths, two bits each (16 KB), filled on first use: CJK and box
+       drawing were two binary searches per character, and showed in throughput. */
+    static uint8_t bmp[0x10000 / 4];
+    static int ready;
+    if (cp < 0x300) return 1;
+    if (cp > 0xFFFF) return cp_width_search(cp);
+    if (!__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) {   /* (a racing second filler writes the same bits) */
+        uint32_t c;
+        for (c = 0; c < 0x10000; c++) bmp[c >> 2] |= (uint8_t)(cp_width_search(c) << ((c & 3) * 2));
+        __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
+    }
+    return bmp[cp >> 2] >> ((cp & 3) * 2) & 3;
 }
 
 static const uint16_t DEC_GFX[31] = { /* ESC ( 0, chars 0x60..0x7e */
@@ -454,10 +468,12 @@ typedef struct {
     /* parser */
     int st, esc_which;
     int params[MAX_PARAMS], np, priv, inter;
+    uint32_t sub;                /* bit i: params[i] came after a ':' (a sub-parameter, as in 38:2::r:g:b) */
+    int csi_bad;                 /* a byte no CSI may hold: ignore the sequence up to its final byte */
     int utf8_need;
-    uint32_t utf8_acc;
-    char osc[OSC_MAX];
-    int osc_n;
+    uint32_t utf8_acc, utf8_min; /* utf8_min: smaller is an overlong encoding */
+    char *osc;                   /* grows as needed, up to OSC_MAX */
+    int osc_n, osc_cap, osc_over;
     /* scrollback */
     HLine *hist;
     int hcount, hstart;
@@ -520,6 +536,7 @@ typedef struct Tab {
     int fd;                      /* pty master, -1 = none */
     pid_t pid;
     void *rsrc;                  /* dispatch source: output ready */
+    void *pin;                   /* PtyIn: what the reader queue has read and the main queue hasn't parsed */
     void *psrc;                  /* dispatch source: shell exit */
     void *wq;                    /* serial queue for writes the pty can't take right away */
     int *wpending;               /* writes waiting on that queue (atomic; the queue frees it last) */
@@ -706,6 +723,9 @@ static void clear_span(Term *t, int y, int x0, int x1) {
     if (x0 < 0) x0 = 0;
     if (x1 > t->cols) x1 = t->cols;
     if (x0 >= x1) return;
+    if (x1 == t->cols) t->wrapf[t->alt][y] = 0;   /* its end is gone: it no longer runs on to the next row */
+    if (x0 > 0 && CELL(t, x0, y)->wflag == W_CONT) x0--;                  /* erase whole wide chars, */
+    if (x1 < t->cols && CELL(t, x1, y)->wflag == W_CONT) x1++;            /* never half of one */
     if (!b.bg) {                 /* default blanks: past rlen there's nothing to clear */
         if (x1 >= *len) {
             x1 = *len;
@@ -764,7 +784,6 @@ static void hist_push(Term *t, const Cell *row, int len, int wrapped) {
     } else {                     /* the oldest line falls off; its buffer is reused */
         idx = t->hstart;
         t->hstart = (t->hstart + 1) % HIST_LINES;
-        if (t->view > 0) t->view--;
     }
     h = &t->hist[idx];
     if (n > h->cap) {
@@ -778,7 +797,7 @@ static void hist_push(Term *t, const Cell *row, int len, int wrapped) {
     h->wrapped = wrapped;
     if (n) memcpy(h->c, row, sizeof(Cell) * n);
     t->hpushed++;
-    if (t->view > 0 && t->view < t->hcount) t->view++;  /* keep the viewport still */
+    if (t->view > 0 && t->view < t->hcount) t->view++;  /* keep the viewport still (full or not: every line moved up one) */
 }
 
 /* Rotates rows [top, bot] by n: positive moves content up (rows leaving at
@@ -862,6 +881,8 @@ static void term_reset(Term *t) {
 static int term_init(Term *t, int cols, int rows) {
     int s;
     memset(t, 0, sizeof(*t));
+    if (cols < 2) cols = 2;      /* as term_resize */
+    if (rows < 1) rows = 1;
     t->cols = cols;
     t->rows = rows;
     t->hist_cols = cols;
@@ -907,6 +928,7 @@ static void term_free(Term *t) {
         int i;
         for (i = 0; i < MAX_LINKS; i++) free(t->links[i]);
     }
+    free(t->osc);
 }
 
 /* growable list of physical lines, used while reflowing */
@@ -947,8 +969,11 @@ static int hist_append(Term *t, HLine h) {
    wrapped at until term_settle. */
 static void reflow_main(Term *t, int cols, int rows, int from) {
     int oc = t->cols, orows = t->rows, y, L, i;
-    int ccx = t->alt ? t->saved[0].cx : t->cx, ccy = t->alt ? t->saved[0].cy : t->cy;
-    int last = ccy, cur_line = -1, cur_off = 0, cur_prow = 0, start, evicted = 0;
+    /* the places that follow the text: [0] the cursor (saved by 1049 while the
+       alt screen is up), [1] the cursor ESC 7 saved on the main screen */
+    struct { int x, y, pend, line, off, prow; } m[2];
+    int nm = t->alt ? 1 : 2, k, ccx, ccy;
+    int last, start, evicted = 0;
     long long base = t->hpushed - t->hcount;   /* absolute number of the oldest line: stays put */
     Cell *acc = NULL;
     int acc_n = 0, acc_cap = 0;
@@ -956,6 +981,14 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
     Cell blank;
     memset(&blank, 0, sizeof(blank));
     blank.ch = ' ';
+    memset(m, 0, sizeof(m));
+    m[0].x = t->alt ? t->saved[0].cx : t->cx;
+    m[0].y = t->alt ? t->saved[0].cy : t->cy;
+    m[0].pend = t->alt ? t->saved[0].wrapnext : t->wrapnext;   /* the next char goes on the next row */
+    m[1].x = t->saved[0].cx; m[1].y = t->saved[0].cy; m[1].pend = t->saved[0].wrapnext;
+    for (k = 0; k < 2; k++) m[k].line = -1;
+    last = m[0].y;
+    if (nm > 1 && m[1].y > last && m[1].y < orows) last = m[1].y;
     /* last screen row worth keeping: the cursor row or the last with content */
     for (y = orows - 1; y > last; y--) {
         int x;
@@ -971,7 +1004,8 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
         } else {
             y = L - t->hcount;
             c = t->row[0][y]; n = oc; wrapped = t->wrapf[0][y] ? wrap_width(c, oc) : 0;
-            if (y == ccy) { cur_line = 1; cur_off = acc_n + ccx; }
+            for (k = 0; k < nm; k++)
+                if (y == m[k].y) { m[k].line = 1; m[k].off = acc_n + m[k].x; }
         }
         if (acc_n + (wrapped > n ? wrapped : n) > acc_cap) {
             acc_cap = (acc_n + (wrapped > n ? wrapped : n)) * 2;
@@ -991,25 +1025,28 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
             do {
                 int take = len - pos > cols ? cols : len - pos;
                 if (take == cols && acc[pos + take - 1].wflag == W_WIDE) take--;  /* don't split a wide char */
-                if (cur_line == 1 && cur_off >= pos && (cur_off < pos + cols || pos + take >= len)) {
-                    cur_prow = out.n + (cur_off - pos) / cols;
-                    ccx = (cur_off - pos) % cols;
-                    cur_line = 2;
-                }
+                for (k = 0; k < nm; k++)
+                    if (m[k].line == 1 && m[k].off >= pos && (m[k].off < pos + cols || pos + take >= len)) {
+                        m[k].prow = out.n + (m[k].off - pos) / cols;
+                        m[k].x = (m[k].off - pos) % cols;
+                        m[k].line = 2;
+                    }
                 ll_add(&out, take ? acc + pos : NULL, take, pos + take < len ? take : 0);   /* take < cols: a wide char went on */
                 pos += take;
             } while (pos < len);
-            if (cur_line == 2 && cur_prow >= out.n) {  /* cursor beyond the text, on rows of its own */
-                while (out.n <= cur_prow) ll_add(&out, NULL, 0, 0);
+            if (m[0].line == 2 && m[0].prow >= out.n) {  /* cursor beyond the text, on rows of its own */
+                while (out.n <= m[0].prow) ll_add(&out, NULL, 0, 0);
             }
-            if (cur_line == 2) cur_line = 3;
+            if (nm > 1 && m[1].line == 2 && m[1].prow >= out.n) { m[1].prow = out.n - 1; m[1].x = cols - 1; }   /* a saved place adds no rows */
+            for (k = 0; k < nm; k++)
+                if (m[k].line == 2) m[k].line = 3;
             acc_n = 0;
         }
     }
     free(acc);
     /* screen = the last `rows` lines, but never scroll the cursor off the top */
     start = out.n - rows;
-    if (start > cur_prow) start = cur_prow;
+    if (start > m[0].prow) start = m[0].prow;
     if (start < 0) start = 0;
     /* history: lines before `from` stay as they are; the rewrapped rest follows */
     for (L = from; L < t->hcount; L++) {   /* hist_clear frees every slot, used or not: leave none dangling */
@@ -1051,12 +1088,19 @@ static void reflow_main(Term *t, int cols, int rows, int from) {
         }
     }
     free(out.v);
-    ccy = cur_prow - start;
-    if (ccy < 0) ccy = 0;
-    if (ccy >= rows) ccy = rows - 1;
-    if (ccx >= cols) ccx = cols - 1;
-    if (t->alt) { t->saved[0].cx = ccx; t->saved[0].cy = ccy; }
-    else { t->cx = ccx; t->cy = ccy; }
+    for (k = nm - 1; k >= 0; k--) {
+        int pend = 0;
+        ccx = m[k].x;
+        ccy = m[k].prow - start;
+        if (m[k].pend) {         /* it sat after the char at its place: still after it, wrapping when that ends a row */
+            if (++ccx >= cols) { ccx = cols - 1; pend = 1; }
+        }
+        if (ccy < 0) ccy = 0;
+        if (ccy >= rows) ccy = rows - 1;
+        if (ccx >= cols) ccx = cols - 1;
+        if (k == 0 && !t->alt) { t->cx = ccx; t->cy = ccy; t->wrapnext = pend; }
+        else { t->saved[0].cx = ccx; t->saved[0].cy = ccy; t->saved[0].wrapnext = pend; }
+    }
 }
 
 /* the alt screen (vim, less, htop) just gets cropped or padded; its owner redraws */
@@ -1097,10 +1141,15 @@ static int g_reflow_all;         /* tests: rewrap everything at every step, the 
 
 static void term_resize(Term *t, int cols, int rows) {
     int s, x, from = 0;
+    if (cols < 2) cols = 2;      /* a wide char needs two columns: with one, reflow would never get past it */
+    if (rows < 1) rows = 1;
     if (cols == t->cols && rows == t->rows) return;
     if (t->hcount > REFLOW_TAIL && !g_reflow_all) {
         from = t->hcount - REFLOW_TAIL;
-        while (from > 0 && t->hist[(t->hstart + from - 1) % HIST_LINES].wrapped) from--;   /* a logical line's start */
+        /* back to a logical line's start, but not without end: one line can be
+           the whole scrollback (minified JSON, base64). Cut mid-line, the rows
+           above keep the width they wrapped at, which settle rejoins. */
+        while (from > 0 && t->hcount - from < 2 * REFLOW_TAIL && t->hist[(t->hstart + from - 1) % HIST_LINES].wrapped) from--;
     }
     reflow_main(t, cols, rows, from);
     if (!from) t->hist_cols = cols;
@@ -1121,7 +1170,7 @@ static void term_resize(Term *t, int cols, int rows) {
     }
     t->top = 0;
     t->bot = rows - 1;
-    t->wrapnext = 0;
+    if (t->alt) t->wrapnext = 0;  /* (the main screen's was carried over by reflow_main) */
     t->view = 0;
     t->dirty = 1;
 }
@@ -1152,8 +1201,13 @@ static void insert_blanks(Term *t, int n) {
     int x;
     Cell b = blank_cell(t);
     if (n > t->cols - t->cx) n = t->cols - t->cx;
+    if (t->cx > 0 && CELL(t, t->cx, t->cy)->wflag == W_CONT) {   /* splitting a wide char: both halves go */
+        *CELL(t, t->cx - 1, t->cy) = b;
+        *CELL(t, t->cx, t->cy) = b;
+    }
     for (x = t->cols - 1; x >= t->cx + n; x--) *CELL(t, x, t->cy) = *CELL(t, x - n, t->cy);
     for (x = t->cx; x < t->cx + n; x++) *CELL(t, x, t->cy) = b;
+    if (CELL(t, t->cols - 1, t->cy)->wflag == W_WIDE) *CELL(t, t->cols - 1, t->cy) = b;   /* its second half fell off */
     row_used(t, t->cy, t->cols);
 }
 
@@ -1183,6 +1237,7 @@ static void term_put(Term *t, uint32_t cp) {
     fix_wide(t, t->cx, w);
     c = CELL(t, t->cx, t->cy);
     row_used(t, t->cy, t->cx + w);
+    if (t->cx + w >= t->cols) t->wrapf[t->alt][t->cy] = 0;   /* a new end: it wraps again only if more follows */
     *c = t->pen;
     c->ch = cp;
     c->wflag = (w == 2) ? W_WIDE : 0;
@@ -1297,11 +1352,33 @@ static void control(Term *t, int b) {
 
 static int P(Term *t, int i, int def) { return (i < t->np && t->params[i]) ? t->params[i] : def; }
 
+#define SUBP(t, i) ((i) < (t)->np && ((t)->sub >> (i) & 1))
+
 static void sgr(Term *t) {
     int i;
     for (i = 0; i < t->np; i++) {
         int p = t->params[i];
         Cell *pen = &t->pen;
+        if (SUBP(t, i + 1)) {    /* colon form: this code's sub-parameters follow it */
+            int k = i + 1, n;
+            while (SUBP(t, k)) k++;
+            n = k - i - 1;
+            if (p == 4) {        /* 4:0 off, 4:1..5 a style of underline (all drawn as one) */
+                if (t->params[i + 1]) pen->attr |= A_UNDER;
+                else pen->attr &= ~A_UNDER;
+            } else if ((p == 38 || p == 48) && n >= 2) {
+                const int *q = &t->params[i + 1];
+                uint32_t col = 0;
+                int ok = 1;
+                if (q[0] == 5) col = C_PAL(q[1] & 255);
+                else if (q[0] == 2 && n >= 4) col = C_RGB(q[n - 3] & 255, q[n - 2] & 255, q[n - 1] & 255);   /* 2:[cs]:r:g:b */
+                else ok = 0;
+                if (ok && p == 38) pen->fg = col;
+                else if (ok) pen->bg = col;
+            }
+            i = k - 1;           /* 58 (underline color) and anything else: skipped whole */
+            continue;
+        }
         switch (p) {
         case 0: pen->fg = pen->bg = 0; pen->attr = 0; break;
         case 1: pen->attr |= A_BOLD; break;
@@ -1372,8 +1449,8 @@ static void decset(Term *t, int p, int on) {
     case 1004: t->m_focus = on; break;
     case 2004: t->m_bracketed = on; break;
     case 2026:
+        if (on && !t->m_sync) t->sync_since = GetTickCount();   /* a repeated BSU can't hold painting off forever */
         t->m_sync = on;
-        t->sync_since = GetTickCount();
         break;
     }
 }
@@ -1543,8 +1620,10 @@ static void csi_dispatch(Term *t, int f) {
         Cell b = blank_cell(t);
         n = P(t, 0, 1);
         if (n > t->cols - t->cx) n = t->cols - t->cx;
+        if (t->cx > 0 && CELL(t, t->cx, t->cy)->wflag == W_CONT) *CELL(t, t->cx - 1, t->cy) = b;   /* its first half stays behind */
         for (x = t->cx; x < t->cols - n; x++) *CELL(t, x, t->cy) = *CELL(t, x + n, t->cy);
         for (x = t->cols - n; x < t->cols; x++) *CELL(t, x, t->cy) = b;
+        if (CELL(t, t->cx, t->cy)->wflag == W_CONT) *CELL(t, t->cx, t->cy) = b;   /* a second half moved in alone */
         if (b.bg) row_used(t, t->cy, t->cols);
         break;
     }
@@ -1760,6 +1839,7 @@ static int term_busy(const Term *t) {
 static void osc_dispatch(Term *t) {
     char *s = t->osc, *rest;
     int code;
+    if (!s) return;              /* nothing was stored */
     t->osc[t->osc_n] = 0;
     code = (int)strtol(s, &rest, 10);
     if (rest == s) return;
@@ -1780,7 +1860,14 @@ static void osc_dispatch(Term *t) {
     case 7700:                   /* from rc.bash: mnt=<wslpath -u C:\>, when drives aren't under /mnt */
         if (!strncmp(rest, "claude=", 7)) {      /* claude=ID as Claude Code starts, claude= as it exits */
             snprintf(t->claude, sizeof(t->claude), "%s", rest + 7);
-            if (!t->claude[0]) t->claude_args[0] = 0;
+            if (!t->claude[0]) {
+                t->claude_args[0] = 0;
+                /* Claude Code has exited, maybe killed: what it turned on mustn't
+                   outlive it in the shell (clicks as escape codes, focus reports,
+                   painting held for a sync that never ends, no cursor) */
+                t->m_mouse = t->m_mouse_sgr = t->m_focus = t->m_sync = 0;
+                t->m_cursor_vis = 1;
+            }
         } else if (!strncmp(rest, "cmd=", 4)) {
             snprintf(t->cmd, sizeof(t->cmd), "%s", rest + 4);
             if (t->cmd[0]) t->had_activity = 1;
@@ -1893,8 +1980,10 @@ static void esc_dispatch(Term *t, int b) {
         t->np = 0;
         t->params[0] = 0;
         t->priv = t->inter = 0;
+        t->sub = 0;
+        t->csi_bad = 0;
         break;
-    case ']': t->st = S_OSC; t->osc_n = 0; break;
+    case ']': t->st = S_OSC; t->osc_n = t->osc_over = 0; break;
     case 'P': case 'X': case '^': case '_': t->st = S_STR; break;
     case '7': save_cursor(t); break;
     case '8': restore_cursor(t); break;
@@ -1925,7 +2014,10 @@ static void vt_byte(Term *t, unsigned char b) {
         if (t->utf8_need) {
             if ((b & 0xC0) == 0x80) {
                 t->utf8_acc = (t->utf8_acc << 6) | (b & 0x3F);
-                if (--t->utf8_need == 0) term_put(t, t->utf8_acc);
+                if (--t->utf8_need == 0) {
+                    uint32_t cp = t->utf8_acc;   /* overlong, a surrogate or past U+10FFFF: not a character */
+                    term_put(t, cp < t->utf8_min || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF ? 0xFFFD : cp);
+                }
                 return;
             }
             t->utf8_need = 0;
@@ -1933,9 +2025,9 @@ static void vt_byte(Term *t, unsigned char b) {
         }
         if (b < 0x20 || b == 0x7F) { control(t, b); return; }
         if (b < 0x80) { term_put(t, b); return; }
-        if ((b & 0xE0) == 0xC0) { t->utf8_acc = b & 0x1F; t->utf8_need = 1; }
-        else if ((b & 0xF0) == 0xE0) { t->utf8_acc = b & 0x0F; t->utf8_need = 2; }
-        else if ((b & 0xF8) == 0xF0) { t->utf8_acc = b & 0x07; t->utf8_need = 3; }
+        if ((b & 0xE0) == 0xC0) { t->utf8_acc = b & 0x1F; t->utf8_need = 1; t->utf8_min = 0x80; }
+        else if ((b & 0xF0) == 0xE0) { t->utf8_acc = b & 0x0F; t->utf8_need = 2; t->utf8_min = 0x800; }
+        else if ((b & 0xF8) == 0xF0) { t->utf8_acc = b & 0x07; t->utf8_need = 3; t->utf8_min = 0x10000; }
         else term_put(t, 0xFFFD);
         return;
     case S_ESC:
@@ -1954,7 +2046,10 @@ static void vt_byte(Term *t, unsigned char b) {
             int *p = &t->params[t->np];
             if (*p < 100000) *p = *p * 10 + (b - '0');
         } else if (b == ';' || b == ':') {
-            if (t->np < MAX_PARAMS - 1) t->params[++t->np] = 0;
+            if (t->np < MAX_PARAMS - 1) {
+                t->params[++t->np] = 0;
+                if (b == ':') t->sub |= 1u << t->np;
+            }
         } else if (b >= '<' && b <= '?') {
             t->priv = b;
         } else if (b >= 0x20 && b <= 0x2F) {
@@ -1962,29 +2057,38 @@ static void vt_byte(Term *t, unsigned char b) {
         } else if (b >= 0x40 && b <= 0x7E) {
             t->np++;
             t->st = S_GROUND;
-            csi_dispatch(t, b);
+            if (!t->csi_bad) csi_dispatch(t, b);
         } else if (b < 0x20) {
             control(t, b);       /* C0 inside CSI executes in place */
-        } else {
-            t->st = S_GROUND;
+        } else if (b >= 0x80) {
+            t->csi_bad = 1;      /* (DEL, 0x7F, is ignored where it stands) */
         }
         return;
     case S_OSC:
-        if (b == 0x07) { osc_dispatch(t); t->st = S_GROUND; }
+        if (b == 0x07) { if (!t->osc_over) osc_dispatch(t); t->st = S_GROUND; }
         else if (b == 0x1B) t->st = S_OSC_ESC;
-        else if (t->osc_n < OSC_MAX - 1) t->osc[t->osc_n++] = (char)b;
+        else if (b == 0x18 || b == 0x1A) t->st = S_GROUND;   /* CAN, SUB: abandoned */
+        else if (b < 0x20) {}                                 /* other C0: not part of the string */
+        else if (t->osc_n + 1 < t->osc_cap) t->osc[t->osc_n++] = (char)b;
+        else if (!t->osc_over) {
+            int cap = t->osc_cap ? t->osc_cap * 4 : 1024;
+            char *more = cap <= OSC_MAX ? (char *)realloc(t->osc, (size_t)cap) : NULL;
+            if (more) { t->osc = more; t->osc_cap = cap; t->osc[t->osc_n++] = (char)b; }
+            else t->osc_over = 1;   /* too long to keep: never act on a truncated one */
+        }
         return;
     case S_OSC_ESC:
-        osc_dispatch(t);
+        if (!t->osc_over) osc_dispatch(t);
         t->st = S_GROUND;
-        if (b != '\\') esc_dispatch(t, b);
+        if (b != '\\') { t->st = S_ESC; vt_byte(t, b); }   /* ESC ends the string and starts a sequence */
         return;
     case S_STR:
         if (b == 0x1B) t->st = S_STR_ESC;
-        else if (b == 0x07) t->st = S_GROUND;
+        else if (b == 0x07 || b == 0x18 || b == 0x1A) t->st = S_GROUND;
         return;
     case S_STR_ESC:
-        t->st = (b == '\\') ? S_GROUND : S_STR;
+        t->st = S_GROUND;
+        if (b != '\\') { t->st = S_ESC; vt_byte(t, b); }   /* as in an OSC: a stray DCS can't swallow what follows */
         return;
     }
 }
@@ -2004,6 +2108,29 @@ static void vt_feed(Term *t, const unsigned char *s, int n) {
                 if (t->cx > t->rlen[t->alt][t->cy]) t->rlen[t->alt][t->cy] = (uint16_t)t->cx;
                 t->last_ch = b;
                 continue;
+            }
+        }
+        /* fast path: a whole, valid UTF-8 character (CJK, box drawing) in the middle of a row */
+        if (b >= 0xC2 && b <= 0xF4 && t->st == S_GROUND && !t->utf8_need && !t->wrapnext && !t->m_insert) {
+            int len = b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4, k, w;
+            uint32_t cp = b & (len == 2 ? 0x1F : len == 3 ? 0x0F : 0x07);
+            if (i + len <= n) {
+                for (k = 1; k < len && (s[i + k] & 0xC0) == 0x80; k++) cp = cp << 6 | (s[i + k] & 0x3F);
+                if (k == len && cp >= (len == 2 ? 0x80u : len == 3 ? 0x800u : 0x10000u) &&
+                    !(cp >= 0xD800 && cp <= 0xDFFF) && cp <= 0x10FFFF && (w = cp_width(cp)) > 0 &&
+                    t->cx + w < t->cols) {
+                    Cell *c = &t->row[t->alt][t->cy][t->cx];
+                    if (!c->wflag && (w == 1 || !c[1].wflag)) {
+                        *c = t->pen;
+                        c->ch = cp;
+                        if (w == 2) { c[1] = t->pen; c[1].ch = 0; c[1].wflag = W_CONT; c->wflag = W_WIDE; }
+                        t->cx += w;
+                        if (t->cx > t->rlen[t->alt][t->cy]) t->rlen[t->alt][t->cy] = (uint16_t)t->cx;
+                        t->last_ch = cp;
+                        i += len - 1;
+                        continue;
+                    }
+                }
             }
         }
         vt_byte(t, b);
@@ -2343,7 +2470,7 @@ static int term_snapshot_check(FILE *f) {
             vt_feed(&t, (const unsigned char *)line, n);
         }
         vt_feed(&t, (const unsigned char *)"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ \x1b[44m\x1b[K\x1b[0m\r\n$ ", 54);
-        if (k == 0) vt_feed(&t, (const unsigned char *)"\x1b[5;9H\x1b[1;32mmid\x1b[0m\x1b[6;40HZ", 30);   /* ends on a pending wrap */
+        if (k == 0) { const char *s = "\x1b[5;9H\x1b[1;32mmid\x1b[0m\x1b[6;40HZ"; vt_feed(&t, (const unsigned char *)s, (int)strlen(s)); }   /* ends on a pending wrap */
         if (k == 1) {
             const char *s = "\x1b[3;5H\x1b" "7\x1b[?1049h\x1b[H\x1b[2J\x1b[1;31mtitle bar\x1b[0m\r\n\x1b[7m inverse \x1b[0m"
                             "\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1h\x1b[?25l\x1b[2;10r\x1b[4;3H\x1b" "7\x1b[6;1H"
@@ -5923,6 +6050,176 @@ static void bench_series(FILE *out, const char *name, Term **ts, int nt, const i
 
 /* --unit, both platforms: what each kind of row leaves in history (rlen
    bookkeeping), and recycling past HIST_LINES. Returns the failures. */
+/* --unit: cases taken from other terminals' bug trackers (Alacritty, Ghostty,
+   kitty, WezTerm), each the bytes from the report and what the screen must
+   hold afterwards. */
+static void unit_row(const Term *t, int y, char *o, size_t cap) {
+    size_t n = 0;
+    int x, len = 0;
+    for (x = 0; x < t->cols; x++) if (t->row[t->alt][y][x].ch != ' ' || t->row[t->alt][y][x].wflag) len = x + 1;
+    for (x = 0; x < len && n + 5 < cap; x++) {
+        const Cell *c = &t->row[t->alt][y][x];
+        if (c->wflag & (W_CONT | W_PAD)) continue;
+        n += (size_t)utf8_encode(c->ch ? c->ch : ' ', o + n);
+    }
+    o[n] = 0;
+}
+
+static int unit_issues(FILE *f) {
+    static const struct {
+        const char *name;
+        int cols, rows;
+        const char *before;
+        int rc, rr;              /* resize to, or 0 */
+        const char *after;
+        const char *want[4];     /* rows 0.. (NULL: not checked) */
+        int cx, cy;              /* -1: not checked */
+    } cases[] = {
+        {"pending wrap survives a wider resize (alacritty#3584, ghostty#12933)", 20, 3,
+         "abcdefghijklmnopqrst", 30, 3, "XYZ", {"abcdefghijklmnopqrstXYZ", "", NULL}, 23, 0},
+        {"pending wrap survives a narrower resize (wezterm#6669)", 10, 4,
+         "0123456789", 5, 4, "X", {"01234", "56789", "X", NULL}, 1, 2},
+        {"pending wrap after a wide char survives a resize", 10, 3,
+         "abcdefgh\xe6\x97\xa5", 12, 3, "XYZ", {"abcdefgh\xe6\x97\xa5" "XY", "Z", NULL}, 1, 1},
+        {"EL 2 ends a row's wrap: no joining on resize (ghostty D#13616)", 10, 6,
+         "-------------------------\x1b[1;1H\x1b[2KAAA\x1b[2;1H\x1b[2KBBB\x1b[3;1H\x1b[KCCC\x1b[5;1H", 20, 6, "",
+         {"AAA", "BBB", "CCC", NULL}, -1, -1},
+        {"a row rewritten to its end then CR LF isn't wrapped (alacritty#8930)", 10, 3,
+         "012345678901234\x1b[HABCDEFGHIJ\r\nxy", 20, 3, "", {"ABCDEFGHIJ", "xy234", NULL}, -1, -1},
+        {"ESC 7 on the main screen follows its text through reflow (wezterm#6669)", 20, 6,
+         "0123456789abcdefghij\r\nsecond\r\n$ \x1b" "7", 10, 6, "\x1b" "8X", {"0123456789", "abcdefghij", "second", "$ X"}, -1, -1},
+        {"a stray DCS doesn't swallow what follows (alacritty#6714, wezterm#1844)", 20, 3,
+         "\x1b_Gabc\x1b[31mhello\r\nworld", 0, 0, "", {"hello", "world", NULL}, -1, -1},
+        {"CAN aborts a DCS", 20, 3, "\x1bPq#0;2;0~~\x18" "ok", 0, 0, "", {"ok", NULL}, -1, -1},
+        {"CAN aborts an OSC", 20, 3, "\x1b]0;title\x18hello", 0, 0, "", {"hello", NULL}, -1, -1},
+        {"invalid UTF-8 is U+FFFD (overlong, surrogate, past U+10FFFF)", 20, 3,
+         "a\xc0\xaf" "b\xed\xa0\x80" "c\xf4\x90\x80\x80" "d", 0, 0, "",
+         {"a\xef\xbf\xbd" "b\xef\xbf\xbd" "c\xef\xbf\xbd" "d", NULL}, -1, -1},
+        {"DEL inside a CSI is ignored (vt100.net)", 20, 3, "a\x1b[3\x7f" "Cb", 0, 0, "", {"a   b", NULL}, -1, -1},
+        {"an 8-bit byte voids a CSI up to its final", 20, 3, "a\x1b[3\xc3\xa9" "Cb", 0, 0, "", {"ab", NULL}, -1, -1},
+        {"EL from the middle of a wide char erases all of it (alacritty#8786)", 8, 2,
+         "\xe6\x97\xa5\xe6\x9c\xacX\x1b[1;2H\x1b[K", 0, 0, "", {"", NULL}, -1, -1},
+        {"DCH from the middle of a wide char", 8, 2, "\xe6\x97\xa5\xe6\x9c\xacX\x1b[1;2H\x1b[P", 0, 0, "",
+         {" \xe6\x9c\xacX", NULL}, -1, -1},
+        {"ICH pushing a wide char off the edge", 8, 2, "abcdef\xe6\x97\xa5\x1b[1;1H\x1b[@", 0, 0, "", {" abcdef", NULL}, -1, -1},
+        {"HTS past the right edge (wezterm#8134)", 8, 4, "\x1b[;9H\x1bH\x1b[;100H\x1bH\x1b[999;999H\x1bHX", 0, 0, "",
+         {NULL}, 7, 3},
+    };
+    int i, fails = 0;
+    for (i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
+        Term t;
+        char got[256], why[512] = "";
+        int r, ok = term_init(&t, cases[i].cols, cases[i].rows);
+        if (!ok) { fails++; continue; }
+        vt_feed(&t, (const unsigned char *)cases[i].before, (int)strlen(cases[i].before));
+        if (cases[i].rc) term_resize(&t, cases[i].rc, cases[i].rr);
+        vt_feed(&t, (const unsigned char *)cases[i].after, (int)strlen(cases[i].after));
+        for (r = 0; r < 4 && cases[i].want[r] && ok; r++) {
+            unit_row(&t, r, got, sizeof(got));
+            if (strcmp(got, cases[i].want[r])) { snprintf(why, sizeof(why), "row %d [%s] want [%s]", r, got, cases[i].want[r]); ok = 0; }
+        }
+        if (ok && cases[i].cx >= 0 && (t.cx != cases[i].cx || t.cy != cases[i].cy)) {
+            snprintf(why, sizeof(why), "cursor (%d,%d) want (%d,%d)", t.cx, t.cy, cases[i].cx, cases[i].cy);
+            ok = 0;
+        }
+        fprintf(f, "%s issue %s%s%s\n", ok ? "ok  " : "FAIL", cases[i].name, ok ? "" : ": ", why);
+        fails += !ok;
+        term_free(&t);
+    }
+    {   /* SGR colon sub-parameters (alacritty/vte#22) */
+        Term t;
+        int ok = term_init(&t, 20, 3);
+        if (ok) {
+            const char *in = "\x1b[1m\x1b[4:3mX\x1b[58:2::255:0:0mY\x1b[38:2::255:0:0mZ\x1b[4:0mW\x1b[48:5:4mV";
+            const Cell *c = t.row[0][0];
+            vt_feed(&t, (const unsigned char *)in, (int)strlen(in));
+            ok = c[0].attr == (A_BOLD | A_UNDER) && c[1].attr == (A_BOLD | A_UNDER) &&
+                 c[2].attr == (A_BOLD | A_UNDER) && c[2].fg == C_RGB(255, 0, 0) &&
+                 c[3].attr == A_BOLD && c[3].fg == C_RGB(255, 0, 0) && c[4].bg == C_PAL(4);
+            term_free(&t);
+        }
+        fprintf(f, "%s issue SGR colon forms: 4:3, 58:2::r:g:b, 38:2::r:g:b, 4:0, 48:5:n\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* scrolled back with the ring full: the view keeps showing the same text */
+        Term t;
+        int ok = term_init(&t, 40, 10), n;
+        char line[64], got[64], want[64];
+        if (ok) {
+            for (n = 0; n < HIST_LINES + 100; n++) vt_feed(&t, (const unsigned char *)line, snprintf(line, sizeof(line), "line %d\r\n", n));
+            t.view = 100;
+            {
+                const HLine *h = &t.hist[(t.hstart + t.hcount - t.view) % HIST_LINES];
+                snprintf(want, sizeof(want), "%.*s", h->n, "");
+                for (n = 0; n < h->n && n < 63; n++) want[n] = (char)h->c[n].ch;
+                want[n] = 0;
+            }
+            for (n = 0; n < 10; n++) vt_feed(&t, (const unsigned char *)"more\r\n", 6);
+            {
+                const HLine *h = &t.hist[(t.hstart + t.hcount - t.view) % HIST_LINES];
+                for (n = 0; n < h->n && n < 63; n++) got[n] = (char)h->c[n].ch;
+                got[n] = 0;
+            }
+            ok = !strcmp(got, want) && t.view == 110;
+            term_free(&t);
+        }
+        fprintf(f, "%s issue scrolled back with full scrollback, output doesn't move the view\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* Claude Code killed with modes on: its exit marker turns them off (kitty) */
+        Term t;
+        int ok = term_init(&t, 20, 3);
+        if (ok) {
+            const char *in = "\x1b]7700;claude=abc\x1b\\\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2026h\x1b[?25l\x1b]7700;claude=\x1b\\";
+            vt_feed(&t, (const unsigned char *)in, (int)strlen(in));
+            ok = !t.m_mouse && !t.m_mouse_sgr && !t.m_focus && !t.m_sync && t.m_cursor_vis && !t.claude[0];
+            term_free(&t);
+        }
+        fprintf(f, "%s issue modes Claude Code left on end when it exits\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* repeated BSU: the hold's clock starts at the first one */
+        Term t;
+        int ok = term_init(&t, 20, 3);
+        if (ok) {
+            vt_feed(&t, (const unsigned char *)"\x1b[?2026h", 8);
+            t.sync_since -= 1000;
+            vt_feed(&t, (const unsigned char *)"\x1b[?2026h", 8);
+            ok = GetTickCount() - t.sync_since >= 1000;
+            term_free(&t);
+        }
+        fprintf(f, "%s issue a repeated 2026h can't hold painting off forever (alacritty#8550)\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* an OSC longer than the old 8 KB cap still lands; one past OSC_MAX is dropped whole */
+        Term t;
+        int ok = term_init(&t, 20, 3);
+        if (ok) {
+            size_t n = 20000, k;
+            unsigned char *b = (unsigned char *)malloc(n + 16);
+            memcpy(b, "\x1b]2;", 4);
+            for (k = 4; k < n; k++) b[k] = 'a' + (char)(k % 26);
+            b[n] = 7;
+            vt_feed(&t, b, (int)n + 1);
+            ok = t.osc_n == (int)n - 2 && !t.osc_over;
+            vt_feed(&t, (const unsigned char *)"\x1b]2;", 4);
+            for (k = 0; k < (size_t)OSC_MAX / 16384 + 1; k++) {
+                memset(b, 'x', 16384 < n ? 16384 : n);
+                vt_feed(&t, b, 16384 < (int)n ? 16384 : (int)n);
+            }
+            ok = ok && t.osc_over && t.osc_cap <= OSC_MAX;
+            vt_feed(&t, (const unsigned char *)"\x07ok", 3);
+            unit_row(&t, 0, (char *)b, 64);
+            ok = ok && !strcmp((char *)b, "ok");
+            free(b);
+            term_free(&t);
+        }
+        fprintf(f, "%s issue OSC past 8 KB kept; past OSC_MAX dropped whole, never truncated (vte#151)\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    return fails;
+}
+
 static int unit_scrollback(FILE *f) {
     int fails = 0;
     {   /* scrollback: what each kind of row leaves in history (rlen bookkeeping) */
@@ -7172,6 +7469,7 @@ static int unit_tests(const char *out_path) {
         fails += strcmp(a, b) != 0;
     }
     fails += unit_scrollback(f);
+    fails += unit_issues(f);
     {
         Term wrapped;
         int ok = term_init(&wrapped, 10, 3);

@@ -1,4 +1,4 @@
-# hardcore on macOS vs Terminal.app
+# hardcore on macOS vs Terminal.app and other terminals
 
 Measured 2026-10-13 on one machine:
 - **Hardware:** iMac 24" (Apple M3), built-in Retina display at 60 Hz, macOS 15.6.1.
@@ -14,6 +14,101 @@ Everything is measured from outside with `bench/macbench`, the Mac counterpart o
   server put it on screen.
 
 The internal breakdowns come from hardcore's own logs (`HARDCORE_LAT=1`, `HARDCORE_TRACE=1`).
+
+## Against Ghostty, kitty, WezTerm, iTerm2 and Terminal.app (2026-10-17)
+
+`bench/compare-mac.py` starts each terminal at 120×36 running `bench/termload.sh`, which times
+its phases from inside, while the script samples the terminal process's CPU time and memory at
+each phase boundary from outside. Nothing is typed and nothing is read off the screen, so it
+needs neither the Accessibility nor the Screen Recording permission (macbench needs both).
+
+A flood counts as done when the terminal answers a cursor-position query (DSR) sent after it. A
+terminal answers only once it has processed everything before the query. Timing `cat` alone
+measures how far ahead a terminal buffers, not how fast it keeps up.
+
+Same machine as above. Ghostty 1.3.1, kitty 0.49.2, WezTerm 20240203, iTerm2 3.7.6, Terminal 2.15.
+Homebrew no longer installs Alacritty: the cask fails Gatekeeper and was disabled on 2026-09-01.
+
+| seconds, best of 3 (lower is better) | plain 18.8 MB | SGR + truecolor 31.7 MB | box drawing + CJK 18.7 MB | 10 × clear + 4,000-line transcript |
+|---|---:|---:|---:|---:|
+| **hardcore, after** | **0.119** | **0.163** | **0.097** | **0.020** |
+| hardcore, before (aa28e5b) | 0.248 | 0.411 | 0.306 | 0.043 |
+| Ghostty | 0.217 | 0.469 | 0.177 | 0.039 |
+| kitty | 0.413 | 0.279 | 0.182 | 0.036 |
+| WezTerm | 0.739 | 0.842 | 0.620 | 0.144 |
+| iTerm2 (80×25: it ignores the resize request) | 0.225 | 3.906 | 7.023 | 0.144 |
+| Terminal.app | 1.053 | 1.109 | 0.547 | 0.105 |
+
+| CPU % of one core while... | idle | Claude Code–like redraw, alt screen (ccsim, 60 fps) | the same, inline | streamed reply, 300 words/s |
+|---|---:|---:|---:|---:|
+| hardcore | 0.1 | 10.4 | 10.1 | 13.5 |
+| Ghostty | 0.8 | 9.9 | 11.8 | 14.8 |
+| kitty | 0.4 | 11.4 | 11.6 | 9.2 |
+| WezTerm | 0.4 | 16.9 | 17.1 | 15.0 |
+| iTerm2 | 3.7 | 44.5 | 43.1 | 50.0 |
+| Terminal.app | 1.1 | 14.2 | 14.3 | 13.0 |
+
+Memory, idle → largest seen: hardcore 30 → 86 MB, Ghostty 79 → 109, kitty 90 → 93, WezTerm
+41 → 132, iTerm2 125 → 302, Terminal.app 40 → 238.
+
+At the redraw rates Claude Code produces, every terminal but iTerm2 costs about a tenth of a
+core. There is little to win there. The floods are where they differ.
+
+What moved hardcore's floods:
+
+| Change | Effect |
+|---|---|
+| Pty output read on a queue of each tab's own (`PtyIn` in hardcore_mac.m), parsed on the main queue | The 1 KB reads macOS hands out overlap parsing and painting instead of taking turns with them. Plain 0.248 → 0.12 s; colour 0.41 → 0.16 s. The reader stops at 8 MB ahead of the parser. A synchronous `read_some` (reload, handoff, first prompt) holds it until that main-queue turn is over. |
+| Character widths for the BMP in a 16 KB table, filled on first use | Two binary searches per non-ASCII character before. Parser alone on CJK: 161 → 118 ms. |
+| A fast path for whole UTF-8 characters mid-row, like the ASCII one | CJK parser 118 → 85 ms (117 → 221 MB/s). It is checked against the byte-at-a-time path on 20,000 random inputs under AddressSanitizer. |
+| Resize walks back at most 1,000 rows to a logical line's start | One 2.5 MB line with no newline cost 13–19 ms per resize step (every step rewrapped the whole line). Now 0.3 ms, plus one 24 ms settle after the drag. Alacritty #2567/#2807, WezTerm #714. |
+| The window title is set only when it changed | Every output event of the active tab used to set it. |
+
+Keypress latency was not re-measured: this session had no Screen Recording permission for macbench.
+
+### Bugs from other terminals' trackers
+
+Five agents read the Ghostty, Alacritty (and vte), kitty, WezTerm, iTerm2 and Claude Code issue
+trackers for reports that apply to hardcore. Each confirmed one is a case in `unit_issues`
+(`--unit`):
+
+- The pending wrap was lost on resize. After a line exactly filled the width, a resize put
+  the cursor on the last character, so the next one overwrote it (alacritty#3584, wezterm#6669,
+  ghostty#12933).
+- EL (`CSI K`, `CSI 2K`) left a row's soft-wrap flag set, so the next resize joined rows that
+  Ink, Claude Code's renderer, had erased and rewritten (ghostty D#13616, alacritty#8930). Writing
+  the last column now also ends the old wrap.
+- The cursor saved with `ESC 7` on the main screen wasn't reflowed with its text (wezterm#6669).
+- A stray DCS/APC/PM/SOS swallowed all later output until a BEL, for example after `cat` of a
+  binary file. ESC now ends the string and starts a new sequence, and CAN/SUB abort strings and
+  OSCs (alacritty#6714, wezterm#1844).
+- Scrolled back with the 20,000-line ring full, streaming output moved the view (net 0 instead
+  of +1 per line).
+- Colon sub-parameters were read as `;`, so `4:3` meant underline + italic and `58:2::r:g:b`
+  ended in a full reset (vte#22).
+- Overlong UTF-8, surrogates and code points past U+10FFFF are U+FFFD now. DEL inside a CSI is
+  ignored, and an 8-bit byte voids the CSI.
+- Erase, delete and insert no longer leave half a wide character (alacritty#8786).
+- A repeated `CSI ? 2026 h` restarted the 200 ms hold, so it could hold painting off forever
+  (alacritty#8550).
+- OSCs were truncated at 8 KB, so long OSC 52 copies were cut short silently. They grow to
+  4 MB now, and longer ones are dropped whole (vte#151).
+- Modes Claude Code turned on (mouse, focus, sync, a hidden cursor) end when its exit marker
+  arrives, so a killed Claude doesn't leave the shell receiving escape codes for clicks.
+- A fuzzer found that a 1-column terminal looped forever in reflow and overran a row in
+  `term_put`. The window and `hardcore here` never go below 2 columns, but the core now clamps
+  too.
+
+Decided against, for now:
+- Grapheme widths (VS16, ZWJ: ⚠️ is 1 cell here and 2 for Ink): this follows the wcwidth
+  ConPTY measures with.
+- Combining marks: they are dropped, as before.
+- The kitty keyboard protocol: Claude Code works without it.
+- Pushing the screen into scrollback on ED 2: hardcore matches xterm.
+
+Claude Code (2.1.302) asks the terminal for DECRQM 2026 after XTVERSION, and hardcore answers
+both, so it does get synchronized output. An earlier probe of ours that didn't answer DECRQM
+wrongly concluded otherwise.
 
 ## After merging main (2026-10-14)
 
@@ -1198,6 +1293,8 @@ $B quit --app hardcore --n 6 --keys cmd+q build/hardcore ~/dev/hardcore
 build/hardcore --bench-resize build/resize.txt          # reflow, 1 and 16 full tabs, plus the correctness checks
 $B drag --app hardcore --n 60 -400,-200                 # a live corner drag (16 tabs: cat a 21,000-line file in each first)
 python3 bench/latstats.py LOG                           # the HARDCORE_LAT breakdown
+bench/compare-mac.py /tmp/termcompare                    # floods, redraw CPU and memory against the other terminals
+                                                        #   (HC_COMPARE_APP=other.app to measure another hardcore build)
 ```
 
 `--left` / `--top` are points from the window's top-left corner to the first text cell

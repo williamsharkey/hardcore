@@ -67,7 +67,7 @@ static int mac_write_all(int fd, const void *bytes, size_t n) {
 static NSString *mac_runtime_dir(void) { return mac_runtime(); }
 
 #define MAC_TERM_NUMBERS(X) \
-    X(st) X(esc_which) X(np) X(priv) X(inter) X(utf8_need) X(utf8_acc) X(osc_n) \
+    X(st) X(esc_which) X(np) X(priv) X(inter) X(sub) X(csi_bad) X(utf8_need) X(utf8_acc) X(utf8_min) X(osc_n) X(osc_over) \
     X(last_ch) X(m_sync) X(sync_since) X(bell) X(spin_ch) X(spin_at) X(spin_n) \
     X(progress) X(ps_state) X(ps_pct) X(ps_tasks)
 #define MAC_TERM_STRINGS(X) X(cwd) X(claude) X(claude_args) X(cmd) X(ps_kind)
@@ -151,7 +151,11 @@ static Tab *mac_unpack_tab(NSDictionary *d) {
     if (t->st < S_GROUND || t->st > S_STR_ESC || t->np < 0 || t->np > MAX_PARAMS || t->utf8_need < 0 || t->utf8_need > 3 || t->osc_n != (int)[osc length]) {
         term_free(t); free(tb); return NULL;
     }
-    memcpy(t->osc, [osc bytes], [osc length]);
+    if ([osc length]) {          /* the OSC buffer grows on demand: give it room for what was pending */
+        t->osc_cap = (int)[osc length] + 1024;
+        if (!(t->osc = malloc((size_t)t->osc_cap))) { term_free(t); free(tb); return NULL; }
+        memcpy(t->osc, [osc bytes], [osc length]);
+    }
     int j = 0;
     for (NSNumber *v in d[@"params"]) t->params[j++] = [v intValue];
     t->nmarks = 0;
