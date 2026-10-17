@@ -18,29 +18,32 @@ HARNESS = r'''
 #include <string.h>
 typedef struct { uint32_t ch,fg,bg; uint8_t attr,wflag; uint16_t link; } Cell;
 #include "hardcore_browser_grid.h"
-@interface FakeWeb : NSObject { @public NSString *script; void (^pending)(id,NSError *); int calls; }
-- (void)evaluateJavaScript:(NSString *)code inFrame:(id)frame inContentWorld:(id)world completionHandler:(void (^)(id,NSError *))completion;
+@interface FakeBrowserEngine : NSObject { @public NSString *script; void (^pending)(id,NSError *); int calls; }
+- (void)evaluate:(NSString *)code completion:(void (^)(id,NSError *))completion;
 - (void)finish:(id)info;
 @end
-@implementation FakeWeb
-- (void)evaluateJavaScript:(NSString *)code inFrame:(id)frame inContentWorld:(id)world completionHandler:(void (^)(id,NSError *))completion {
-    (void)frame;(void)world;calls++;[script release];script=[code copy];[pending release];pending=[completion copy];
+@implementation FakeBrowserEngine
+- (void)evaluate:(NSString *)code completion:(void (^)(id,NSError *))completion {
+    calls++;[script release];script=[code copy];[pending release];pending=[completion copy];
 }
 - (void)finish:(id)info { void (^callback)(id,NSError *)=[pending copy];[pending release];pending=nil;callback(info,nil);[callback release]; }
 - (void)dealloc { [script release];[pending release];[super dealloc]; }
 @end
 @interface HCBrowser : NSObject { @public
     int generation,epoch,cutieGeneration,cutiePopupEpoch,blockCount,scroll,total,dirty,lastCols,lastRows;
-    NSTimeInterval cutiePopupUntil;BrowserBlock *blocks;FakeWeb *web;
+    NSTimeInterval cutiePopupUntil;BrowserBlock *blocks;FakeBrowserEngine *engine;
 }
+- (void)evaluate:(NSString *)code completion:(void (^)(id,NSError *))completion;
 @end
 @implementation HCBrowser
+- (void)evaluate:(NSString *)code completion:(void (^)(id,NSError *))completion {
+    [engine evaluate:code completion:completion];
+}
 @end
 typedef struct { int id;HCBrowser *browser;int cols,rows,view; } Tab;
 static Tab *g_tabs[2];static int g_ntabs=2,active=0,control_calls=0,control_node;
 static HCBrowser *browser_for(Tab *tb) { return tb ? tb->browser : nil; }
 static NSString *browser_string(id value) {return [value isKindOfClass:NSString.class] ? value : @"";}
-static id browser_world(void) {return nil;}
 static Tab *tab_by_id(int identity) {for(int i=0;i<g_ntabs;i++)if(g_tabs[i] && g_tabs[i]->id==identity)return g_tabs[i];return NULL;}
 static void activate(int at) {active=at;}
 static void mac_browser_begin_control(Tab *tb,int node,int revision,int epoch,NSDictionary *info) {
@@ -74,31 +77,31 @@ static void projection(void) {
     [b release];
 }
 static void actions(void) {
-    HCBrowser *b=[HCBrowser new];b->web=[FakeWeb new];b->generation=9;b->epoch=3;b->cutieGeneration=8;
+    HCBrowser *b=[HCBrowser new];b->engine=[FakeBrowserEngine new];b->generation=9;b->epoch=3;b->cutieGeneration=8;
     Tab selected={.id=1},source={.id=2,.browser=b};g_tabs[0]=&selected;g_tabs[1]=&source;
     assert(mac_browser_cutie_generation(&source)==8 && !mac_browser_cutie_generation(NULL));
     browser_cutie_changed(b);assert(mac_browser_cutie_generation(&source)==9);
     b->cutieGeneration=0x7fffffff;browser_cutie_changed(b);assert(b->cutieGeneration==1);
-    mac_browser_cutie_action(&source,7);assert([b->web->script containsString:@".info(7,9)"]);
-    [b->web finish:@{@"tag":@"A",@"href":@"https://example.invalid/"}];
-    assert(active==0 && !control_calls && [b->web->script containsString:@".activate(7,9)"]);
+    mac_browser_cutie_action(&source,7);assert([b->engine->script containsString:@".info(7,9)"]);
+    [b->engine finish:@{@"tag":@"A",@"href":@"https://example.invalid/"}];
+    assert(active==0 && !control_calls && [b->engine->script containsString:@".activate(7,9)"]);
     assert(b->cutiePopupEpoch==3 && b->cutiePopupUntil>NSProcessInfo.processInfo.systemUptime);
     /* A replacement snapshot between info request and reply cannot act. */
-    mac_browser_cutie_action(&source,8);browser_cutie_changed(b);int calls=b->web->calls;
-    [b->web finish:@{@"tag":@"BUTTON"}];assert(b->web->calls==calls && active==0);
+    mac_browser_cutie_action(&source,8);browser_cutie_changed(b);int calls=b->engine->calls;
+    [b->engine finish:@{@"tag":@"BUTTON"}];assert(b->engine->calls==calls && active==0);
     /* An identity reused by another browser object is likewise rejected. */
-    mac_browser_cutie_action(&source,8);source.browser=nil;calls=b->web->calls;
-    [b->web finish:@{@"tag":@"BUTTON"}];assert(b->web->calls==calls && active==0);source.browser=b;
-    mac_browser_cutie_action(&source,8);b->epoch++;calls=b->web->calls;
-    [b->web finish:@{@"tag":@"BUTTON"}];assert(b->web->calls==calls);
-    mac_browser_cutie_action(&source,8);[b->web finish:@{@"tag":@"INPUT",@"type":@"checkbox"}];
-    assert(active==0 && !control_calls && [b->web->script containsString:@".activate(8,9)"]);
-    mac_browser_cutie_action(&source,9);[b->web finish:@{@"tag":@"TEXTAREA"}];
+    mac_browser_cutie_action(&source,8);source.browser=nil;calls=b->engine->calls;
+    [b->engine finish:@{@"tag":@"BUTTON"}];assert(b->engine->calls==calls && active==0);source.browser=b;
+    mac_browser_cutie_action(&source,8);b->epoch++;calls=b->engine->calls;
+    [b->engine finish:@{@"tag":@"BUTTON"}];assert(b->engine->calls==calls);
+    mac_browser_cutie_action(&source,8);[b->engine finish:@{@"tag":@"INPUT",@"type":@"checkbox"}];
+    assert(active==0 && !control_calls && [b->engine->script containsString:@".activate(8,9)"]);
+    mac_browser_cutie_action(&source,9);[b->engine finish:@{@"tag":@"TEXTAREA"}];
     assert(active==1 && control_calls==1 && control_node==9);
-    active=0;mac_browser_cutie_action(&source,10);[b->web finish:@{@"tag":@"SELECT"}];
+    active=0;mac_browser_cutie_action(&source,10);[b->engine finish:@{@"tag":@"SELECT"}];
     assert(active==1 && control_calls==2 && control_node==10);
-    calls=b->web->calls;mac_browser_cutie_action(&source,4001);mac_browser_cutie_action(NULL,1);assert(b->web->calls==calls);
-    [b->web release];[b release];
+    calls=b->engine->calls;mac_browser_cutie_action(&source,4001);mac_browser_cutie_action(NULL,1);assert(b->engine->calls==calls);
+    [b->engine release];[b release];
 }
 int main(int argc,char **argv) {assert(argc==2);@autoreleasepool {
     if(!strcmp(argv[1],"project"))projection();else if(!strcmp(argv[1],"action"))actions();else return 2;

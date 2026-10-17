@@ -1,6 +1,10 @@
-/* Runs in a WebKit isolated content world, outside the site's JS namespace. */
+/* Runs in an isolated browser content world, outside the site's JS namespace. */
 (() => {
   if (globalThis.hardcoreBrowser) return;
+  const notify = message => {
+    if (typeof globalThis.hardcoreChromeNotify === 'function') globalThis.hardcoreChromeNotify(JSON.stringify(message));
+    else globalThis.webkit?.messageHandlers?.hardcoreBrowser?.postMessage(message);
+  };
   let actions = new Map(), nodeIds = new WeakMap(), nextNode = 1, generation = 0, pending = false;
   const blockTags = new Set(['ADDRESS','ARTICLE','ASIDE','BLOCKQUOTE','DIV','DL','DT','DD','FIGCAPTION','FIGURE','FOOTER','FORM','H1','H2','H3','H4','H5','H6','HEADER','LI','MAIN','NAV','OL','P','PRE','SECTION','TABLE','TR','UL']);
   const clean = text => String(text || '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
@@ -9,7 +13,7 @@
     pending = true;
     setTimeout(() => {
       pending = false;
-      globalThis.webkit?.messageHandlers?.hardcoreBrowser?.postMessage({type:'changed'});
+      notify({type:'changed'});
     }, 150);
   }
     function actionFor(node) {
@@ -52,7 +56,7 @@
         const src = node.currentSrc || node.src || '', alt = clean(node.getAttribute('alt') || 'Image');
         if (src && images < 32) {
           images++;
-          runs.push({text:'',action,node:currentNode,image:{src,alt,width:node.naturalWidth || node.width || 64,height:node.naturalHeight || node.height || 48}});
+          runs.push({text:'',action,node:currentNode,image:{src,alt,loaded:!!node.complete && node.naturalWidth>0,width:node.naturalWidth || node.width || 64,height:node.naturalHeight || node.height || 48}});
         } else if (alt) push(`[${alt}]`,action,bold);
       }
       else if (['INPUT','TEXTAREA','SELECT','BUTTON'].includes(tag) || node.getAttribute('role') === 'button') {
@@ -120,7 +124,7 @@
         if(tag==='IMG') {
           const src=node.currentSrc || node.src || '',alt=clean(node.getAttribute('alt') || '');
           if(options.images===false) {if(alt)add(alt,node,action,bold);return;}
-          if(src)result.push({text:'',action,node:actionFor(node),image:{src,alt,width:node.naturalWidth || node.width || 64,height:node.naturalHeight || node.height || 48}});
+          if(src)result.push({text:'',action,node:actionFor(node),image:{src,alt,loaded:!!node.complete && node.naturalWidth>0,width:node.naturalWidth || node.width || 64,height:node.naturalHeight || node.height || 48}});
           return;
         }
         if(tag==='A' && node.hasAttribute('href'))action=actionFor(node);
@@ -197,7 +201,7 @@
     if(!target)return;
     event.preventDefault();
     const anchor=target.closest?.('a[href]');
-    globalThis.webkit?.messageHandlers?.hardcoreBrowser?.postMessage({type:'context',generation,node:actionFor(target),link:anchor ? actionFor(anchor) : 0});
+    notify({type:'context',generation,node:actionFor(target),link:anchor ? actionFor(anchor) : 0});
   },true);
   globalThis.addEventListener?.('resize',changed);
   document.addEventListener('load',changed,true);

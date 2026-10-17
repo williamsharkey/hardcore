@@ -73,6 +73,7 @@ class NativeApp:
         self.artifacts = artifacts
         self.sequence = 0
         self.pids = set()
+        self.chrome_profile = root / "chrome-profile"
         cfg = root / "config"
         cfg.mkdir(parents=True)
         (cfg / "config.ini").write_text(
@@ -83,7 +84,9 @@ class NativeApp:
         shutil.copytree(ROOT / "hardcore.app", install)
         env = dict(os.environ, HARDCORE_CTL=str(self.fifo), HARDCORE_NO_ACTIVATE="1",
                    HARDCORE_TEST_CHROME_MOTION="1" if adaptive else "0",
-                   HARDCORE_TEST_CONFIG=str(cfg), HARDCORE_SHELL="/bin/zsh")
+                   HARDCORE_TEST_CONFIG=str(cfg), HARDCORE_SHELL="/bin/zsh",
+                   HARDCORE_CHROME_PROFILE=str(self.chrome_profile))
+        env.pop("HARDCORE_CHROME_ATTACH", None)
         self.proc = subprocess.Popen([str(install / "Contents/MacOS/hardcore"), "--cd", str(root)],
                                      env=env, stdout=self.log, stderr=self.log)
         try:
@@ -116,7 +119,42 @@ class NativeApp:
             except ProcessLookupError:
                 pass
         Path(f"/tmp/hardcore-{os.getuid()}/{self.proc.pid}.sock").unlink(missing_ok=True)
+        self.stop_chrome()
         self.log.close()
+
+    def stop_chrome(self):
+        # Browser fixtures must neither reuse nor leave behind a personal
+        # profile. Restrict cleanup to this app copy's unique profile argument.
+        marker = "--user-data-dir=" + str(self.chrome_profile)
+        def owned():
+            table = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
+            pids = []
+            for line in table.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) != 2:
+                    continue
+                start = parts[1].find(marker)
+                end = start + len(marker)
+                if start >= 0 and (end == len(parts[1]) or parts[1][end].isspace()):
+                    pids.append(int(parts[0]))
+            return pids
+        if not self.chrome_profile.exists():
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            pids = owned()
+            if not pids:
+                return
+            for pid in pids:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if not owned():
+                    return
+                time.sleep(.05)
+        raise AssertionError("owned fixture Chrome did not exit")
 
     def send(self, command):
         assert "\n" not in command, command

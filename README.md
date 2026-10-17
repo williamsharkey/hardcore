@@ -1,6 +1,6 @@
 # hardcore
 
-Experimental browser tabs are available on **macOS 11+**. Press **⇧⌘B** to
+Chrome-backed browser tabs are available on **macOS 11+** with Google Chrome installed. Press **⇧⌘B** to
 open the built-in welcome page, **⌘L** to enter an address, and **⇧⌘M** to switch
 between Hardcore and native rendering. **⌘[ / ⌘]** navigate back/forward and
 **⌘R** reloads the page. Browser tabs appear below their owning terminal tab and
@@ -13,7 +13,7 @@ app reloads. Hover the top window edge
 for grid-aligned back/forward buttons, address input, Go, close, new browser tab,
 and the Mono/Native switch. The narrow-window layout uses additional grid rows.
 
-Hardcore mode is the default: a live system WebKit page projects semantic text,
+Hardcore mode is the default: a live Chrome page projects semantic text,
 headings, links, lists, code, tables and basic controls into the current bitmap
 font, theme and character grid. Blocks wrap around either menu dock and regain
 full width outside it. Links have a faint one-device-pixel hairline; hovering removes it, brightens
@@ -22,7 +22,7 @@ inputs open a grid editor, selects use a grid picker, and text areas support
 multiple lines (Control-Return applies).
 Tab/Shift-Tab selects visible controls and Return activates them. Wheel, arrows,
 Page Up/Down, Home and End scroll; Shift/Option-drag selects grid text. Native
-mode displays the real page across the full canvas, with a full-opacity menu
+mode displays Chrome’s rendered page across the full canvas, with a full-opacity menu
 that comes forward on hover. Switching modes retains the same live document. Right-click opens a grid
 context menu for copying link locations, opening child browser tabs, copying
 selection, navigation, and inspecting elements. **Inspect element** splits off
@@ -38,9 +38,12 @@ Text in the same block wraps beside them. Thumbnails are decoded at bounded
 size, nearest-neighbor sampled, ordered-dithered into the theme's 16 terminal
 colors plus its foreground/background, and cached between frames. Downloads
 are asynchronous, capped at 2 MB per image, with at most 32 cached sources per
-page. Embedded base64 PNG/JPEG images work too. Image requests use an isolated
-HTTP session; authenticated/blocked assets and unsupported image formats show
-a placeholder. Native mode uses WebKit's own complete image presentation.
+page. Embedded base64 PNG/JPEG images work too. Website image bytes come from
+Chrome’s loaded resources, including authenticated resources, rather than a
+second independent cookie store. Unavailable or unsupported images show a
+placeholder. Normal rendering shows Chrome’s full page, including canvas/video.
+The first implementation samples about eight frames per second while visible;
+it is suited to browsing rather than smooth video playback.
 
 From a terminal or an agent running inside Hardcore:
 
@@ -59,20 +62,64 @@ the parent. `hardcore browser --help` lists commands. After building locally,
 reload the existing window with `./hardcore.app/Contents/MacOS/hardcore --reload`
 before trying these commands in that window.
 
-This first pass uses its own WebKit cookies/profile, separate from Safari and
-Chrome. It does not inherit their signed-in sessions or password-manager
-extensions. Successful logins in Hardcore use its persistent WebKit store;
-switching Mono/Native keeps that same session. Some providers, including Google,
-restrict login in embedded browsers. Native mode is still the embedded WebKit
-page, so it does not bypass that restriction. Use the regular browser for sites
-that require its existing login. Grid mode covers the main document's first 100,000 characters and 2,000
-blocks; canvas, embedded frames, rich editors, combining marks and advanced
-controls need native mode. Browser URLs, mode and parent IDs survive an app
-reload, but pages reload and their in-memory JavaScript/form state is lost;
-terminal sessions keep the existing live-reload behavior. Windows WebView2,
-extensions (including Claude's Chrome extension), and an agent DOM/MCP API are
-not implemented. Browser layout, projection, command validation and reload
-metadata have headless tests; native rendering/input still need desktop review.
+Web tabs now use a real installed Chrome process, hidden by default, controlled
+by a native DevTools Protocol client compiled into Hardcore. Desktop **+www** and
+macOS `hardcore here` **WWW** share this backend. No Python, Node, browser driver,
+or bundled Chromium runtime is needed. The local Clips player remains WebKit.
+
+By default Chrome uses a persistent Hardcore profile at
+`~/Library/Application Support/hardcore/Chrome`. Its cookies, history, site data,
+and installed extensions remain in Chrome across tab closes and Hardcore updates.
+This is a **separate profile**: existing regular Chrome logins and extensions are
+not copied. To sign in or install extensions, close Hardcore website tabs and run:
+
+```sh
+hardcore chrome setup
+```
+
+That opens the same profile visibly in Chrome for browser-level setup and prompts.
+The hidden backend can reconnect to that profile afterward. `hardcore chrome profile`
+prints its path. `HARDCORE_CHROME_PROFILE` selects another dedicated profile and
+`HARDCORE_CHROME_EXECUTABLE` selects an installed Chrome/Chromium-compatible binary.
+
+For your **existing Chrome profile**, Chrome 144+ offers an explicit opt-in:
+open `chrome://inspect/#remote-debugging` in Chrome, enable remote debugging,
+then start Hardcore with the profile’s endpoint file and accept Chrome’s prompt:
+
+```sh
+HARDCORE_CHROME_ATTACH="$HOME/Library/Application Support/Google/Chrome/DevToolsActivePort" hardcore
+```
+
+Hardcore reads only the debugging endpoint; it does not copy cookies, passwords,
+or profile databases. This mode uses Chrome’s existing authentication, history,
+and installed extensions. It creates hidden page targets and never closes your
+Chrome browser. Chrome controls the consent prompt. See
+[Chrome’s connection documentation](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session).
+The endpoint setting applies to the process hosting the website tabs; setting it
+only on a CLI that contacts an already-running Hardcore window cannot change that
+window’s browser profile.
+
+Grid mode uses the same document adapters, reflow, forms, links and inspector as
+before. Normal mode streams Chrome’s rendered viewport and forwards pointer,
+keyboard, scroll and text input; this is a rendered surface, not an embedded Chrome
+toolbar. Open `chrome://history`, `chrome://extensions`, or `chrome://settings` in a
+website tab for profile tools. Extension content scripts and background workers
+run in Chrome. Extension toolbar popups, browser permission UI, downloads, file
+pickers, and extension-specific native messaging are not all mirrored in Hardcore;
+use visible profile setup when a site or extension needs those surfaces. Individual
+extensions, including Claude’s browser extension, need their own compatibility
+checks; a running extension does not imply its full toolbar UI is reproduced.
+
+Grid mode covers the main document’s first 100,000 characters and 2,000 blocks;
+embedded frames, canvas and rich editors generally need normal mode. In a dedicated
+headless profile, GUI reloads reconnect to the same Chrome page target, preserving live
+JavaScript, forms and per-tab navigation history while Chrome remains running.
+Unavailable targets reload their saved URL. Existing-profile hidden targets end
+when their debugging connection closes, so those pages reload after a Hardcore
+exec update. The same applies while a visible profile-setup Chrome is still
+running; quit that instance after setup to return to the persistent hidden backend.
+Terminal sessions retain the existing in-place reload behavior.
+Windows browser integration and an agent DOM/MCP API remain unimplemented.
 
 Cross-window transfers (`slurp --pid` and `reload --exe`) currently leave a
 source window containing browser tabs open and report that it cannot transfer.
@@ -106,9 +153,15 @@ mode for their original visual relationships.
 `make browser-test` exercises six explicitly synthetic Wikipedia structural
 fixtures at four widths, on both docks and without a dock, and generates a
 readable review at `build/wikipedia-preview/index.html`. They cover biography,
-geography, mathematics, population data, prose history and complex spans; they
-are not live-page screenshots. `python3 tools/capture_wikipedia.py --representative`
+geography, mathematics, population data, prose history and complex spans;
+they are not live-page screenshots. `python3 tools/capture_wikipedia.py --representative`
 can capture original article HTML and provenance when network access is available.
+
+`make chrome-browser-test` uses installed Chrome, disposable profiles, and local
+fixtures to check dynamic pages, forms, history, persisted cookies, screenshots,
+popup relationships, and a real extension. `python3 tests/test_chrome_browser_mac.py`
+checks the desktop input surface, authenticated images, and live page preservation
+across GUI reload.
 
 Drag the single **↕** handle in the header to position the menu. It snaps
 to the nearer left or right edge and follows the pointer vertically, keeping
@@ -505,9 +558,12 @@ restoration. Theme and font preferences are stored separately from native app
 settings. Hardcore's bundled bitmap fonts require host support/installation and
 cannot be selected merely by emitting terminal text.
 
-On macOS, the built-in text web reader follows numbered links and provides scrolling, Back, and
-explicit opening in the system browser. It does not execute JavaScript, share
-browser logins, or render forms and images. Files opens a built-in keyboard file browser in another tab. The menu's **caf** toggle uses macOS `caffeinate -di`
+On macOS, WWW uses the same hidden Chrome backend as desktop tabs. JavaScript
+runs in the real page; numbered links and controls support navigation and form
+editing. **b/f** use Chrome's history, **u** enters an address, and **q** closes
+only that website tab. Cookies, history, and extensions persist in the Chrome
+profile. Images remain text descriptions in this terminal presentation.
+Files opens a built-in keyboard file browser in another tab. The menu's **caf** toggle uses macOS `caffeinate -di`
 while this frontend is running.
 
 On macOS, **cam** and **image** open low-resolution character previews using
@@ -545,7 +601,7 @@ This frontend still differs from the native app: full browser rendering,
 camera recording/Clips export, the native music player, floating TV layout,
 GUI session transfers, custom bitmap rendering, and advanced graphics/keyboard
 protocols and host clipboard writes are not implemented here. The Linux backend
-also does not yet include image/camera sources, the text web reader or host-font control. Reloading the attachment does not hot-swap
+also does not yet include image/camera sources, Chrome browsing or host-font control. Reloading the attachment does not hot-swap
 its running session owner: that process retains the engine and UI it started
 with. Native GUI reload/slurp and terminal-hosted sessions remain separate.
 `make here-test` (also `make mac-here-test` on Mac) exercises the compiled

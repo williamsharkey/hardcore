@@ -1,8 +1,10 @@
-/* Live WebKit documents with an embedded DOM -> bitmap-grid projection.
+/* Full Chrome documents with an embedded DOM -> bitmap-grid projection.
    Included after HCView. Runtime assets are compiled into the executable. */
 #include "build/browser.inc"
 #include "hardcore_browser_grid.h"
 #include "hardcore_browser_label.h"
+#include "hardcore_chrome_browser.h"
+#include "hardcore_browser_chrome_view.h"
 
 static NSString *browser_page_title(Tab *tb) {
     char utf[1024];int length=0;
@@ -57,6 +59,7 @@ static NSString *browser_url(NSString *input) {
     NSString *scheme = u.scheme.lowercaseString;
     if (([scheme isEqualToString:@"https"] || [scheme isEqualToString:@"http"]) && u.host.length) return browser_url_bound(u.absoluteString);
     if ([scheme isEqualToString:@"file"] && (!u.host.length || [u.host isEqualToString:@"localhost"])) return browser_url_bound(u.absoluteString);
+    if ([scheme isEqual:@"chrome"] && [@[@"history",@"extensions",@"settings"] containsObject:u.host.lowercaseString]) return browser_url_bound(u.absoluteString);
     return [s isEqualToString:@"about:blank"] ? s : nil;
 }
 
@@ -68,10 +71,15 @@ static NSString *browser_url(NSString *input) {
     int cutieGeneration, cutiePopupEpoch;
     NSTimeInterval cutiePopupUntil;
     int lastCols, lastRows, lastX, lastY, lastHeight, lastSide, lastPreview;
-    WKWebView *web;
+    WKWebView *web; /* Specialized local documents retain their WebKit bridge. */
+    HCChromePage *chrome;
+    HCChromeBrowserView *chromeView;
+    int chromeStarted, disposed, projectSerial;
+    NSString *adoptTargetID;
     BrowserBlock *blocks;
     int blockCount;
-    NSMutableDictionary *imageCache, *anchorBlocks;
+    NSMutableDictionary *imageCache, *anchorBlocks, *imageAttempts;
+    NSMutableSet *imageLoading;
     NSMutableArray *images;
     uint16_t *nodeGrid;
     int nodeCols,nodeRows,pageRows;
@@ -93,6 +101,19 @@ static NSString *browser_url(NSString *input) {
 - (void)project;
 - (void)accept:(NSDictionary *)snapshot;
 - (void)dispose;
+- (NSView *)documentView;
+- (void)evaluate:(NSString *)code completion:(void (^)(id,NSError *))done;
+- (BOOL)canGoBack;
+- (BOOL)canGoForward;
+- (void)go:(int)delta;
+- (void)reload;
+- (void)showNative:(BOOL)visible;
+- (void)resizeDocument:(NSRect)rect;
+- (void)chromeEvent:(NSDictionary *)event;
+- (void)chromeFailure:(NSString *)message;
+- (void)loadImage:(HCBrowserImage *)image source:(NSString *)source;
+- (void)completeImage:(HCBrowserImage *)image source:(NSString *)source epoch:(int)documentEpoch data:(NSData *)bytes;
+- (void)createChrome;
 @end
 
 static void mac_browser_begin_control(Tab *tb,int node,int revision,int documentEpoch,NSDictionary *info);
@@ -103,10 +124,11 @@ static void browser_ui_reset(HCBrowser *b);
 static NSView *g_browser_root;
 static HCBrowser *record_library_restore(Tab *tb);
 static void mac_browser_edit(SEL action, id sender) {
-    /* Native selection and text editing belong to WebKit's responder chain. */
+    /* The embedded browser surface owns native selection and text editing. */
     if ([g_win firstResponder]!=(NSResponder *)g_view) [NSApp sendAction:action to:nil from:sender];
 }
 static Tab *mac_browser_new(NSString *url, int parent, int native);
+static Tab *mac_browser_new_document(NSString *address,int parent,int native,Class browserClass,NSString *targetID);
 static HCBrowser *browser_for(Tab *tb) { return tb && tb->kind == TK_BROWSER ? (HCBrowser *)tb->browser : nil; }
 static void browser_cutie_changed(HCBrowser *b) {
     /* JS generations restart after navigation. This token also invalidates
@@ -150,10 +172,17 @@ static void browser_decode_runs(HCBrowser *b,BrowserBlock *block,NSArray *runs,
             if (src.length>3*1024*1024) src=@"";
             HCBrowserImage *image=b->imageCache[src];
             if (!image && src.length && b->imageCache.count<32) {
-                image=[[[HCBrowserImage alloc] initWithSource:src owner:b->tabID] autorelease];
+                if(b->chrome) {
+                    image=[[[HCBrowserImage alloc] init] autorelease];image->owner=b->tabID;image->source=[src copy];
+                } else image=[[[HCBrowserImage alloc] initWithSource:src owner:b->tabID] autorelease];
                 b->imageCache[src]=image;
             }
             if (image) {
+                /* Chrome may expose the DOM before this resource exists in its
+                   cache. The image load event triggers a later projection. */
+                BOOL loaded=!asset[@"loaded"] || [asset[@"loaded"] boolValue];
+                if(b->chrome && loaded && !image->rgba && !image->failed && ![b->imageLoading containsObject:src])
+                    [b loadImage:image source:src];
                 [b->images addObject:image];
                 int width=MAX(1,MIN(20000,browser_integer(asset[@"width"])));
                 int height=MAX(1,MIN(20000,browser_integer(asset[@"height"])));
@@ -194,6 +223,8 @@ static void browser_decode_runs(HCBrowser *b,BrowserBlock *block,NSArray *runs,
 static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
     browser_free_blocks(b);
     if (!b->imageCache) b->imageCache=[[NSMutableDictionary alloc] init];
+    if (!b->imageAttempts) b->imageAttempts=[[NSMutableDictionary alloc] init];
+    if (!b->imageLoading) b->imageLoading=[[NSMutableSet alloc] init];
     if (!b->anchorBlocks) b->anchorBlocks=[[NSMutableDictionary alloc] init];
     if (!b->images) b->images=[[NSMutableArray alloc] init];
     [b->images removeAllObjects];
@@ -239,7 +270,98 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
 
 @implementation HCBrowser
 - (NSRect)contentRect:(NSRect)bounds { return bounds; }
-- (void)prepareNative {}
+- (void)prepareNative { [chromeView refresh]; }
+- (NSView *)documentView { return chromeView ?: (NSView *)web; }
+- (void)evaluate:(NSString *)code completion:(void (^)(id,NSError *))done {
+    if(chrome)[chrome evaluate:code completion:done];
+    else [web evaluateJavaScript:code inFrame:nil inContentWorld:browser_world() completionHandler:done];
+}
+- (BOOL)canGoBack { return chrome ? chrome->canGoBack : web.canGoBack; }
+- (BOOL)canGoForward { return chrome ? chrome->canGoForward : web.canGoForward; }
+- (void)go:(int)delta { if(chrome)[chrome go:delta];else if(delta<0)[web goBack];else [web goForward]; }
+- (void)reload { if(chrome)[chrome reload];else [web reload]; }
+- (void)showNative:(BOOL)visible { [chromeView setRendering:visible]; }
+- (void)resizeDocument:(NSRect)rect {
+    [self documentView].frame=rect;
+    if(chrome)[chrome setWidth:MAX(1,(int)rect.size.width) height:MAX(1,(int)rect.size.height)];
+    dirty=1;
+}
+- (void)chromeFailure:(NSString *)message {
+    Tab *tb=tab_by_id(tabID);if(disposed || !tb || tb->browser!=self)return;
+    tb->busy=0;tb->browser_native=0;[chromeView setRendering:NO];
+    [self accept:@{@"generation":@0,@"title":@"Chrome unavailable",@"blocks":@[
+        @{@"kind":@"heading",@"runs":@[@{@"text":@"Chrome browsing unavailable"}]},
+        @{@"runs":@[@{@"text":message ?: @"Could not connect to Chrome."}]},
+        @{@"runs":@[@{@"text":@"Install Google Chrome, then use Command-R to retry. Your existing terminal sessions are unaffected."}]}]}];
+    if(tb==active_tab()){g_layer.opaque=YES;[g_win makeFirstResponder:g_view];}update_busy(0);plat_invalidate();
+}
+- (void)chromeEvent:(NSDictionary *)event {
+    Tab *tb=tab_by_id(tabID);if(disposed || !tb || tb->browser!=self)return;
+    NSString *type=browser_string(event[@"type"]);
+    if([type isEqual:@"error"]){[self chromeFailure:browser_string(event[@"message"])];return;}
+    if([type isEqual:@"context"]){if(tb==active_tab())mac_browser_context_native(event);return;}
+    if([type isEqual:@"popup"]) {
+        NSString *target=browser_string(event[@"targetID"]);if(!target.length)return;
+        int activeID=active_tab()?active_tab()->id:0;
+        BOOL cutie=cutiePopupEpoch==epoch && cutiePopupUntil>=NSProcessInfo.processInfo.systemUptime;
+        NSString *address=browser_url(browser_string(event[@"url"]));
+        mac_browser_new_document(address ?: @"about:blank",tb->parent_id,tb->browser_native,Nil,target);
+        if(cutie){cutiePopupUntil=0;for(int i=0;i<g_ntabs;i++)if(g_tabs[i]->id==activeID){activate(i);break;}}
+        return;
+    }
+    if([type isEqual:@"navigation"]) {
+        browser_ui_reset(self);epoch++;generation=0;scroll=0;browser_free_blocks(self);dirty=1;hoverLink=0;
+        for(HCBrowserImage *image in imageCache.allValues)[image cancel];[imageCache removeAllObjects];[imageAttempts removeAllObjects];[imageLoading removeAllObjects];[images removeAllObjects];
+        NSString *address=browser_url(chrome->url);
+        if(address && ![address isEqual:@"about:blank"])mac_browser_metadata(tb,chrome->title,nil,address);
+        tb->busy=!chrome->ready;update_busy(0);
+    }
+    if(chrome->ready){tb->busy=0;update_busy(0);[self project];}
+    [chromeView refresh];plat_invalidate();
+}
+- (void)completeImage:(HCBrowserImage *)image source:(NSString *)source epoch:(int)documentEpoch data:(NSData *)bytes {
+    Tab *tb=tab_by_id(tabID);
+    if(disposed || !tb || tb->browser!=self || epoch!=documentEpoch || imageCache[source]!=image)return;
+    [imageLoading removeObject:source];
+    if(bytes.length && bytes.length<=2*1024*1024)[image decode:bytes];
+    image->failed=!image->rgba;browser_image_ready(tabID);
+    int attempts=[imageAttempts[source] intValue];
+    if(image->failed && attempts<3) {
+        /* A completed DOM image can briefly race Chrome's resource cache.
+           Bound retries; permanent HTTP/decode failures never poll forever. */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.3*attempts*attempts*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+            Tab *live=tab_by_id(tabID);
+            if(!disposed && live && live->browser==self && epoch==documentEpoch && imageCache[source]==image) {
+                image->failed=0;[self loadImage:image source:source];
+            }
+        });
+    }
+}
+- (void)loadImage:(HCBrowserImage *)image source:(NSString *)source {
+    if([imageLoading containsObject:source] || [imageAttempts[source] intValue]>=3)return;
+    imageAttempts[source]=@([imageAttempts[source] intValue]+1);[imageLoading addObject:source];
+    /* Read the already authenticated resource from Chrome, never refetch it
+       with a separate cookie jar. Navigation guards reject late image bytes. */
+    int documentEpoch=epoch,identity=tabID;
+    if([source hasPrefix:@"data:image/"]) {
+        NSRange comma=[source rangeOfString:@","];
+        if(comma.location!=NSNotFound && [[source substringToIndex:comma.location] hasSuffix:@";base64"])
+            [image decode:[[[NSData alloc] initWithBase64EncodedString:[source substringFromIndex:comma.location+1] options:0] autorelease]];
+        [imageLoading removeObject:source];image->failed=!image->rgba;return;
+    }
+    [chrome command:@"Page.getFrameTree" params:@{} completion:^(NSDictionary *tree,NSError *error){
+        NSString *frame=tree[@"frameTree"][@"frame"][@"id"];
+        if(error || ![frame isKindOfClass:NSString.class]){[self completeImage:image source:source epoch:documentEpoch data:nil];return;}
+        [chrome command:@"Page.getResourceContent" params:@{@"frameId":frame,@"url":source} completion:^(NSDictionary *result,NSError *failure){
+            Tab *live=tab_by_id(identity);if(!live || live->browser!=self || epoch!=documentEpoch)return;
+            NSString *content=browser_string(result[@"content"]);
+            NSData *bytes=nil;
+            if(!failure && content.length<=3*1024*1024)
+                bytes=[result[@"base64Encoded"] boolValue] ? [[[NSData alloc] initWithBase64EncodedString:content options:0] autorelease] : [content dataUsingEncoding:NSUTF8StringEncoding];
+            [self completeImage:image source:source epoch:documentEpoch data:bytes];
+        }];
+    }];
+}
 - (WKWebViewConfiguration *)configuration {
     WKWebViewConfiguration *config=[[[WKWebViewConfiguration alloc] init] autorelease];
     WKUserContentController *controller=[[[WKUserContentController alloc] init] autorelease];
@@ -253,6 +375,11 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
 - (id)initWithTab:(Tab *)tb {
     if (!(self=[super init])) return nil;
     tabID=tb->id; dirty=1;
+    if([self class]==HCBrowser.class) {
+        [self createChrome];
+        if(tb->browser_target[0])adoptTargetID=[[NSString stringWithUTF8String:tb->browser_target] copy];
+        return self;
+    }
     WKWebViewConfiguration *config=[self configuration];
     web=[[WKWebView alloc] initWithFrame:[g_browser_root bounds] configuration:config];
     web.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
@@ -260,14 +387,29 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
     [g_browser_root addSubview:web positioned:NSWindowBelow relativeTo:g_view];
     return self;
 }
+- (void)createChrome {
+    epoch++;projectSerial++;requesting=changedAgain=0;
+    NSRect frame=chromeView ? chromeView.frame : [g_browser_root bounds];
+    [chromeView setRendering:NO];[chromeView removeFromSuperview];[chromeView release];chromeView=nil;
+    [chrome close];[chrome release];chrome=nil;
+    int identity=tabID;
+    chrome=[[HCChromePage alloc] initWithScript:[NSString stringWithUTF8String:(const char *)browser_script] changed:^(NSDictionary *event){
+        HCBrowser *live=browser_for(tab_by_id(identity));if(live && live->chrome)[live chromeEvent:event];
+    }];
+    chromeView=[[HCChromeBrowserView alloc] initWithFrame:frame page:chrome];
+    chromeView.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
+    [g_browser_root addSubview:chromeView positioned:NSWindowBelow relativeTo:g_view];
+    Tab *tb=tab_by_id(tabID);chromeView.hidden=tb!=active_tab();[chromeView setRendering:tb==active_tab() && tb->browser_native];
+}
 - (void)dispose {
+    disposed=1;[chromeView setRendering:NO];[chrome close];[chromeView removeFromSuperview];
     for(HCBrowserImage *image in imageCache.allValues)[image cancel];
     [web stopLoading]; web.navigationDelegate=nil; web.UIDelegate=nil;
     [web.configuration.userContentController removeScriptMessageHandlerForName:@"hardcoreBrowser" contentWorld:browser_world()];
     [web removeFromSuperview];
 }
-- (void)dealloc { browser_free_blocks(self);free(nodeGrid);[imageCache release];[anchorBlocks release];[images release];[editText release];
-    [menuItems release];[menuURL release];[inspection release];[inspectLines release];[web release];[super dealloc]; }
+- (void)dealloc { browser_free_blocks(self);free(nodeGrid);[imageCache release];[imageAttempts release];[imageLoading release];[anchorBlocks release];[images release];[editText release];
+    [menuItems release];[menuURL release];[inspection release];[inspectLines release];[web release];[chromeView release];[chrome release];[adoptTargetID release];[super dealloc]; }
 - (void)load:(NSString *)url {
     browser_cutie_changed(self);
     scroll=0; generation=0; browser_free_blocks(self); dirty=1; editKind=0;[editText release];editText=nil;
@@ -275,6 +417,36 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
     if (tb) {
         tb->busy=1; mac_browser_metadata(tb,nil,nil,url);
         update_busy(0); plat_invalidate();
+    }
+    if(chrome) {
+        if([url hasPrefix:@"chrome://"] && tb && !mac_record_active()){tb->browser_native=1;mac_browser_sync();}
+        if(chrome->closed || (!chrome->ready && chrome->targetID)){[self createChrome];chromeStarted=0;}
+        NSString *address=url;
+        if([url isEqual:@"hardcore:welcome"]) {
+            NSData *html=[NSData dataWithBytes:browser_welcome length:strlen((const char *)browser_welcome)];
+            address=[@"data:text/html;base64," stringByAppendingString:[html base64EncodedStringWithOptions:0]];
+        }
+        [chromeView clearFrame];
+        if(chromeStarted && !chrome->closed)[chrome navigate:address];
+        else {
+            chromeStarted=1;int identity=tabID;BOOL adopting=adoptTargetID.length>0;HCChromePage *connecting=chrome;
+            void (^connected)(NSError *)=^(NSError *error){
+                Tab *liveTab=tab_by_id(identity);HCBrowser *live=browser_for(liveTab);if(live!=self || disposed || chrome!=connecting)return;
+                if(error && adopting) {
+                    /* A browser restart or attached Chrome closing its hidden
+                       target can invalidate a saved ID. Keep the URL usable. */
+                    liveTab->browser_target[0]=0;[self createChrome];chromeStarted=0;[self load:url];return;
+                }
+                if(error){chromeStarted=0;[self chromeFailure:error.localizedDescription];}
+                else {
+                    snprintf(liveTab->browser_target,sizeof(liveTab->browser_target),"%s",chrome->targetID.UTF8String ?: "");
+                    [self resizeDocument:[self documentView].frame];[self project];
+                }
+            };
+            if(adoptTargetID){NSString *target=adoptTargetID;adoptTargetID=nil;[chrome adoptTarget:target completion:connected];[target release];}
+            else [chrome start:address completion:connected];
+        }
+        return;
     }
     if ([url isEqualToString:@"hardcore:welcome"]) {
         [web loadHTMLString:[NSString stringWithUTF8String:(const char *)browser_welcome] baseURL:nil];
@@ -285,9 +457,9 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
 }
 - (void)project {
     if (requesting) { changedAgain=1; return; }
-    requesting=1; int documentEpoch=epoch;
-    [web evaluateJavaScript:@"globalThis.hardcoreBrowser?.project()" inFrame:nil inContentWorld:browser_world()
-        completionHandler:^(id value,NSError *error) {
+    requesting=1; int documentEpoch=epoch,serial=++projectSerial;
+    [self evaluate:@"globalThis.hardcoreBrowser?.project()" completion:^(id value,NSError *error) {
+            if(serial!=projectSerial)return;
             requesting=0;
             Tab *tb=tab_by_id(tabID);
             if (tb && tb->browser==self && epoch==documentEpoch && !error && [value isKindOfClass:NSDictionary.class]) [self accept:value];
@@ -318,7 +490,7 @@ static void browser_decode(HCBrowser *b, NSDictionary *snapshot) {
 - (void)webView:(WKWebView *)view didStartProvisionalNavigation:(WKNavigation *)navigation {
     (void)view; (void)navigation;
     browser_ui_reset(self);epoch++;browser_cutie_changed(self); generation=0; scroll=0; browser_free_blocks(self); dirty=1;hoverLink=0;
-    for(HCBrowserImage *image in imageCache.allValues)[image cancel];[imageCache removeAllObjects];[images removeAllObjects];
+    for(HCBrowserImage *image in imageCache.allValues)[image cancel];[imageCache removeAllObjects];[imageAttempts removeAllObjects];[imageLoading removeAllObjects];[images removeAllObjects];
     Tab *tb=tab_by_id(tabID); if (tb) tb->busy=1;
     update_busy(0); plat_invalidate();
 }
@@ -415,12 +587,12 @@ static void mac_browser_sync(void) {
             [browser_for(tb) load:browser_url([NSString stringWithUTF8String:tb->browser_url]) ?: @"hardcore:welcome"];
         }
         HCBrowser *b=browser_for(tb);
-        if (b) { b->web.hidden=tb!=active; if (tb==active) b->dirty=1; }
+        if (b) { [b documentView].hidden=tb!=active;[b showNative:tb==active && tb->browser_native];if (tb==active) b->dirty=1; }
     }
     BOOL native=active && active->kind==TK_BROWSER && active->browser_native;
     g_layer.opaque=!native;
     HCBrowser *current=browser_for(active);
-    [g_win makeFirstResponder:native && current && !current->editKind && !current->menuKind ? (NSView *)current->web : (NSView *)g_view];
+    [g_win makeFirstResponder:native && current && !current->editKind && !current->menuKind ? [current documentView] : (NSView *)g_view];
     plat_invalidate();
 }
 static void mac_browser_destroy(Tab *tb) {
@@ -431,7 +603,7 @@ static void mac_browser_resize(Tab *tb) {
     HCBrowser *b=browser_for(tb); if (!b) return;
     NSRect rect=[b contentRect:[g_browser_root bounds]];
     if(b->inspectOpen) {CGFloat scale=[g_win backingScaleFactor];CGFloat pane=(tb->t.rows-mac_browser_page_rows(tb))*CH/scale;rect.origin.y+=pane;rect.size.height=MAX(1,rect.size.height-pane);}
-    b->web.frame=rect;b->dirty=1;
+    [b resizeDocument:rect];
 }
 static void mac_browser_prepare(Tab *tb) {
     /* Every browser already keeps a DOM projection, including Native tabs.
@@ -500,7 +672,7 @@ static void mac_browser_scroll(int lines) {
 }
 /* Specialized local documents opt in at creation; ordinary file/web tabs never
    acquire a host bridge just by navigating to a matching URL. */
-static Tab *mac_browser_new_with_class(NSString *address, int parent, int native, Class browserClass) {
+static Tab *mac_browser_new_document(NSString *address,int parent,int native,Class browserClass,NSString *targetID) {
     NSString *url=browser_url(address); if (!url || g_ntabs>=MAX_TABS) return NULL;
     Tab *owner=tab_by_id(parent);
     if (!owner) owner=active_tab();
@@ -516,10 +688,16 @@ static Tab *mac_browser_new_with_class(NSString *address, int parent, int native
     }
     memmove(g_tabs+at+1,g_tabs+at,(size_t)(g_ntabs-at)*sizeof(Tab *));
     g_tabs[at]=tb; g_ntabs++;
-    if(browserClass) {mac_browser_ensure_root();tb->browser=[[browserClass alloc] initWithTab:tb];}
+    if(browserClass || targetID) {
+        mac_browser_ensure_root();HCBrowser *browser=[[(browserClass ?: HCBrowser.class) alloc] initWithTab:tb];
+        browser->adoptTargetID=[targetID copy];tb->browser=browser;
+    }
     activate(at);
-    if(browserClass)[browser_for(tb) load:url];
+    if(browserClass || targetID)[browser_for(tb) load:url];
     return tb;
+}
+static Tab *mac_browser_new_with_class(NSString *address,int parent,int native,Class browserClass) {
+    return mac_browser_new_document(address,parent,native,browserClass,nil);
 }
 static Tab *mac_browser_new(NSString *address, int parent, int native) {
     return mac_browser_new_with_class(address,parent,native,Nil);
@@ -530,11 +708,12 @@ static void mac_browser_command(int command) {
     Tab *tb=active_tab(); HCBrowser *b=browser_for(tb);
     if (!b) return;
     if (command==0) { if(mac_record_active()){NSBeep();return;} tb->browser_native=!tb->browser_native; mac_browser_sync(); }
-    else if (command==1) [b->web goBack];
-    else if (command==2) [b->web goForward];
+    else if (command==1) [b go:-1];
+    else if (command==2) [b go:1];
     else if (command==3) {
         if (!strcmp(tb->browser_url,"hardcore:welcome")) [b load:@"hardcore:welcome"];
-        else [b->web reload];
+        else if(b->chrome && (!b->chromeStarted || !b->chrome->ready))[b load:[NSString stringWithUTF8String:tb->browser_url]];
+        else [b reload];
     }
     plat_invalidate();
 }
@@ -571,7 +750,7 @@ static void mac_browser_action(Tab *tb, int action) {
     HCBrowser *b=browser_for(tb); if (!b || action<1 || action>4000) return;
     int revision=b->generation, identity=tb->id, documentEpoch=b->epoch;
     NSString *js=[NSString stringWithFormat:@"globalThis.hardcoreBrowser?.info(%d,%d)",action,revision];
-    [b->web evaluateJavaScript:js inFrame:nil inContentWorld:browser_world() completionHandler:^(id info,NSError *error) {
+    [b evaluate:js completion:^(id info,NSError *error) {
         Tab *live=tab_by_id(identity);
         if (error || !live || live->browser!=b || b->generation!=revision || b->epoch!=documentEpoch || ![info isKindOfClass:NSDictionary.class]) return;
         if (!browser_follow_anchor(live,b,browser_integer(info[@"target"])))
@@ -582,7 +761,7 @@ static void mac_browser_cutie_action(Tab *tb,int action) {
     HCBrowser *b=browser_for(tb);if(!b || action<1 || action>4000)return;
     int revision=b->generation,identity=tb->id,documentEpoch=b->epoch,stamp=b->cutieGeneration;
     NSString *js=[NSString stringWithFormat:@"globalThis.hardcoreBrowser?.info(%d,%d)",action,revision];
-    [b->web evaluateJavaScript:js inFrame:nil inContentWorld:browser_world() completionHandler:^(id info,NSError *error) {
+    [b evaluate:js completion:^(id info,NSError *error) {
         Tab *live=tab_by_id(identity);
         if(error || !live || live->browser!=b || b->generation!=revision || b->epoch!=documentEpoch ||
             b->cutieGeneration!=stamp || ![info isKindOfClass:NSDictionary.class])return;
@@ -599,7 +778,7 @@ static void mac_browser_cutie_action(Tab *tb,int action) {
         }
         b->cutiePopupEpoch=documentEpoch;b->cutiePopupUntil=NSProcessInfo.processInfo.systemUptime+2.0;
         NSString *code=[NSString stringWithFormat:@"globalThis.hardcoreBrowser?.activate(%d,%d)",action,revision];
-        [b->web evaluateJavaScript:code inFrame:nil inContentWorld:browser_world() completionHandler:nil];
+        [b evaluate:code completion:nil];
     }];
 }
 
@@ -610,12 +789,14 @@ static NSDictionary *mac_browser_request(NSDictionary *request) {
         NSMutableArray *tabs=[NSMutableArray array];
         for (int i=0;i<g_ntabs;i++) {
             Tab *tb=g_tabs[i];
-            HCBrowser *browser=browser_for(tb);NSRect frame=browser?browser->web.frame:NSZeroRect,bounds=g_browser_root.bounds;
+            HCBrowser *browser=browser_for(tb);NSRect frame=browser?[browser documentView].frame:NSZeroRect,bounds=g_browser_root.bounds;
             [tabs addObject:@{@"id":@(tb->id),@"parent":@(tb->parent_id),@"active":@(i==g_active),
                 @"kind":tb->kind==TK_BROWSER ? @"browser" : @"terminal",@"url":[NSString stringWithUTF8String:tb->browser_url],
                 @"title":tb->kind==TK_BROWSER ? browser_page_title(tb) : @"",@"site":[NSString stringWithUTF8String:tb->browser_site] ?: @"",
                 @"mode":tb->browser_native ? @"native" : @"hardcore",
                 @"host":tb->browser_recording==1?@"replay":tb->browser_recording==2?@"video":@"web",
+                @"engine":browser && browser->chrome?@"chrome":tb->kind==TK_BROWSER?@"webkit":@"",
+                @"target":[NSString stringWithUTF8String:tb->browser_target] ?: @"",
                 @"viewFrame":@[@(frame.origin.x),@(frame.origin.y),@(frame.size.width),@(frame.size.height)],
                 @"viewBounds":@[@(bounds.origin.x),@(bounds.origin.y),@(bounds.size.width),@(bounds.size.height)],
                 @"viewFlipped":@([g_browser_root isFlipped]),@"backingScale":@([g_win backingScaleFactor])}];

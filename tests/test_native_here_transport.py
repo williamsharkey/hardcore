@@ -228,7 +228,7 @@ while True:time.sleep(.1)
         self.addCleanup(cleanup_jobs)
         other_name=self.name+'-other'
         other=self.host('--session',other_name,'--','/bin/sh','-c','printf "OTHER_READY\\n"; exec /bin/cat')
-        self.addCleanup(lambda:self.cli('--stop',other_name))
+        self.addCleanup(lambda:self.stop(other_name))
         other.wait(lambda:b'OTHER_READY' in other.output,'unrelated here session')
         other_status=json.loads(self.cli('--status',other_name).stdout)
         host.send(b'\x02c');host.wait(lambda:len(self.status()['tabs'])==2,'second owned shell')

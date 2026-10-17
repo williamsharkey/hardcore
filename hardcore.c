@@ -502,6 +502,7 @@ typedef struct Tab {
     int browser_recording;       /* explicit Clips host: 1 replay, 2 exported video */
     void *browser;               /* platform-owned live document, never a shell */
     char browser_url[4096];
+    char browser_target[128];    /* Live Chrome target, reused across GUI exec reloads. */
     char browser_site[512];
     wchar_t browser_label[256];  /* fitted browser caption cache, never a process label */
     int browser_label_cols;

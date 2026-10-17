@@ -1,3 +1,27 @@
+Current implementation — 2026-10-17
+
+Desktop +www and macOS native `hardcore here` WWW now use installed full Chrome
+through the embedded native CDP backend (hardcore_chrome_browser.h). The default
+is a persistent Hardcore-owned profile and a hidden Chrome process. Existing
+Chrome144+ profiles can be attached after explicit browser opt-in/consent using
+HARDCORE_CHROME_ATTACH. No profile/cookie copying is performed. Desktop retains
+semantic grid projection and adds a screenshot/input surface for normal mode;
+terminal WWW now supports live JS, numbered DOM controls, and Chrome history.
+Local Clips documents retain WKWebView. `hardcore chrome setup` provides visible
+sign-in/extension setup for the dedicated profile.
+
+Verified with disposable Chrome profiles: DOM projection, form/native input,
+history, persisted cookies across processes, screenshots, popup opener retention,
+and a real MV3 extension content script/background worker/storage. Desktop GUI
+reload reconnects to a persistent headless target with unsaved input intact.
+Existing-profile hidden targets have connection-scoped lifetime and reload URLs
+on reconnect. Browser toolbar popups, permission/file dialogs, downloads, and
+extension-specific native messaging are not fully mirrored; Claude-extension
+compatibility and Windows remain separate work. See README for current commands.
+
+The notes below record the initial investigation; the WebKit recommendation and
+first-pass status describe the earlier implementation, superseded above.
+
 Browser tabs investigation — 2026-10-15
 Status: macOS first pass built on 2026-10-15. Live WKWebView tabs, default
 Hardcore grid/native switching, link/basic-control activation, bounded DOM

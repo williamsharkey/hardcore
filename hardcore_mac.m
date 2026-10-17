@@ -2643,6 +2643,9 @@ static void focus_changed(int focused) {
        whenever it changes. */
     remember_dir(active_tab());  /* the next window opens where this one closed */
     config_save();
+    /* Reload keeps Chrome targets alive; an actual quit closes this window's
+       pages and waits briefly for their asynchronous close acknowledgments. */
+    hc_chrome_close_pages_main();
     for (i = 0; i < g_ntabs; i++)   /* the ptys close as we exit, which hangs them up too */
         if (g_tabs[i]->pid > 0 && !g_tabs[i]->exited) kill(g_tabs[i]->pid, SIGHUP);
     if (g_spare && g_spare->pid > 0) kill(g_spare->pid, SIGHUP);
@@ -3034,6 +3037,24 @@ static void ctl_line(char *s) {
                 if(!strcmp(action,"monitor-down") || !strcmp(action,"monitor-up") || !strcmp(action,"monitor-drag")) {
                     g_mac_test_monitor_consumed=mac_title_event(e)==nil;return;
                 }
+                /* Match AppKit hit routing when a browser surface, rather
+                   than the Metal terminal view, owns this point. */
+                if(tb && tb->kind==TK_BROWSER && tb->browser_native &&
+                   !over_chrome(x,y) && !mac_title_contains(x,y) && !mac_browser_ui_contains(x,y) &&
+                   strcmp(action,"monitor") && strcmp(action,"cursor") && strcmp(action,"flags")) {
+                    NSView *surface=[browser_for(tb) documentView];
+                    if(surface && mac_title_event(e)) {
+                        if(kind==NSEventTypeMouseMoved)[surface mouseMoved:e];
+                        else if(kind==NSEventTypeLeftMouseDown)[surface mouseDown:e];
+                        else if(kind==NSEventTypeLeftMouseUp)[surface mouseUp:e];
+                        else if(kind==NSEventTypeLeftMouseDragged)[surface mouseDragged:e];
+                        else if(kind==NSEventTypeRightMouseDown)[surface rightMouseDown:e];
+                        else if(kind==NSEventTypeRightMouseUp)[surface rightMouseUp:e];
+                        else if(kind==NSEventTypeOtherMouseDown)[surface otherMouseDown:e];
+                        else if(kind==NSEventTypeOtherMouseUp)[surface otherMouseUp:e];
+                        return;
+                    }
+                }
                 if(kind==NSEventTypeMouseMoved) {
                     if(!strcmp(action,"monitor"))mac_title_event(e);
                     else if(!strcmp(action,"cursor"))[g_view cursorUpdate:e];
@@ -3068,7 +3089,12 @@ static void ctl_line(char *s) {
         e = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:flags timestamp:0
                          windowNumber:[g_win windowNumber] context:nil characters:ctl_unescape(chars)
           charactersIgnoringModifiers:ctl_unescape(plain[0] ? plain : chars) isARepeat:NO keyCode:(unsigned short)kc];
-        if (!(flags & NSEventModifierFlagCommand) || ![[NSApp mainMenu] performKeyEquivalent:e]) [g_view keyDown:e];
+        if (!(flags & NSEventModifierFlagCommand) || ![[NSApp mainMenu] performKeyEquivalent:e]) {
+            NSResponder *responder=[g_win firstResponder];
+            if(tb && tb->kind==TK_BROWSER && tb->browser_native && responder!=(NSResponder *)g_view &&
+               [responder respondsToSelector:@selector(keyDown:)]) [responder keyDown:e];
+            else [g_view keyDown:e];
+        }
     } else if (!strncmp(s, "winid ", 6)) {
         FILE *f = fopen(s + 6, "wb");
         if (f) { fprintf(f, "%ld\n", (long)[g_win windowNumber]); fclose(f); }
@@ -3285,6 +3311,7 @@ static int mac_browser_cli(int argc, char **argv);
 #include "hardcore_mac_launch.h"
 
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "chrome")) return hc_chrome_setup_main(argc, argv);
     /* The ANSI backend does not initialize Cocoa, Metal, a Dock app, or the
        GUI's dispatch queues. Its session owner forks before any of those. */
     if (argc > 1 && !strcmp(argv[1], "here")) return here_main(argc - 2, argv + 2);

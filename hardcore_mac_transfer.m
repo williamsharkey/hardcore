@@ -949,6 +949,7 @@ static int mac_cli(int argc, char **argv) {
         puts("hardcore [DIR]                 launch the app and return to this prompt\n"
              "hardcore --foreground [DIR]    keep the GUI attached for debugging\n"
              "hardcore here [-- COMMAND...]   run inside this terminal, without a GUI window\n"
+             "hardcore chrome setup          open Chrome profile setup for sign-in/extensions\n"
              "hardcore detach                 leave this here session running in the background\n"
              "hardcore exit                   end this here session and its owned processes\n"
              "hardcore browser open [URL]     new live browser tab (Hardcore grid by default)\n"
