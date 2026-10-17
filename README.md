@@ -78,14 +78,17 @@ hardcore chrome setup
 
 That opens `chrome://inspect/#remote-debugging` in Chrome; allow remote
 debugging there. If Chrome is not running, Hardcore starts it as the Dock does.
-Chrome then asks you to **Allow** each connection (Hardcore brings the prompt
-forward and returns focus afterwards). One connection serves a window until it
-quits or reloads in place, so expect one prompt per launch or reload while web
-tabs are open. Chrome shows its "controlled by automated test software" banner
-while connected. Hardcore's pages are hidden targets, not tabs in your tab
-strip, and Quit closes only those pages. Because these targets live only as
-long as the connection, a reload reopens their URLs rather than keeping
-unsaved form state.
+Chrome asks you to **Allow** a new connection (Hardcore brings the prompt
+forward and returns focus afterwards). A small background helper, `hardcore
+chrome relay`, holds that one allowed connection for every Hardcore window and
+`hardcore here` session of your login, so you are asked once per Chrome
+session, not per window or reload. Pages survive an in-place reload with their
+form state and JavaScript intact. Hardcore's pages are hidden targets, not
+tabs in your tab strip; Quit closes only those pages, and pages no window
+re-adopts within a minute (a crash) are closed. The helper exits after ten idle
+minutes with no pages, which also removes Chrome's "controlled by automated
+test software" banner. It listens only on a socket in Hardcore's private 0700
+runtime directory, for your user, like the windows' own control sockets.
 
 `HARDCORE_CHROME_ATTACH=<DevToolsActivePort file or profile directory>` attaches
 to another Chrome-family browser that allowed remote debugging. For tests and

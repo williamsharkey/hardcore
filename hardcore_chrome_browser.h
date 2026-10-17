@@ -90,6 +90,8 @@ static BOOL hc_chrome_listening(NSURL *endpoint) {
 }
 
 @class HCChromePage,HCChromeBroker;
+#include "hardcore_chrome_relay.h"
+
 static HCChromeBroker *hc_chrome_shared_broker;
 @interface HCChromePending : NSObject {
 @public HCChromeReply callback;
@@ -102,7 +104,9 @@ static HCChromeBroker *hc_chrome_shared_broker;
 @interface HCChromeBroker : NSObject {
 @public BOOL attached,headed,regular,raisedChrome;
     NSURLSession *session;
-    NSURLSessionWebSocketTask *socket;
+    NSURLSessionWebSocketTask *socket;      /* private headless profile */
+    int relayFD;                            /* user's Chrome, through the shared relay */
+    dispatch_source_t relayRead;dispatch_queue_t relayWriter;
     NSMutableDictionary *pending,*pages,*targets;
     NSMutableArray *waiting;
     NSUInteger serial,connectionGeneration;
@@ -118,6 +122,11 @@ static HCChromeBroker *hc_chrome_shared_broker;
 - (NSNumber *)send:(NSString *)method params:(NSDictionary *)params session:(NSString *)sessionID timeout:(NSTimeInterval)timeout completion:(HCChromeReply)done;
 - (void)receive;
 - (void)receiveOn:(NSURLSessionWebSocketTask *)task generation:(NSUInteger)generation;
+- (void)openRelay:(int)fd generation:(NSUInteger)generation;
+- (void)dropTransport;
+- (void)arrived:(NSData *)data generation:(NSUInteger)generation;
+- (void)handle:(NSData *)data generation:(NSUInteger)generation;
+- (void)handshake:(NSUInteger)generation;
 - (void)fail:(NSError *)error generation:(NSUInteger)generation;
 - (void)closeTarget:(NSString *)identifier completion:(void (^)(NSError *))done;
 - (void)closeTarget:(NSString *)identifier session:(NSString *)pageSession completion:(void (^)(NSError *))done;
@@ -163,7 +172,7 @@ static HCChromeBroker *hc_chrome_shared_broker;
 - (id)init {
     if((self=[super init])) {
         pending=[NSMutableDictionary new];pages=[NSMutableDictionary new];targets=[NSMutableDictionary new];waiting=[NSMutableArray new];
-        closingTargets=[NSMutableSet new];quitReplies=[NSMutableSet new];
+        closingTargets=[NSMutableSet new];quitReplies=[NSMutableSet new];relayFD=-1;
         NSURLSessionConfiguration *config=[NSURLSessionConfiguration ephemeralSessionConfiguration];
         /* Chrome holds the attach handshake open until the user clicks Allow. */
         config.timeoutIntervalForRequest=120;config.timeoutIntervalForResource=130;
@@ -174,7 +183,7 @@ static HCChromeBroker *hc_chrome_shared_broker;
     connecting=NO;connected=error==nil;
     /* Hand focus back after the Allow prompt (GUI only; `hardcore here` has no NSApp). */
     if(raisedChrome){raisedChrome=NO;if(NSApp && NSApp.activationPolicy==NSApplicationActivationPolicyRegular)[NSApp activateIgnoringOtherApps:YES];}
-    if(error)[socket cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil];
+    if(error)[self dropTransport];
     NSArray *callbacks=[[waiting copy] autorelease];[waiting removeAllObjects];
     for(HCChromePending *p in callbacks)if(p->callback)p->callback(nil,error);
 }
@@ -188,12 +197,23 @@ static HCChromeBroker *hc_chrome_shared_broker;
     NSString *attach=NSProcessInfo.processInfo.environment[@"HARDCORE_CHROME_ATTACH"];
     attached=!hc_chrome_owned_profile();regular=attached && !attach.length;
     NSString *profile=hc_chrome_profile();
-    NSString *endpointPath=!attached ? [profile stringByAppendingPathComponent:@"DevToolsActivePort"] :
-        regular ? hc_chrome_regular_endpoint() : attach.stringByExpandingTildeInPath;
-    BOOL isDir=NO;if(attached && [NSFileManager.defaultManager fileExistsAtPath:endpointPath isDirectory:&isDir] && isDir)endpointPath=[endpointPath stringByAppendingPathComponent:@"DevToolsActivePort"];
+    NSString *endpointPath=[profile stringByAppendingPathComponent:@"DevToolsActivePort"];
+    if(attached) {
+        /* One relay holds the user's single consented connection (see hardcore_chrome_relay.h). */
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{@autoreleasepool {
+            NSError *failure=nil;int fd=hc_chrome_relay_connect(&failure);[failure retain];
+            dispatch_async(dispatch_get_main_queue(),^{
+                [failure autorelease];
+                if(generation!=self->connectionGeneration){if(fd>=0)close(fd);return;}
+                if(fd<0){[self finishConnect:failure];return;}
+                [self openRelay:fd generation:generation];[self handshake:generation];
+            });
+        }});
+        return;
+    }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{@autoreleasepool {
         NSError *failure=nil;NSURL *endpoint=nil;NSTask *launched=nil;int lock=-1;
-        if(!self->attached) {
+        {
             NSString *exe=hc_chrome_executable();
             if(!exe.length)failure=hc_chrome_error(@"Install Google Chrome to browse inside Hardcore.");
             if(hc_chrome_is_regular_profile(profile))failure=hc_chrome_error(@"HARDCORE_CHROME_PROFILE must be a separate profile. Use HARDCORE_CHROME_ATTACH with Chrome's explicit remote-debugging consent to attach your regular browser.");
@@ -229,22 +249,6 @@ static HCChromeBroker *hc_chrome_shared_broker;
                     }
                 }
             }
-        } else {
-            endpoint=hc_chrome_endpoint(endpointPath);
-            if(!hc_chrome_listening(endpoint) && self->regular && !hc_chrome_regular_app()) {
-                /* Start Chrome the way the Dock does, without taking focus;
-                   its remote-debugging allowance lives in the profile. */
-                NSTask *open=[NSTask launchedTaskWithExecutableURL:[NSURL fileURLWithPath:@"/usr/bin/open"] arguments:@[@"-g",@"-b",@"com.google.Chrome"] error:nil terminationHandler:nil];
-                (void)open;
-                NSTimeInterval deadline=NSDate.timeIntervalSinceReferenceDate+15;
-                while(NSDate.timeIntervalSinceReferenceDate<deadline) {
-                    endpoint=hc_chrome_endpoint(endpointPath);
-                    if(hc_chrome_listening(endpoint))break;
-                    [NSThread sleepForTimeInterval:0.1];
-                }
-            }
-            if(!hc_chrome_listening(endpoint))failure=hc_chrome_error(self->regular ? HC_CHROME_ALLOW_HELP :
-                @"Chrome attach is unavailable. Enable chrome://inspect/#remote-debugging in Chrome, then retry.");
         }
         if(lock>=0){flock(lock,LOCK_UN);close(lock);}
         dispatch_async(dispatch_get_main_queue(),^{
@@ -253,27 +257,55 @@ static HCChromeBroker *hc_chrome_shared_broker;
             [self->process release];self->process=[launched retain];
             [self->socket release];self->socket=[[self->session webSocketTaskWithURL:endpoint] retain];
             self->socket.maximumMessageSize=16*1024*1024;
-            [self->socket resume];[self receive];
-            /* Chrome's Allow prompt can be behind Hardcore; bring it forward if
-               the handshake is still waiting, and focus returns in finishConnect. */
-            if(self->regular)dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.4*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
-                if(generation!=self->connectionGeneration || !self->connecting)return;
-                NSRunningApplication *chrome=hc_chrome_regular_app();
-                if(chrome && !chrome.active){self->raisedChrome=YES;[chrome activateWithOptions:0];}
-            });
-            [self send:@"Browser.getVersion" params:@{} session:nil timeout:120 completion:^(NSDictionary *r,NSError *e){
-                if(generation!=self->connectionGeneration)return;
-                self->headed=[r[@"userAgent"] rangeOfString:@"HeadlessChrome/"].location==NSNotFound;
-                [self finishConnect:e];
-                if(!e)[self send:@"Target.setDiscoverTargets" params:@{@"discover":@YES} session:nil completion:nil];
-            }];
+            [self->socket resume];[self receive];[self handshake:generation];
         });
         [launched release];
     }});
 }
+- (void)handshake:(NSUInteger)generation {
+    /* Chrome's Allow prompt can be behind Hardcore; bring it forward if the
+       first reply is still waiting, and focus returns in finishConnect. */
+    if(regular)dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.4*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+        if(generation!=self->connectionGeneration || !self->connecting)return;
+        NSRunningApplication *chrome=hc_chrome_regular_app();
+        if(chrome && !chrome.active){self->raisedChrome=YES;[chrome activateWithOptions:0];}
+    });
+    [self send:@"Browser.getVersion" params:@{} session:nil timeout:120 completion:^(NSDictionary *r,NSError *e){
+        if(generation!=self->connectionGeneration)return;
+        self->headed=[r[@"userAgent"] rangeOfString:@"HeadlessChrome/"].location==NSNotFound;
+        [self finishConnect:e];
+        if(!e)[self send:@"Target.setDiscoverTargets" params:@{@"discover":@YES} session:nil completion:nil];
+    }];
+}
+- (void)openRelay:(int)fd generation:(NSUInteger)generation {
+    relayFD=fd;
+    relayWriter=dispatch_queue_create("hardcore.chrome.relay.write",DISPATCH_QUEUE_SERIAL);
+    /* Read off the main queue, like the WebSocket path, so quit can count replies. */
+    dispatch_queue_t reader=dispatch_queue_create("hardcore.chrome.relay.read",DISPATCH_QUEUE_SERIAL);
+    relayRead=dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,(uintptr_t)fd,0,reader);
+    dispatch_release(reader);
+    NSMutableData *buffer=[NSMutableData new];__block BOOL ended=NO;
+    dispatch_queue_t writer=relayWriter;dispatch_retain(writer);
+    dispatch_source_set_event_handler(relayRead,^{@autoreleasepool {
+        if(ended)return;
+        if(!hc_relay_read_frames(fd,buffer,^(NSData *frame){[self arrived:frame generation:generation];})) {
+            ended=YES;
+            dispatch_async(dispatch_get_main_queue(),^{[self fail:hc_chrome_error(@"Hardcore's Chrome connection closed.") generation:generation];});
+        }
+    }});
+    /* Close only after queued writes, so a reused descriptor never gets them. */
+    dispatch_source_set_cancel_handler(relayRead,^{[buffer release];dispatch_async(writer,^{close(fd);});dispatch_release(writer);});
+    dispatch_resume(relayRead);
+}
+- (void)dropTransport {
+    [socket cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil];
+    if(relayRead){dispatch_source_cancel(relayRead);dispatch_release(relayRead);relayRead=nil;}
+    if(relayWriter){dispatch_release(relayWriter);relayWriter=nil;}
+    relayFD=-1;
+}
 - (void)fail:(NSError *)error generation:(NSUInteger)generation {
     if(generation!=connectionGeneration || (!connected && !connecting))return;
-    connected=NO;[socket cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil];
+    connected=NO;[self dropTransport];
     NSArray *callbacks=[[pending.allValues copy] autorelease];[pending removeAllObjects];
     for(HCChromePending *p in callbacks)if(p->callback)p->callback(nil,error);
     if(connecting)[self finishConnect:error];
@@ -284,7 +316,7 @@ static HCChromeBroker *hc_chrome_shared_broker;
 }
 - (NSNumber *)send:(NSString *)method params:(NSDictionary *)params session:(NSString *)pageSession timeout:(NSTimeInterval)timeout completion:(HCChromeReply)done {
     if(!NSThread.isMainThread){dispatch_async(dispatch_get_main_queue(),^{[self send:method params:params session:pageSession timeout:timeout completion:done];});return nil;}
-    if(!socket || (!connected && !connecting)){if(done)done(nil,hc_chrome_error(@"Chrome is not connected."));return nil;}
+    if((!socket && relayFD<0) || (!connected && !connecting)){if(done)done(nil,hc_chrome_error(@"Chrome is not connected."));return nil;}
     if(pending.count>=512){if(done)done(nil,hc_chrome_error(@"Chrome is busy; retry the operation."));return nil;}
     NSNumber *key=@(++serial);NSMutableDictionary *message=[NSMutableDictionary dictionaryWithDictionary:@{@"id":key,@"method":method,@"params":params ?: @{}}];
     if(pageSession.length)message[@"sessionId"]=pageSession;
@@ -292,9 +324,16 @@ static HCChromeBroker *hc_chrome_shared_broker;
     if(!data || data.length>8*1024*1024){if(done)done(nil,error ?: hc_chrome_error(@"Chrome request exceeds the size limit."));return nil;}
     HCChromePending *p=[HCChromePending new];p->callback=[done copy];pending[key]=p;[p release];
     NSUInteger generation=connectionGeneration;
-    NSString *string=[[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
-    NSURLSessionWebSocketMessage *frame=[[[NSURLSessionWebSocketMessage alloc] initWithString:string] autorelease];
-    [socket sendMessage:frame completionHandler:^(NSError *e){if(e)dispatch_async(dispatch_get_main_queue(),^{[self fail:e generation:generation];});}];
+    if(relayFD>=0) {
+        int fd=relayFD;
+        dispatch_async(relayWriter,^{
+            if(!hc_relay_send_frame(fd,data))dispatch_async(dispatch_get_main_queue(),^{[self fail:hc_chrome_error(@"Hardcore's Chrome connection closed.") generation:generation];});
+        });
+    } else {
+        NSString *string=[[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
+        NSURLSessionWebSocketMessage *frame=[[[NSURLSessionWebSocketMessage alloc] initWithString:string] autorelease];
+        [socket sendMessage:frame completionHandler:^(NSError *e){if(e)dispatch_async(dispatch_get_main_queue(),^{[self fail:e generation:generation];});}];
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(timeout*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
         HCChromePending *expired=[[self->pending objectForKey:key] retain];
         if(expired){[self->pending removeObjectForKey:key];if(expired->callback)expired->callback(nil,hc_chrome_error([NSString stringWithFormat:@"Chrome timed out: %@",method]));[expired release];}
@@ -307,47 +346,53 @@ static HCChromeBroker *hc_chrome_shared_broker;
    tab), and its close replies must still arrive. Main still sees messages in order. */
 - (void)receiveOn:(NSURLSessionWebSocketTask *)task generation:(NSUInteger)generation {
     [task receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *message,NSError *error){
-        if(!error && self->shuttingDown) {
-            NSData *raw=message.type==NSURLSessionWebSocketMessageTypeData ? message.data : [message.string dataUsingEncoding:NSUTF8StringEncoding];
-            id reply=raw.length<=16*1024*1024 ? [NSJSONSerialization JSONObjectWithData:raw options:0 error:nil] : nil;
-            if([reply isKindOfClass:NSDictionary.class] && reply[@"id"])@synchronized(self->quitReplies){[self->quitReplies removeObject:reply[@"id"]];}
-        }
-        dispatch_async(dispatch_get_main_queue(),^{@autoreleasepool {
-            if(generation!=self->connectionGeneration)return;
-            if(error){[self fail:error generation:generation];return;}
-            NSData *data=message.type==NSURLSessionWebSocketMessageTypeData ? message.data : [message.string dataUsingEncoding:NSUTF8StringEncoding];
-            id value=data.length<=16*1024*1024 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-            if(![value isKindOfClass:NSDictionary.class]){[self fail:hc_chrome_error(@"Chrome returned an invalid message.") generation:generation];return;}
-            NSDictionary *reply=value;NSNumber *key=reply[@"id"];
-            if(key) {
-                HCChromePending *p=[[self->pending objectForKey:key] retain];[self->pending removeObjectForKey:key];
-                if(p){NSDictionary *failure=reply[@"error"];if(p->callback)p->callback(reply[@"result"],failure ? hc_chrome_error(failure[@"message"]) : nil);[p release];}
-            } else {
-                NSString *method=reply[@"method"];NSDictionary *params=reply[@"params"] ?: @{};
-                HCChromePage *page=self->pages[reply[@"sessionId"] ?: @""];
-                if(page)[page event:method params:params];
-                if([method isEqualToString:@"Target.targetInfoChanged"]) {
-                    NSDictionary *info=params[@"targetInfo"];HCChromePage *owner=self->targets[info[@"targetId"] ?: @""];
-                    if(owner) {
-                        if([info[@"url"] isKindOfClass:NSString.class]){[owner->url release];owner->url=[info[@"url"] copy];}
-                        if([info[@"title"] isKindOfClass:NSString.class]){[owner->title release];owner->title=[info[@"title"] copy];}
-                        [owner notify:@{@"type":@"changed"}];
-                    }
-                }
-                if([method isEqualToString:@"Target.targetCreated"]) {
-                    NSDictionary *info=params[@"targetInfo"];
-                    HCChromePage *opener=self->targets[info[@"openerId"] ?: @""];
-                    if(opener && [info[@"type"] isEqualToString:@"page"])
-                        [opener notify:@{@"type":@"popup",@"targetID":info[@"targetId"] ?: @"",@"url":info[@"url"] ?: @"about:blank"}];
-                }
-                if([method isEqualToString:@"Target.targetDestroyed"]) {
-                    HCChromePage *owner=self->targets[params[@"targetId"] ?: @""];
-                    if(owner && !owner->closed){owner->ready=NO;[owner notify:@{@"type":@"error",@"message":@"This Chrome tab was closed."}];}
-                }
-            }
-        }});
-        if(!error)[self receiveOn:task generation:generation];
+        if(error){dispatch_async(dispatch_get_main_queue(),^{if(generation==self->connectionGeneration)[self fail:error generation:generation];});return;}
+        [self arrived:message.type==NSURLSessionWebSocketMessageTypeData ? message.data : [message.string dataUsingEncoding:NSUTF8StringEncoding] generation:generation];
+        [self receiveOn:task generation:generation];
     }];
+}
+/* Either transport's queue. During quit, close replies are counted here
+   because the main queue may be blocked (see hc_chrome_close_pages_main). */
+- (void)arrived:(NSData *)data generation:(NSUInteger)generation {
+    if(shuttingDown) {
+        id reply=data.length<=16*1024*1024 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if([reply isKindOfClass:NSDictionary.class] && reply[@"id"])@synchronized(quitReplies){[quitReplies removeObject:reply[@"id"]];}
+    }
+    dispatch_async(dispatch_get_main_queue(),^{@autoreleasepool {
+        if(generation==self->connectionGeneration)[self handle:data generation:generation];
+    }});
+}
+- (void)handle:(NSData *)data generation:(NSUInteger)generation {
+    id value=data.length<=16*1024*1024 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    if(![value isKindOfClass:NSDictionary.class]){[self fail:hc_chrome_error(@"Chrome returned an invalid message.") generation:generation];return;}
+    if([value[@"relayError"] isKindOfClass:NSString.class]){[self fail:hc_chrome_error(value[@"relayError"]) generation:generation];return;}
+    NSDictionary *reply=value;NSNumber *key=reply[@"id"];
+    if(key) {
+        HCChromePending *p=[[self->pending objectForKey:key] retain];[self->pending removeObjectForKey:key];
+        if(p){NSDictionary *failure=reply[@"error"];if(p->callback)p->callback(reply[@"result"],failure ? hc_chrome_error(failure[@"message"]) : nil);[p release];}
+    } else {
+        NSString *method=reply[@"method"];NSDictionary *params=reply[@"params"] ?: @{};
+        HCChromePage *page=self->pages[reply[@"sessionId"] ?: @""];
+        if(page)[page event:method params:params];
+        if([method isEqualToString:@"Target.targetInfoChanged"]) {
+            NSDictionary *info=params[@"targetInfo"];HCChromePage *owner=self->targets[info[@"targetId"] ?: @""];
+            if(owner) {
+                if([info[@"url"] isKindOfClass:NSString.class]){[owner->url release];owner->url=[info[@"url"] copy];}
+                if([info[@"title"] isKindOfClass:NSString.class]){[owner->title release];owner->title=[info[@"title"] copy];}
+                [owner notify:@{@"type":@"changed"}];
+            }
+        }
+        if([method isEqualToString:@"Target.targetCreated"]) {
+            NSDictionary *info=params[@"targetInfo"];
+            HCChromePage *opener=self->targets[info[@"openerId"] ?: @""];
+            if(opener && [info[@"type"] isEqualToString:@"page"])
+                [opener notify:@{@"type":@"popup",@"targetID":info[@"targetId"] ?: @"",@"url":info[@"url"] ?: @"about:blank"}];
+        }
+        if([method isEqualToString:@"Target.targetDestroyed"]) {
+            HCChromePage *owner=self->targets[params[@"targetId"] ?: @""];
+            if(owner && !owner->closed){owner->ready=NO;[owner notify:@{@"type":@"error",@"message":@"This Chrome tab was closed."}];}
+        }
+    }
 }
 - (void)closeTarget:(NSString *)identifier completion:(void (^)(NSError *))done {
     [self closeTarget:identifier session:nil completion:done];
@@ -599,6 +644,8 @@ static void hc_chrome_close_pages_main(void) {
 static int hc_chrome_setup_main(int argc,char **argv) {
     @autoreleasepool {
         const char *action=argc>2 ? argv[2] : "";
+        if(!strcmp(action,"relay"))return hc_chrome_relay_main();
+        if(!strcmp(action,"relay-launch"))return hc_chrome_relay_launch_main();
         NSString *profile=hc_chrome_profile();
         if(!strcmp(action,"profile")){printf("%s\n",profile.fileSystemRepresentation);return 0;}
         if(strcmp(action,"setup")){fprintf(stderr,"Usage: hardcore chrome setup | profile\n");return 2;}
@@ -607,7 +654,7 @@ static int hc_chrome_setup_main(int argc,char **argv) {
             [open waitUntilExit];
             if(!open || open.terminationStatus){fprintf(stderr,"hardcore: install Google Chrome to browse inside Hardcore.\n");return 2;}
             BOOL allowed=hc_chrome_listening(hc_chrome_endpoint(hc_chrome_regular_endpoint()));
-            printf(allowed ? "Your Chrome already allows Hardcore; WWW tabs use its sign-ins, history and extensions.\nChrome asks you to Allow each time Hardcore connects.\n"
+            printf(allowed ? "Your Chrome already allows Hardcore; WWW tabs use its sign-ins, history and extensions.\nChrome asks you to Allow once; Hardcore keeps that connection while Chrome runs.\n"
                            : "Opened chrome://inspect/#remote-debugging in your Chrome.\nAllow remote debugging there; WWW tabs then use your Chrome's sign-ins, history and extensions.\n");
             return 0;
         }

@@ -36,7 +36,7 @@ MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -framework 
 APP        = hardcore.app
 APPDIR    ?= $(HOME)/Applications
 BINDIR    ?= $(HOME)/.local/bin
-HERE_HEADERS = hardcore_here.h hardcore_here_transport.h hardcore_here_ui.h hardcore_here_helpers.h hardcore_here_chrome.h hardcore_chrome_browser.h hardcore_here_media.h hardcore_here_media_source.h hardcore_textile.h
+HERE_HEADERS = hardcore_here.h hardcore_here_transport.h hardcore_here_ui.h hardcore_here_helpers.h hardcore_here_chrome.h hardcore_chrome_browser.h hardcore_chrome_relay.h hardcore_here_media.h hardcore_here_media_source.h hardcore_textile.h
 
 .PHONY: all clean selftest install test mac-test slurp-test
 

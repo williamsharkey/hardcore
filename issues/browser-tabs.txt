@@ -12,8 +12,11 @@ semantic grid projection and adds a screenshot/input surface for normal mode;
 terminal WWW now supports live JS, numbered DOM controls, and Chrome history.
 Local Clips documents retain WKWebView. `hardcore chrome setup` opens Chrome's
 remote-debugging opt-in page (or, with HARDCORE_CHROME_PROFILE, that profile).
-Follow-up: a per-login relay holding the single consented connection would
-remove repeat Allow prompts and keep attached targets alive across reloads.
+A per-login relay (hardcore_chrome_relay.h, `hardcore chrome relay`) holds the
+single consented connection, so prompts are per Chrome session and attached
+hidden targets survive reloads; unadopted targets close after 60 s, the relay
+exits after 10 idle minutes. Note: Target.getTargets omits hidden targets;
+use Target.getTargetInfo per ID.
 
 Verified with disposable Chrome profiles: DOM projection, form/native input,
 history, persisted cookies across processes, screenshots, popup opener retention,
