@@ -45,7 +45,8 @@ int main(int argc, const char **argv) {
     const char *keys[] = {"TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION",
                           "NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE",
                           "PATH", "HARDCORE_BIN_DIR", "HARDCORE_WINDOW_PID", "LANG",
-                          "HC_USER_VALUE", "CI", "CLAUDECODE", "HARDCORE_CTL"};
+                          "HC_USER_VALUE", "CI", "CLAUDECODE", "HARDCORE_CTL",
+                          "HARDCORE_HERE_SESSION", "HARDCORE_HERE_PID", "HARDCORE_HERE_TAB_PID", "HC_HERE_MEDIA_FD"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         const char *value = getenv(keys[i]);
         printf("HCENV %s=%s\n", keys[i], value ? value : "<unset>");
@@ -159,7 +160,8 @@ class ChildEnvironmentTests(unittest.TestCase):
             self.assertEqual(values[key], '<unset>', key)
 
     def test_unrelated_user_configuration_and_existing_isolation_survive(self):
-        values = self.run_child({'LANG': 'fr_FR.UTF-8'})
+        here_keys = ('HARDCORE_HERE_SESSION', 'HARDCORE_HERE_PID', 'HARDCORE_HERE_TAB_PID', 'HC_HERE_MEDIA_FD')
+        values = self.run_child(dict(LANG='fr_FR.UTF-8', **{k: 'stale-parent' for k in here_keys}))
         self.assertEqual(values['PATH'], '/owned/hardcore/bin:/usr/bin:/bin')
         self.assertEqual(values['HARDCORE_BIN_DIR'], '/owned/hardcore/bin')
         self.assertEqual(values['LANG'], 'fr_FR.UTF-8')
@@ -167,6 +169,8 @@ class ChildEnvironmentTests(unittest.TestCase):
         self.assertEqual(values['CI'], '1')
         self.assertEqual(values['CLAUDECODE'], '<unset>')
         self.assertEqual(values['HARDCORE_CTL'], '<unset>')
+        for key in here_keys:
+            self.assertEqual(values[key], '<unset>', key)
 
     def test_shell_startup_can_still_choose_its_own_color_policy(self):
         rc = Path(self.temp.name)/'owned.bashrc'

@@ -19,6 +19,9 @@ static void set_clipboard_utf8(const char *s, int n) { (void)s; (void)n; }
 static uint64_t test_now = 1000;
 static SBuf writes[HERE_MAX_TABS];
 static int font_calls;
+/* Palette negotiation/quantization is exercised through the real transport.
+ * This UI harness defaults to truecolor, so this mock is not used. */
+static int here_color_index(uint32_t rgb) { (void)rgb; return 16; }
 static void tab_write(Tab *tab, const void *data, int n) { (void)tab; (void)data; (void)n; }
 static uint64_t here_now_ms(void) { return test_now; }
 static int here_write(Here *h, int index, const char *data, size_t n) {
@@ -78,6 +81,21 @@ int main(void) {
     require(frame.n < full / 5, "unchanged frame emits only modes and cursor");
     here_ui_resize(h, 100, 36); render(h, &frame);
     require(frame.n > full / 2, "same-size reconnect forces repaint");
+
+    HereHit exit_hit={0},detach_hit={0};
+    for(int i=0;i<h->ui->nhits;i++) {
+        if(h->ui->hits[i].op==HU_EXIT)exit_hit=h->ui->hits[i];
+        if(h->ui->hits[i].op==HU_DETACH)detach_hit=h->ui->hits[i];
+    }
+    require(exit_hit.op&&detach_hit.op&&exit_hit.y==2&&detach_hit.y==2,"Exit and Detach occupy the third menu row");
+    mouse(h,0,exit_hit.x,exit_hit.y,1);
+    require(!h->action&&!h->ui->confirm,"Exit waits for mouse release");
+    mouse(h,0,exit_hit.x,exit_hit.y,0);
+    require(h->ui->confirm==2&&!h->action,"Exit menu asks before ending all programs");
+    input(h,"n");require(!h->action,"cancelled Exit keeps programs alive");
+    mouse(h,0,detach_hit.x,detach_hit.y,1);mouse(h,0,detach_hit.x,detach_hit.y,0);
+    require(h->action==HERE_DETACH&&!h->ui->confirm,"Detach menu preserves session without prompting");
+    h->action=0;
 
     mouse(h, 35, 73, 4, 1);
     require(h->ui->preview == 2 && h->active == 0, "hover previews without selecting");
@@ -155,6 +173,23 @@ int main(void) {
     int old_active = h->active;
     mouse(h, 0, 73, 4, 1); mouse(h, 0, 73, 4, 0);
     require(h->active == old_active, "settings overlay blocks underlying tab click");
+
+    input(h,"q");here_ui_resize(h,100,36);h->active=0;
+    h->tabs[1].media_tab=1;
+    Term *photo=&h->tabs[1].t;
+    for(int y=0;y<photo->rows;y++)for(int x=0;x<photo->cols;x++)
+        photo->row[photo->alt][y][x]=(Cell){.ch=0x2588,.fg=0x02000000u|(x<photo->cols/2?0xff0000u:0x0000ffu),.bg=0x02000000u};
+    if(!hu_has_tv(h->ui,h->tabs[1].id))hu_toggle_tv(h,h->tabs[1].id);
+    render(h,&frame);require(here_ui_media_visible(h,1),"visible media TV keeps its source visible");
+    int red=0,blue=0;
+    for(int y=6;y<h->child_rows;y++)for(int x=h->child_cols+1;x<h->cols;x++) {
+        Cell c=h->ui->grid[(size_t)y*h->cols+x].c;
+        red|=(c.fg&0xffffff)==0xff0000u||(c.bg&0xffffff)==0xff0000u;
+        blue|=(c.fg&0xffffff)==0x0000ffu||(c.bg&0xffffff)==0x0000ffu;
+    }
+    require(red&&blue,"media TV shows both image edges instead of cropping");
+    hu_toggle_tv(h,h->tabs[1].id);render(h,&frame);
+    require(!here_ui_media_visible(h,1),"hidden media tab releases visibility");
 
     for (int i = 0; i < h->ntabs; i++) term_free(&h->tabs[i].t);
     here_ui_free(h); free(h); free(frame.p);

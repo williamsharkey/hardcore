@@ -4,9 +4,12 @@ import json
 import os
 from pathlib import Path
 import select
+import shlex
+import shutil
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -39,7 +42,13 @@ def receive(sock):
 
 @unittest.skipUnless(EXE.is_file() and os.name == 'posix', 'native POSIX build required')
 class NativeTransport(unittest.TestCase):
-    setUp = NativeHere.setUp
+    _native_setup = NativeHere.setUp
+    def setUp(self):
+        self._native_setup()
+        # Never let tests target a real outer session if the test runner itself
+        # is invoked from hardcore here. Only test-owned context is supplied.
+        for key in ('HARDCORE_HERE_SESSION','HARDCORE_HERE_PID','HARDCORE_HERE_TAB_PID','HC_HERE_MEDIA_FD'):
+            self.env.pop(key,None)
     stop = NativeHere.stop
     cli = NativeHere.cli
     host = NativeHere.host
@@ -58,7 +67,8 @@ class NativeTransport(unittest.TestCase):
         pid = self.status()['tabs'][0]['pid']
         for data in (struct.pack('!III', 0, 1, 0),
                      struct.pack('!III', MAGIC, 2, 0xffffffff),
-                     frame(2, b'unauthorized input')):
+                     frame(2, b'unauthorized input'),
+                     frame(8, struct.pack('!I', 1))):
             sock = self.socket()
             sock.sendall(data)
             self.assertEqual(sock.recv(1), b'', 'invalid peer was retained')
@@ -66,6 +76,202 @@ class NativeTransport(unittest.TestCase):
             self.assertEqual(self.status()['tabs'][0]['pid'], pid)
         host.send(b'STILL_OWNED\n')
         host.wait(lambda: b'STILL_OWNED' in host.output, 'original controller survives bad peer')
+
+    def test_host_color_capability_updates_on_reattach(self):
+        # An inherited truecolor variable must not override Apple Terminal's
+        # actual 256-color capability. Reattaching to another host renegotiates.
+        self.env['TERM_PROGRAM'] = 'Apple_Terminal'
+        self.env['COLORTERM'] = 'truecolor'
+        host = self.start("printf '\\033[38;2;12;123;245;48;2;45;67;89mNATIVE_READY\\033[0m\\n'; exec /bin/cat")
+        self.assertTrue(self.status()['color256'])
+        self.assertIn(b'38;5;', host.output)
+        self.assertNotIn(b'38;2;', host.output)
+        self.assertNotIn(b'48;2;', host.output)
+        host.send(b'\x02D');self.assertEqual(host.exited(), 0)
+        self.env['TERM_PROGRAM'] = 'iTerm.app'
+        resumed = self.host('--attach', self.name)
+        resumed.wait(lambda: b'NATIVE_READY' in resumed.output, 'host palette renegotiation')
+        self.assertFalse(self.status()['color256'])
+        self.assertIn(b'38;2;', resumed.output)
+
+    def media_fixture(self):
+        # This is explicitly a test child, never a real camera. The production
+        # app itself still runs from a copied bare executable with an empty PATH.
+        script = self.root/'controlled-media'
+        events = self.root/'media-events'
+        script.write_text('#!'+sys.executable+'\n'+r'''import os,select,signal,sys,time
+signal.signal(signal.SIGHUP,signal.SIG_IGN)
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+fd=int(os.environ['HC_HERE_MEDIA_FD'])
+with open(sys.argv[3],'ab',buffering=0) as out:
+ out.write(b'S')
+ os.write(1,b'NATIVE_READY\r\n')
+ while True:
+  if select.select([fd],[],[],.1)[0]:
+   data=os.read(fd,4096)
+   if not data:out.write(b'E');break
+   out.write(data)
+''')
+        script.chmod(0o700)
+        host = self.host('--session', self.name, '--', str(script), '--here-media', '--camera', str(events))
+        host.wait(lambda: events.exists() and b'1' in events.read_bytes(), 'fake media visibility')
+        return host, events
+
+    def test_media_lifetime_follows_tab_visibility_and_attachment(self):
+        self.env['HC_HERE_MEDIA_FD'] = '99999'  # Never leak this stale parent value.
+        host, events = self.media_fixture()
+        tab = self.status()['tabs'][0]
+        self.assertTrue(tab['media'] and tab['camera'] and tab['media_visible'])
+        host.send(b'\x02c')
+        host.wait(lambda: events.read_bytes().endswith(b'0'), 'hidden media paused')
+        self.assertFalse(self.status()['tabs'][0]['media_visible'])
+        host.send(b'printf "MEDIA_ENV:%s\\n" "${HC_HERE_MEDIA_FD-unset}"\n')
+        host.wait(lambda: b'MEDIA_ENV:unset' in host.output, 'ordinary shell environment scrubbed')
+        host.send(b'\x02p')
+        host.wait(lambda: events.read_bytes().endswith(b'1'), 'selected media resumed')
+        os.kill(host.process.pid, signal.SIGTSTP)
+        self.addCleanup(lambda: os.kill(host.process.pid,signal.SIGCONT) if host.process.poll() is None else None)
+        host.wait(lambda: events.read_bytes().endswith(b'0'), 'suspended host pauses media')
+        self.assertTrue(self.status()['suspended'])
+        os.kill(host.process.pid, signal.SIGCONT)
+        host.wait(lambda: events.read_bytes().endswith(b'1'), 'continued host resumes media')
+        self.assertFalse(self.status()['suspended'])
+        host.send(b'\x02D');self.assertEqual(host.exited(), 0)
+        host.wait(lambda: events.read_bytes().endswith(b'0'), 'detached media paused')
+        resumed = self.host('--attach', self.name)
+        resumed.wait(lambda: events.read_bytes().endswith(b'1'), 'reattached media resumed')
+        self.assertEqual(self.status()['tabs'][0]['pid'], tab['pid'])
+
+    def test_media_control_eof_on_owner_crash(self):
+        host, events = self.media_fixture()
+        status = self.status();pid = status['tabs'][0]['pid']
+        # Keep test cleanup bounded even if the implementation regresses EOF.
+        def cleanup_owned_helper():
+            if alive(pid):
+                try:os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:pass
+        self.addCleanup(cleanup_owned_helper)
+        os.kill(status['pid'], signal.SIGKILL)
+        host.wait(lambda: events.read_bytes().endswith(b'E'), 'helper gets owner EOF')
+        host.exited()
+        deadline = time.monotonic()+3
+        while alive(pid) and time.monotonic()<deadline:time.sleep(.02)
+        self.assertFalse(alive(pid), 'media helper outlived its owner channel')
+
+    def test_media_cli_rejects_conflicting_operations(self):
+        for args in (('--camera','--image','anything'), ('--image',),
+                     ('--camera','--attach',self.name), ('--camera','--list'),
+                     ('--image','anything','--stop',self.name),
+                     ('--camera','--','/bin/echo','oops')):
+            result = self.cli(*args)
+            self.assertEqual(result.returncode, 2, (args,result.stdout,result.stderr))
+            self.assertNotIn('interactive terminal', result.stderr)
+
+    def lifecycle(self, action, env=None):
+        return subprocess.run([str(self.exe),action],env=env or self.env,cwd=self.root,
+                              stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=5)
+
+    def test_lifecycle_commands_refuse_outside_or_stale_context(self):
+        host = self.start();before=self.status()
+        for command in ('exit','detach'):
+            for env in (self.env,dict(self.env,HARDCORE_HERE_SESSION=self.name,
+                                     HARDCORE_HERE_PID=str(before['pid']),
+                                     HARDCORE_HERE_TAB_PID=str(before['tabs'][0]['pid']))):
+                result=self.lifecycle(command,env)
+                self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+                self.assertIn('inside a native hardcore here session',result.stderr)
+                self.assertTrue(self.status()['attached'])
+        # Owner and tab IDs are checked again by the owner, not trusted merely
+        # because a same-user peer can reach the private socket.
+        sock=self.socket();sock.sendall(frame(9,struct.pack('!III',before['pid']+1,before['tabs'][0]['pid'],3)))
+        self.assertEqual(receive(sock)[0],104)
+        self.assertEqual(self.status()['tabs'][0]['pid'],before['tabs'][0]['pid'])
+
+    def test_detach_command_from_child_preserves_shell_and_returns_success(self):
+        host=self.start('printf "NATIVE_READY\\n"; exec /bin/sh -i')
+        before=self.status()
+        command=shlex.quote(str(self.exe))+' detach; printf "DETACH_RETURN:%s\\n" "$?"\n'
+        host.send(command.encode());self.assertEqual(host.exited(),0)
+        self.assertFalse(self.status()['attached'])
+        self.assertTrue(alive(before['tabs'][0]['pid']))
+        resumed=self.host('--attach',self.name)
+        resumed.wait(lambda:b'DETACH_RETURN:0' in resumed.output,'native detach command returned zero')
+        self.assertEqual(self.status()['tabs'][0]['pid'],before['tabs'][0]['pid'])
+
+    def test_exit_command_stops_all_tabs_and_changed_session_descendants(self):
+        report=self.root/'exit-owned-jobs.json'
+        code=r'''import os,signal,time,json,pathlib,sys
+signal.signal(signal.SIGHUP,signal.SIG_IGN)
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+pids=[os.getpid()]
+for separate_session in (True,False):
+ r,w=os.pipe();pid=os.fork()
+ if not pid:
+  os.close(r)
+  if separate_session:os.setsid()
+  else:os.setpgid(0,0)
+  os.write(w,b'1');os.close(w)
+  while True:time.sleep(.1)
+ os.close(w);os.read(r,1);os.close(r);pids.append(pid)
+pathlib.Path(sys.argv[1]).write_text(json.dumps(pids))
+os.write(1,b'NATIVE_READY\r\n')
+while True:time.sleep(.1)
+'''
+        host=self.host('--session',self.name,'--',sys.executable,'-c',code,str(report))
+        host.wait(lambda:report.exists(),'owned new-session descendants')
+        pids=json.loads(report.read_text())
+        self.assertNotEqual(os.getsid(pids[1]),os.getsid(pids[0]))
+        def cleanup_jobs():
+            for pid in pids:
+                try:os.kill(pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+        self.addCleanup(cleanup_jobs)
+        other_name=self.name+'-other'
+        other=self.host('--session',other_name,'--','/bin/sh','-c','printf "OTHER_READY\\n"; exec /bin/cat')
+        self.addCleanup(lambda:self.cli('--stop',other_name))
+        other.wait(lambda:b'OTHER_READY' in other.output,'unrelated here session')
+        other_status=json.loads(self.cli('--status',other_name).stdout)
+        host.send(b'\x02c');host.wait(lambda:len(self.status()['tabs'])==2,'second owned shell')
+        all_tabs=self.status()['tabs'];owner=self.status()['pid']
+        host.send((shlex.quote(str(self.exe))+' exit\n').encode())
+        self.assertEqual(host.exited(),0)
+        self.assertIn(b'Stopped here session',host.output)
+        self.assertNotIn(b'Reattach:',host.output)
+        deadline=time.monotonic()+5
+        owned=pids+[tab['pid'] for tab in all_tabs]+[owner]
+        while any(alive(pid) for pid in owned) and time.monotonic()<deadline:time.sleep(.03)
+        self.assertFalse(any(alive(pid) for pid in owned),f'owned processes survived exit: {owned}')
+        self.assertTrue(alive(other_status['tabs'][0]['pid']))
+        self.assertIsNone(other.process.poll())
+        self.assertEqual(self.cli('--status',other_name).returncode,0)
+        self.assertEqual(tty_settings(host.slave),host.original)
+
+    def test_palette_quantizer_matches_nearest_fixed_xterm_color(self):
+        compiler = shutil.which('cc')
+        if not compiler:self.skipTest('C compiler unavailable')
+        source = (EXE.parent.parent/'hardcore_here_transport.h').read_text()
+        function = source[source.index('static int here_color_index('):source.index('static int here_host_color256(')]
+        probe = self.root/'palette.c'
+        probe.write_text('#include <stdint.h>\n#include <stdio.h>\n'+function+r'''
+int main(void) {
+ int levels[6]={0,95,135,175,215,255};
+ for(int r=0;r<256;r+=5)for(int g=0;g<256;g+=5)for(int b=0;b<256;b+=5) {
+  int actual=here_color_index((r<<16)|(g<<8)|b),best=0x7fffffff,chosen=-1;
+  if(actual<16||actual>255)return 1;
+  for(int i=16;i<256;i++) {
+   int p=i-16,rr=i<232?levels[p/36]:8+10*(i-232),gg=i<232?levels[(p/6)%6]:rr,bb=i<232?levels[p%6]:rr;
+   int dr=rr-r,dg=gg-g,db=bb-b,error=dr*dr+dg*dg+db*db;
+   if(error<best)best=error;
+   if(i==actual)chosen=error;
+  }
+  if(chosen!=best){fprintf(stderr,"wrong nearest color for %d %d %d: %d\n",r,g,b,actual);return 2;}
+ }
+ return 0;
+}
+''')
+        binary = self.root/'palette'
+        subprocess.run([compiler,'-O2',str(probe),'-o',str(binary)],check=True,capture_output=True)
+        subprocess.run([str(binary)],check=True,capture_output=True)
 
     def test_fragmented_frames_and_reconnect_after_transport_loss(self):
         host = self.start()

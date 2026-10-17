@@ -33,8 +33,9 @@ class NativeHere(unittest.TestCase):
         (self.root/'home').mkdir()
         (self.root/'empty-path').mkdir()
         self.env = dict(os.environ, HOME=str(self.root/'home'), PATH=str(self.root/'empty-path'),
-                        SHELL='/bin/sh', TERM='xterm-256color', COLORTERM='truecolor')
-        for key in ('HARDCORE_CTL', 'HARDCORE_ADOPT', 'HARDCORE_RUNTIME_DIR', 'HARDCORE_TEST_CONFIG'):
+                        SHELL='/bin/sh', TERM='xterm-256color', COLORTERM='truecolor', TERM_PROGRAM='owned-truecolor-host')
+        for key in ('HARDCORE_CTL', 'HARDCORE_ADOPT', 'HARDCORE_RUNTIME_DIR', 'HARDCORE_TEST_CONFIG',
+                    'HARDCORE_HERE_SESSION', 'HARDCORE_HERE_PID', 'HARDCORE_HERE_TAB_PID', 'HC_HERE_MEDIA_FD'):
             self.env.pop(key, None)
         self.name = 'native-test-' + uuid.uuid4().hex[:12]
         self.addCleanup(self.stop)

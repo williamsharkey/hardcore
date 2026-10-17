@@ -24,6 +24,10 @@
 #define HHH_BODY_MAX (2 * 1024 * 1024)
 #define HHH_URL_MAX 4096
 #define HHH_LINK_MAX 300
+static int hhh_image_path(const char *path) {
+    const char *e=strrchr(path,'.');if(!e)return 0;
+    return !strcasecmp(e,".png")||!strcasecmp(e,".jpg")||!strcasecmp(e,".jpeg")||!strcasecmp(e,".gif")||!strcasecmp(e,".webp")||!strcasecmp(e,".tif")||!strcasecmp(e,".tiff")||!strcasecmp(e,".heic")||!strcasecmp(e,".bmp");
+}
 typedef struct { char theme; int allow_host_font,font_size; char font_name[128]; } HereSettings;
 typedef struct {
     int available,active; long window_id; double original_size;
@@ -42,7 +46,10 @@ typedef struct {
     int entered, cols, rows, paste, string_control, string_escape;
     unsigned char input[8192];
     int input_len;
+    void (*before_suspend)(void *);
+    void *suspend_context;
 } HHHTerm;
+static int (*hhh_image_open)(const char *path, HHHTerm *parent);
 static const int hhh_signals[] = {SIGTERM, SIGHUP, SIGINT, SIGWINCH, SIGTSTP};
 static void hhh_size(HHHTerm *t) {
     struct winsize ws = {0};
@@ -61,7 +68,7 @@ static void hhh_enter(HHHTerm *t) {
 }
 static void hhh_leave(HHHTerm *t) {
     if (!t->entered) return;
-    fputs("\033[0m\033[?1006l\033[?1000l\033[?2004l\033[?25h\033[?1049l", stdout);
+    fputs("\033[0m\033[?7h\033[?1006l\033[?1000l\033[?2004l\033[?25h\033[?1049l", stdout);
     fflush(stdout); tcsetattr(STDIN_FILENO, TCSANOW, &t->saved); t->entered = 0;
 }
 static int hhh_start(HHHTerm *t) {
@@ -122,6 +129,7 @@ static void hhh_consume(HHHTerm *t, int n) {
    never interpreted as menu shortcuts, even across fragmented reads. */
 static int hhh_key(HHHTerm *t, int allow_paste) {
     if (hhh_suspend) {
+        if (t->before_suspend) t->before_suspend(t->suspend_context);
         hhh_leave(t); hhh_suspend = 0; kill(getpid(), SIGSTOP); hhh_enter(t); hhh_resize = 1;
     }
     struct pollfd pfd = {0, POLLIN, 0};
@@ -337,6 +345,7 @@ static int hc_here_files_main(int argc,char **argv) {
             if(snprintf(full,sizeof(full),"%s/%s",path,files[selected].name)>=(int)sizeof(full)) snprintf(error,sizeof(error),"Path is too long");
             else if(k=='o') { if(!hhh_open_external(full)) snprintf(error,sizeof(error),"Could not open system application"); }
             else if(files[selected].dir) { if(realpath(full,path)) {reload=1;selected=top=0;} }
+            else if(hhh_image_open && hhh_image_path(full)){hhh_image_open(full,&t);hhh_enter(&t);fputs("\033]0;Files\007",stdout);dirty=1;}
             else if(!hhh_preview(&t,full)) snprintf(error,sizeof(error),"Could not read file: %s",strerror(errno));
         }
         if(reload) {hhh_files_free(files,count);files=hhh_files_read(path,&count,error,sizeof(error));}

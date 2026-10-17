@@ -3,10 +3,12 @@
  * parses child output: vt_feed(), term_line(), and term_resize() do that work. */
 #ifndef HARDCORE_HERE_UI_H
 #define HARDCORE_HERE_UI_H
+#include "hardcore_textile.h"
 
 enum { HU_NONE, HU_CHOOSE, HU_TV, HU_TV_INPUT, HU_CLOSE, HU_NEW,
        HU_CONFIG, HU_FILES, HU_WEB, HU_CAF, HU_DISMISS, HU_THEME,
-       HU_HOSTFONT, HU_FONT, HU_FONT_SIZE, HU_FONT_APPLY };
+       HU_HOSTFONT, HU_FONT, HU_FONT_SIZE, HU_FONT_APPLY, HU_CAMERA, HU_IMAGE,
+       HU_EXIT, HU_DETACH };
 typedef struct { int x, y, w, h, op, value; } HereHit;
 typedef struct { Cell c; const Term *owner; } HerePixel;
 struct HereUI {
@@ -14,6 +16,7 @@ struct HereUI {
     size_t capacity;
     int force, menu, menu_width, menu_offset, preview, tv_focus;
     int tvs[4], ntvs, visible_tvs, tv_cx, tv_cy;
+    int media_tvs[4], media_ntvs;
     int overlay, overlay_offset, focused, prefix, confirm, confirm_id;
     int prompt, prompt_n, search_n, search_direction, search_next, search_left;
     char prompt_text[2049], search[2049], message[320];
@@ -196,6 +199,12 @@ static void hu_open_web(Here *h, const char *url) {
     char *argv[] = {h->exe, "--here-web", (char *)url, NULL};
     if (*url) here_new(h, NULL, argv);
 }
+static void hu_open_media(Here *h,const char *path) {
+    char expanded[PATH_MAX];
+    if(path&&path[0]=='~'&&path[1]=='/'&&getenv("HOME")){if(snprintf(expanded,sizeof(expanded),"%s/%s",getenv("HOME"),path+2)>=(int)sizeof(expanded)){here_ui_message(h,"Image path is too long");return;}path=expanded;}
+    char *argv[]={h->exe,"--here-media",path?"--image":"--camera",(char*)path,NULL};
+    if(here_new(h,NULL,argv)<0)here_ui_message(h,"Could not open media tab");
+}
 static void hu_persist(Here *h) {
     HereUI *u = h->ui;
     HereSettings s = {0}; s.theme = g_scheme->key;
@@ -248,6 +257,10 @@ static void hu_action(Here *h, int op, int value) {
     case HU_CONFIG: u->overlay = u->overlay == 1 ? 0 : 1; u->overlay_offset = 0; break;
     case HU_FILES: hu_open_files(h); break;
     case HU_WEB: hu_prompt(h, 2, "https://"); break;
+    case HU_CAMERA: hu_open_media(h,NULL); break;
+    case HU_IMAGE: hu_prompt(h,4,""); break;
+    case HU_EXIT: u->confirm = 2; break;
+    case HU_DETACH: h->action = HERE_DETACH; break;
     case HU_CAF: here_caf(h, h->caf_pid <= 0); break;
     case HU_DISMISS: u->overlay = 0; break;
     case HU_THEME: hu_theme(h, value); break;
@@ -265,14 +278,16 @@ static void hu_control(Here *h, unsigned char key) {
     case 'n': hu_choose(h, h->active + 1); break;
     case 'p': hu_choose(h, h->active - 1); break;
     case 'x': if (i >= 0) hu_action(h, HU_CLOSE, h->tabs[i].id); break;
-    case 'q': u->confirm = 2; break;
-    case 'D': h->action = HERE_DETACH; break;
+    case 'q': hu_action(h, HU_EXIT, 0); break;
+    case 'D': hu_action(h, HU_DETACH, 0); break;
     case 'R': h->action = HERE_RELOAD; break;
     case 's': case ',': hu_action(h, HU_CONFIG, 0); break;
     case 'm': u->menu = !u->menu; here_ui_resize(h, h->cols, h->rows); break;
     case 'v': if (i >= 0) hu_toggle_tv(h, h->tabs[i].id); break;
     case 'F': hu_open_files(h); break;
     case 'w': hu_action(h, HU_WEB, 0); break;
+    case 'C': hu_action(h, HU_CAMERA, 0); break;
+    case 'I': hu_action(h, HU_IMAGE, 0); break;
     case '/': case 'f': hu_prompt(h, 1, u->search); break;
     case 'N': hu_search_start(h, -1, 0); break;
     case 'j': hu_search_start(h, 1, 0); break;
@@ -306,6 +321,7 @@ static void hu_send(Here *h, const char *data, size_t n) {
                 if (kind == 1) { snprintf(u->search, sizeof(u->search), "%s", u->prompt_text); hu_search_start(h, 1, 1); }
                 else if (kind == 2) hu_open_web(h, u->prompt_text);
                 else if (kind == 3) { snprintf(u->font_name, sizeof(u->font_name), "%.*s", (int)sizeof(u->font_name) - 1, u->prompt_text); if (u->hostfont) hu_font(h); else hu_persist(h); }
+                else if (kind == 4 && u->prompt_text[0]) hu_open_media(h,u->prompt_text);
                 break;
             }
             if (c == 127 || c == 8) {
@@ -531,10 +547,42 @@ static void here_ui_resize(Here *h, int cols, int rows) {
     here_resize_tabs(h, hu_max(2, cols - u->menu_width - (u->menu_width ? 1 : 0)), rows - 1);
     u->preview = u->tv_focus = 0; u->have_pressed = 0; u->force = 1; h->dirty = 1;
 }
+static int here_ui_media_visible(Here *h,int index) {
+    if(!h->ui||index<0||index>=h->ntabs)return 0;
+    HereUI *u=h->ui;int shown=hu_index(h,u->preview);if(shown<0)shown=hu_current(h);
+    if(index==shown)return 1;
+    for(int i=0;i<u->media_ntvs;i++)if(u->media_tvs[i]==h->tabs[index].id)return 1;
+    return 0;
+}
+/* Reconstruct color samples from the helper's character screen, then repack
+ * the whole image into a TV. Cropping would hide almost all of a photo. */
+static void hu_media_tv(Here *h,Term *t,int x,int y,int width,int height) {
+    if(width<=0||height<=0||t->cols<=0||t->rows<3)return;
+    double scale=fmin((double)width/t->cols,(double)height/(t->rows-2));
+    int w=hu_max(1,(int)(t->cols*scale)),ht=hu_max(1,(int)((t->rows-2)*scale));
+    if(w>width)w=width;if(ht>height)ht=height;
+    /* Menu TVs are at most 28x9 cells; keep this work bounded independently of
+     * source dimensions and allocate no frame-sized image. */
+    if(w>28||ht>9)return;
+    unsigned char pixels[28*2*9*4*4];HcTextileCell packed[28*9];int pw=w*2,ph=ht*4;
+    for(int py=0;py<ph;py++)for(int px=0;px<pw;px++) {
+        int sx=hu_min(t->cols*2-1,(px*t->cols*2+pw/2)/pw);
+        int sy=hu_min((t->rows-2)*4-1,(py*(t->rows-2)*4+ph/2)/ph);
+        Cell c=t->row[t->alt][1+sy/4][sx/2];uint32_t fg,bg;cell_colors(&c,&fg,&bg);
+        uint32_t rgb=hc_textile_sample_cell((HcTextileCell){c.ch?c.ch:' ',fg,bg},sx%2,sy%4,4);
+        unsigned char *p=pixels+((size_t)py*pw+px)*4;p[0]=rgb>>16;p[1]=rgb>>8;p[2]=rgb;p[3]=255;
+    }
+    if(!hc_textile_render(pixels,pw,ph,pw*4,packed,w,ht,HC_TEXTILE_BRAILLE,g_scheme->bg))return;
+    x+=(width-w)/2;y+=(height-ht)/2;
+    for(int r=0;r<ht;r++)for(int c=0;c<w;c++) {
+        HcTextileCell p=packed[r*w+c];Cell v=hu_style(0);v.ch=p.ch;v.fg=0x02000000u|p.fg;v.bg=0x02000000u|p.bg;
+        h->ui->grid[(size_t)(y+r)*h->cols+x+c]=(HerePixel){v,NULL};
+    }
+}
 static void hu_compose(Here *h) {
     HereUI *u = h->ui; Cell blank = hu_style(0);
     for (size_t i = 0; i < (size_t)h->cols * h->rows; i++) u->grid[i] = (HerePixel){blank, NULL};
-    u->nhits = 0; u->tv_cx = u->tv_cy = -1; u->visible_tvs = 0;
+    u->nhits = 0; u->tv_cx = u->tv_cy = -1; u->visible_tvs = 0;u->media_ntvs=0;
     for (int i = u->ntvs - 1; i >= 0; i--) if (hu_index(h, u->tvs[i]) < 0) {
         memmove(u->tvs + i, u->tvs + i + 1, (size_t)(--u->ntvs - i) * sizeof(int));
     }
@@ -552,8 +600,10 @@ static void hu_compose(Here *h) {
         int x = h->child_cols + 1, w = u->menu_width;
         hu_put(h, x, 0, "⚙config", 9, 1, HU_CONFIG, 0); hu_put(h, x + 10, 0, "+term", 7, 0, HU_NEW, 0);
         hu_put(h, x + 19, 0, "files", 7, 0, HU_FILES, 0);
-        hu_put(h, x, 1, "+www", 7, 0, HU_WEB, 0); hu_put(h, x + 9, 1, h->caf_pid > 0 ? "CAF" : "caf", 5, 0, HU_CAF, 0);
-        hu_put(h, x + 15, 1, "^B ? help", 12, 2, 0, 0);
+        hu_put(h,x,1,"+www",6,0,HU_WEB,0);hu_put(h,x+7,1,"cam",4,0,HU_CAMERA,0);
+        hu_put(h,x+12,1,"image",7,0,HU_IMAGE,0);hu_put(h,x+21,1,h->caf_pid>0?"CAF":"caf",5,0,HU_CAF,0);
+        hu_put(h,x,2,"exit ^B q",12,0,HU_EXIT,0);
+        hu_put(h,x+13,2,"detach ^B D",w-13,0,HU_DETACH,0);
         int available = hu_max(1, h->child_rows - 3);
         int offset = hu_min(u->menu_offset, hu_max(0, h->ntabs - available));
         int y = 3;
@@ -579,13 +629,15 @@ static void hu_compose(Here *h) {
             hu_put(h, x + w - 5, y, "↗", 2, 0, HU_CHOOSE, tab->id);
             hu_put(h, x + w - 3, y, "−", 2, 0, HU_TV, tab->id);
             int body = ht - 2, start = hu_max(0, hu_min(t->rows, hu_max(body, t->cy + 1)) - body);
+            if(tab->media_tab&&u->media_ntvs<4)u->media_tvs[u->media_ntvs++]=tab->id;
             int left = focused ? hu_max(0, t->cx - (w - 4)) : 0;
             for (int row = 0; row < body; row++) {
                 hu_glyph(h, x, y + row + 1, strong ? 0x2551 : 0x2502, 0);
                 hu_glyph(h, x + w - 1, y + row + 1, strong ? 0x2551 : 0x2502, 0);
-                if (start + row < t->rows) hu_copy(h, x + 1, y + row + 1, t, t->row[t->alt][start + row], t->cols, left, w - 2, 0);
+                if (!tab->media_tab && start + row < t->rows) hu_copy(h, x + 1, y + row + 1, t, t->row[t->alt][start + row], t->cols, left, w - 2, 0);
                 hu_hit(h, x + 1, y + row + 1, w - 2, 1, HU_TV_INPUT, tab->id);
             }
+            if(tab->media_tab)hu_media_tv(h,t,x+1,y+1,w-2,body);
             hu_edge(h, x, y + ht - 1, w, strong ? 0x255a : 0x2514, strong ? 0x2550 : 0x2500, strong ? 0x255d : 0x2518, 0);
             if (focused && t->cy >= start && t->cy < start + body) { u->tv_cx = x + 1 + t->cx - left; u->tv_cy = y + 1 + t->cy - start; tv_visible_focus = 1; }
             y += ht;
@@ -615,7 +667,7 @@ static void hu_compose(Here *h) {
     }
     if (u->overlay) u->nhits = 0; /* Covered chrome must not stay clickable. */
     if (u->overlay == 2) {
-        const char *lines[] = {"Ctrl-B then:", "c new tab     n/p next/previous    1–9 select", "s config      m menu on/off       v mini TV", "F files       w text web          / search", "j next match  N previous match    u/d history", "] live        D detach           R reconnect", "x close tab   q end session       ? help", "Click a tab to select; hover only previews.", "Click TV content to type; Esc returns; ↗ expands.", "Closing the host keeps your session available.", "Shift-drag uses host selection; Esc closes help."};
+        const char *lines[] = {"Ctrl-B then:", "c new tab     n/p next/previous    1–9 select", "s config      m menu on/off       v mini TV", "F files       w text web          / search", "C camera      I image             ? help", "j next match  N previous match    u/d history", "] live        D detach           R reconnect", "x close tab   q end session", "Click a tab to select; hover only previews.", "Click TV content to type; Esc returns; ↗ expands.", "Closing the host keeps your session available.", "Shift-drag uses host selection; Esc closes help."};
         int ht = hu_min((int)(sizeof(lines) / sizeof(lines[0])) + 2, h->child_rows), w = hu_min(72, h->cols);
         int x = (h->cols - w) / 2, y = hu_max(0, (h->child_rows - ht) / 2);
         hu_box(h, x, y, w, ht, "Hardcore here");
@@ -644,7 +696,7 @@ static void hu_compose(Here *h) {
     if ((u->confirm || u->prompt) && !u->menu_width) u->nhits = 0;
     if (u->confirm) hu_put(h, 0, h->child_rows, u->confirm == 2 ? "End all session processes? y/N" : "Close this tab and its programs? y/N", h->cols, 1, 0, 0);
     if (u->prompt) {
-        snprintf(status, sizeof(status), "%s: %.*s▏", u->prompt == 1 ? "search" : u->prompt == 2 ? "url" : "font", (int)sizeof(status) - 20, u->prompt_text);
+        snprintf(status, sizeof(status), "%s: %.*s▏", u->prompt == 1 ? "search" : u->prompt == 2 ? "url" : u->prompt==4 ? "image path" : "font", (int)sizeof(status) - 20, u->prompt_text);
         hu_put(h, 0, h->child_rows, status, h->cols, 1, 0, 0);
     }
 }
@@ -666,7 +718,7 @@ static void here_ui_render(Here *h, SBuf *out) {
              * palette and theme never have to change for Hardcore's theme. */
             if (owner != line[x].owner && pen.link) { sb_put(out, "\x1b]8;;\x1b\\", 7); pen.link = 0; }
             owner = line[x].owner;
-            snap_sgr(out, owner, &pen, 0x02000000u | fg, 0x02000000u | bg,
+            snap_sgr(out, owner, &pen, h->color256?C_PAL(here_color_index(fg)):0x02000000u | fg, h->color256?C_PAL(here_color_index(bg)):0x02000000u | bg,
                      c->attr & ~(A_INV | A_DIM | A_HIDDEN), owner ? c->link : 0);
             char b[8]; uint32_t cp = c->ch ? c->ch : ' ';
             if (cp < 32 || (cp >= 127 && cp < 160) || cp > 0x10ffff) cp = ' ';

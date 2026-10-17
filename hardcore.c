@@ -7474,8 +7474,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     HANDLE gfx_thread = NULL;
     (void)prev; (void)cmdline;
 
-    if (argc > 1 && !wcscmp(argv[1], L"here")) {
-        fputs("hardcore here: use the native Linux build inside WSL. The Windows GUI executable does not contain a console attachment backend.\n", stderr);
+    if (argc > 1 && (!wcscmp(argv[1], L"here") || !wcscmp(argv[1], L"exit") || !wcscmp(argv[1], L"detach"))) {
+        fputs("hardcore here/exit/detach: use the native Linux build inside WSL. The Windows GUI executable does not contain a console attachment backend.\n", stderr);
         return 2;
     }
 
@@ -7566,6 +7566,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             cli("hardcore %s: a terminal for WSL\n"
                 "  hardcore [DIR]          a new window in DIR (from a tab: this folder)\n"
                 "  hardcore here           use the native Linux build inside WSL\n"
+                "  hardcore exit/detach    here session commands in the native Linux build\n"
                 "  hardcore update         install the latest release (--force: even if current)\n"
                 "  hardcore slurp          attach running WSL and classic Windows consoles\n"
                 "  hardcore slurp --list   discover eligible sessions without attaching\n"
@@ -7735,8 +7736,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 static void tab_write(Tab *tb, const void *s, int n) { (void)tb; (void)s; (void)n; }
 static void set_clipboard_utf8(const char *s, int n) { (void)s; (void)n; }
 int main(int argc, char **argv) {
-    if (argc > 1 && !strcmp(argv[1], "--here-files")) return hc_here_files_main(argc - 1, argv + 1);
+    if (argc > 1 && (!strcmp(argv[1], "exit") || !strcmp(argv[1], "detach"))) return here_lifecycle_main(argc - 2, argv + 2, !strcmp(argv[1], "exit"));
+    if (argc > 1 && !strcmp(argv[1], "--here-files")) return hc_here_files_with_media(argc - 1, argv + 1);
     if (argc > 1 && !strcmp(argv[1], "--here-web")) return hc_here_web_main(argc - 1, argv + 1);
+    if (argc > 1 && !strcmp(argv[1], "--here-media")) return hc_here_media_main(argc - 1, argv + 1);
     if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "version"))) {
         printf("hardcore %s (native terminal backend)\n", HARDCORE_VERSION); return 0;
     }

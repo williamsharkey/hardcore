@@ -819,6 +819,7 @@ static void child_env(void) {
                                  "CLAUDE_CODE_MESSAGING_TOKEN", "OLDPWD",
                                  /* our own test knobs */
                                  "HARDCORE_CTL", "HARDCORE_NO_ACTIVATE", "HARDCORE_SHELL", "HARDCORE_MAC_ROLLBACK", "HARDCORE_TEST_CONFIG",
+                                 "HARDCORE_HERE_SESSION", "HARDCORE_HERE_PID", "HARDCORE_HERE_TAB_PID", "HC_HERE_MEDIA_FD",
                                  "HARDCORE_BRIDGE_READY_FD", "HARDCORE_CAF_CHILD"};
     size_t i;
     for (i = 0; i < sizeof(drop) / sizeof(drop[0]); i++) unsetenv(drop[i]);
@@ -3287,8 +3288,10 @@ int main(int argc, char **argv) {
     /* The ANSI backend does not initialize Cocoa, Metal, a Dock app, or the
        GUI's dispatch queues. Its session owner forks before any of those. */
     if (argc > 1 && !strcmp(argv[1], "here")) return here_main(argc - 2, argv + 2);
-    if (argc > 1 && !strcmp(argv[1], "--here-files")) return hc_here_files_main(argc - 1, argv + 1);
+    if (argc > 1 && (!strcmp(argv[1], "exit") || !strcmp(argv[1], "detach"))) return here_lifecycle_main(argc - 2, argv + 2, !strcmp(argv[1], "exit"));
+    if (argc > 1 && !strcmp(argv[1], "--here-files")) return hc_here_files_with_media(argc - 1, argv + 1);
     if (argc > 1 && !strcmp(argv[1], "--here-web")) return hc_here_web_main(argc - 1, argv + 1);
+    if (argc > 1 && !strcmp(argv[1], "--here-media")) return hc_here_media_main(argc - 1, argv + 1);
     int i;
     char selftest_out[MAX_PATH] = "";
     HCDelegate *dlg;

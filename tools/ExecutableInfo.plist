@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Embedded by the normal executable link. This keeps macOS privacy
+         descriptions available when hardcore is copied without its app bundle.
+         The app bundle's full Info.plist takes precedence when it is present. -->
+    <key>CFBundleName</key>
+    <string>hardcore</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.williamsharkey.hardcore</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Show your camera in a mini TV and record videos you choose to make in Hardcore.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Record your voice alongside camera videos you choose to make in Hardcore.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Create optional on-device captions for videos you record in Hardcore.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Hardcore reads your selected Terminal tabs to provide a live bridge while their programs keep running.</string>
+</dict>
+</plist>

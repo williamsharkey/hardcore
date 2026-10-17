@@ -11,10 +11,11 @@
 #define HERE_PEERS 8
 /* Separate namespace from the retired Python protocol. */
 #define HERE_SOCKET_SUFFIX ".native.sock"
-enum { HW_HELLO=1, HW_INPUT, HW_SIZE, HW_STATUS, HW_STOP, HW_FOCUS, HW_FONT_REPLY,
+enum { HW_HELLO=1, HW_INPUT, HW_SIZE, HW_STATUS, HW_STOP, HW_FOCUS, HW_FONT_REPLY, HW_CAPS, HW_LIFECYCLE,
        HW_OK=101, HW_OUTPUT, HW_LEAVE, HW_ERROR, HW_STATUS_REPLY, HW_FONT };
+#define HERE_EXT_CAPS 1u
 typedef struct { uint32_t magic, type, length; } HereWire;
-typedef struct { int fd, controller, closing; uint64_t since; SBuf in, out; size_t off; } HerePeer;
+typedef struct { int fd, controller, closing; uint64_t since, caps_until; SBuf in, out; size_t off; } HerePeer;
 static Here *here_owner;
 static volatile sig_atomic_t here_signal_exit, here_signal_resize, here_signal_suspend, here_signal_continue;
 static char here_error[256];
@@ -22,6 +23,28 @@ static char here_error[256];
 static uint64_t here_now_ms(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec*1000u + (uint64_t)t.tv_nsec/1000000u;
+}
+/* The fixed xterm cube and gray ramp are stable across host themes. Avoid
+ * palette entries 0..15, whose RGB values can be changed by the host user. */
+static int here_color_index(uint32_t rgb) {
+    static const int levels[6]={0,95,135,175,215,255};
+    int v[3]={(int)((rgb>>16)&255),(int)((rgb>>8)&255),(int)(rgb&255)};
+    int cube[3],distance=0;
+    for(int channel=0;channel<3;channel++) {
+        int best=0,delta=v[channel]-levels[0],error=delta*delta;
+        for(int i=1;i<6;i++){delta=v[channel]-levels[i];int e=delta*delta;if(e<error){best=i;error=e;}}
+        cube[channel]=best;distance+=error;
+    }
+    int gray=(v[0]+v[1]+v[2]-9)/30;if(gray<0)gray=0;if(gray>23)gray=23;
+    int level=8+10*gray,dr=v[0]-level,dg=v[1]-level,db=v[2]-level;
+    if(dr*dr+dg*dg+db*db<distance)return 232+gray;
+    return 16+36*cube[0]+6*cube[1]+cube[2];
+}
+static int here_host_color256(void) {
+    const char *program=getenv("TERM_PROGRAM");
+    /* Apple Terminal advertises xterm-256color. An inherited COLORTERM from
+     * another application does not add direct-color support to this host. */
+    return program&&!strcmp(program,"Apple_Terminal");
 }
 static void here_fd_flags(int fd) {
     fcntl(fd, F_SETFD, FD_CLOEXEC); int flags=fcntl(fd,F_GETFL,0);
@@ -139,8 +162,58 @@ static int here_process_cwd(pid_t pid,char *out,size_t cap) {
 #endif
     return 0;
 }
+static pid_t here_parent_pid(pid_t pid) {
+#ifdef __APPLE__
+    struct proc_bsdinfo info;
+    if(proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&info,sizeof(info))==(int)sizeof(info))return (pid_t)info.pbi_ppid;
+#else
+    char path[80],line[4096];snprintf(path,sizeof(path),"/proc/%ld/stat",(long)pid);FILE *f=fopen(path,"r");
+    if(f){char *got=fgets(line,sizeof(line),f);fclose(f);if(got){char *end=strrchr(line,')');long parent;char state;if(end&&sscanf(end+1," %c %ld",&state,&parent)==2&&parent>0&&parent<=INT_MAX)return (pid_t)parent;}}
+#endif
+    return -1;
+}
+static int here_descendant(pid_t pid,pid_t ancestor) {
+    for(int depth=0;depth<128&&pid>1;depth++) {
+        if(pid==ancestor)return 1;pid_t parent=here_parent_pid(pid);if(parent==pid)break;pid=parent;
+    }
+    return 0;
+}
+typedef struct { pid_t pid; uint64_t birth; } HereOwnedProcess;
+static uint64_t here_process_birth(pid_t pid) {
+#ifdef __APPLE__
+    struct proc_bsdinfo info;
+    if(proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&info,sizeof(info))==(int)sizeof(info))return (uint64_t)info.pbi_start_tvsec*1000000u+info.pbi_start_tvusec;
+#else
+    char path[80],line[4096];snprintf(path,sizeof(path),"/proc/%ld/stat",(long)pid);FILE *f=fopen(path,"r");
+    if(f){char *got=fgets(line,sizeof(line),f);fclose(f);if(got){char *end=strrchr(line,')');if(end){char *next=end+1;for(int field=3;field<=22;field++){while(*next==' ')next++;if(!*next)break;if(field==22)return strtoull(next,NULL,10);while(*next&&*next!=' ')next++;}}}}
+#endif
+    return 0;
+}
+static int here_owned_process_live(HereOwnedProcess p) { return p.birth&&here_process_birth(p.pid)==p.birth; }
+static int here_owned_tree_add(HereTab *t,pid_t pid,HereOwnedProcess *owned,int n,int cap) {
+    if(pid<=1||n>=cap)return n;
+    for(int i=0;i<n;i++)if(owned[i].pid==pid)return n;
+    int belongs=!t->exited&&here_descendant(pid,t->pid);
+    /* A surviving captured descendant may have become a session leader and
+     * been reparented after its shell exited. Its start identity keeps newly
+     * spawned children attributable without trusting a recycled PID. */
+    if(!belongs)for(pid_t p=here_parent_pid(pid),depth=0;p>1&&depth<128;depth++) {
+        for(int i=0;i<n;i++)if(owned[i].pid==p&&here_owned_process_live(owned[i])){belongs=1;break;}
+        if(belongs)break;pid_t parent=here_parent_pid(p);if(parent==p)break;p=parent;
+    }
+    if(belongs){uint64_t birth=here_process_birth(pid);if(birth)owned[n++]=(HereOwnedProcess){pid,birth};}return n;
+}
+static int here_owned_tree(HereTab *t,HereOwnedProcess *owned,int n,int cap) {
+    if(!owned)return 0;
+#ifdef __APPLE__
+    int count=proc_listallpids(NULL,0)+128;if(count>128&&count<65536){pid_t *pids=calloc((size_t)count,sizeof(pid_t));if(pids){int got=proc_listallpids(pids,count*(int)sizeof(pid_t));for(int i=0;i<got&&n<cap;i++)n=here_owned_tree_add(t,pids[i],owned,n,cap);free(pids);}}
+#else
+    DIR *d=opendir("/proc");if(d){struct dirent *e;while((e=readdir(d))&&n<cap){pid_t pid=(pid_t)strtol(e->d_name,NULL,10);if(pid>1)n=here_owned_tree_add(t,pid,owned,n,cap);}closedir(d);}
+#endif
+    return n;
+}
 static void here_program(HereTab *t) {
-    if(t->fd<0)return;pid_t fg=tcgetpgrp(t->fd);if(fg<=0)return;
+    if(t->fd<0||t->media_tab)return;pid_t fg=tcgetpgrp(t->fd);if(fg<=0)return;
 #ifdef __APPLE__
     char name[256];int n=proc_name(fg,name,sizeof(name));if(n>0)snprintf(t->program,sizeof(t->program),"%s",name);
 #else
@@ -148,10 +221,11 @@ static void here_program(HereTab *t) {
     if(f){if(fgets(name,sizeof(name),f)){name[strcspn(name,"\r\n")]=0;snprintf(t->program,sizeof(t->program),"%s",name);}fclose(f);}
 #endif
 }
-static void here_child_close_fds(void) {
+static void here_child_close_fds_except(int keep) {
     long limit=sysconf(_SC_OPEN_MAX);if(limit<0||limit>65536)limit=65536;
-    for(int fd=3;fd<limit;fd++)close(fd);
+    for(int fd=3;fd<limit;fd++)if(fd!=keep)close(fd);
 }
+static void here_child_close_fds(void) { here_child_close_fds_except(-1); }
 static void here_child_reset(void) {
     int signals[]={SIGINT,SIGTERM,SIGHUP,SIGPIPE,SIGTSTP,SIGCONT,SIGWINCH,SIGCHLD};
     for(size_t i=0;i<sizeof(signals)/sizeof(signals[0]);i++)signal(signals[i],SIG_DFL);
@@ -159,7 +233,9 @@ static void here_child_reset(void) {
 }
 static int here_new(Here *h,const char *cwd,char *const *argv) {
     if(h->ntabs>=HERE_MAX_TABS)return -1;
-    HereTab *t=&h->tabs[h->ntabs];memset(t,0,sizeof(*t));t->fd=-1;
+    HereTab *t=&h->tabs[h->ntabs];memset(t,0,sizeof(*t));t->fd=t->media_fd=-1;t->media_visible=-1;
+    t->media_tab=argv&&argv[0]&&argv[1]&&!strcmp(argv[1],"--here-media");
+    t->media_camera=t->media_tab&&argv[2]&&!strcmp(argv[2],"--camera");
     char current[1024];
     if(!cwd||!*cwd) {
         HereTab *active=h->ntabs?&h->tabs[h->active]:NULL;
@@ -170,23 +246,42 @@ static int here_new(Here *h,const char *cwd,char *const *argv) {
     struct stat st;if(stat(cwd,&st)<0||!S_ISDIR(st.st_mode))return -1;
     snprintf(t->cwd,sizeof(t->cwd),"%s",cwd);
     if(!term_init(&t->t,h->child_cols>1?h->child_cols:80,h->child_rows>0?h->child_rows:23))return -1;
+    int control[2]={-1,-1};
+    if(t->media_tab){if(socketpair(AF_UNIX,SOCK_STREAM,0,control)<0){term_free(&t->t);return -1;}here_fd_flags(control[0]);here_fd_flags(control[1]);}
     struct winsize ws={0};ws.ws_col=(unsigned short)t->t.cols;ws.ws_row=(unsigned short)t->t.rows;
-    pid_t pid=forkpty(&t->fd,NULL,NULL,&ws);
-    if(pid<0){term_free(&t->t);return -1;}
+    pid_t owner_pid=getpid(),pid=forkpty(&t->fd,NULL,NULL,&ws);
+    if(pid<0){if(control[0]>=0)close(control[0]);if(control[1]>=0)close(control[1]);term_free(&t->t);return -1;}
     if(!pid) {
         here_child_reset();
-        /* No listener, frontend or another tab PTY is inherited by a shell. */
-        here_child_close_fds();
+        /* A media helper inherits only its dedicated visibility channel. No
+         * shell inherits a listener, frontend, other PTY or media control fd. */
+        here_child_close_fds_except(control[1]);
+        if(control[1]>=0){char value[32];snprintf(value,sizeof(value),"%d",control[1]);fcntl(control[1],F_SETFD,0);setenv("HC_HERE_MEDIA_FD",value,1);}
+        else unsetenv("HC_HERE_MEDIA_FD");
         if(chdir(t->cwd)<0){dprintf(2,"hardcore here: cannot enter directory: %s\r\n",strerror(errno));_exit(126);}
         setenv("TERM","xterm-256color",1);setenv("COLORTERM","truecolor",1);setenv("TERM_PROGRAM","hardcore-here",1);
+        char owner[32],tab[32];snprintf(owner,sizeof(owner),"%ld",(long)owner_pid);snprintf(tab,sizeof(tab),"%ld",(long)getpid());
+        setenv("HARDCORE_HERE_SESSION",h->session,1);setenv("HARDCORE_HERE_PID",owner,1);setenv("HARDCORE_HERE_TAB_PID",tab,1);
         unsetenv("HARDCORE_CTL");unsetenv("HARDCORE_WINDOW_PID");unsetenv("HARDCORE_TAB_ID");
         char *shellargs[]={h->shell,"-i",NULL};char *const *command=argv&&argv[0]?argv:shellargs;
         execvp(command[0],command);dprintf(2,"hardcore here: %s: %s\r\n",command[0],strerror(errno));_exit(127);
     }
+    if(control[1]>=0)close(control[1]);t->media_fd=control[0];
     t->pid=pid;t->id=++h->next_id;here_fd_flags(t->fd);
     const char *program=argv&&argv[0]?argv[0]:h->shell;const char *slash=strrchr(program,'/');
     snprintf(t->program,sizeof(t->program),"%s",slash?slash+1:program);
     h->active=h->ntabs++;h->dirty=1;return h->active;
+}
+static void here_media_sync(Here *h) {
+    for(int i=0;i<h->ntabs;i++) {
+        HereTab *t=&h->tabs[i];if(t->media_fd<0)continue;
+        if(t->exited||t->fd<0){close(t->media_fd);t->media_fd=-1;t->media_visible=0;continue;}
+        int visible=h->attached&&!h->host_suspended&&here_ui_media_visible(h,i);
+        if(visible==t->media_visible)continue;
+        char state=visible?'1':'0';ssize_t n=write(t->media_fd,&state,1);
+        if(n==1)t->media_visible=visible;
+        else if(n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR){close(t->media_fd);t->media_fd=-1;t->media_visible=0;}
+    }
 }
 static int here_write(Here *h,int index,const char *data,size_t n) {
     if(index<0||index>=h->ntabs)return 0;HereTab *t=&h->tabs[index];if(t->fd<0||t->exited)return 0;
@@ -229,16 +324,24 @@ static int here_owned_groups(HereTab *t,pid_t *groups,int cap) {
 }
 static void here_close(Here *h,int index) {
     if(index<0||index>=h->ntabs)return;HereTab *t=&h->tabs[index];pid_t groups[256];int n=here_owned_groups(t,groups,256);
+    HereOwnedProcess *owned=calloc(4096,sizeof(*owned));int nowned=here_owned_tree(t,owned,0,4096);
+    if(t->media_fd>=0){close(t->media_fd);t->media_fd=-1;t->media_visible=0;}
     for(int i=0;i<n;i++)kill(-groups[i],SIGHUP);
+    for(int i=0;i<nowned;i++)if(here_owned_process_live(owned[i]))kill(owned[i].pid,SIGHUP);
     if(t->fd>=0){close(t->fd);t->fd=-1;}
     /* SIGTERM after HUP handles shell jobs that deliberately ignore hangup. */
     for(int i=0;i<n;i++)if(getsid(groups[i])==t->pid)kill(-groups[i],SIGTERM);
+    for(int i=0;i<nowned;i++)if(here_owned_process_live(owned[i]))kill(owned[i].pid,SIGTERM);
     /* Re-scan the owned session after a short grace period: group leaders can
      * exit before their children, so checking getsid(group_leader) alone misses
      * orphaned jobs. The scan authorizes every final kill by a live member. */
     uint64_t deadline=here_now_ms()+120;
-    while(n&&here_now_ms()<deadline){struct timespec pause={0,10000000};nanosleep(&pause,NULL);n=here_owned_groups(t,groups,256);}
+    int tree_live=nowned;
+    while((n||tree_live)&&here_now_ms()<deadline){struct timespec pause={0,10000000};nanosleep(&pause,NULL);n=here_owned_groups(t,groups,256);tree_live=0;for(int i=0;i<nowned;i++)tree_live+=here_owned_process_live(owned[i]);}
+    if(tree_live)nowned=here_owned_tree(t,owned,nowned,4096);
     for(int i=0;i<n;i++)kill(-groups[i],SIGKILL);
+    for(int i=0;i<nowned;i++)if(here_owned_process_live(owned[i]))kill(owned[i].pid,SIGKILL);
+    free(owned);
     if(!t->exited){int status;pid_t reaped=waitpid(t->pid,&status,WNOHANG);
         if(!reaped){uint64_t end=here_now_ms()+100;while(!reaped&&here_now_ms()<end){struct timespec pause={0,5000000};nanosleep(&pause,NULL);reaped=waitpid(t->pid,&status,WNOHANG);}}}
     term_free(&t->t);free(t->pending.p);
@@ -259,7 +362,7 @@ static void here_font(Here *h,const char *name,int size,int allowed) {
     snprintf(h->font_name,sizeof(h->font_name),"%s",name);h->font_size=size;h->font_allowed=!!allowed;h->font_request=1;
 }
 static void here_peer_drop(Here *h,HerePeer *p) {
-    if(p->controller){h->attached=0;here_ui_focus(h,0);here_caf(h,0);}
+    if(p->controller){h->attached=0;here_ui_focus(h,0);here_caf(h,0);here_media_sync(h);}
     if(p->fd>=0)close(p->fd);free(p->in.p);free(p->out.p);memset(p,0,sizeof(*p));p->fd=-1;
 }
 static void here_json_string(SBuf *b,const char *s) {
@@ -269,32 +372,41 @@ static void here_json_string(SBuf *b,const char *s) {
 }
 static void here_status(Here *h,SBuf *b) {
     sb_put(b,"{\"name\":",8);here_json_string(b,h->session);
-    sb_printf(b,",\"native\":true,\"version\":2,\"pid\":%ld,\"attached\":%s,\"active\":%d,\"cols\":%d,\"rows\":%d,\"tabs\":[",(long)getpid(),h->attached?"true":"false",h->active,h->child_cols,h->child_rows);
+    sb_printf(b,",\"native\":true,\"version\":2,\"pid\":%ld,\"attached\":%s,\"active\":%d,\"cols\":%d,\"rows\":%d,\"color256\":%s,\"suspended\":%s,\"tabs\":[",(long)getpid(),h->attached?"true":"false",h->active,h->child_cols,h->child_rows,h->color256?"true":"false",h->host_suspended?"true":"false");
     for(int i=0;i<h->ntabs;i++) {
         HereTab *t=&h->tabs[i];if(i)sb_put(b,",",1);
         sb_printf(b,"{\"id\":%d,\"pid\":%ld,\"exited\":%s,\"status\":%d,\"cwd\":",t->id,(long)t->pid,t->exited?"true":"false",t->status);
         here_json_string(b,t->t.cwd[0]?t->t.cwd:t->cwd);sb_put(b,",\"program\":",11);here_json_string(b,t->program);
-        sb_printf(b,",\"cols\":%d,\"rows\":%d,\"pending\":%zu}",t->t.cols,t->t.rows,t->pending.n-t->pending_off);
+        sb_printf(b,",\"cols\":%d,\"rows\":%d,\"pending\":%zu,\"media\":%s,\"camera\":%s,\"media_visible\":%s}",t->t.cols,t->t.rows,t->pending.n-t->pending_off,t->media_tab?"true":"false",t->media_camera?"true":"false",t->media_visible>0?"true":"false");
     }sb_put(b,"]}",2);
 }
 static int here_owner_request(Here *h,HerePeer *peers,int at,int type,const char *p,size_t n) {
     HerePeer *peer=&peers[at];
     if(type==HW_STATUS&&n==0){SBuf b={0};here_status(h,&b);here_frame(&peer->out,HW_STATUS_REPLY,b.p,b.n);free(b.p);peer->closing=1;return 1;}
     if(type==HW_STOP&&n==0){here_frame(&peer->out,HW_OK,"",0);h->action=HERE_STOP;return 1;}
+    if(type==HW_LIFECYCLE&&n==12) {
+        uint32_t values[3];memcpy(values,p,sizeof(values));uint32_t owner=ntohl(values[0]),tab=ntohl(values[1]),action=ntohl(values[2]);
+        int found=0;for(int i=0;i<h->ntabs;i++)if(!h->tabs[i].exited&&(uint32_t)h->tabs[i].pid==tab)found=1;
+        if(owner!=(uint32_t)getpid()||!found||(action!=HERE_DETACH&&action!=HERE_STOP)){
+            const char *message="This command no longer belongs to that live here session";here_frame(&peer->out,HW_ERROR,message,strlen(message));peer->closing=1;return 1;
+        }
+        here_frame(&peer->out,HW_OK,"",0);peer->closing=1;h->action=(int)action;return 1;
+    }
     if(type==HW_HELLO&&n==16&&!peer->controller) {
         uint32_t value[4];memcpy(value,p,sizeof(value));int version=(int)ntohl(value[0]),cols=(int)ntohl(value[1]),rows=(int)ntohl(value[2]),takeover=(int)ntohl(value[3]);
         if(version!=2||cols<2||cols>500||rows<2||rows>200)return 0;
         if(h->attached&&!takeover){const char *msg="Session already attached; use --takeover to replace its attachment";here_frame(&peer->out,HW_ERROR,msg,strlen(msg));peer->closing=1;return 1;}
         for(int i=0;i<HERE_PEERS;i++)if(i!=at&&peers[i].controller){here_frame(&peers[i].out,HW_LEAVE,"takeover",8);peers[i].controller=0;peers[i].closing=1;}
-        peer->controller=1;h->attached=1;h->action=0;
+        peer->controller=1;peer->caps_until=here_now_ms()+100;h->attached=1;h->host_suspended=0;h->action=0;
         here_ui_attached(h);here_ui_resize(h,cols,rows);here_ui_focus(h,1);h->dirty=1;
-        here_frame(&peer->out,HW_OK,"",0);return 1;
+        uint32_t extensions=htonl(HERE_EXT_CAPS);here_frame(&peer->out,HW_OK,&extensions,sizeof(extensions));return 1;
     }
     if(!peer->controller)return 0;
+    if(type==HW_CAPS&&n==4){uint32_t value;memcpy(&value,p,4);value=ntohl(value);if(value>1)return 0;peer->caps_until=0;if(h->color256!=(int)value){h->color256=(int)value;here_ui_resize(h,h->cols,h->rows);}h->dirty=1;return 1;}
     if(type==HW_FONT_REPLY&&n==268){uint32_t values[3];memcpy(values,p,12);h->font_available=!!ntohl(values[0]);h->font_active=!!ntohl(values[1]);memcpy(h->font_error,p+12,255);h->font_error[255]=0;if(ntohl(values[2]))here_ui_message(h,h->font_error[0]?h->font_error:h->font_active?"Host font changed (restored when leaving)":"Host font restored");h->dirty=1;return 1;}
     if(type==HW_INPUT&&n<=65536){here_ui_input(h,p,n);return 1;}
     if(type==HW_SIZE&&n==8){uint32_t values[2];memcpy(values,p,8);int cols=(int)ntohl(values[0]),rows=(int)ntohl(values[1]);if(cols<2||cols>500||rows<2||rows>200)return 0;here_ui_resize(h,cols,rows);return 1;}
-    if(type==HW_FOCUS&&n==1){here_ui_focus(h,p[0]!=0);return 1;}
+    if(type==HW_FOCUS&&n==1){h->host_suspended=p[0]==0;here_ui_focus(h,p[0]!=0);return 1;}
     return 0;
 }
 static void here_owner_loop(Here *h,int listener,const char *path,int lockfd) {
@@ -341,8 +453,9 @@ static void here_owner_loop(Here *h,int listener,const char *path,int lockfd) {
         if(now-program_at>=500){for(int i=0;i<h->ntabs;i++){char before[64];memcpy(before,h->tabs[i].program,sizeof(before));here_program(&h->tabs[i]);if(strcmp(before,h->tabs[i].program))h->dirty=1;}program_at=now;}
         if(h->font_request&&h->attached){for(int i=0;i<HERE_PEERS;i++)if(peers[i].controller&&!peers[i].closing){unsigned char request[136]={0};uint32_t values[2]={htonl((uint32_t)h->font_allowed),htonl((uint32_t)h->font_size)};memcpy(request,values,8);memcpy(request+8,h->font_name,strlen(h->font_name));here_frame(&peers[i].out,HW_FONT,request,sizeof(request));h->font_request=0;break;}}
         if(h->action==HERE_DETACH||h->action==HERE_RELOAD){for(int i=0;i<HERE_PEERS;i++)if(peers[i].controller){uint32_t action=htonl((uint32_t)h->action);here_frame(&peers[i].out,HW_LEAVE,&action,sizeof(action));peers[i].closing=1;peers[i].controller=0;}h->attached=0;here_ui_focus(h,0);here_caf(h,0);h->action=0;}
+        here_media_sync(h);
         if(h->dirty&&h->attached&&now-render_at>=16) {
-            for(int i=0;i<HERE_PEERS;i++)if(peers[i].controller&&!peers[i].closing&&peers[i].out.n-peers[i].off<65536) {
+            for(int i=0;i<HERE_PEERS;i++)if(peers[i].controller&&!peers[i].closing&&now>=peers[i].caps_until&&peers[i].out.n-peers[i].off<65536) {
                 if(peers[i].off){here_consume(&peers[i].out,peers[i].off);peers[i].off=0;}
                 SBuf out={0};here_ui_render(h,&out);
                 if(out.n&&!here_frame(&peers[i].out,HW_OUTPUT,out.p,out.n))here_peer_drop(h,&peers[i]);
@@ -438,7 +551,8 @@ static int here_attach(Here *h,const char *path,int takeover) {
     SBuf reply={0};int type=0;
     if(!here_send_frame(fd,HW_HELLO,hello,sizeof(hello),2000)||!here_read_frame(fd,&type,&reply,4000)||type!=HW_OK) {
         snprintf(here_error,sizeof(here_error),"%s",type==HW_ERROR&&reply.p?reply.p:"Session did not accept attachment");free(reply.p);close(fd);return 1;
-    }free(reply.p);
+    }
+    uint32_t extensions=0;if(reply.n>=4){memcpy(&extensions,reply.p,4);extensions=ntohl(extensions);}free(reply.p);
     struct termios saved,raw;if(tcgetattr(0,&saved)<0){close(fd);snprintf(here_error,sizeof(here_error),"Cannot read host terminal settings");return 1;}
     raw=saved;cfmakeraw(&raw);raw.c_cc[VMIN]=1;raw.c_cc[VTIME]=0;
     int in_flags=fcntl(0,F_GETFL),out_flags=fcntl(1,F_GETFL);fcntl(0,F_SETFL,in_flags|O_NONBLOCK);fcntl(1,F_SETFL,out_flags|O_NONBLOCK);
@@ -446,7 +560,8 @@ static int here_attach(Here *h,const char *path,int takeover) {
     here_signal_exit=here_signal_resize=here_signal_suspend=here_signal_continue=0;
     for(int i=0;i<7;i++){act.sa_handler=sigs[i]==SIGPIPE?SIG_IGN:here_signal;sigaction(sigs[i],&act,&old[i]);}
     int entered=tcsetattr(0,TCSADRAIN,&raw)==0;if(entered)here_send_all(1,here_host_enter,sizeof(here_host_enter)-1,1000);
-    SBuf incoming={0},outgoing={0},screen={0};size_t outoff=0,screenoff=0;int result=0,leaving=0,reload=0;
+    SBuf incoming={0},outgoing={0},screen={0};size_t outoff=0,screenoff=0;int result=0,leaving=0,reload=0,stopped=0;
+    if(extensions&HERE_EXT_CAPS){uint32_t caps=htonl((uint32_t)here_host_color256());here_frame(&outgoing,HW_CAPS,&caps,sizeof(caps));}
     HereFontWorker font;here_font_worker_init(&font);here_font_worker_reply(&font,&outgoing,1);
     unsigned char resume_font[136]={0};int resume_font_valid=0;
     while(entered&&!here_signal_exit&&!leaving) {
@@ -476,7 +591,7 @@ static int here_attach(Here *h,const char *path,int takeover) {
         while(incoming.n){size_t n;int msg;int got=here_peek(&incoming,&msg,&n,HERE_WIRE_MAX);if(got<0){result=1;leaving=1;break;}if(!got)break;char *p=incoming.p+sizeof(HereWire);
             if(msg==HW_OUTPUT){if(screenoff){here_consume(&screen,screenoff);screenoff=0;}if(!here_append(&screen,p,n,HERE_WIRE_MAX)){result=1;leaving=1;break;}}
             else if(msg==HW_FONT){here_font_worker_request(&font,p,n);}
-            else if(msg==HW_LEAVE){if(n==4){uint32_t a;memcpy(&a,p,4);reload=ntohl(a)==HERE_RELOAD;}leaving=1;}
+            else if(msg==HW_LEAVE){if(n==4){uint32_t a;memcpy(&a,p,4);reload=ntohl(a)==HERE_RELOAD;stopped=ntohl(a)==HERE_STOP;}else if(n==7&&!memcmp(p,"stopped",7))stopped=1;leaving=1;}
             else if(msg==HW_ERROR){snprintf(here_error,sizeof(here_error),"%.*s",(int)n,p);result=1;leaving=1;}
             here_consume(&incoming,sizeof(HereWire)+n);
         }
@@ -487,12 +602,34 @@ static int here_attach(Here *h,const char *path,int takeover) {
     free(incoming.p);free(outgoing.p);free(screen.p);
     if(font.active)fprintf(stderr,"hardcore here: host font restoration needs attention: %s\n",font.error);
     if(reload){char *args[]={h->exe,"here","--attach",h->session,NULL};execv(h->exe,args);snprintf(here_error,sizeof(here_error),"Cannot reload attachment: %s",strerror(errno));return 1;}
-    if(!result&&!here_signal_exit)fprintf(stdout,"Detached from %s. Reattach: hardcore here --attach %s\n",h->session,h->session);
+    if(!result&&!here_signal_exit){if(stopped)fprintf(stdout,"Stopped here session %s.\n",h->session);else fprintf(stdout,"Detached from %s. Reattach: hardcore here --attach %s\n",h->session,h->session);}
     return result;
 }
 static int here_admin(const char *name,int stop,SBuf *reply) {
     char path[256];if(!here_path(name,path,sizeof(path)))return 0;int fd=here_connect(path);if(fd<0){snprintf(here_error,sizeof(here_error),"Session %s: %s",name,strerror(errno));return 0;}
     int type;int ok=here_send_frame(fd,stop?HW_STOP:HW_STATUS,"",0,400)&&here_read_frame(fd,&type,reply,1000)&&type==(stop?HW_OK:HW_STATUS_REPLY);close(fd);return ok;
+}
+static pid_t here_environment_pid(const char *key) {
+    const char *value=getenv(key);if(!value||!*value)return -1;
+    for(const char *p=value;*p;p++)if(*p<'0'||*p>'9')return -1;
+    errno=0;unsigned long pid=strtoul(value,NULL,10);return !errno&&pid>1&&pid<=INT_MAX?(pid_t)pid:-1;
+}
+static int here_lifecycle_main(int argc,char **argv,int stop) {
+    const char *command=stop?"exit":"detach";
+    if(argc==1&&(!strcmp(argv[0],"--help")||!strcmp(argv[0],"-h"))) {
+        printf("hardcore %s — %s\nRun inside a native hardcore here session.\n",command,stop?"end this here session and its owned processes":"return to the host terminal, preserving this here session and its processes");return 0;
+    }
+    if(argc){fprintf(stderr,"Usage: hardcore %s\n",command);return 2;}
+    const char *name=getenv("HARDCORE_HERE_SESSION");pid_t owner=here_environment_pid("HARDCORE_HERE_PID"),tab=here_environment_pid("HARDCORE_HERE_TAB_PID");
+    if(!name||!here_name_valid(name)||owner<=1||tab<=1||!here_descendant(getpid(),tab)||!here_descendant(getpid(),owner)) {
+        fprintf(stderr,"hardcore %s: run this inside a native hardcore here session; no other session was changed.\n",command);return 2;
+    }
+    char path[256];if(!here_path(name,path,sizeof(path))){fprintf(stderr,"hardcore %s: %s\n",command,here_error);return 1;}
+    int fd=here_connect(path);if(fd<0){fprintf(stderr,"hardcore %s: cannot reach this here session: %s\n",command,strerror(errno));return 1;}
+    signal(SIGPIPE,SIG_IGN);
+    uint32_t values[3]={htonl((uint32_t)owner),htonl((uint32_t)tab),htonl(stop?HERE_STOP:HERE_DETACH)};SBuf reply={0};int type=0;
+    int ok=here_send_frame(fd,HW_LIFECYCLE,values,sizeof(values),400)&&here_read_frame(fd,&type,&reply,2000)&&type==HW_OK;
+    close(fd);if(!ok)fprintf(stderr,"hardcore %s: %s\n",command,type==HW_ERROR&&reply.p?reply.p:"session did not accept the request");free(reply.p);return ok?0:1;
 }
 static int here_list(void) {
     char dir[128];if(!here_runtime(dir,sizeof(dir)))return 1;DIR *d=opendir(dir);if(!d)return 1;struct dirent *e;int count=0;size_t suffix=strlen(HERE_SOCKET_SUFFIX);
@@ -501,22 +638,32 @@ static int here_list(void) {
 }
 static int here_main(int argc,char **argv) {
     Here h;memset(&h,0,sizeof(h));const char *shell=getenv("SHELL");snprintf(h.shell,sizeof(h.shell),"%s",shell&&*shell?shell:"/bin/sh");
+    h.color256=here_host_color256();
     if(!getcwd(h.cwd,sizeof(h.cwd)))strcpy(h.cwd,"/");
 #ifdef __APPLE__
     uint32_t exe_n=sizeof(h.exe);if(_NSGetExecutablePath(h.exe,&exe_n)!=0)return 1;char resolved[4096];if(realpath(h.exe,resolved))snprintf(h.exe,sizeof(h.exe),"%s",resolved);
 #else
     ssize_t exe_n=readlink("/proc/self/exe",h.exe,sizeof(h.exe)-1);if(exe_n>0)h.exe[exe_n]=0;
 #endif
-    int attach=0,takeover=0,list=0,stop=0,status=0;here_error[0]=0;
+    int attach=0,takeover=0,list=0,stop=0,status=0,media=0;const char *media_path=NULL;here_error[0]=0;
     for(int i=0;i<argc;i++) {
         const char *a=argv[i];
         if(!strcmp(a,"--help")||!strcmp(a,"-h")) {
             puts("hardcore here — native terminal mode, using Hardcore's C engine\n"
                  "Usage: hardcore here [--cwd DIR] [--shell SHELL] [--session NAME |\n"
                  "       --attach NAME | --list | --stop NAME] [--takeover] [-- command ...]\n"
+                 "       hardcore here [--session NAME] --camera | --image PATH\n"
                  "Ctrl-B then ?: help; c: new tab; D: detach; R: reload attachment.\n"
+                 "C: character camera preview; I: open an image; m inside media changes its style.\n"
                  "Sessions and their shells survive detaching. No Python/Lua runtime.\n"
+                 "Inside a child shell: hardcore detach preserves it; hardcore exit ends the session.\n"
                  "--status NAME prints native session details as JSON.");return 0;
+        }
+        if(!strcmp(a,"--camera")||!strcmp(a,"--image")) {
+            if(media){fprintf(stderr,"hardcore here: choose one of --camera or --image PATH\n");return 2;}
+            media=!strcmp(a,"--camera")?1:2;
+            if(media==2){if(++i>=argc){fprintf(stderr,"hardcore here: --image needs a path\n");return 2;}media_path=argv[i];}
+            continue;
         }
         if(!strcmp(a,"--takeover")){takeover=1;continue;}if(!strcmp(a,"--list")){list=1;continue;}
         if(!strcmp(a,"--")){h.command=argv+i+1;break;}
@@ -529,6 +676,8 @@ static int here_main(int argc,char **argv) {
         }
         if(a[0]=='-'){fprintf(stderr,"hardcore here: unknown option: %s\n",a);return 2;}h.command=argv+i;break;
     }
+    char *media_args[]={h.exe,"--here-media",media==1?"--camera":"--image",(char*)media_path,NULL};
+    if(media){if(list||attach||stop||status||(h.command&&h.command[0])){fprintf(stderr,"hardcore here: media starts a new session and cannot be combined with an attachment, admin operation or command\n");return 2;}h.command=media_args;}
     if(list){if(h.session[0]){fprintf(stderr,"hardcore here: choose one session operation\n");return 2;}int r=here_list();if(r)fprintf(stderr,"hardcore here: %s\n",here_error);return r;}
     if(stop||status){SBuf reply={0};int ok=here_admin(h.session,stop,&reply);if(ok&&status)printf("%s\n",reply.p?reply.p:"");free(reply.p);if(!ok)fprintf(stderr,"hardcore here: %s\n",here_error[0]?here_error:"Session did not respond");return ok?0:1;}
     if(!isatty(0)||!isatty(1)){fprintf(stderr,"hardcore here needs an interactive terminal on stdin and stdout.\n");return 2;}

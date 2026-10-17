@@ -848,8 +848,10 @@ static int mac_cli(int argc, char **argv) {
     g_mac_install_exe = [@(g_mac_exe_path) copy];
     if (argc < 2) return -1;
     if (!strcmp(argv[1], "here")) return here_main(argc - 2, argv + 2);
-    if (!strcmp(argv[1], "--here-files")) return hc_here_files_main(argc - 1, argv + 1);
+    if (!strcmp(argv[1], "exit") || !strcmp(argv[1], "detach")) return here_lifecycle_main(argc - 2, argv + 2, !strcmp(argv[1], "exit"));
+    if (!strcmp(argv[1], "--here-files")) return hc_here_files_with_media(argc - 1, argv + 1);
     if (!strcmp(argv[1], "--here-web")) return hc_here_web_main(argc - 1, argv + 1);
+    if (!strcmp(argv[1], "--here-media")) return hc_here_media_main(argc - 1, argv + 1);
     if (!strcmp(argv[1], "browser")) return mac_browser_cli(argc - 2, argv + 2);
     if (!strcmp(argv[1], "--slurp-sources")) {
         if (argc != 2) return 2;
@@ -947,6 +949,8 @@ static int mac_cli(int argc, char **argv) {
         puts("hardcore [DIR]                 launch the app and return to this prompt\n"
              "hardcore --foreground [DIR]    keep the GUI attached for debugging\n"
              "hardcore here [-- COMMAND...]   run inside this terminal, without a GUI window\n"
+             "hardcore detach                 leave this here session running in the background\n"
+             "hardcore exit                   end this here session and its owned processes\n"
              "hardcore browser open [URL]     new live browser tab (Hardcore grid by default)\n"
              "hardcore browser --help         browser commands and tab targeting\n"
              "hardcore host [--] [COMMAND...] start a portable tmux-backed session in this terminal\n"

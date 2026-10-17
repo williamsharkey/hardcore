@@ -72,7 +72,7 @@ def alive(pid):
 
 
 class OwnedTerminal:
-    def __init__(self, argv, env, cwd):
+    def __init__(self, argv, env, cwd, pass_fds=()):
         self.master, self.slave = pty.openpty()
         self.output = bytearray()
         self.process = None
@@ -85,7 +85,7 @@ class OwnedTerminal:
             # The application itself still creates a real controlling PTY for
             # the child probe via forkpty, exactly as it does in Terminal.
             self.process = subprocess.Popen(argv, stdin=self.slave, stdout=self.slave,
-                stderr=self.slave, env=env, cwd=cwd, start_new_session=True)
+                stderr=self.slave, env=env, cwd=cwd, start_new_session=True, pass_fds=pass_fds)
         except BaseException:
             os.close(self.master);os.close(self.slave)
             raise
@@ -148,11 +148,13 @@ class HereDispatch(unittest.TestCase):
         self.home = self.root / "private-home";self.home.mkdir()
         self.runtime = self.root / "runtime";self.runtime.mkdir(mode=0o700)
         self.control = self.root / "unexpected GUI FIFO"
-        self.env = dict(os.environ, HOME=str(self.home), TERM="xterm-256color",
+        self.env = dict(os.environ, HOME=str(self.home), TERM="xterm-256color", TERM_PROGRAM="owned-truecolor-host",
                         COLORTERM="truecolor", LC_ALL="en_US.UTF-8",
                         HARDCORE_CTL=str(self.control), HARDCORE_NO_ACTIVATE="1",
                         HARDCORE_RUNTIME_DIR=str(self.runtime),
                         HARDCORE_TEST_CONFIG=str(self.root / "config"))
+        for key in ('HARDCORE_HERE_SESSION', 'HARDCORE_HERE_PID', 'HARDCORE_HERE_TAB_PID', 'HC_HERE_MEDIA_FD'):
+            self.env.pop(key, None)
 
     def stop_session(self):
         subprocess.run([str(self.exe), "here", "--stop", self.session], stdin=subprocess.DEVNULL,

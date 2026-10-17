@@ -33,6 +33,7 @@ typedef struct HereUI HereUI;
 typedef struct {
     Term t;
     int id, fd, exited, status, unread;
+    int media_tab, media_camera, media_fd, media_visible;
     pid_t pid;
     char cwd[1024], program[64];
     SBuf pending;
@@ -41,7 +42,8 @@ typedef struct {
 typedef struct {
     HereTab tabs[HERE_MAX_TABS];
     int ntabs, active, cols, rows, child_cols, child_rows, dirty;
-    int action, attached, next_id;
+    int action, attached, next_id, host_suspended;
+    int color256;
     int font_request, font_allowed, font_size, font_available, font_active;
     char font_name[128], font_error[256];
     pid_t caf_pid;
@@ -66,8 +68,11 @@ static void here_ui_render(Here *h, SBuf *out);
 static void here_ui_tick(Here *h, uint64_t now);
 static void here_ui_focus(Here *h, int focused);
 static void here_ui_attached(Here *h);
+static int here_ui_media_visible(Here *h, int index);
+static int here_color_index(uint32_t rgb);
 
 #include "hardcore_here_helpers.h"
+#include "hardcore_here_media.h"
 #include "hardcore_here_ui.h"
 #include "hardcore_here_transport.h"
 #endif

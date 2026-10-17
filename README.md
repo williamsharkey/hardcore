@@ -439,6 +439,8 @@ hardcore here --session work --cwd ~/project
 hardcore here -- python3 my_program.py
 hardcore here --list
 hardcore here --attach work
+hardcore here --image ~/Pictures/photo.jpg
+hardcore here --camera
 ```
 
 A background instance of the **same executable** keeps shells, jobs, unsent
@@ -448,6 +450,16 @@ attachment that manages the host terminal's input and restoration. **Ctrl-B D**
 detaches; **Ctrl-B R** reloads the terminal attachment without restarting those programs.
 Reattach with the command printed on exit. **Ctrl-B q**, then **y**, explicitly
 ends all programs in that session; `hardcore here --stop NAME` also ends it.
+The side menu's third row contains **exit** and **detach**, with their keyboard
+shortcuts. Exit asks before stopping the session; Detach returns to the outer
+terminal with the programs still running. From a shell inside that session,
+`hardcore exit` ends it directly and `hardcore detach` detaches its current
+attachment. These commands target the containing `here` session, never every
+Hardcore window or another session. Outside a session, use the explicit
+`hardcore here --stop NAME` command to end a named session.
+Shutdown covers owned shell jobs and discoverable descendants, including children
+that changed process groups or sessions. A fully daemonized process already
+reparented outside that ancestry before shutdown may survive.
 A second attachment is refused unless `--takeover` is explicitly requested.
 Sessions survive frontend exits, not reboots; this does not take over the shell
 that launched `hardcore here` or attach native GUI sessions.
@@ -462,6 +474,7 @@ Press **Ctrl-B**, release it, then a key:
 | `m` | Show/hide the side menu |
 | `v` | Toggle the selected tab's small TV |
 | `F`, `w` | Files / text web reader |
+| `C`, `I` | Camera preview / open an image path |
 | `/`, `j`, `N` | Search scrollback / next / previous match |
 | `u` / `d`, `]` | Scroll history / return to live output |
 | `D`, `R` | Detach / reload frontend |
@@ -479,6 +492,8 @@ there, **Esc** to return input to the main tab, **↗** to expand it, and **−*
 hide it. TV content follows the cursor; it is a cropped view of the same live
 screen, not another shell. TVs use the menu's available space rather than
 native floating/drag-resize placement. Shift-drag uses the host's text selection.
+Image and camera TVs shrink the whole picture into their available space rather
+than cropping it to the cursor.
 
 All 16 native themes are available in configuration. Themes color Hardcore's
 own cells and do not change the host's palette. Fonts remain host-owned. In local
@@ -495,6 +510,25 @@ explicit opening in the system browser. It does not execute JavaScript, share
 browser logins, or render forms and images. Files opens a built-in keyboard file browser in another tab. The menu's **caf** toggle uses macOS `caffeinate -di`
 while this frontend is running.
 
+On macOS, **cam** and **image** open low-resolution character previews using
+ImageIO and AVFoundation built into the same executable. Files also opens local
+images with **Enter**; **q** returns to the directory. The default renderer uses
+eight-dot Braille with two colors per cell. Press **m** in the viewer to cycle
+through Braille, sextants, quadrants and half blocks; the block modes are useful
+when the host font lacks the finer glyphs. This adapts the two-color sampling
+approach from [SL-TUI](https://github.com/williamsharkey/sl-tui/blob/6f0992258bc2d8bc0ad584c9ae54cff183eba281/server/pixel-to-cells.ts).
+Apple Terminal receives 256-color frames; other hosts currently receive truecolor.
+No special image protocol or host palette change is needed.
+
+Camera previews prefer the built-in/front-facing camera, mirror the view and
+request permission on first use. **Space** pauses/resumes, **r** retries, and
+**q** closes the viewer. Capture stops when the camera tab and its TV are hidden,
+when the frontend detaches or suspends, and when the preview is paused. It resumes
+when visible again. This mode captures no microphone audio and does not record;
+the native app's recording/Clips tools remain separate. Rendering is capped at
+ten updates per second with a single pending frame, so a slow terminal cannot
+accumulate a queue of video frames.
+
 Use the usual `make` and `make install`. On macOS these build/install the app
 with both GPU and ANSI backends in its executable. On Linux/WSL they build/install
 `build/hardcore` from the same `hardcore.c`, with the ANSI backend and no graphics
@@ -508,10 +542,10 @@ is not automatically converted; its owner must remain alive until its programs
 are finished. New sessions use private native sockets and the shared C engine.
 
 This frontend still differs from the native app: full browser rendering,
-camera/Clips capture and export, the native music player, floating TV layout,
+camera recording/Clips export, the native music player, floating TV layout,
 GUI session transfers, custom bitmap rendering, and advanced graphics/keyboard
 protocols and host clipboard writes are not implemented here. The Linux backend
-also does not yet include the text web reader or host-font control. Reloading the attachment does not hot-swap
+also does not yet include image/camera sources, the text web reader or host-font control. Reloading the attachment does not hot-swap
 its running session owner: that process retains the engine and UI it started
 with. Native GUI reload/slurp and terminal-hosted sessions remain separate.
 `make here-test` (also `make mac-here-test` on Mac) exercises the compiled
