@@ -65,6 +65,7 @@ static void here_ui_input(Here *h, const char *data, size_t n);
 static void here_ui_render(Here *h, SBuf *out);
 static void here_ui_tick(Here *h, uint64_t now);
 static void here_ui_focus(Here *h, int focused);
+static void here_ui_attached(Here *h);
 
 #include "hardcore_here_helpers.h"
 #include "hardcore_here_ui.h"

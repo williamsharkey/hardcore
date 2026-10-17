@@ -34,6 +34,32 @@ SOURCE = r'''
 #include <unistd.h>
 #include <math.h>
 #include <ctype.h>
+#import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
+/* Replace only the system script executor in this test translation unit.
+   Production helper code has no test flags and no Apple event reaches a tab. */
+static NSArray *fontReplies;
+static NSMutableArray *fontScripts;
+@interface HHHMockScript : NSObject { NSString *source; }
+- (id)initWithSource:(NSString*)value;
+- (NSAppleEventDescriptor*)executeAndReturnError:(NSDictionary**)error;
+@end
+@implementation HHHMockScript
+- (id)initWithSource:(NSString*)value {if((self=[super init]))source=[value copy];return self;}
+- (void)dealloc {[source release];[super dealloc];}
+- (NSAppleEventDescriptor*)executeAndReturnError:(NSDictionary**)error {
+    NSUInteger index=[fontScripts count];[fontScripts addObject:source];
+    if(index>=[fontReplies count]){if(error)*error=@{NSAppleScriptErrorMessage:@"Unexpected extra font operation"};return nil;}
+    NSDictionary *reply=fontReplies[index];
+    if(reply[@"error"]){if(error)*error=@{NSAppleScriptErrorMessage:reply[@"error"]};return nil;}
+    NSAppleEventDescriptor *list=[NSAppleEventDescriptor listDescriptor];
+    [list insertDescriptor:[NSAppleEventDescriptor descriptorWithInt32:72] atIndex:1];
+    [list insertDescriptor:[NSAppleEventDescriptor descriptorWithString:reply[@"name"]] atIndex:2];
+    [list insertDescriptor:[NSAppleEventDescriptor descriptorWithString:[reply[@"size"] stringValue]] atIndex:3];
+    return list;
+}
+@end
+#define NSAppleScript HHHMockScript
 static int cp_width(uint32_t cp) {
     if (cp >= 0x300 && cp <= 0x36f) return 0;
     return cp >= 0x1100 ? 2 : 1;
@@ -70,6 +96,37 @@ int main(int argc, char **argv) {
             HCHereHostFont font;hc_here_host_font_init(&font);
             if(hc_here_host_font_apply(&font,"Monaco",15,0)||font.active)return 2;
             if(!hc_here_host_font_restore(&font))return 3;puts(font.error);return 0;
+        }
+        if(argc>2 && !strcmp(argv[1],"font-transaction")) {
+            HCHereHostFont font={0};font.available=1;snprintf(font.tty,sizeof(font.tty),"/dev/ttysowned");
+            fontScripts=[NSMutableArray array];
+            NSDictionary *before=@{@"name":@"Menlo-Regular",@"size":@11.5};
+            NSDictionary *after=@{@"name":@"Monaco",@"size":@15};
+            NSDictionary *failure=@{@"error":@"Owned fixture denied request"};
+            if(!strcmp(argv[2],"normal")) {
+                fontReplies=@[before,after,before];
+                if(!hc_here_host_font_apply(&font,"Monaco",15,1)||!font.active||font.original_size!=11.5)return 10;
+                if(!hc_here_host_font_restore(&font)||font.active)return 11;
+            }else if(!strcmp(argv[2],"apply-failed")) {
+                fontReplies=@[before,failure,before];
+                if(hc_here_host_font_apply(&font,"Monaco",15,1)||font.active)return 12;
+            }else if(!strcmp(argv[2],"restore-retry")) {
+                fontReplies=@[before,after,failure,before];
+                if(!hc_here_host_font_apply(&font,"Monaco",15,1))return 13;
+                if(hc_here_host_font_restore(&font)||!font.active||strcmp(font.original_name,"Menlo-Regular")||font.original_size!=11.5)return 14;
+                if(!hc_here_host_font_restore(&font)||font.active)return 15;
+            }else if(!strcmp(argv[2],"mismatch")) {
+                fontReplies=@[before,@{@"name":@"Unexpected",@"size":@15},before];
+                if(hc_here_host_font_apply(&font,"Monaco",15,1)||font.active)return 16;
+            }else if(!strcmp(argv[2],"read-failed")) {
+                fontReplies=@[failure];
+                if(hc_here_host_font_apply(&font,"Monaco",15,1)||font.active)return 17;
+            }else if(!strcmp(argv[2],"not-allowed")) {
+                fontReplies=@[];
+                if(hc_here_host_font_apply(&font,"Monaco",15,0)||font.active)return 18;
+            }else return 19;
+            NSData *out=[NSJSONSerialization dataWithJSONObject:fontScripts options:0 error:NULL];
+            fwrite(out.bytes,1,out.length,stdout);return 0;
         }
     }
     return 2;
@@ -219,6 +276,43 @@ class NativeHelpers(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn(b'Enable Allow host font changes first', result.stdout)
 
+    def test_font_transaction_snapshot_apply_restore_order(self):
+        result = self.run_helper('font-transaction', 'normal')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scripts = json.loads(result.stdout)
+        self.assertEqual(len(scripts), 3)
+        self.assertNotIn('set font name', scripts[0])
+        self.assertIn('set font name of pickedTab to "Monaco"', scripts[1])
+        self.assertIn('set font name of pickedTab to "Menlo-Regular"', scripts[2])
+        self.assertIn('set font size of pickedTab to 11.5', scripts[2])
+        self.assertIn('pickedWindow is not 72', scripts[1])
+        self.assertNotIn('current settings', ''.join(scripts))
+
+    def test_font_failed_write_and_verification_both_roll_back(self):
+        for scenario in ('apply-failed', 'mismatch'):
+            result = self.run_helper('font-transaction', scenario)
+            self.assertEqual(result.returncode, 0, (scenario, result.stderr))
+            scripts = json.loads(result.stdout)
+            self.assertEqual(len(scripts), 3)
+            self.assertIn('set font size of pickedTab to 11.5', scripts[-1])
+
+    def test_font_failed_restore_retains_snapshot_for_retry(self):
+        result = self.run_helper('font-transaction', 'restore-retry')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scripts = json.loads(result.stdout)
+        self.assertEqual(len(scripts), 4)
+        self.assertEqual(scripts[2], scripts[3])
+
+    def test_font_read_failure_and_missing_opt_in_never_write(self):
+        result = self.run_helper('font-transaction', 'read-failed')
+        self.assertEqual(result.returncode, 0)
+        scripts = json.loads(result.stdout)
+        self.assertEqual(len(scripts), 1)
+        self.assertNotIn('set font name', scripts[0])
+        result = self.run_helper('font-transaction', 'not-allowed')
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), [])
+
     def test_files_native_preview_and_restore(self):
         (self.path / 'sample.txt').write_text('NATIVE FILE CONTENT café\n')
         p = self.owned('files', str(self.path))
@@ -227,6 +321,12 @@ class NativeHelpers(unittest.TestCase):
         p.read_until('NATIVE FILE CONTENT')
         p.send(b'q')
         p.read_until('Hardcore files')
+
+    def test_filename_controls_are_visible_text_not_terminal_commands(self):
+        (self.path / '\x1b]2;REMOTE TITLE\x07.txt').write_text('safe')
+        p = self.owned('files', str(self.path))
+        p.read_until('REMOTE TITLE')
+        self.assertNotIn(b'\x1b]2;REMOTE TITLE', p.output)
 
     def test_bracketed_paste_cannot_execute_helper_shortcuts(self):
         p = self.owned('files', str(self.path))
@@ -270,6 +370,49 @@ class NativeHelpers(unittest.TestCase):
             if select.select([p.master], [], [], .05)[0]:
                 p.output.extend(os.read(p.master, 65536))
         self.assertEqual(p.process.poll(), 0)
+
+    def test_native_web_download_redirect_bounds_and_live_cancellation(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/large':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html')
+                    self.send_header('Content-Length', str(2 * 1024 * 1024 + 1))
+                    self.end_headers()
+                elif self.path == '/loop':
+                    self.send_response(302)
+                    self.send_header('Location', '/loop')
+                    self.end_headers()
+                else:
+                    time.sleep(.7)
+                    try:
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html')
+                        self.end_headers()
+                        self.wfile.write(b'LATE RESPONSE')
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f'http://127.0.0.1:{server.server_port}'
+        large = self.owned('web', base + '/large')
+        large.read_until('2 MiB limit')
+        large.send(b'q')
+        redirect = self.owned('web', base + '/loop')
+        redirect.read_until('excessive redirects')
+        redirect.send(b'q')
+        pending = self.owned('web', base + '/pending')
+        pending.read_until('Loading page')
+        started = time.monotonic()
+        pending.send(b'q')
+        while pending.process.poll() is None and time.monotonic() - started < .5:
+            if select.select([pending.master], [], [], .02)[0]:
+                pending.output.extend(os.read(pending.master, 65536))
+        self.assertEqual(pending.process.poll(), 0, 'quit must not wait for a network response')
 
 
 if __name__ == '__main__':

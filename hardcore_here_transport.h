@@ -212,6 +212,9 @@ static void here_resize_tabs(Here *h,int cols,int rows) {
  * catches background shell jobs without touching the invoking terminal. */
 static int here_owned_groups(HereTab *t,pid_t *groups,int cap) {
     int n=0;if(t->pid<=0)return 0;
+    /* A reaped leader cannot come back. If this PID now exists, it has been
+     * reused; never confuse its new session with our departed child. */
+    if(t->exited&&(kill(t->pid,0)==0||errno==EPERM))return 0;
     if(!t->exited&&getsid(t->pid)==t->pid)groups[n++]=t->pid;
 #ifdef __APPLE__
     int bytes=proc_listallpids(NULL,0);if(bytes>0&&bytes<1000000) {
@@ -284,7 +287,7 @@ static int here_owner_request(Here *h,HerePeer *peers,int at,int type,const char
         if(h->attached&&!takeover){const char *msg="Session already attached; use --takeover to replace its attachment";here_frame(&peer->out,HW_ERROR,msg,strlen(msg));peer->closing=1;return 1;}
         for(int i=0;i<HERE_PEERS;i++)if(i!=at&&peers[i].controller){here_frame(&peers[i].out,HW_LEAVE,"takeover",8);peers[i].controller=0;peers[i].closing=1;}
         peer->controller=1;h->attached=1;h->action=0;
-        here_ui_resize(h,cols,rows);here_ui_focus(h,1);h->dirty=1;
+        here_ui_attached(h);here_ui_resize(h,cols,rows);here_ui_focus(h,1);h->dirty=1;
         here_frame(&peer->out,HW_OK,"",0);return 1;
     }
     if(!peer->controller)return 0;
@@ -335,11 +338,12 @@ static void here_owner_loop(Here *h,int listener,const char *path,int lockfd) {
             for(int i=0;i<h->ntabs;i++)if(h->tabs[i].pid==reaped){HereTab *t=&h->tabs[i];t->exited=1;t->status=WIFEXITED(child_status)?WEXITSTATUS(child_status):WIFSIGNALED(child_status)?128+WTERMSIG(child_status):0;h->dirty=1;}
         }
         uint64_t now=here_now_ms();here_ui_tick(h,now);
-        if(now-program_at>=500){for(int i=0;i<h->ntabs;i++)here_program(&h->tabs[i]);program_at=now;}
+        if(now-program_at>=500){for(int i=0;i<h->ntabs;i++){char before[64];memcpy(before,h->tabs[i].program,sizeof(before));here_program(&h->tabs[i]);if(strcmp(before,h->tabs[i].program))h->dirty=1;}program_at=now;}
         if(h->font_request&&h->attached){for(int i=0;i<HERE_PEERS;i++)if(peers[i].controller&&!peers[i].closing){unsigned char request[136]={0};uint32_t values[2]={htonl((uint32_t)h->font_allowed),htonl((uint32_t)h->font_size)};memcpy(request,values,8);memcpy(request+8,h->font_name,strlen(h->font_name));here_frame(&peers[i].out,HW_FONT,request,sizeof(request));h->font_request=0;break;}}
         if(h->action==HERE_DETACH||h->action==HERE_RELOAD){for(int i=0;i<HERE_PEERS;i++)if(peers[i].controller){uint32_t action=htonl((uint32_t)h->action);here_frame(&peers[i].out,HW_LEAVE,&action,sizeof(action));peers[i].closing=1;peers[i].controller=0;}h->attached=0;here_ui_focus(h,0);here_caf(h,0);h->action=0;}
         if(h->dirty&&h->attached&&now-render_at>=16) {
             for(int i=0;i<HERE_PEERS;i++)if(peers[i].controller&&!peers[i].closing&&peers[i].out.n-peers[i].off<65536) {
+                if(peers[i].off){here_consume(&peers[i].out,peers[i].off);peers[i].off=0;}
                 SBuf out={0};here_ui_render(h,&out);
                 if(out.n&&!here_frame(&peers[i].out,HW_OUTPUT,out.p,out.n))here_peer_drop(h,&peers[i]);
                 free(out.p);h->dirty=0;render_at=now;break;
@@ -423,6 +427,9 @@ static void here_font_worker_reply(HereFontWorker *w,SBuf *out,int initial) {
 static void here_font_worker_stop(HereFontWorker *w) {
     pthread_mutex_lock(&w->mutex);w->quit=1;w->pending=0;pthread_cond_signal(&w->cond);pthread_mutex_unlock(&w->mutex);
     if(w->started)pthread_join(w->thread,NULL);
+#ifdef __APPLE__
+    else if(w->font.active){if(!hc_here_host_font_restore(&w->font))hc_here_host_font_restore(&w->font);w->active=w->font.active;snprintf(w->error,sizeof(w->error),"%s",w->font.error);}
+#endif
     pthread_cond_destroy(&w->cond);pthread_mutex_destroy(&w->mutex);
 }
 static int here_attach(Here *h,const char *path,int takeover) {
@@ -453,7 +460,9 @@ static int here_attach(Here *h,const char *path,int takeover) {
 #ifdef __APPLE__
             if(retained.active){font.font=retained;font.active=1;}
 #endif
-            here_send_all(1,here_host_leave,sizeof(here_host_leave)-1,300);tcsetattr(0,TCSANOW,&saved);char focus=0;here_frame(&outgoing,HW_FOCUS,&focus,1);here_send_all(fd,outgoing.p+outoff,outgoing.n-outoff,200);outgoing.n=outoff=0;kill(getpid(),SIGSTOP);here_signal_continue=1;}
+            here_send_all(1,here_host_leave,sizeof(here_host_leave)-1,300);tcsetattr(0,TCSANOW,&saved);char focus=0;here_frame(&outgoing,HW_FOCUS,&focus,1);uint64_t flush_end=here_now_ms()+200;
+            while(outoff<outgoing.n&&here_now_ms()<flush_end){ssize_t n=write(fd,outgoing.p+outoff,outgoing.n-outoff);if(n>0){outoff+=(size_t)n;continue;}if(n<0&&errno==EINTR)continue;if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)){struct pollfd wait={fd,POLLOUT,0};poll(&wait,1,10);continue;}break;}
+            if(outoff==outgoing.n)outgoing.n=outoff=0;kill(getpid(),SIGSTOP);here_signal_continue=1;}
         if(here_signal_continue){here_signal_continue=0;if(resume_font_valid)here_font_worker_request(&font,(const char*)resume_font,sizeof(resume_font));tcsetattr(0,TCSANOW,&raw);here_send_all(1,here_host_enter,sizeof(here_host_enter)-1,300);char focus=1;here_frame(&outgoing,HW_FOCUS,&focus,1);here_signal_resize=1;}
         here_font_worker_reply(&font,&outgoing,0);
         if(here_signal_resize){here_signal_resize=0;here_host_size(&h->cols,&h->rows);uint32_t size[2]={htonl((uint32_t)h->cols),htonl((uint32_t)h->rows)};here_frame(&outgoing,HW_SIZE,size,sizeof(size));}

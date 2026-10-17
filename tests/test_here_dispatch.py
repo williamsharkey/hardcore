@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Exercise packaged macOS `hardcore here` dispatch in owned terminals only.
+"""Exercise native `hardcore here` dispatch in owned terminals only.
 
-The fixture copies the built executable and its bundled helper into a path
+The fixture copies only the built executable into a path
 containing spaces. Raw child probes report arguments, terminal size and input
 independently of the frontend. No real application window or user PTY is used.
 """
@@ -25,7 +25,6 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BUNDLE = ROOT / "hardcore.app" / "Contents"
 EXE = ROOT / "build" / "hardcore"
 
 PROBE = r'''
@@ -132,7 +131,7 @@ class OwnedTerminal:
         os.close(self.master);os.close(self.slave)
 
 
-@unittest.skipUnless(os.name == "posix" and EXE.is_file(), "built macOS app required")
+@unittest.skipUnless(os.name == "posix" and EXE.is_file(), "built POSIX executable required")
 class HereDispatch(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="hc here dispatch ",dir="/tmp")

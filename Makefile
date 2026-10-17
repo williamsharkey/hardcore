@@ -2,10 +2,13 @@
 # and for macOS with the Xcode command line tools.
 #
 # Windows (cross-builds also need LINUX_CC targeting x86-64 Linux with static libc):
-#   make hardcore.exe → hardcore.exe          (the default everywhere but macOS)
+#   make hardcore.exe → hardcore.exe          (explicit Windows cross-build)
 #   make test         → unit tests + xterm.js fixtures + ConPTY/WSL and slurp tests
 #   make bench/termbench.exe → the measuring tool (see bench/RESULTS.md)
 #   make install      → copy to %LOCALAPPDATA%\hardcore\ and add Start menu + desktop shortcuts
+#
+# Linux/WSL: make builds the same engine as a native ANSI executable.
+#           make install installs it as ~/.local/bin/hardcore.
 #
 # macOS:
 #   make              → hardcore.app (and build/hardcore, the bare binary)
@@ -158,7 +161,7 @@ build/browser.inc: tools/embed_browser.py browser/project.js browser/welcome.htm
 
 ifeq ($(UNAME),Linux)
 build/hardcore: hardcore.c $(HERE_HEADERS) build/font.bin build/fonts.bin build/fonts.inc build/width.inc
-	$(LINUX_CC) -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c -lutil
+	$(LINUX_CC) -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c -lutil -pthread
 else
 build/hardcore: hardcore_mac_launch.h $(HERE_HEADERS)
 

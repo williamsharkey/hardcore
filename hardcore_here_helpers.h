@@ -102,6 +102,7 @@ static int hhh_printable(uint32_t c) {
 }
 static void hhh_line(int row, int cols, const char *style, const char *text) {
     printf("\033[%d;1H%s", row, style);
+    if(!text)text="";
     size_t n = strlen(text), p = 0; int x = 0;
     while (p < n) {
         size_t z; uint32_t c = hhh_cp(text + p, n - p, &z); p += z;
@@ -361,7 +362,7 @@ static void here_settings_load(HereSettings *s) {
         id obj=[NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:buf length:total] options:0 error:NULL];
         if(![obj isKindOfClass:[NSDictionary class]])return;
         id theme=obj[@"theme"],name=obj[@"font_name"],size=obj[@"font_size"],allow=obj[@"allow_host_font"];
-        if([theme isKindOfClass:[NSString class]]&&[theme length]==1&&strchr("hdmngsockrGSOCKR",[theme characterAtIndex:0]))s->theme=(char)[theme characterAtIndex:0];
+        if([theme isKindOfClass:[NSString class]]&&[theme length]==1&&[theme characterAtIndex:0]>0&&[theme characterAtIndex:0]<128&&strchr("hdmngsockrGSOCKR",[theme characterAtIndex:0]))s->theme=(char)[theme characterAtIndex:0];
         if([name isKindOfClass:[NSString class]]&&[name length]&&[name lengthOfBytesUsingEncoding:NSUTF8StringEncoding]<sizeof(s->font_name)) {
             BOOL valid=YES;for(NSUInteger i=0;i<[name length];++i){unichar c=[name characterAtIndex:i];if(c<32||c==127)valid=NO;}
             if(valid)snprintf(s->font_name,sizeof(s->font_name),"%s",[name UTF8String]);
@@ -390,12 +391,15 @@ static int here_settings_save(const HereSettings *s) {
 }
 static NSString *hhh_safe(NSString *s) {
     if(!s) return @"";
-    NSMutableString *result=[NSMutableString string];
     NSUInteger limit=MIN([s length],(NSUInteger)HHH_TEXT_MAX);
+    if(limit && CFStringIsSurrogateHighCharacter([s characterAtIndex:limit-1]))--limit;
+    unichar *buffer=malloc(MAX(limit,(NSUInteger)1)*sizeof(*buffer));if(!buffer)return @"";
+    NSUInteger length=0;
     for(NSUInteger i=0;i<limit;++i) {
         unichar c=[s characterAtIndex:i];
-        if(c=='\n'||c=='\t'||hhh_printable(c)) [result appendFormat:@"%C",c];
+        if(c=='\n'||c=='\t'||hhh_printable(c))buffer[length++]=c;
     }
+    NSString *result=[NSString stringWithCharacters:buffer length:length];free(buffer);
     return result;
 }
 static NSString *hhh_url(NSString *value,NSString *base) {
@@ -462,8 +466,14 @@ static NSDictionary *hhh_attributes(NSString *tag) {
 }
 static void hhh_append(NSMutableString *text,NSString *value) {
     NSUInteger room=HHH_TEXT_MAX-[text length];
-    if([value length]>room)value=[value substringToIndex:room];
+    if([value length]>room) {
+        if(room && CFStringIsSurrogateHighCharacter([value characterAtIndex:room-1]))--room;
+        value=[value substringToIndex:room];
+    }
     [text appendString:value];
+}
+static void hhh_string_set(NSString **target,NSString *value) {
+    [value retain];[*target release];*target=value;
 }
 static NSDictionary *hhh_html(NSString *html,NSString *url,int plain) {
     if(plain)return @{@"url":url,@"title":[[NSURL URLWithString:url] host]?:@"Web",@"text":hhh_safe(html),@"links":@[]};
@@ -535,7 +545,8 @@ static NSDictionary *hhh_html(NSString *html,NSString *url,int plain) {
         }
     }
     if([text length]>=HHH_TEXT_MAX)[text appendString:@"\n[Page truncated at text limit]"];
-    NSString *heading=[title stringByTrimmingCharactersInSet:ws];if([heading length]>200)heading=[heading substringToIndex:200];
+    NSString *heading=[title stringByTrimmingCharactersInSet:ws];
+    if([heading length]>200){NSUInteger end=200;if(CFStringIsSurrogateHighCharacter([heading characterAtIndex:end-1]))--end;heading=[heading substringToIndex:end];}
     return @{@"url":url,@"title":[heading length]?heading:([[NSURL URLWithString:url] host]?:@"Web"),@"text":[text stringByTrimmingCharactersInSet:ws],@"links":links};
 }
 
@@ -572,6 +583,7 @@ static NSDictionary *hhh_html(NSString *html,NSString *url,int plain) {
 }
 - (void)URLSession:(NSURLSession*)s dataTask:(NSURLSessionDataTask*)t didReceiveResponse:(NSURLResponse*)response completionHandler:(void (^)(NSURLSessionResponseDisposition))completion {
     @synchronized(self) {
+        if(error){done=YES;completion(NSURLSessionResponseCancel);return;}
         NSInteger status=[response isKindOfClass:[NSHTTPURLResponse class]]?[(NSHTTPURLResponse*)response statusCode]:0;
         NSString *type=[[response MIMEType] lowercaseString];
         if(status<200||status>=300)error=[[NSString stringWithFormat:@"HTTP %ld",(long)status] copy];
@@ -597,36 +609,38 @@ static NSDictionary *hhh_html(NSString *html,NSString *url,int plain) {
 
 static int hc_here_web_main(int argc,char **argv) {
     @autoreleasepool {
-        NSString *url=hhh_url(argc>1?[NSString stringWithUTF8String:argv[1]]:@"https://www.wikipedia.org/",nil);
+        NSString *url=[hhh_url(argc>1?[NSString stringWithUTF8String:argv[1]]:@"https://www.wikipedia.org/",nil) retain];
         if(!url){fputs("Web: enter an HTTP or HTTPS URL without embedded credentials.\n",stderr);return 2;}
-        HHHTerm t;if(!hhh_start(&t))return 2;
-        NSMutableArray *history=[NSMutableArray array];NSDictionary *page=nil;HCHereFetch *fetch=nil;
-        NSString *message=@"Loading page…";NSMutableString *input=[NSMutableString string];
+        HHHTerm t;if(!hhh_start(&t)){[url release];return 2;}
+        NSMutableArray *history=[[NSMutableArray alloc] init];NSDictionary *page=nil;HCHereFetch *fetch=nil;
+        NSString *message=[@"Loading page…" retain];NSMutableString *input=[[NSMutableString alloc] init];
         HHHLines lines={0};int offset=0,oldcols=0,dirty=1,prompt=0,navigate=1;
         while(!hhh_stop) {
+          @autoreleasepool {
             if(navigate) {
                 if(fetch){[fetch cancel];[fetch release];fetch=nil;}
-                url=[[url copy] autorelease];
                 [page release];page=nil;hhh_lines_free(&lines);offset=0;
-                fetch=[[HCHereFetch alloc] initWithURL:url];message=@"Loading page…";navigate=0;dirty=1;
+                fetch=[[HCHereFetch alloc] initWithURL:url];hhh_string_set(&message,@"Loading page…");navigate=0;dirty=1;
             }
             if(fetch) {
+                BOOL completed=NO;
                 @synchronized(fetch) {
                     if(!fetch->done && CFAbsoluteTimeGetCurrent()-fetch->started>=15) {fetch->error=[@"Page request timed out" copy];fetch->done=YES;[fetch cancel];}
                     if(fetch->done) {
-                        if(fetch->error)message=[[fetch->error copy] autorelease];
+                        completed=YES;
+                        if(fetch->error)hhh_string_set(&message,fetch->error);
                         else {
                             NSStringEncoding enc=NSUTF8StringEncoding;
                             if(fetch->encoding) {CFStringEncoding cf=CFStringConvertIANACharSetNameToEncoding((CFStringRef)fetch->encoding);if(cf!=kCFStringEncodingInvalidId)enc=CFStringConvertEncodingToNSStringEncoding(cf);}
                             NSString *html=[[[NSString alloc] initWithData:fetch->body encoding:enc] autorelease];
                             if(!html)html=[[[NSString alloc] initWithData:fetch->body encoding:NSISOLatin1StringEncoding] autorelease];
-                            page=[hhh_html(html?:@"",fetch->url,[fetch->mime isEqual:@"text/plain"]) retain];url=page[@"url"];
-                            message=[NSString stringWithFormat:@"%lu links · text view; JavaScript and forms are not supported",(unsigned long)[page[@"links"] count]];oldcols=0;
+                            page=[hhh_html(html?:@"",fetch->url,[fetch->mime isEqual:@"text/plain"]) retain];hhh_string_set(&url,page[@"url"]);
+                            hhh_string_set(&message,[NSString stringWithFormat:@"%lu links · text view; JavaScript and forms are not supported",(unsigned long)[page[@"links"] count]]);oldcols=0;
                         }
                         dirty=1;
                     }
                 }
-                if(fetch->done){[fetch cancel];[fetch release];fetch=nil;}
+                if(completed){[fetch cancel];[fetch release];fetch=nil;}
             }
             hhh_size(&t);int bodyrows=t.rows-4;
             if(oldcols!=t.cols){hhh_wrap(&lines,[page[@"text"] UTF8String]?:"",t.cols);oldcols=t.cols;dirty=1;}
@@ -651,8 +665,8 @@ static int hc_here_web_main(int argc,char **argv) {
                     else {NSInteger number=[input integerValue];if(number>0&&number<=(NSInteger)[page[@"links"] count])target=page[@"links"][number-1];}
                     if(target) {
                         if(page){[history addObject:@{@"page":page,@"offset":@(offset)}];if([history count]>32)[history removeObjectAtIndex:0];}
-                        url=[[target copy] autorelease];navigate=1;
-                    }else message=prompt==1?@"Enter a valid HTTP(S) URL":@"Enter a link number from this page";
+                        hhh_string_set(&url,target);navigate=1;
+                    }else hhh_string_set(&message,prompt==1?@"Enter a valid HTTP(S) URL":@"Enter a link number from this page");
                     prompt=0;[input setString:@""];
                 }else if(k<0x110000&&hhh_printable(k)&&[input length]<HHH_URL_MAX) {
                     char u[5]={0};utf8_encode(k,u);[input appendString:[NSString stringWithUTF8String:u]?:@""];
@@ -669,13 +683,14 @@ static int hc_here_web_main(int argc,char **argv) {
             if(k=='u'){prompt=1;[input setString:@""];}
             if(k>='0'&&k<='9'){prompt=2;[input setString:[NSString stringWithFormat:@"%c",k]];}
             if(k=='r')navigate=1;
-            if(k=='o')message=hhh_open_external([url UTF8String])?@"Opened in system browser":@"Could not open system browser";
+            if(k=='o')hhh_string_set(&message,hhh_open_external([url UTF8String])?@"Opened in system browser":@"Could not open system browser");
             if(k=='b'&&[history count]) {
                 if(fetch){[fetch cancel];[fetch release];fetch=nil;}
-                NSDictionary *last=[history lastObject];[page release];page=[last[@"page"] retain];offset=[last[@"offset"] intValue];url=page[@"url"];[history removeLastObject];oldcols=0;message=@"Previous page";
+                NSDictionary *last=[history lastObject];[page release];page=[last[@"page"] retain];offset=[last[@"offset"] intValue];hhh_string_set(&url,page[@"url"]);[history removeLastObject];oldcols=0;hhh_string_set(&message,@"Previous page");
             }
+          }
         }
-        if(fetch){[fetch cancel];[fetch release];} [page release];hhh_lines_free(&lines);hhh_finish(&t);return 0;
+        if(fetch){[fetch cancel];[fetch release];} [page release];[url release];[message release];[history release];[input release];hhh_lines_free(&lines);hhh_finish(&t);return 0;
     }
 }
 
@@ -705,7 +720,7 @@ static int hhh_font_call(HCHereHostFont *font,const char *name,double size,int s
         NSAppleScript *script=[[[NSAppleScript alloc] initWithSource:source] autorelease];NSDictionary *error=nil;
         NSAppleEventDescriptor *result=[script executeAndReturnError:&error];
         NSString *actual=[[result descriptorAtIndex:2] stringValue];double actualsize=[[[result descriptorAtIndex:3] stringValue] doubleValue];long actualwindow=[[result descriptorAtIndex:1] int32Value];
-        if(!result||result.numberOfItems!=3||![actual length]||[actual length]>200||!isfinite(actualsize)||actualsize<1||actualsize>200||actualwindow<=0) {
+        if(!result||result.numberOfItems!=3||![actual length]||[actual lengthOfBytesUsingEncoding:NSUTF8StringEncoding]>=256||!isfinite(actualsize)||actualsize<1||actualsize>200||actualwindow<=0) {
             NSString *message=hhh_safe(error[NSAppleScriptErrorMessage]?:@"Terminal did not provide a restorable font state");
             snprintf(font->error,sizeof(font->error),"%s",[message UTF8String]);return 0;
         }
@@ -722,6 +737,7 @@ static int hc_here_host_font_restore(HCHereHostFont *font) {
 static int hc_here_host_font_apply(HCHereHostFont *font,const char *name,double size,int allowed) {
     if(!allowed){snprintf(font->error,sizeof(font->error),"Enable Allow host font changes first");return 0;}
     if(!name||!*name||strlen(name)>200||!isfinite(size)||size<6||size>48){snprintf(font->error,sizeof(font->error),"Choose a valid font name and size from 6 to 48");return 0;}
+    @autoreleasepool {if(![NSString stringWithUTF8String:name]){snprintf(font->error,sizeof(font->error),"Font name must be valid UTF-8");return 0;}}
     for(const unsigned char *p=(const unsigned char*)name;*p;++p)if(*p<32||*p==127){snprintf(font->error,sizeof(font->error),"Font name contains control characters");return 0;}
     if(!font->active) {
         if(!hhh_font_call(font,NULL,0,0,font->original_name,&font->original_size,&font->window_id))return 0;

@@ -20,7 +20,7 @@ struct HereUI {
     uint32_t search_cp[512];
     int search_count;
     char input[4096]; size_t input_n;
-    int paste, paste_wrapped;
+    int paste, paste_wrapped, paste_id;
     uint64_t input_at;
     HereHit hits[256], pressed;
     int nhits, have_pressed;
@@ -292,7 +292,7 @@ static void hu_send(Here *h, const char *data, size_t n) {
         int action = u->confirm, id = u->confirm_id; u->confirm = 0;
         if (data[0] == 'y' || data[0] == 'Y') {
             if (action == 2) h->action = HERE_STOP;
-            else { int i = hu_index(h, id); if (i >= 0) here_close(h, i); }
+            else { int i = hu_index(h, id); if (i >= 0) here_close(h, i); u->force = 1; }
         }
         h->dirty = 1; return;
     }
@@ -338,6 +338,16 @@ static void hu_send(Here *h, const char *data, size_t n) {
     }
     t->had_activity = 1;
     if (!here_write(h, i, data, n)) snprintf(u->message, sizeof(u->message), "Input queue is full; wait for the program to read input");
+    h->dirty = 1;
+}
+static void hu_paste_send(Here *h, const char *data, size_t n) {
+    HereUI *u = h->ui;
+    if (!u->paste_id) { hu_send(h, data, n); return; }
+    int i = hu_index(h, u->paste_id);
+    if (i >= 0) {
+        h->tabs[i].t.had_activity = 1;
+        if (!here_write(h, i, data, n)) here_ui_message(h, "Input queue is full; wait for the program to read input");
+    }
     h->dirty = 1;
 }
 static HereHit hu_hit_at(HereUI *u, int x, int y) {
@@ -406,13 +416,13 @@ static void hu_decode(Here *h) {
             static const char end[] = "\x1b[201~";
             size_t take = 0;
             while (take < n && p[take] != 27) take++;
-            if (take) { hu_send(h, p, take); at += take; continue; }
+            if (take) { hu_paste_send(h, p, take); at += take; continue; }
             if (n < sizeof(end) - 1 && !memcmp(p, end, n)) break;
             if (n >= sizeof(end) - 1 && !memcmp(p, end, sizeof(end) - 1)) {
-                if (u->paste_wrapped) hu_send(h, end, sizeof(end) - 1);
-                u->paste = 0; u->paste_wrapped = 0; at += sizeof(end) - 1; continue;
+                if (u->paste_wrapped) hu_paste_send(h, end, sizeof(end) - 1);
+                u->paste = 0; u->paste_wrapped = u->paste_id = 0; at += sizeof(end) - 1; continue;
             }
-            hu_send(h, p, 1); at++; continue;
+            hu_paste_send(h, p, 1); at++; continue;
         }
         if (u->prefix) { u->prefix = 0; if ((unsigned char)*p == 2) hu_send(h, p, 1); else hu_control(h, (unsigned char)*p); at++; continue; }
         if ((unsigned char)*p == 2) { u->prefix = 1; at++; h->dirty = 1; continue; }
@@ -422,8 +432,9 @@ static void hu_decode(Here *h) {
             if (n < sizeof(begin) - 1 && !memcmp(p, begin, n)) break;
             if (n >= sizeof(begin) - 1 && !memcmp(p, begin, sizeof(begin) - 1)) {
                 int i = hu_input(h); u->paste = 1;
-                u->paste_wrapped = i >= 0 && !u->prompt && !u->overlay && h->tabs[i].t.m_bracketed;
-                if (u->paste_wrapped) hu_send(h, begin, sizeof(begin) - 1);
+                u->paste_id = i >= 0 && !u->prompt && !u->overlay && !u->confirm ? h->tabs[i].id : 0;
+                u->paste_wrapped = u->paste_id && h->tabs[i].t.m_bracketed;
+                if (u->paste_wrapped) hu_paste_send(h, begin, sizeof(begin) - 1);
                 at += sizeof(begin) - 1; continue;
             }
             if (p[1] == '[') {
@@ -445,7 +456,7 @@ static void hu_decode(Here *h) {
             hu_send(h, p, used); at += used; continue;
         }
         size_t take = 1;
-        while (take < n && p[take] != 2 && p[take] != 27) take++;
+        if (!u->overlay) while (take < n && p[take] != 2 && p[take] != 27) take++;
         hu_send(h, p, take); at += take;
     }
     if (at) { memmove(u->input, u->input + at, u->input_n - at); u->input_n -= at; }
@@ -465,6 +476,7 @@ static void here_ui_tick(Here *h, uint64_t now) {
     HereUI *u = h->ui; if (!u) return;
     if (u->input_n && !u->paste && now - u->input_at >= 45) { hu_send(h, u->input, u->input_n); u->input_n = 0; }
     if (u->search_left) {
+        h->dirty = 1; /* Continue bounded search work on the next render tick. */
         int i = hu_current(h);
         if (i < 0) { u->search_left = 0; return; }
         Term *t = &h->tabs[i].t; int total = t->hcount + t->rows;
@@ -481,6 +493,16 @@ static void here_ui_tick(Here *h, uint64_t now) {
             if (!u->search_left) { snprintf(u->message, sizeof(u->message), "No matches"); h->dirty = 1; }
         }
     }
+}
+static void here_ui_attached(Here *h) {
+    HereUI *u = h->ui; if (!u) return;
+    if (u->paste_wrapped) { int i = hu_index(h, u->paste_id); if (i >= 0) here_write(h, i, "\x1b[201~", 6); }
+    u->input_n = 0; u->prefix = 0; u->paste = u->paste_wrapped = u->paste_id = 0;
+    u->preview = u->tv_focus = u->have_pressed = u->confirm = 0;
+    u->force = 1; h->dirty = 1;
+    /* The saved checkbox is explicit consent; each client owns its own font
+     * snapshot and restores that exact host tab before it disconnects. */
+    if (u->hostfont) here_font(h, u->font_name, u->font_size, 1);
 }
 static void here_ui_init(Here *h) {
     h->ui = (HereUI *)calloc(1, sizeof(HereUI));
@@ -587,10 +609,13 @@ static void hu_compose(Here *h) {
     if (u->tv_focus) snprintf(status, sizeof(status), "Typing in TV · Esc returns to main tab · ↗ expands");
     if (u->visible_tvs < u->ntvs) snprintf(status, sizeof(status), "TV kept open; enlarge terminal or hide another TV to view");
     if (cur >= 0 && h->tabs[cur].exited) snprintf(status, sizeof(status), "Program exited (%d); ^B c new / x close / D detach", h->tabs[cur].status);
-    if (u->menu_width || u->message[0] || u->prefix || u->preview || u->visible_tvs < u->ntvs || (cur >= 0 && h->tabs[cur].exited))
+    if (u->menu_width || u->message[0] || u->prefix || u->preview || u->visible_tvs < u->ntvs || (cur >= 0 && h->tabs[cur].exited)) {
+        if (!u->menu_width) u->nhits = 0;
         hu_put(h, 0, h->child_rows, status, h->cols, 2, 0, 0);
+    }
+    if (u->overlay) u->nhits = 0; /* Covered chrome must not stay clickable. */
     if (u->overlay == 2) {
-        const char *lines[] = {"Ctrl-B then:", "c new tab     n/p next/previous    1–9 select", "s config      m menu on/off       v mini TV", "F files       w text web          / search", "j next match  N previous match    u/d history", "] live        D detach           R reload UI", "x close tab   q end session       ? help", "Click a tab to select; hover only previews.", "Click TV content to type; Esc returns; ↗ expands.", "Closing the host keeps your session available.", "Shift-drag uses host selection; Esc closes help."};
+        const char *lines[] = {"Ctrl-B then:", "c new tab     n/p next/previous    1–9 select", "s config      m menu on/off       v mini TV", "F files       w text web          / search", "j next match  N previous match    u/d history", "] live        D detach           R reconnect", "x close tab   q end session       ? help", "Click a tab to select; hover only previews.", "Click TV content to type; Esc returns; ↗ expands.", "Closing the host keeps your session available.", "Shift-drag uses host selection; Esc closes help."};
         int ht = hu_min((int)(sizeof(lines) / sizeof(lines[0])) + 2, h->child_rows), w = hu_min(72, h->cols);
         int x = (h->cols - w) / 2, y = hu_max(0, (h->child_rows - ht) / 2);
         hu_box(h, x, y, w, ht, "Hardcore here");
@@ -616,6 +641,7 @@ static void hu_compose(Here *h) {
             hu_put(h, x + 2, row + 4, h->font_available ? "Font control: this Terminal tab only" : h->font_error[0] ? h->font_error : "Host font unavailable; themes work here", w - 4, 2, 0, 0);
         }
     }
+    if ((u->confirm || u->prompt) && !u->menu_width) u->nhits = 0;
     if (u->confirm) hu_put(h, 0, h->child_rows, u->confirm == 2 ? "End all session processes? y/N" : "Close this tab and its programs? y/N", h->cols, 1, 0, 0);
     if (u->prompt) {
         snprintf(status, sizeof(status), "%s: %.*s▏", u->prompt == 1 ? "search" : u->prompt == 2 ? "url" : "font", (int)sizeof(status) - 20, u->prompt_text);
@@ -658,6 +684,6 @@ static void here_ui_render(Here *h, SBuf *out) {
             if (x >= 0 && y >= 0 && x < h->cols && y < h->child_rows) { snap_cup(out, x, y); sb_put(out, "\x1b[?25h", 6); }
         }
     }
-    u->force = 0; h->dirty = 0;
+    u->force = 0; h->dirty = u->search_left > 0;
 }
 #endif

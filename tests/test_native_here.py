@@ -100,6 +100,21 @@ class NativeHere(unittest.TestCase):
         self.assertEqual(tty_settings(original.slave), original.original)
         self.assertEqual(len(self.status()['tabs']), 1)
 
+    def test_attachment_reload_keeps_pid_shell_and_pending_input(self):
+        t=self.start()
+        before=self.status();frontend=t.process.pid
+        t.send(b'draft-before-reload')
+        t.wait(lambda:b'draft-before-reload' in t.output,'draft displayed')
+        t.send(b'\x02R')
+        t.wait(lambda:t.output.count(b'\x1b[?1049h')>=2,'same executable reload')
+        self.assertEqual(t.process.pid,frontend)
+        self.assertIsNone(t.process.poll())
+        after=self.status()
+        self.assertEqual(before['pid'],after['pid'])
+        self.assertEqual([x['pid'] for x in before['tabs']],[x['pid'] for x in after['tabs']])
+        t.send(b'-after\n')
+        t.wait(lambda:b'draft-before-reload-after' in t.output,'kernel input survives reload')
+
     def test_resize_alternate_screen_and_parser_replies_share_engine(self):
         # DSR is answered by the C engine to its owned PTY, never the outer host.
         report = self.root/'reply'
