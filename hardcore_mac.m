@@ -3284,6 +3284,11 @@ static int mac_browser_cli(int argc, char **argv);
 #include "hardcore_mac_launch.h"
 
 int main(int argc, char **argv) {
+    /* The ANSI backend does not initialize Cocoa, Metal, a Dock app, or the
+       GUI's dispatch queues. Its session owner forks before any of those. */
+    if (argc > 1 && !strcmp(argv[1], "here")) return here_main(argc - 2, argv + 2);
+    if (argc > 1 && !strcmp(argv[1], "--here-files")) return hc_here_files_main(argc - 1, argv + 1);
+    if (argc > 1 && !strcmp(argv[1], "--here-web")) return hc_here_web_main(argc - 1, argv + 1);
     int i;
     char selftest_out[MAX_PATH] = "";
     HCDelegate *dlg;

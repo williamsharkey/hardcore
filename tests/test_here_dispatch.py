@@ -26,8 +26,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLE = ROOT / "hardcore.app" / "Contents"
-EXE = BUNDLE / "MacOS" / "hardcore"
-HELPER = BUNDLE / "Resources" / "here.py"
+EXE = ROOT / "build" / "hardcore"
 
 PROBE = r'''
 import fcntl,json,os,select,signal,struct,sys,termios,tty
@@ -133,20 +132,17 @@ class OwnedTerminal:
         os.close(self.master);os.close(self.slave)
 
 
-@unittest.skipUnless(sys.platform == "darwin" and EXE.is_file(), "built macOS app required")
+@unittest.skipUnless(os.name == "posix" and EXE.is_file(), "built macOS app required")
 class HereDispatch(unittest.TestCase):
     def setUp(self):
-        self.assertTrue(HELPER.is_file(), "run make to bundle tools/here.py before this integration test")
-        self.temp = tempfile.TemporaryDirectory(prefix="hc here dispatch ",dir="/private/tmp")
+        self.temp = tempfile.TemporaryDirectory(prefix="hc here dispatch ",dir="/tmp")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         contents = self.root / "A bundle with spaces.app" / "Contents"
         (contents / "MacOS").mkdir(parents=True)
         (contents / "Resources").mkdir()
         self.exe = contents / "MacOS" / "hardcore"
         shutil.copy2(EXE, self.exe)
-        for helper in HELPER.parent.glob("here*.py"):
-            shutil.copy2(helper, contents / "Resources" / helper.name)
         self.session = "dispatch-" + uuid.uuid4().hex[:12]
         self.addCleanup(self.stop_session)
         self.cwd = self.root / "child folder's $literal";self.cwd.mkdir()

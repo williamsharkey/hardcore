@@ -30,7 +30,7 @@ MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -framework 
 APP        = hardcore.app
 APPDIR    ?= $(HOME)/Applications
 BINDIR    ?= $(HOME)/.local/bin
-HERE_SRC   = $(wildcard tools/here*.py) tools/files.py
+HERE_HEADERS = hardcore_here.h hardcore_here_transport.h hardcore_here_ui.h hardcore_here_helpers.h
 
 .PHONY: all clean selftest install test mac-test slurp-test
 
@@ -39,6 +39,12 @@ all: $(APP)
 test: mac-test
 install: $(APP)
 	@python3 tools/install_mac.py "$(APP)" "$(APPDIR)" "$(BINDIR)"
+else ifeq ($(UNAME),Linux)
+all: build/hardcore
+test: here-test
+install: build/hardcore
+	install -d "$(BINDIR)"
+	install -m 755 build/hardcore "$(BINDIR)/hardcore"
 else
 all: hardcore.exe
 test: win-test
@@ -129,15 +135,14 @@ bench/termbench.exe: bench/termbench.c
 selftest: hardcore.exe
 	./hardcore.exe --selftest selftest.txt; rc=$$?; cat selftest.txt; exit $$rc
 
-win-install: hardcore.exe $(HERE_SRC)
-	powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/install.ps1 -Exe "$$(wslpath -w hardcore.exe 2>/dev/null || echo hardcore.exe)" -HereScript "$$(wslpath -w tools/here.py 2>/dev/null || echo tools/here.py)"
-	python3 tools/install_here.py "$(BINDIR)"
+win-install: hardcore.exe
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/install.ps1 -Exe "$$(wslpath -w hardcore.exe 2>/dev/null || echo hardcore.exe)"
 
 # ── macOS ──────────────────────────────────────────────────────────────
 
 # The shader, compiled ahead of time when Xcode's metal compiler is there
 # (the app compiles the same source at startup when it isn't).
-HAVE_METAL := $(shell xcrun --find metal >/dev/null 2>&1 && echo 1)
+HAVE_METAL := $(shell command -v xcrun >/dev/null 2>&1 && xcrun --find metal >/dev/null 2>&1 && echo 1)
 ifeq ($(HAVE_METAL),1)
 METALLIB = build/hardcore.metallib
 MAC_FLAGS += -DHAVE_METALLIB
@@ -151,10 +156,16 @@ build/hardcore.metallib: hardcore.metal
 build/browser.inc: tools/embed_browser.py browser/project.js browser/welcome.html $(wildcard browser/adapters/*.js)
 	python3 tools/embed_browser.py
 
-build/hardcore: hardcore_mac_launch.h
+ifeq ($(UNAME),Linux)
+build/hardcore: hardcore.c $(HERE_HEADERS) build/font.bin build/fonts.bin build/fonts.inc build/width.inc
+	$(LINUX_CC) -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c -lutil
+else
+build/hardcore: hardcore_mac_launch.h $(HERE_HEADERS)
 
 build/hardcore: hardcore_mac_music.m hardcore_music_panel.m hardcore_recording_view_geometry.h hardcore_clips_panel.m hardcore_recording_jobs.m hardcore_camera_capture.h hardcore_camera_capture.m hardcore_camera_panel.m hardcore_recording.m hardcore_recording_library.m build/browser.inc hardcore_browser_image_geometry.h hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_LIBS)
+
+endif
 
 build/hardcore.icns: tools/gen_icon.py
 	@mkdir -p build
@@ -167,7 +178,7 @@ build/recording-export: tools/recording_export.m
 	@mkdir -p build
 	clang -O2 -fobjc-arc -mmacosx-version-min=11.0 -arch arm64 -arch x86_64 -framework Foundation -framework AppKit -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework ImageIO $< -o $@
 
-$(APP): build/recording-export $(wildcard recording/*.html recording/*.js recording/*.css) $(HERE_SRC) build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
+$(APP): build/recording-export $(wildcard recording/*.html recording/*.js recording/*.css) tools/files.py build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
 	rm -rf $@
 	mkdir -p $@/Contents/MacOS $@/Contents/Resources
 	cp build/hardcore $@/Contents/MacOS/hardcore
@@ -177,7 +188,7 @@ $(APP): build/recording-export $(wildcard recording/*.html recording/*.js record
 	mkdir -p $@/Contents/Resources/recording
 	cp recording/*.html recording/*.js recording/*.css $@/Contents/Resources/recording/
 	cp tools/update_mac.py $@/Contents/Resources/update_mac.py
-	cp tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(HERE_SRC) $@/Contents/Resources/
+	cp tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py tools/files.py $@/Contents/Resources/
 	mkdir -p $@/Contents/Resources/plugins
 	cp -R plugins/.claude-plugin plugins/hardcore-slurp plugins/hardcore-slurp-driver $@/Contents/Resources/plugins/
 	sed 's/@VERSION@/$(shell sed -n 's/^#define HARDCORE_VERSION "\(.*\)"/\1/p' hardcore.c)/' tools/Info.plist > $@/Contents/Info.plist
@@ -357,23 +368,13 @@ browser-test: build/browser.inc
 	cc -std=c99 -O2 -Wall -Wextra -Wno-unused-function tests/browser_document_dump.c -o build/browser-document-dump
 	node tests/test_wikipedia.js --preview
 
-# Portable terminal-hosted mode, with no graphics or cross compiler required.
-.PHONY: install-here here-test
-install-here: $(HERE_SRC)
-	python3 tools/install_here.py "$(BINDIR)"
-here-test:
-	python3 tests/test_here.py
-	python3 tests/test_here_events.py
-	python3 tests/test_here_terminal.py
-	python3 tests/test_here_settings.py
-	python3 tests/test_here_broker.py
-	python3 tests/test_here_frontend.py
-	python3 tests/test_here_web.py
-	python3 tests/test_here_install.py
-
-.PHONY: mac-here-test
-mac-here-test: $(APP)
+# The terminal backend is compiled into the normal executable. Python is only
+# the test driver; the fixture deliberately copies just the executable.
+.PHONY: here-test mac-here-test
+here-test: build/hardcore
 	python3 tests/test_here_dispatch.py
+	python3 tests/test_native_here.py
+mac-here-test: here-test
 
 .PHONY: mac-browser-images-test
 mac-browser-images-test: $(APP)

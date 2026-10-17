@@ -30,6 +30,10 @@
  *   hardcore.exe --selftest OUT.txt     # headless ConPTY + parser check
  */
 
+#if defined(__linux__)
+#define HARDCORE_TTY_ONLY 1
+#endif
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef _WIN32_WINNT
@@ -60,7 +64,14 @@ typedef uint32_t DWORD;
 #define _strdup strdup
 #define _stricmp strcasecmp
 #define _snwprintf swprintf      /* same argument order; wchar_t is UTF-32 here */
-static DWORD GetTickCount(void) { return (DWORD)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000); }
+static DWORD GetTickCount(void) {
+#ifdef __APPLE__
+    return (DWORD)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000);
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (DWORD)((uint64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000);
+#endif
+}
 #endif
 #include <stdint.h>
 #include <stdio.h>
@@ -74,6 +85,9 @@ static DWORD GetTickCount(void) { return (DWORD)(clock_gettime_nsec_np(CLOCK_UPT
 #ifdef __APPLE__
 #define BLOB_SECTION ".const_data\n"
 #define BLOB_SYM(name) "_" #name
+#elif defined(__linux__)
+#define BLOB_SECTION ".section .rodata\n"
+#define BLOB_SYM(name) #name
 #else
 #define BLOB_SECTION ".section .rdata,\"dr\"\n"
 #define BLOB_SYM(name) #name
@@ -667,7 +681,12 @@ static void utf8_to_wide(const char *s, wchar_t *out, int cap) {
     out[cap - 1] = 0;
 }
 
-static void term_reply(Term *t, const char *s) { tab_write((Tab *)t, s, (int)strlen(s)); }
+/* A renderer/backend can own a Term without pretending to be a GUI Tab. */
+static void (*g_term_reply_backend)(Term *, const char *, int);
+static void term_reply(Term *t, const char *s) {
+    if (g_term_reply_backend) g_term_reply_backend(t, s, (int)strlen(s));
+    else tab_write((Tab *)t, s, (int)strlen(s));
+}
 
 static Cell blank_cell(const Term *t) {
     Cell c;
@@ -1831,6 +1850,7 @@ static void osc_dispatch(Term *t) {
         char *data = strchr(rest, ';');
         if (data && strcmp(data + 1, "?") != 0) {
             unsigned char *out = (unsigned char *)malloc(strlen(data) + 1);
+            if (!out) break;
             int bits = 0, n = 0, v;
             uint32_t acc = 0;
             for (data++; *data; data++) {
@@ -1843,7 +1863,10 @@ static void osc_dispatch(Term *t) {
                 }
             }
             if (out) {
-                set_clipboard_utf8((char *)out, n);
+                /* A terminal attachment does not own the host clipboard.
+                   Preserve the GPU backend's behavior without calling Cocoa
+                   from the terminal session owner (including remote shells). */
+                if (!g_term_reply_backend) set_clipboard_utf8((char *)out, n);
                 free(out);
             }
         }
@@ -2018,7 +2041,14 @@ static void sgr_color(char *o, size_t cap, uint32_t spec, int bg) {
     else snprintf(o, cap, ";%d;2;%u;%u;%u", bg ? 48 : 38, (spec >> 16) & 255, (spec >> 8) & 255, spec & 255);
 }
 
-static int utf8_encode(uint32_t cp, char *o);
+static int utf8_encode(uint32_t cp, char *o) {
+    if (cp < 0x80) { o[0] = (char)cp; return 1; }
+    if (cp < 0x800) { o[0] = (char)(0xC0 | (cp >> 6)); o[1] = (char)(0x80 | (cp & 63)); return 2; }
+    if (cp < 0x10000) { o[0] = (char)(0xE0 | (cp >> 12)); o[1] = (char)(0x80 | ((cp >> 6) & 63)); o[2] = (char)(0x80 | (cp & 63)); return 3; }
+    o[0] = (char)(0xF0 | (cp >> 18)); o[1] = (char)(0x80 | ((cp >> 12) & 63)); o[2] = (char)(0x80 | ((cp >> 6) & 63)); o[3] = (char)(0x80 | (cp & 63));
+    return 4;
+}
+
 
 #ifdef _WIN32
 static void term_dump(Term *t, FILE *f, int max_rows) {
@@ -2218,6 +2248,27 @@ static void term_snapshot(Term *t, SBuf *b) {
     if (t->m_newline) sb_put(b, "\x1b[20h", 5);
     snap_sgr(b, t, &cur, t->pen.fg, t->pen.bg, t->pen.attr, t->pen.link);
 }
+
+static uint32_t resolve(uint32_t spec, int is_fg, int bold) {
+    if (!spec) return is_fg ? (bold ? g_look.bold : DEF_FG) : DEF_BG;
+    if (spec & 0x01000000u) {
+        int i = spec & 255;
+        if (is_fg && bold && i < 8) i += 8;
+        return PAL[i];
+    }
+    return spec & 0xFFFFFF;
+}
+
+static void cell_colors(const Cell *c, uint32_t *fg, uint32_t *bg) {
+    uint32_t f = resolve(c->fg, 1, c->attr & A_BOLD), b = resolve(c->bg, 0, 0);
+    if (c->attr & A_INV) { uint32_t s = f; f = b; b = s; }
+    if (c->attr & A_DIM) f = ((f >> 1) & 0x7F7F7F) + ((b >> 1) & 0x7F7F7F);
+    if (c->attr & A_HIDDEN) f = b;
+    *fg = f;
+    *bg = b;
+}
+
+#ifndef HARDCORE_TTY_ONLY
 
 /* --unit: term_snapshot replayed into a fresh Term gives back the same cells
    and state. Returns 0 if equal, else describes the first difference. */
@@ -2464,7 +2515,7 @@ static const char RC_BASH[] =
     "if [ -n \"$HARDCORE_EXE\" ] && ! declare -F hardcore >/dev/null; then\n"
     "  hardcore() {\n"
     "    case $1 in\n"
-    "      here) shift; python3 -B \"${HARDCORE_EXE%/*}/here.py\" \"$@\" ;;\n"
+    "      here) echo 'Native terminal mode: run a Linux build of hardcore here in WSL.' >&2; return 2 ;;\n"
     "      update|--update|version|--version|-v|help|--help|-h) \"$HARDCORE_EXE\" \"$@\" | cat ;;\n"
     "      *) local d; d=$(cd -- \"${1:-.}\" 2>/dev/null && pwd) || { echo \"hardcore: no folder $1\" >&2; return 1; }\n"
     "         ( \"$HARDCORE_EXE\" --cd \"$d\" </dev/null >/dev/null 2>&1 & ) ;;\n"
@@ -2942,13 +2993,6 @@ static void set_clipboard_utf8(const char *s, int n) {
 
 #endif /* _WIN32: ConPTY, config, clipboard */
 
-static int utf8_encode(uint32_t cp, char *o) {
-    if (cp < 0x80) { o[0] = (char)cp; return 1; }
-    if (cp < 0x800) { o[0] = (char)(0xC0 | (cp >> 6)); o[1] = (char)(0x80 | (cp & 63)); return 2; }
-    if (cp < 0x10000) { o[0] = (char)(0xE0 | (cp >> 12)); o[1] = (char)(0x80 | ((cp >> 6) & 63)); o[2] = (char)(0x80 | (cp & 63)); return 3; }
-    o[0] = (char)(0xF0 | (cp >> 18)); o[1] = (char)(0x80 | ((cp >> 12) & 63)); o[2] = (char)(0x80 | ((cp >> 6) & 63)); o[3] = (char)(0x80 | (cp & 63));
-    return 4;
-}
 
 /* ── window, input, rendering ─────────────────────────────────────── */
 
@@ -3840,25 +3884,6 @@ static void draw_glyph(uint32_t cp, float x, float y, int w_cells, int scale) {
 
 /* how far a bold glyph is smeared right: one of the font's pixels */
 static int smear(void) { return g_cf->dev ? 1 : g_scale; }
-
-static uint32_t resolve(uint32_t spec, int is_fg, int bold) {
-    if (!spec) return is_fg ? (bold ? g_look.bold : DEF_FG) : DEF_BG;
-    if (spec & 0x01000000u) {
-        int i = spec & 255;
-        if (is_fg && bold && i < 8) i += 8;
-        return PAL[i];
-    }
-    return spec & 0xFFFFFF;
-}
-
-static void cell_colors(const Cell *c, uint32_t *fg, uint32_t *bg) {
-    uint32_t f = resolve(c->fg, 1, c->attr & A_BOLD), b = resolve(c->bg, 0, 0);
-    if (c->attr & A_INV) { uint32_t s = f; f = b; b = s; }
-    if (c->attr & A_DIM) f = ((f >> 1) & 0x7F7F7F) + ((b >> 1) & 0x7F7F7F);
-    if (c->attr & A_HIDDEN) f = b;
-    *fg = f;
-    *bg = b;
-}
 
 /* draws a UTF-16 label clipped to max_w pixels; returns width used */
 /* UTF-16 → code points with cell widths (zero-width dropped); returns count */
@@ -7449,6 +7474,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     HANDLE gfx_thread = NULL;
     (void)prev; (void)cmdline;
 
+    if (argc > 1 && !wcscmp(argv[1], L"here")) {
+        fputs("hardcore here: use the native Linux build inside WSL. The Windows GUI executable does not contain a console attachment backend.\n", stderr);
+        return 2;
+    }
+
     if (argc == 2 && !wcscmp(argv[1], L"--slurp-fixture")) return slurp_fixture();
     if (argc == 2 && !wcscmp(argv[1], L"--slurp-owner-fixture")) { Sleep(INFINITE); return 0; }
     if (argc == 3 && !wcscmp(argv[1], L"--slurp-probe")) return slurp_probe(wcstoul(argv[2], NULL, 10));
@@ -7695,6 +7725,24 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 }
 #endif /* _WIN32 */
 
-#ifdef __APPLE__
+#endif /* !HARDCORE_TTY_ONLY: GPU frontend */
+
+#ifndef _WIN32
+#include "hardcore_here.h"
+#endif
+
+#if defined(HARDCORE_TTY_ONLY)
+static void tab_write(Tab *tb, const void *s, int n) { (void)tb; (void)s; (void)n; }
+static void set_clipboard_utf8(const char *s, int n) { (void)s; (void)n; }
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--here-files")) return hc_here_files_main(argc - 1, argv + 1);
+    if (argc > 1 && !strcmp(argv[1], "--here-web")) return hc_here_web_main(argc - 1, argv + 1);
+    if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "version"))) {
+        printf("hardcore %s (native terminal backend)\n", HARDCORE_VERSION); return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "here")) return here_main(argc - 2, argv + 2);
+    return here_main(argc - 1, argv + 1);
+}
+#elif defined(__APPLE__)
 #include "hardcore_mac.m"
 #endif

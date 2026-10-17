@@ -425,8 +425,11 @@ repeated drawing data.
 ## Run inside another terminal
 
 `hardcore here` opens Hardcore inside your current terminal, with no GPU window.
-It requires Python 3.10+ on macOS or Linux (including WSL). Each tab has its own
-PTY, ANSI/256-color/truecolor screen, alternate screen, and bounded scrollback.
+It is compiled into the regular Hardcore executable on macOS and Linux
+(including WSL), using the same C terminal parser, scrollback, Unicode tables,
+and themes as the GPU app. There is no Python or Lua runtime, separate frontend
+executable, or extra build/install step. Each tab has its own PTY,
+ANSI/256-color/truecolor screen, alternate screen, and bounded scrollback.
 Styled logical lines reflow when the host is resized, preserving wide characters,
 cursor position, and soft-wrap boundaries.
 
@@ -438,9 +441,11 @@ hardcore here --list
 hardcore here --attach work
 ```
 
-A separate local session process keeps shells, jobs, unsent command lines, and
-screen state alive when the frontend detaches or the host closes. **Ctrl-B D**
-detaches; **Ctrl-B R** reloads the frontend without restarting those programs.
+A background instance of the **same executable** keeps shells, jobs, unsent
+command lines, and screen state alive when the terminal attachment detaches or
+the host closes. It runs the shared engine and sends ANSI frames to a thin
+attachment that manages the host terminal's input and restoration. **Ctrl-B D**
+detaches; **Ctrl-B R** reloads the terminal attachment without restarting those programs.
 Reattach with the command printed on exit. **Ctrl-B q**, then **y**, explicitly
 ends all programs in that session; `hardcore here --stop NAME` also ends it.
 A second attachment is refused unless `--takeover` is explicitly requested.
@@ -487,22 +492,30 @@ cannot be selected merely by emitting terminal text.
 
 The text web reader follows numbered links and provides scrolling, Back, and
 explicit opening in the system browser. It does not execute JavaScript, share
-browser logins, or render forms and images. Files opens the existing keyboard
-file browser in another tab. The menu's **caf** toggle uses macOS `caffeinate -di`
+browser logins, or render forms and images. Files opens a built-in keyboard file browser in another tab. The menu's **caf** toggle uses macOS `caffeinate -di`
 while this frontend is running.
 
-The Mac app includes every helper. For a standalone Linux/WSL installation,
-run `make install-here` and put `~/.local/bin` on your PATH. This needs no graphics
-libraries or cross compiler. If a native Hardcore command already exists as a
-symlink, the launcher preserves it for commands other than `here`.
+Use the usual `make` and `make install`. On macOS these build/install the app
+with both GPU and ANSI backends in its executable. On Linux/WSL they build/install
+`build/hardcore` from the same `hardcore.c`, with the ANSI backend and no graphics
+libraries. `make hardcore.exe` remains the explicit Windows GUI cross-build;
+terminal-hosted mode in WSL uses the native Linux build. There is no separate
+`install-here` target. Python remains a development dependency for generating
+font assets and running tests, not for running this mode.
+
+The old Python session protocol is separate. An already-running Python session
+is not automatically converted; its owner must remain alive until its programs
+are finished. New sessions use private native sockets and the shared C engine.
 
 This frontend still differs from the native app: full browser rendering,
 camera/Clips capture and export, the native music player, floating TV layout,
 GUI session transfers, custom bitmap rendering, and advanced graphics/keyboard
-protocols are not implemented here. Reloading the frontend updates its UI;
-an already-running session process continues using the engine it started with.
-`make here-test` exercises the portable frontend and actual owned PTYs;
-`make mac-here-test` additionally tests packaged native-command dispatch.
+protocols are not implemented here. Reloading the attachment does not hot-swap
+its running session owner: that process retains the engine and UI it started
+with. Native GUI reload/slurp and terminal-hosted sessions remain separate.
+`make here-test` (also `make mac-here-test` on Mac) exercises the compiled
+executable in disposable PTYs, including a bare copy without helper resources,
+process persistence, terminal restoration, input, colors, and resizing.
 
 ## Install
 

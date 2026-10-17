@@ -847,16 +847,9 @@ static int mac_cli(int argc, char **argv) {
     g_mac_image = [mac_hash(@(g_mac_exe_path)) retain];
     g_mac_install_exe = [@(g_mac_exe_path) copy];
     if (argc < 2) return -1;
-    if (!strcmp(argv[1], "here")) {
-        NSString *helper=mac_helper(@"here.py");
-        if(!helper){fprintf(stderr,"hardcore: missing terminal mode; rebuild or reinstall Hardcore\n");return 1;}
-        char **args=calloc((size_t)argc+3,sizeof(*args));
-        if(!args)return 1;
-        args[0]="python3";args[1]="-B";args[2]=(char *)helper.fileSystemRepresentation;
-        for(int i=2;i<argc;i++)args[i+1]=argv[i];
-        execvp(args[0],args);
-        perror("hardcore: terminal mode");free(args);return 1;
-    }
+    if (!strcmp(argv[1], "here")) return here_main(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "--here-files")) return hc_here_files_main(argc - 1, argv + 1);
+    if (!strcmp(argv[1], "--here-web")) return hc_here_web_main(argc - 1, argv + 1);
     if (!strcmp(argv[1], "browser")) return mac_browser_cli(argc - 2, argv + 2);
     if (!strcmp(argv[1], "--slurp-sources")) {
         if (argc != 2) return 2;
