@@ -26,6 +26,13 @@ def wait_for(test, timeout=20):
     raise AssertionError("timed out waiting for update test")
 
 
+def reload_state(state):
+    """Compare focus ownership, not Cocoa object addresses recreated by exec."""
+    stable = dict(state)
+    stable['first_responder'] = state['first_responder'].split(':', 1)[1]
+    return stable
+
+
 def main():
     if sys.platform != "darwin":
         print("SKIP: macOS GUI required")
@@ -144,7 +151,7 @@ for line in sys.stdin:
                                     capture_output=True, text=True, timeout=40)
             assert result.returncode == 0, result.stdout + result.stderr
             after = state()
-            assert before == after, (before, after)
+            assert reload_state(before) == reload_state(after), (before, after)
             assert proc.poll() is None
             # Background macOS processes can have their timers coalesced. Check
             # that the same worker keeps advancing, rather than its tick age at

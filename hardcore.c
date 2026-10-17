@@ -2464,7 +2464,7 @@ static const char RC_BASH[] =
     "if [ -n \"$HARDCORE_EXE\" ] && ! declare -F hardcore >/dev/null; then\n"
     "  hardcore() {\n"
     "    case $1 in\n"
-    "      here) shift; python3 -B \"${HARDCORE_EXE%/*}/here.py\" \"$@\" ;;\n"
+    "      here) \"$HARDCORE_EXE\" \"$@\" | cat; return ${PIPESTATUS[0]} ;;\n"
     "      update|--update|version|--version|-v|help|--help|-h) \"$HARDCORE_EXE\" \"$@\" | cat ;;\n"
     "      *) local d; d=$(cd -- \"${1:-.}\" 2>/dev/null && pwd) || { echo \"hardcore: no folder $1\" >&2; return 1; }\n"
     "         ( \"$HARDCORE_EXE\" --cd \"$d\" </dev/null >/dev/null 2>&1 & ) ;;\n"
@@ -7522,7 +7522,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 if (!WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, request, sizeof(request), NULL, NULL) || !slurp_filter(request)) return 2;
             }
         } else if (!strcmp(a, "here")) {
-            cli("hardcore here runs inside a POSIX terminal. In WSL, install the terminal launcher with make install-here, then run ~/.local/bin/hardcore here.\n");
+            cli("hardcore: terminal-hosted mode is not available in this build.\n");
             return 2;
         } else if (!strcmp(a, "browser")) {
             cli("hardcore: browser tabs are available on macOS in this first pass; Windows WebView2 is not implemented yet.\n");
@@ -7535,7 +7535,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         } else if (!strcmp(a, "help") || !strcmp(a, "--help") || !strcmp(a, "-h")) {
             cli("hardcore %s: a terminal for WSL\n"
                 "  hardcore [DIR]          a new window in DIR (from a tab: this folder)\n"
-                "  hardcore here           terminal-hosted mode through the WSL launcher\n"
                 "  hardcore update         install the latest release (--force: even if current)\n"
                 "  hardcore slurp          attach running WSL and classic Windows consoles\n"
                 "  hardcore slurp --list   discover eligible sessions without attaching\n"

@@ -848,14 +848,8 @@ static int mac_cli(int argc, char **argv) {
     g_mac_install_exe = [@(g_mac_exe_path) copy];
     if (argc < 2) return -1;
     if (!strcmp(argv[1], "here")) {
-        NSString *helper=mac_helper(@"here.py");
-        if(!helper){fprintf(stderr,"hardcore: missing terminal mode; rebuild or reinstall Hardcore\n");return 1;}
-        char **args=calloc((size_t)argc+3,sizeof(*args));
-        if(!args)return 1;
-        args[0]="python3";args[1]="-B";args[2]=(char *)helper.fileSystemRepresentation;
-        for(int i=2;i<argc;i++)args[i+1]=argv[i];
-        execvp(args[0],args);
-        perror("hardcore: terminal mode");free(args);return 1;
+        fprintf(stderr,"hardcore: terminal-hosted mode is not available in this build.\n");
+        return 2;
     }
     if (!strcmp(argv[1], "browser")) return mac_browser_cli(argc - 2, argv + 2);
     if (!strcmp(argv[1], "--slurp-sources")) {
@@ -953,7 +947,6 @@ static int mac_cli(int argc, char **argv) {
     if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "help") || !strcmp(argv[1], "-h")) {
         puts("hardcore [DIR]                 launch the app and return to this prompt\n"
              "hardcore --foreground [DIR]    keep the GUI attached for debugging\n"
-             "hardcore here [-- COMMAND...]   run inside this terminal, without a GUI window\n"
              "hardcore browser open [URL]     new live browser tab (Hardcore grid by default)\n"
              "hardcore browser --help         browser commands and tab targeting\n"
              "hardcore host [--] [COMMAND...] start a portable tmux-backed session in this terminal\n"

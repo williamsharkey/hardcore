@@ -58,6 +58,7 @@ static int mac_spawn(NSString *exe, NSArray *args, int fd, int detached, pid_t *
 }
 static NSDictionary *mac_info(void) { return @{@"protocol": @1, @"tabs": @[]}; }
 static NSDictionary *mac_camera_status(void) { return @{@"state": @"Camera closed", @"video_frames": @0}; }
+static NSDictionary *mac_music_panel_status(void) { return @{@"enabled": @NO}; }
 static NSDictionary *mac_claude_receipt(NSDictionary *request) { return @{@"fixture": request[@"op"]}; }
 static NSDictionary *mac_bridge_refresh(NSDictionary *request) { return @{@"fixture": request[@"op"]}; }
 static NSDictionary *mac_browser_request(NSDictionary *request) {

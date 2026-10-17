@@ -218,12 +218,21 @@ while sys.stdin.readline():
                 self.assertFalse(self.snapshot.exists())
                 self.assertEqual(self.windows(), [])
 
-    def test_cli_and_terminal_mode_help_remain_synchronous(self):
-        for args in (("--version",), ("--help",), ("here", "--help")):
+    def test_cli_help_remains_synchronous(self):
+        for args in (("--version",), ("--help",)):
             with self.subTest(args=args):
                 result = self.launch(*args)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(result.stdout.strip())
+                self.assertFalse(self.snapshot.exists())
+                self.assertEqual(self.windows(), [])
+
+    def test_retired_terminal_mode_does_not_launch_a_window(self):
+        for args in (("here",), ("here", "--help")):
+            with self.subTest(args=args):
+                result = self.launch(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("not available", result.stderr)
                 self.assertFalse(self.snapshot.exists())
                 self.assertEqual(self.windows(), [])
 

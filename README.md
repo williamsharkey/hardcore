@@ -422,88 +422,6 @@ real Metal renderer with a replay export in an isolated test window. Long
 recordings retain their source JSON for seeking; ZIP sharing compresses the
 repeated drawing data.
 
-## Run inside another terminal
-
-`hardcore here` opens Hardcore inside your current terminal, with no GPU window.
-It requires Python 3.10+ on macOS or Linux (including WSL). Each tab has its own
-PTY, ANSI/256-color/truecolor screen, alternate screen, and bounded scrollback.
-Styled logical lines reflow when the host is resized, preserving wide characters,
-cursor position, and soft-wrap boundaries.
-
-```sh
-hardcore here
-hardcore here --session work --cwd ~/project
-hardcore here -- python3 my_program.py
-hardcore here --list
-hardcore here --attach work
-```
-
-A separate local session process keeps shells, jobs, unsent command lines, and
-screen state alive when the frontend detaches or the host closes. **Ctrl-B D**
-detaches; **Ctrl-B R** reloads the frontend without restarting those programs.
-Reattach with the command printed on exit. **Ctrl-B q**, then **y**, explicitly
-ends all programs in that session; `hardcore here --stop NAME` also ends it.
-A second attachment is refused unless `--takeover` is explicitly requested.
-Sessions survive frontend exits, not reboots; this does not take over the shell
-that launched `hardcore here` or attach native GUI sessions.
-
-Press **Ctrl-B**, release it, then a key:
-
-| Key | Action |
-| --- | --- |
-| `c`, `n` / `p`, `1`–`9` | New tab, next/previous, select tab |
-| `x`, `q` | Close tab / end session, with confirmation |
-| `s` or `,` | Configuration and themes |
-| `m` | Show/hide the side menu |
-| `v` | Toggle the selected tab's small TV |
-| `F`, `w` | Files / text web reader |
-| `/`, `j`, `N` | Search scrollback / next / previous match |
-| `u` / `d`, `]` | Scroll history / return to live output |
-| `D`, `R` | Detach / reload frontend |
-| `?` | Help |
-
-**Ctrl-B Ctrl-B** sends a literal Ctrl-B to the program. The menu reserves space
-beside the application, so their text cannot overlap. Narrow windows use a
-bottom tab strip. Hovering a tab previews it without changing the keyboard's
-destination; click to select. Focus loss cancels the preview. A solid dot marks
-the selected tab; a small dot marks unseen output. New tabs follow the active
-shell's current directory where available.
-
-Up to four TVs fit below the tab list, in tab order. Click a TV's content to type
-there, **Esc** to return input to the main tab, **↗** to expand it, and **−** to
-hide it. TV content follows the cursor; it is a cropped view of the same live
-screen, not another shell. TVs use the menu's available space rather than
-native floating/drag-resize placement. Shift-drag uses the host's text selection.
-
-All 16 native themes are available in configuration. Themes color Hardcore's
-own cells and do not change the host's palette. Fonts remain host-owned. In local
-macOS Terminal, **Allow host font changes** opts into changing the originating
-tab's installed font and point size; the original font is saved, verified, and
-restored on normal exit, handled signals, and suspension. This is unavailable
-through SSH, tmux/screen, and unsupported hosts; SIGKILL or power loss cannot run
-restoration. Theme and font preferences are stored separately from native app
-settings. Hardcore's bundled bitmap fonts require host support/installation and
-cannot be selected merely by emitting terminal text.
-
-The text web reader follows numbered links and provides scrolling, Back, and
-explicit opening in the system browser. It does not execute JavaScript, share
-browser logins, or render forms and images. Files opens the existing keyboard
-file browser in another tab. The menu's **caf** toggle uses macOS `caffeinate -di`
-while this frontend is running.
-
-The Mac app includes every helper. For a standalone Linux/WSL installation,
-run `make install-here` and put `~/.local/bin` on your PATH. This needs no graphics
-libraries or cross compiler. If a native Hardcore command already exists as a
-symlink, the launcher preserves it for commands other than `here`.
-
-This frontend still differs from the native app: full browser rendering,
-camera/Clips capture and export, the native music player, floating TV layout,
-GUI session transfers, custom bitmap rendering, and advanced graphics/keyboard
-protocols are not implemented here. Reloading the frontend updates its UI;
-an already-running session process continues using the engine it started with.
-`make here-test` exercises the portable frontend and actual owned PTYs;
-`make mac-here-test` additionally tests packaged native-command dispatch.
-
 ## Install
 
 In PowerShell:
@@ -833,8 +751,7 @@ make test       # unit, xterm.js, PTY import-size regression, and shell selftest
 After installing, run `hardcore` (or `hardcore DIR` to open a folder).
 It launches a separate app and returns your shell prompt immediately; no `&`
 is needed. Plain `hardcore` uses your current directory. Closing the launching
-terminal leaves the app running. Use `hardcore here` when you want the TUI
-inside your current terminal instead. Commands such as `update`, `slurp`, and
+terminal leaves the app running. Commands such as `update`, `slurp`, and
 `--version` still wait and report their results. For debugging the GUI with
 attached output, use `hardcore --foreground [DIR]`.
 The command is a symlink to the installed app's executable. If `~/.local/bin`

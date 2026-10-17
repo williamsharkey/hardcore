@@ -8,16 +8,16 @@ import subprocess
 import sys
 import tempfile
 
-HERE_LAUNCHER_HEADER = b"#!/usr/bin/env python3\n# HARDCORE_TERMINAL_LAUNCHER_V1\n"
+LEGACY_TERMINAL_LAUNCHER_HEADER = b"#!/usr/bin/env python3\n# HARDCORE_TERMINAL_LAUNCHER_V1\n"
 
 
-def here_launcher(path):
-    """Only our exact portable launcher header permits migration to the app."""
+def legacy_terminal_launcher(path):
+    """Replace only our retired Python launcher when migrating to the native app."""
     if path.is_symlink():
         return False
     try:
         with path.open("rb") as source:
-            return source.read(len(HERE_LAUNCHER_HEADER)) == HERE_LAUNCHER_HEADER
+            return source.read(len(LEGACY_TERMINAL_LAUNCHER_HEADER)) == LEGACY_TERMINAL_LAUNCHER_HEADER
     except OSError:
         return False
 
@@ -35,7 +35,7 @@ def install(source, appdir, bindir):
     if not (source / "Contents/MacOS/hardcore").is_file():
         raise SystemExit(f"Missing app executable in {source}")
     if os.path.lexists(command) and not (
-        (command.is_symlink() and command.resolve() == executable.resolve()) or here_launcher(command)
+        (command.is_symlink() and command.resolve() == executable.resolve()) or legacy_terminal_launcher(command)
     ):
         raise SystemExit(f"Refusing to overwrite {command}; choose another BINDIR.")
     appdir.mkdir(parents=True, exist_ok=True)
@@ -59,7 +59,7 @@ def install(source, appdir, bindir):
         replacement_command = Path(command_temp) / "hardcore"
         replacement_command.symlink_to(executable)
         if os.path.lexists(command) and not (
-            (command.is_symlink() and command.resolve() == executable.resolve()) or here_launcher(command)
+            (command.is_symlink() and command.resolve() == executable.resolve()) or legacy_terminal_launcher(command)
         ):
             raise SystemExit(f"Refusing to overwrite {command}; command changed during installation.")
         backup = app.with_name(app.name + ".previous")

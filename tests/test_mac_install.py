@@ -155,7 +155,7 @@ class InstallTests(unittest.TestCase):
     def portable_command(self):
         self.bindir.mkdir(parents=True, exist_ok=True)
         command = self.bindir/"hardcore"
-        command.write_bytes(installer.HERE_LAUNCHER_HEADER + b"print('portable launcher')\n")
+        command.write_bytes(installer.LEGACY_TERMINAL_LAUNCHER_HEADER + b"print('portable launcher')\n")
         command.chmod(0o755)
         return command
 
