@@ -490,7 +490,7 @@ restoration. Theme and font preferences are stored separately from native app
 settings. Hardcore's bundled bitmap fonts require host support/installation and
 cannot be selected merely by emitting terminal text.
 
-The text web reader follows numbered links and provides scrolling, Back, and
+On macOS, the built-in text web reader follows numbered links and provides scrolling, Back, and
 explicit opening in the system browser. It does not execute JavaScript, share
 browser logins, or render forms and images. Files opens a built-in keyboard file browser in another tab. The menu's **caf** toggle uses macOS `caffeinate -di`
 while this frontend is running.
@@ -510,7 +510,8 @@ are finished. New sessions use private native sockets and the shared C engine.
 This frontend still differs from the native app: full browser rendering,
 camera/Clips capture and export, the native music player, floating TV layout,
 GUI session transfers, custom bitmap rendering, and advanced graphics/keyboard
-protocols are not implemented here. Reloading the attachment does not hot-swap
+protocols and host clipboard writes are not implemented here. The Linux backend
+also does not yet include the text web reader or host-font control. Reloading the attachment does not hot-swap
 its running session owner: that process retains the engine and UI it started
 with. Native GUI reload/slurp and terminal-hosted sessions remain separate.
 `make here-test` (also `make mac-here-test` on Mac) exercises the compiled

@@ -374,6 +374,9 @@ browser-test: build/browser.inc
 here-test: build/hardcore
 	python3 tests/test_here_dispatch.py
 	python3 tests/test_native_here.py
+	python3 tests/test_native_here_transport.py
+	python3 tests/test_here_native_helpers.py
+	python3 tests/test_native_here_ui.py
 mac-here-test: here-test
 
 .PHONY: mac-browser-images-test

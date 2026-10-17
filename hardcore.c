@@ -7552,7 +7552,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 if (!WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, request, sizeof(request), NULL, NULL) || !slurp_filter(request)) return 2;
             }
         } else if (!strcmp(a, "here")) {
-            cli("hardcore here runs inside a POSIX terminal. In WSL, install the terminal launcher with make install-here, then run ~/.local/bin/hardcore here.\n");
+            cli("hardcore here uses the native Linux build in WSL. Run make install in a Linux checkout.\n");
             return 2;
         } else if (!strcmp(a, "browser")) {
             cli("hardcore: browser tabs are available on macOS in this first pass; Windows WebView2 is not implemented yet.\n");
@@ -7565,7 +7565,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         } else if (!strcmp(a, "help") || !strcmp(a, "--help") || !strcmp(a, "-h")) {
             cli("hardcore %s: a terminal for WSL\n"
                 "  hardcore [DIR]          a new window in DIR (from a tab: this folder)\n"
-                "  hardcore here           terminal-hosted mode through the WSL launcher\n"
+                "  hardcore here           use the native Linux build inside WSL\n"
                 "  hardcore update         install the latest release (--force: even if current)\n"
                 "  hardcore slurp          attach running WSL and classic Windows consoles\n"
                 "  hardcore slurp --list   discover eligible sessions without attaching\n"

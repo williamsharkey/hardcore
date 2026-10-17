@@ -218,7 +218,7 @@ while sys.stdin.readline():
                 self.assertFalse(self.snapshot.exists())
                 self.assertEqual(self.windows(), [])
 
-    def test_cli_and_terminal_mode_help_remain_synchronous(self):
+    def test_cli_help_remains_synchronous(self):
         for args in (("--version",), ("--help",), ("here", "--help")):
             with self.subTest(args=args):
                 result = self.launch(*args)
@@ -226,6 +226,13 @@ while sys.stdin.readline():
                 self.assertTrue(result.stdout.strip())
                 self.assertFalse(self.snapshot.exists())
                 self.assertEqual(self.windows(), [])
+
+    def test_native_terminal_mode_requires_tty_without_launching_window(self):
+        result = self.launch("here")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("interactive terminal", result.stderr)
+        self.assertFalse(self.snapshot.exists())
+        self.assertEqual(self.windows(), [])
 
 
 if __name__ == "__main__":
