@@ -815,6 +815,11 @@ and forth between them.
 Claude Code turns on mouse reporting, so a plain drag goes to Claude. Hold
 **Shift** to select text with the terminal instead.
 
+If Claude Code is killed while those modes are on, the shell doesn't inherit them.
+When `claude` exits, hardcore's shell wrapper marks it (OSC 7700 `claude=`), and
+mouse reporting, focus events and synchronized output turn off and the cursor
+shows again.
+
 ## Sessions
 
 Session restoration starts new processes after reopening Hardcore.
@@ -901,6 +906,29 @@ See [PRODUCT.md](PRODUCT.md) for what sharing it more widely would take.
 The same terminal runs natively on a Mac: same parser, tab column, Unifont
 and Claude Code integration, on Cocoa, `forkpty` and Metal instead of
 Win32, ConPTY and Direct3D. It's one universal (arm64 + x86_64) app.
+
+**Speed against other Mac terminals** (M3 iMac, 120×36, seconds until the
+terminal has processed the whole output, lower is better):
+
+| | plain 18.8 MB | color 31.7 MB | CJK + box drawing 18.7 MB |
+|---|---:|---:|---:|
+| hardcore | **0.12** | **0.16** | **0.10** |
+| Ghostty 1.3 | 0.22 | 0.47 | 0.18 |
+| kitty 0.49 | 0.41 | 0.28 | 0.18 |
+| WezTerm | 0.74 | 0.84 | 0.62 |
+| iTerm2 3.7 | 0.23 | 3.91 | 7.02 |
+| Terminal.app | 1.05 | 1.11 | 0.55 |
+
+- **Pty reading overlaps parsing.** Each tab's output is read on a queue of its
+  own and parsed on the main queue, so the 1 KB reads macOS hands out overlap
+  parsing and painting. The reader stays at most 8 MB ahead.
+- **Claude Code–style redraws cost about a tenth of a core** in hardcore, Ghostty
+  and kitty alike (iTerm2: about half). At those rates the terminal isn't what
+  makes an agent slow.
+- **Idle memory is 30 MB.**
+
+Method, CPU and memory tables: [bench/RESULTS-mac.md](bench/RESULTS-mac.md).
+To re-run it, use `bench/compare-mac.py`.
 
 While running, the Dock icon is a small terminal showing the active
 tab's folder and foreground program, such as `wm` / `codex`. The lower line
@@ -1498,6 +1526,21 @@ comparison.
 - `tests/run_xtermjs.py` replays xterm.js's escape-sequence fixtures through the
   parser (`hardcore.exe --replay`) and diffs against screens captured from real
   xterm. All 71 pass.
+- `--unit` includes `unit_issues`: bug reports from the Ghostty, Alacritty/vte,
+  kitty and WezTerm trackers, as bytes in and the screen expected out. They
+  cover:
+  - the pending wrap and `ESC 7` across a resize;
+  - erase ending a row's soft wrap;
+  - stray DCS strings and CAN/SUB;
+  - invalid UTF-8;
+  - colon SGR parameters;
+  - half wide characters;
+  - the scrolled-back view with full scrollback;
+  - repeated synchronized-output begins;
+  - long OSCs.
+- `bench/compare-mac.py` measures hardcore against other terminals on a Mac.
+  It times floods to the terminal's DSR answer and samples CPU and memory from
+  outside, so it needs no Screen Recording or Accessibility permission.
 - `bench/run-esctest.sh` runs [esctest2](https://github.com/ThomasDickey/esctest2)
   inside a live window: 273 passing, against 90 for Windows Terminal.
 - `bench/termbench.exe send|cmd|snap` drives a hardcore window over
