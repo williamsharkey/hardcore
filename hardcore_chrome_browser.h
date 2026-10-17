@@ -1,6 +1,8 @@
 /* Full installed Chrome, shared by GUI and terminal-hosted browser tabs.
    This native CDP client deliberately never reads/copies cookies or profiles.
-   Its private Chrome profile persists sign-ins, history and installed extensions. */
+   By default it attaches to the user's own Chrome (the one the Dock opens), so
+   tabs have its sign-ins, history and extensions. HARDCORE_CHROME_PROFILE
+   instead launches a private headless profile (tests, development). */
 #ifndef HARDCORE_CHROME_BROWSER_H
 #define HARDCORE_CHROME_BROWSER_H
 #ifdef __APPLE__
@@ -45,6 +47,20 @@ static BOOL hc_chrome_is_regular_profile(NSString *profile) {
     }
     return NO;
 }
+/* The profile Chrome opens from the Dock. Chrome 136+ ignores remote
+   debugging switches for it; Chrome 144+ publishes this endpoint once the user
+   allows remote debugging at chrome://inspect, and asks before each connection. */
+static NSString *hc_chrome_regular_endpoint(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Google/Chrome/DevToolsActivePort"];
+}
+static BOOL hc_chrome_owned_profile(void) {
+    NSDictionary *env=NSProcessInfo.processInfo.environment;
+    return ![env[@"HARDCORE_CHROME_ATTACH"] length] && [env[@"HARDCORE_CHROME_PROFILE"] length]>0;
+}
+static NSRunningApplication *hc_chrome_regular_app(void) {
+    return [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.google.Chrome"].firstObject;
+}
+#define HC_CHROME_ALLOW_HELP @"Hardcore browses in your own Chrome. In Chrome, open chrome://inspect/#remote-debugging and allow remote debugging (or run: hardcore chrome setup), then reload this tab."
 /* Only the two-line endpoint file is read, never browser profile contents. */
 static NSURL *hc_chrome_endpoint(NSString *path) {
     NSData *data=[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
@@ -84,7 +100,7 @@ static HCChromeBroker *hc_chrome_shared_broker;
 @end
 
 @interface HCChromeBroker : NSObject {
-@public BOOL attached,headed;
+@public BOOL attached,headed,regular,raisedChrome;
     NSURLSession *session;
     NSURLSessionWebSocketTask *socket;
     NSMutableDictionary *pending,*pages,*targets;
@@ -99,6 +115,7 @@ static HCChromeBroker *hc_chrome_shared_broker;
 + (HCChromeBroker *)shared;
 - (void)connect:(void (^)(NSError *))done;
 - (NSNumber *)send:(NSString *)method params:(NSDictionary *)params session:(NSString *)sessionID completion:(HCChromeReply)done;
+- (NSNumber *)send:(NSString *)method params:(NSDictionary *)params session:(NSString *)sessionID timeout:(NSTimeInterval)timeout completion:(HCChromeReply)done;
 - (void)receive;
 - (void)receiveOn:(NSURLSessionWebSocketTask *)task generation:(NSUInteger)generation;
 - (void)fail:(NSError *)error generation:(NSUInteger)generation;
@@ -148,12 +165,15 @@ static HCChromeBroker *hc_chrome_shared_broker;
         pending=[NSMutableDictionary new];pages=[NSMutableDictionary new];targets=[NSMutableDictionary new];waiting=[NSMutableArray new];
         closingTargets=[NSMutableSet new];quitReplies=[NSMutableSet new];
         NSURLSessionConfiguration *config=[NSURLSessionConfiguration ephemeralSessionConfiguration];
-        config.timeoutIntervalForRequest=20;config.timeoutIntervalForResource=30;
+        /* Chrome holds the attach handshake open until the user clicks Allow. */
+        config.timeoutIntervalForRequest=120;config.timeoutIntervalForResource=130;
         session=[[NSURLSession sessionWithConfiguration:config] retain];
     }return self;
 }
 - (void)finishConnect:(NSError *)error {
     connecting=NO;connected=error==nil;
+    /* Hand focus back after the Allow prompt (GUI only; `hardcore here` has no NSApp). */
+    if(raisedChrome){raisedChrome=NO;if(NSApp && NSApp.activationPolicy==NSApplicationActivationPolicyRegular)[NSApp activateIgnoringOtherApps:YES];}
     if(error)[socket cancelWithCloseCode:NSURLSessionWebSocketCloseCodeGoingAway reason:nil];
     NSArray *callbacks=[[waiting copy] autorelease];[waiting removeAllObjects];
     for(HCChromePending *p in callbacks)if(p->callback)p->callback(nil,error);
@@ -166,9 +186,10 @@ static HCChromeBroker *hc_chrome_shared_broker;
     if(connecting)return;connecting=YES;
     NSUInteger generation=++connectionGeneration;
     NSString *attach=NSProcessInfo.processInfo.environment[@"HARDCORE_CHROME_ATTACH"];
-    attached=attach.length>0;
+    attached=!hc_chrome_owned_profile();regular=attached && !attach.length;
     NSString *profile=hc_chrome_profile();
-    NSString *endpointPath=attached ? attach.stringByExpandingTildeInPath : [profile stringByAppendingPathComponent:@"DevToolsActivePort"];
+    NSString *endpointPath=!attached ? [profile stringByAppendingPathComponent:@"DevToolsActivePort"] :
+        regular ? hc_chrome_regular_endpoint() : attach.stringByExpandingTildeInPath;
     BOOL isDir=NO;if(attached && [NSFileManager.defaultManager fileExistsAtPath:endpointPath isDirectory:&isDir] && isDir)endpointPath=[endpointPath stringByAppendingPathComponent:@"DevToolsActivePort"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{@autoreleasepool {
         NSError *failure=nil;NSURL *endpoint=nil;NSTask *launched=nil;int lock=-1;
@@ -210,7 +231,20 @@ static HCChromeBroker *hc_chrome_shared_broker;
             }
         } else {
             endpoint=hc_chrome_endpoint(endpointPath);
-            if(!hc_chrome_listening(endpoint))failure=hc_chrome_error(@"Chrome attach is unavailable. Enable chrome://inspect/#remote-debugging in Chrome, then retry.");
+            if(!hc_chrome_listening(endpoint) && self->regular && !hc_chrome_regular_app()) {
+                /* Start Chrome the way the Dock does, without taking focus;
+                   its remote-debugging allowance lives in the profile. */
+                NSTask *open=[NSTask launchedTaskWithExecutableURL:[NSURL fileURLWithPath:@"/usr/bin/open"] arguments:@[@"-g",@"-b",@"com.google.Chrome"] error:nil terminationHandler:nil];
+                (void)open;
+                NSTimeInterval deadline=NSDate.timeIntervalSinceReferenceDate+15;
+                while(NSDate.timeIntervalSinceReferenceDate<deadline) {
+                    endpoint=hc_chrome_endpoint(endpointPath);
+                    if(hc_chrome_listening(endpoint))break;
+                    [NSThread sleepForTimeInterval:0.1];
+                }
+            }
+            if(!hc_chrome_listening(endpoint))failure=hc_chrome_error(self->regular ? HC_CHROME_ALLOW_HELP :
+                @"Chrome attach is unavailable. Enable chrome://inspect/#remote-debugging in Chrome, then retry.");
         }
         if(lock>=0){flock(lock,LOCK_UN);close(lock);}
         dispatch_async(dispatch_get_main_queue(),^{
@@ -220,7 +254,14 @@ static HCChromeBroker *hc_chrome_shared_broker;
             [self->socket release];self->socket=[[self->session webSocketTaskWithURL:endpoint] retain];
             self->socket.maximumMessageSize=16*1024*1024;
             [self->socket resume];[self receive];
-            [self send:@"Browser.getVersion" params:@{} session:nil completion:^(NSDictionary *r,NSError *e){
+            /* Chrome's Allow prompt can be behind Hardcore; bring it forward if
+               the handshake is still waiting, and focus returns in finishConnect. */
+            if(self->regular)dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.4*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+                if(generation!=self->connectionGeneration || !self->connecting)return;
+                NSRunningApplication *chrome=hc_chrome_regular_app();
+                if(chrome && !chrome.active){self->raisedChrome=YES;[chrome activateWithOptions:0];}
+            });
+            [self send:@"Browser.getVersion" params:@{} session:nil timeout:120 completion:^(NSDictionary *r,NSError *e){
                 if(generation!=self->connectionGeneration)return;
                 self->headed=[r[@"userAgent"] rangeOfString:@"HeadlessChrome/"].location==NSNotFound;
                 [self finishConnect:e];
@@ -239,7 +280,10 @@ static HCChromeBroker *hc_chrome_shared_broker;
     for(HCChromePage *page in [[pages.allValues copy] autorelease]){page->ready=NO;[page notify:@{@"type":@"error",@"message":error.localizedDescription ?: @"Chrome disconnected"}];}
 }
 - (NSNumber *)send:(NSString *)method params:(NSDictionary *)params session:(NSString *)pageSession completion:(HCChromeReply)done {
-    if(!NSThread.isMainThread){dispatch_async(dispatch_get_main_queue(),^{[self send:method params:params session:pageSession completion:done];});return nil;}
+    return [self send:method params:params session:pageSession timeout:20 completion:done];
+}
+- (NSNumber *)send:(NSString *)method params:(NSDictionary *)params session:(NSString *)pageSession timeout:(NSTimeInterval)timeout completion:(HCChromeReply)done {
+    if(!NSThread.isMainThread){dispatch_async(dispatch_get_main_queue(),^{[self send:method params:params session:pageSession timeout:timeout completion:done];});return nil;}
     if(!socket || (!connected && !connecting)){if(done)done(nil,hc_chrome_error(@"Chrome is not connected."));return nil;}
     if(pending.count>=512){if(done)done(nil,hc_chrome_error(@"Chrome is busy; retry the operation."));return nil;}
     NSNumber *key=@(++serial);NSMutableDictionary *message=[NSMutableDictionary dictionaryWithDictionary:@{@"id":key,@"method":method,@"params":params ?: @{}}];
@@ -251,7 +295,7 @@ static HCChromeBroker *hc_chrome_shared_broker;
     NSString *string=[[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
     NSURLSessionWebSocketMessage *frame=[[[NSURLSessionWebSocketMessage alloc] initWithString:string] autorelease];
     [socket sendMessage:frame completionHandler:^(NSError *e){if(e)dispatch_async(dispatch_get_main_queue(),^{[self fail:e generation:generation];});}];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(20*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(timeout*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
         HCChromePending *expired=[[self->pending objectForKey:key] retain];
         if(expired){[self->pending removeObjectForKey:key];if(expired->callback)expired->callback(nil,hc_chrome_error([NSString stringWithFormat:@"Chrome timed out: %@",method]));[expired release];}
     });
@@ -558,6 +602,15 @@ static int hc_chrome_setup_main(int argc,char **argv) {
         NSString *profile=hc_chrome_profile();
         if(!strcmp(action,"profile")){printf("%s\n",profile.fileSystemRepresentation);return 0;}
         if(strcmp(action,"setup")){fprintf(stderr,"Usage: hardcore chrome setup | profile\n");return 2;}
+        if(!hc_chrome_owned_profile() && ![NSProcessInfo.processInfo.environment[@"HARDCORE_CHROME_ATTACH"] length]) {
+            NSTask *open=[NSTask launchedTaskWithExecutableURL:[NSURL fileURLWithPath:@"/usr/bin/open"] arguments:@[@"-a",@"Google Chrome",@"chrome://inspect/#remote-debugging"] error:nil terminationHandler:nil];
+            [open waitUntilExit];
+            if(!open || open.terminationStatus){fprintf(stderr,"hardcore: install Google Chrome to browse inside Hardcore.\n");return 2;}
+            BOOL allowed=hc_chrome_listening(hc_chrome_endpoint(hc_chrome_regular_endpoint()));
+            printf(allowed ? "Your Chrome already allows Hardcore; WWW tabs use its sign-ins, history and extensions.\nChrome asks you to Allow each time Hardcore connects.\n"
+                           : "Opened chrome://inspect/#remote-debugging in your Chrome.\nAllow remote debugging there; WWW tabs then use your Chrome's sign-ins, history and extensions.\n");
+            return 0;
+        }
         if([NSProcessInfo.processInfo.environment[@"HARDCORE_CHROME_ATTACH"] length]) {
             fprintf(stderr,"hardcore: attached Chrome uses your existing profile. Open Chrome's settings/extensions directly.\n");return 2;
         }

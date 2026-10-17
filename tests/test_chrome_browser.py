@@ -308,7 +308,7 @@ class ChromeIntegrationTests(unittest.TestCase):
         source.write_text(HARNESS)
         cls.exe = cls.root / 'chrome-fixture'
         result = subprocess.run(['clang', '-fblocks', '-Werror=implicit-function-declaration',
-                                 '-framework', 'Foundation', '-I', str(ROOT), str(source),
+                                 '-framework', 'Foundation', '-framework', 'AppKit', '-I', str(ROOT), str(source),
                                  '-o', str(cls.exe)], capture_output=True, text=True, timeout=60)
         if result.returncode:
             raise AssertionError(result.stdout + result.stderr)

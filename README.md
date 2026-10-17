@@ -67,37 +67,35 @@ by a native DevTools Protocol client compiled into Hardcore. Desktop **+www** an
 macOS `hardcore here` **WWW** share this backend. No Python, Node, browser driver,
 or bundled Chromium runtime is needed. The local Clips player remains WebKit.
 
-By default Chrome uses a persistent Hardcore profile at
-`~/Library/Application Support/hardcore/Chrome`. Its cookies, history, site data,
-and installed extensions remain in Chrome across tab closes and Hardcore updates.
-This is a **separate profile**: existing regular Chrome logins and extensions are
-not copied. To sign in or install extensions, close Hardcore website tabs and run:
+Web tabs use **your own Chrome**: the same profile the Dock icon opens, with its
+sign-ins, history and extensions. Hardcore never reads or copies cookies or
+profile files. It talks to Chrome through Chrome's own opt-in for remote
+debugging, which needs one switch, once:
 
 ```sh
 hardcore chrome setup
 ```
 
-That opens the same profile visibly in Chrome for browser-level setup and prompts.
-The hidden backend can reconnect to that profile afterward. `hardcore chrome profile`
-prints its path. `HARDCORE_CHROME_PROFILE` selects another dedicated profile and
-`HARDCORE_CHROME_EXECUTABLE` selects an installed Chrome/Chromium-compatible binary.
+That opens `chrome://inspect/#remote-debugging` in Chrome; allow remote
+debugging there. If Chrome is not running, Hardcore starts it as the Dock does.
+Chrome then asks you to **Allow** each connection (Hardcore brings the prompt
+forward and returns focus afterwards). One connection serves a window until it
+quits or reloads in place, so expect one prompt per launch or reload while web
+tabs are open. Chrome shows its "controlled by automated test software" banner
+while connected. Hardcore's pages are hidden targets, not tabs in your tab
+strip, and Quit closes only those pages. Because these targets live only as
+long as the connection, a reload reopens their URLs rather than keeping
+unsaved form state.
 
-For your **existing Chrome profile**, Chrome 144+ offers an explicit opt-in:
-open `chrome://inspect/#remote-debugging` in Chrome, enable remote debugging,
-then start Hardcore with the profile’s endpoint file and accept Chrome’s prompt:
-
-```sh
-HARDCORE_CHROME_ATTACH="$HOME/Library/Application Support/Google/Chrome/DevToolsActivePort" hardcore
-```
-
-Hardcore reads only the debugging endpoint; it does not copy cookies, passwords,
-or profile databases. This mode uses Chrome’s existing authentication, history,
-and installed extensions. It creates hidden page targets and never closes your
-Chrome browser. Chrome controls the consent prompt. See
-[Chrome’s connection documentation](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session).
-The endpoint setting applies to the process hosting the website tabs; setting it
+`HARDCORE_CHROME_ATTACH=<DevToolsActivePort file or profile directory>` attaches
+to another Chrome-family browser that allowed remote debugging. For tests and
+development, `HARDCORE_CHROME_PROFILE=<dir>` instead launches a private headless
+profile (`hardcore chrome setup` then opens that profile visibly) and
+`HARDCORE_CHROME_EXECUTABLE` selects the binary. See
+[Chrome's connection documentation](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session).
+The browser choice belongs to the process hosting the website tabs; setting it
 only on a CLI that contacts an already-running Hardcore window cannot change that
-window’s browser profile.
+window’s browser.
 
 Grid mode uses the same document adapters, reflow, forms, links and inspector as
 before. Normal mode streams Chrome’s rendered viewport and forwards pointer,

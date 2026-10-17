@@ -2,13 +2,18 @@ Current implementation — 2026-10-17
 
 Desktop +www and macOS native `hardcore here` WWW now use installed full Chrome
 through the embedded native CDP backend (hardcore_chrome_browser.h). The default
-is a persistent Hardcore-owned profile and a hidden Chrome process. Existing
-Chrome144+ profiles can be attached after explicit browser opt-in/consent using
-HARDCORE_CHROME_ATTACH. No profile/cookie copying is performed. Desktop retains
+attaches to the user's regular Chrome profile through Chrome 144+'s
+chrome://inspect remote-debugging opt-in (Chrome 136+ ignores debugging switches
+on the default profile, and Google refuses sign-in in a debugged private
+profile). Chrome prompts per connection; the handshake waits for Allow.
+HARDCORE_CHROME_PROFILE selects a private headless profile for tests/dev.
+No profile/cookie copying is performed. Desktop retains
 semantic grid projection and adds a screenshot/input surface for normal mode;
 terminal WWW now supports live JS, numbered DOM controls, and Chrome history.
-Local Clips documents retain WKWebView. `hardcore chrome setup` provides visible
-sign-in/extension setup for the dedicated profile.
+Local Clips documents retain WKWebView. `hardcore chrome setup` opens Chrome's
+remote-debugging opt-in page (or, with HARDCORE_CHROME_PROFILE, that profile).
+Follow-up: a per-login relay holding the single consented connection would
+remove repeat Allow prompts and keep attached targets alive across reloads.
 
 Verified with disposable Chrome profiles: DOM projection, form/native input,
 history, persisted cookies across processes, screenshots, popup opener retention,
