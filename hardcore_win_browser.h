@@ -22,6 +22,7 @@ typedef struct {
     uint32_t palette[18], background;
 } WbImage;
 typedef struct { char label[160]; char value[512]; int op; } WbItem;
+typedef struct { char *text; int id; } WbLine;
 typedef struct WinBrowser {
     int tab_id, serial, disposed;
     char target[128], session[128], frame[128], adopt[128];
@@ -49,6 +50,9 @@ typedef struct WinBrowser {
     WbItem *menu;
     int menu_count, menu_kind, menu_selected, menu_node, menu_revision, menu_x, menu_y, menu_w;
     char menu_url[4096];
+    /* the inspector: one element's DOM, style and text, a panel below the page */
+    WbLine *insp[3];
+    int insp_n[3], inspect_open, inspect_tab, inspect_scroll, inspect_revision, inspect_id, inspect_parent;
     /* native */
     int casting, buttons, sent_w, sent_h;
     double sent_scale;
@@ -66,6 +70,7 @@ static Tab *wb_new_tab(const char *address, int parent, int native, const char *
 static void mac_browser_sync(void);
 static void wb_project(WinBrowser *b);
 static void wb_load(WinBrowser *b, const char *url);
+static void wb_inspect_request(WinBrowser *b, int node);
 
 /* ── small helpers ── */
 static uint32_t wb_utf8(const char **p) {
@@ -395,6 +400,7 @@ static void wb_accept(WinBrowser *b, JDoc *d, int snapshot) {
     if (raw[0] && wb_url(raw, url, sizeof(url)) && strcmp(url, "about:blank") && strncmp(url, "data:", 5))
         snprintf(tb->browser_url, sizeof(tb->browser_url), "%s", url);
     wb_set_metadata(tb, jstr(d, jget(d, snapshot, "title")), jstr(d, jget(d, snapshot, "site")), NULL);
+    if (b->inspect_open && b->insp_n[0]) wb_inspect_request(b, b->inspect_id);   /* the inspected node, again */
     if (tb == active_tab()) { g_sel_on = 0; update_title(); }
     else tb->activity = 1;
     plat_invalidate();
@@ -445,7 +451,7 @@ static void wb_command(WinBrowser *b, const char *method, const char *params, Cd
 }
 
 /* evaluation in the "hardcore.browser" isolated world; the first one in a world loads the script */
-enum { EV_NONE, EV_PROJECT, EV_INFO_ACTION, EV_INFO_MENU, EV_COPY };
+enum { EV_NONE, EV_PROJECT, EV_INFO_ACTION, EV_INFO_MENU, EV_COPY, EV_INSPECT };
 static void wb_eval_done(WinBrowser *b, WbCtx *x, JDoc *d, int value);
 static void wb_eval_cb(JDoc *d, int result, const char *error, void *ctx) {
     WbCtx *x = (WbCtx *)ctx;
@@ -569,6 +575,7 @@ static void wb_viewport(WinBrowser *b) {
     int w, h;
     double s = wb_scale();
     plat_client_size(&w, &h);
+    if (b->inspect_open) { Tab *tb = tab_by_id(b->tab_id); if (tb) h = chrome_min(h, mac_browser_page_rows(tb) * CH); }
     int cw = chrome_max(1, chrome_min(8192, (int)(w / s))), chh = chrome_max(1, chrome_min(8192, (int)(h / s)));
     if (!b->ready || (b->sent_w == cw && b->sent_h == chh && b->sent_scale == s)) return;
     char p[160];
@@ -615,7 +622,8 @@ static void wb_setup_next(WinBrowser *b, WbCtx *x) {
             wb_command(b, "Page.navigate", p.p, wb_setup_cb, x);
             break;
         }
-        /* fall through: an adopted page is already where it was */
+        /* an adopted page is already where it was */
+        /* fall through */
     default: {
         Tab *tb = tab_by_id(b->tab_id);
         if (tb) snprintf(tb->browser_target, sizeof(tb->browser_target), "%s", b->target);
@@ -699,7 +707,17 @@ static char *wb_welcome_url(void) {
     sb_put(&s, "", 1);
     return s.p;
 }
+static void wb_inspect_free(WinBrowser *b) {
+    for (int t = 0; t < 3; t++) {
+        for (int i = 0; i < b->insp_n[t]; i++) free(b->insp[t][i].text);
+        free(b->insp[t]);
+        b->insp[t] = NULL;
+        b->insp_n[t] = 0;
+    }
+}
 static void wb_reset_document(WinBrowser *b) {
+    wb_inspect_free(b);
+    b->inspect_scroll = 0;
     if (b->edit_kind > 1) b->edit_kind = 0;
     free(b->menu); b->menu = NULL; b->menu_kind = b->menu_count = 0;
     b->epoch++; b->generation = 0; b->scroll = 0; b->dirty = 1;
@@ -966,6 +984,7 @@ static void mac_browser_destroy(Tab *tb) {
     }
     wb_free_blocks(b);
     wb_free_images(b);
+    wb_inspect_free(b);
     free(b->node_grid);
     free(b->menu);
     free(b->frame_px);
@@ -1023,7 +1042,11 @@ static void mac_browser_sync(void) {
     plat_invalidate();
 }
 static void mac_browser_resize(Tab *tb) { WinBrowser *b = browser_for(tb); if (b) wb_viewport(b); }
-static int mac_browser_page_rows(Tab *tb) { return tb ? tb->t.rows : 0; }
+static int mac_browser_page_rows(Tab *tb) {
+    WinBrowser *b = browser_for(tb);
+    if (!b || !b->inspect_open) return tb ? tb->t.rows : 0;
+    return chrome_max(3, tb->t.rows - chrome_max(5, tb->t.rows / 3));
+}
 
 /* Grid mode: the blocks laid out into the tab's own cells, each frame they change. */
 static void mac_browser_prepare(Tab *tb) {
@@ -1204,10 +1227,11 @@ static void wb_menu_add(WinBrowser *b, const char *label, const char *value, int
     it->op = op;
 }
 static void wb_context_items(WinBrowser *b, int with_link) {
-    wb_menu_set(b, 1, 6);
+    wb_menu_set(b, 1, 7);
     if (!b->menu) return;
     if (with_link) { wb_menu_add(b, "Copy link location", NULL, 1); wb_menu_add(b, "Open in new browser tab", NULL, 2); }
     wb_menu_add(b, "Copy selection", NULL, 3);
+    wb_menu_add(b, "Inspect element", NULL, 4);
     wb_menu_add(b, "Back", NULL, 5);
     wb_menu_add(b, "Reload", NULL, 6);
 }
@@ -1268,10 +1292,74 @@ static void wb_eval_done(WinBrowser *b, WbCtx *x, JDoc *d, int value) {
             b->menu_x = mx; b->menu_y = my; b->menu_w = mw; b->menu_node = node; b->menu_revision = rev;
         }
         plat_invalidate();
+    } else if (x->op == EV_INSPECT) {
+        if (b->generation != x->b2 || b->epoch != x->epoch || jtype(d, value) != JN_OBJ) return;
+        int id = jint(d, jget(d, value, "id"));
+        int keep = id == b->inspect_id ? b->inspect_scroll : 0;
+        wb_inspect_free(b);
+        for (int t = 0; t < 3; t++) {
+            int cap = 64;
+            WbLine *lines = (WbLine *)calloc((size_t)cap, sizeof(WbLine));
+            int n = 0;
+            char text[1200];
+            #define WB_LINE(str, ident) do { if (n == cap) { WbLine *more = (WbLine *)realloc(lines, (size_t)(cap *= 2) * sizeof(WbLine)); if (!more) break; lines = more; } \
+                                             lines[n].text = _strdup(str); lines[n++].id = (ident); } while (0)
+            if (!lines) continue;
+            snprintf(text, sizeof(text), "<%s>", jstr(d, jget(d, value, "tag")));
+            WB_LINE(text, 0);
+            if (t == 2) {
+                const char *all = jstr(d, jget(d, value, "text"));
+                while (*all) {
+                    size_t k = strcspn(all, "\n");
+                    snprintf(text, sizeof(text), "%.*s", (int)(k < 1000 ? k : 1000), all);
+                    WB_LINE(text, 0);
+                    all += k + (all[k] == '\n');
+                }
+            } else {
+                int items = jget(d, value, t == 1 ? "style" : "attributes");
+                for (int it = jtype(d, items) == JN_ARR ? d->n[items].first : -1; it >= 0; it = d->n[it].next) {
+                    snprintf(text, sizeof(text), "  %s = %s", jstr(d, jget(d, it, "name")), jstr(d, jget(d, it, "value")));
+                    WB_LINE(text, 0);
+                }
+                int kids = t == 0 ? jget(d, value, "children") : -1;
+                for (int c = jtype(d, kids) == JN_ARR ? d->n[kids].first : -1; c >= 0; c = d->n[c].next) {
+                    snprintf(text, sizeof(text), "  <%s> %s", jstr(d, jget(d, c, "tag")), jstr(d, jget(d, c, "text")));
+                    WB_LINE(text, jint(d, jget(d, c, "id")));
+                }
+            }
+            #undef WB_LINE
+            b->insp[t] = lines;
+            b->insp_n[t] = n;
+        }
+        b->inspect_id = id;
+        b->inspect_parent = jint(d, jget(d, value, "parent"));
+        b->inspect_revision = x->b2;
+        b->inspect_open = 1;
+        b->inspect_scroll = keep;
+        b->dirty = 1;
+        wb_viewport(b);
+        plat_invalidate();
     } else if (x->op == EV_COPY) {
         const char *s = jstr(d, value);
         if (s[0]) set_clipboard_utf8(s, (int)strlen(s));
     }
+}
+static void wb_inspect_request(WinBrowser *b, int node) {
+    char js[96];
+    snprintf(js, sizeof(js), "globalThis.hardcoreBrowser?.inspect(%d,%d)", node, b->generation);
+    wb_eval(b, js, EV_INSPECT, node, b->generation);
+}
+/* the inspector's lines on its current tab, with a note when the page has moved on */
+static int wb_inspect_count(WinBrowser *b) { return b->insp_n[b->inspect_tab] ? b->insp_n[b->inspect_tab] + (b->inspect_revision != b->generation) : 1; }
+static const char *wb_inspect_line(WinBrowser *b, int i, int *id) {
+    int stale = b->inspect_revision != b->generation;
+    *id = 0;
+    if (!b->insp_n[b->inspect_tab]) return "Choose Inspect element from the page context menu.";
+    if (stale && i == 1) return "Page changed; inspect again to refresh this node.";
+    if (stale && i > 1) i--;
+    if (i < 0 || i >= b->insp_n[b->inspect_tab]) return "";
+    *id = b->insp[b->inspect_tab][i].id;
+    return b->insp[b->inspect_tab][i].text ? b->insp[b->inspect_tab][i].text : "";
 }
 static void mac_browser_action(Tab *tb, int action) {
     WinBrowser *b = browser_for(tb);
@@ -1408,6 +1496,21 @@ static void mac_browser_draw_overlay(void) {
     Tab *tb = active_tab();
     WinBrowser *b = browser_for(tb);
     if (chrome_preview_active() || !b) return;
+    if (b->inspect_open) {
+        int top = mac_browser_page_rows(tb), height = tb->t.rows - top;
+        fill_rect(0, (float)(top * CH), (float)(tb->t.cols * CW), (float)(tb->t.rows * CH), BAR_BG, 1);
+        fill_rect(0, (float)(top * CH), (float)(tb->t.cols * CW), (float)(top * CH + 1), g_look.dim, 1);
+        wb_text("[↑ parent]", 0, top, 10, DEF_FG);
+        wb_text("[DOM]", 11, top, 6, b->inspect_tab == 0 ? AMBER : DEF_FG);
+        wb_text("[Style]", 18, top, 8, b->inspect_tab == 1 ? AMBER : DEF_FG);
+        wb_text("[Text]", 27, top, 7, b->inspect_tab == 2 ? AMBER : DEF_FG);
+        wb_text("[×]", tb->t.cols - 3, top, 3, DEF_FG);
+        for (int i = 0; i < height - 1 && i + b->inspect_scroll < wb_inspect_count(b); i++) {
+            int id;
+            const char *line = wb_inspect_line(b, i + b->inspect_scroll, &id);
+            wb_text(line, 0, top + i + 1, tb->t.cols, id ? g_shown->pal[4] : DEF_FG);
+        }
+    }
     if (b->edit_kind > 1) {
         wb_box(b->edit_x, b->edit_y, b->edit_w, b->edit_h);
         wb_text(b->edit_kind == 3 ? " Ctrl+Enter applies " : " Enter applies ", b->edit_x + 1, b->edit_y, b->edit_w - 7, g_look.detail);
@@ -1584,7 +1687,7 @@ static void wb_menu_choose(WinBrowser *b, int at) {
     if (!b->menu || at < 0 || at >= b->menu_count) return;
     WbItem item = b->menu[at];
     char url[4096];
-    int kind = b->menu_kind, node = b->menu_node;
+    int kind = b->menu_kind, node = b->menu_node, rev = b->menu_revision;
     snprintf(url, sizeof(url), "%s", b->menu_url);
     free(b->menu); b->menu = NULL; b->menu_kind = b->menu_count = 0;
     if (kind == 2) { wb_activate_value(b, node, b->epoch, item.value); return; }
@@ -1596,6 +1699,7 @@ static void wb_menu_choose(WinBrowser *b, int at) {
         if (tb && tb->browser_native) wb_eval(b, "globalThis.getSelection()?.toString() || ''", EV_COPY, 0, 0);
         else sel_copy();
         break;
+    case 4: if (rev == b->generation) wb_inspect_request(b, node); break;
     case 5: mac_browser_command(1); break;
     case 6: mac_browser_command(3); break;
     }
@@ -1635,8 +1739,8 @@ static void mac_browser_context_native(WinBrowser *b, JDoc *d, int message) {
 }
 static int mac_browser_ui_contains(int mx, int my) {
     WinBrowser *b = browser_for(active_tab());
-    (void)mx; (void)my;
-    return b && (b->menu_kind || b->edit_kind > 1);
+    (void)mx;
+    return b && (b->menu_kind || b->edit_kind > 1 || (b->inspect_open && my >= mac_browser_page_rows(active_tab()) * CH));
 }
 /* A left press: the menus, editors and nav bar first. 1 when taken. */
 static int mac_browser_ui_mouse(int mx, int my) {
@@ -1648,6 +1752,20 @@ static int mac_browser_ui_mouse(int mx, int my) {
         int cap = chrome_max(1, chrome_min(10, tb->t.rows - b->menu_y - 2)), offset = wb_menu_offset(b, cap);
         if (col >= b->menu_x && col < b->menu_x + b->menu_w && row > b->menu_y && row <= b->menu_y + cap) wb_menu_choose(b, offset + row - b->menu_y - 1);
         else { free(b->menu); b->menu = NULL; b->menu_kind = b->menu_count = 0; }
+        plat_invalidate();
+        return 1;
+    }
+    if (b->inspect_open && row >= mac_browser_page_rows(tb)) {
+        int top = mac_browser_page_rows(tb);
+        if (row == top) {
+            if (col >= tb->t.cols - 3) { b->inspect_open = 0; b->dirty = 1; wb_viewport(b); }
+            else if (col < 10) { if (b->inspect_revision == b->generation && b->insp_n[0]) wb_inspect_request(b, b->inspect_parent); }
+            else { b->inspect_tab = col < 18 ? 0 : col < 27 ? 1 : 2; b->inspect_scroll = 0; }
+        } else {
+            int id;
+            wb_inspect_line(b, row - top - 1 + b->inspect_scroll, &id);
+            if (id && b->inspect_revision == b->generation) wb_inspect_request(b, id);
+        }
         plat_invalidate();
         return 1;
     }
@@ -1684,9 +1802,16 @@ static int mac_browser_ui_mouse(int mx, int my) {
     return 0;
 }
 static int mac_browser_ui_scroll(int mx, int my, int lines) {
-    WinBrowser *b = browser_for(active_tab());
-    (void)mx; (void)my;
-    if (!b || !b->menu_kind) return 0;
+    Tab *tb = active_tab();
+    WinBrowser *b = browser_for(tb);
+    (void)mx;
+    if (!b) return 0;
+    if (b->inspect_open && my >= mac_browser_page_rows(tb) * CH) {
+        b->inspect_scroll = chrome_max(0, chrome_min(chrome_max(0, wb_inspect_count(b) - (tb->t.rows - mac_browser_page_rows(tb) - 1)), b->inspect_scroll + lines));
+        plat_invalidate();
+        return 1;
+    }
+    if (!b->menu_kind) return 0;
     b->menu_selected = chrome_max(0, chrome_min(b->menu_count - 1, b->menu_selected + lines));
     plat_invalidate();
     return 1;
@@ -1714,6 +1839,7 @@ static int mac_browser_ui_move(int mx, int my) {
         return 1;
     }
     if (b->edit_kind > 1 && col >= b->edit_x && col < b->edit_x + b->edit_w && row >= b->edit_y && row < b->edit_y + b->edit_h) { win_cursor(IDC_IBEAM); return 1; }
+    if (b->inspect_open && row >= mac_browser_page_rows(tb)) { win_cursor(IDC_ARROW); return 1; }
     if (!g_grid_on && tb->browser_native && !over_chrome(mx, my)) { win_cursor(IDC_ARROW); return 1; }
     if (!tb->browser_native && mac_browser_hover_link()) { win_cursor(IDC_HAND); return 1; }
     if (!tb->browser_native) { win_cursor(IDC_ARROW); return 1; }
