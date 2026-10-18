@@ -77,6 +77,13 @@ static void mac_music_layout(Term *term) {
     }
     UI_DONE;
 }
+/* Transport buttons: {column, width}. Grid rails are as narrow as the tab
+   menu, so narrow panels pack the same four buttons tighter. */
+static const int g_music_transport_wide[4][2]={{1,7},{9,7},{17,7},{25,5}};
+static const int g_music_transport_narrow[4][2]={{1,5},{7,7},{15,5},{21,5}};
+static const int (*mac_music_transport(void))[2] {
+    return g_music_rect.w<32?g_music_transport_narrow:g_music_transport_wide;
+}
 static int mac_music_hit(int x,int y) {
     if(!g_music_visible || !g_music_placed || x<0 || y<0)return MUSIC_NONE;
     UI_FONT;int col=x/CW-g_music_rect.x,row=y/CH-g_music_rect.y;UI_DONE;
@@ -90,10 +97,9 @@ static int mac_music_hit(int x,int y) {
     }
     if(row==3 && col>=1 && col<r.w-1)return MUSIC_SEEK;
     if(row==4) {
-        if(col>=1 && col<8)return MUSIC_PREVIOUS;
-        if(col>=9 && col<16)return MUSIC_PLAY;
-        if(col>=17 && col<24)return MUSIC_NEXT;
-        if(col>=25 && col<30)return MUSIC_STOP;
+        const int (*b)[2]=mac_music_transport();
+        static const int actions[4]={MUSIC_PREVIOUS,MUSIC_PLAY,MUSIC_NEXT,MUSIC_STOP};
+        for(int i=0;i<4;i++)if(col>=b[i][0] && col<b[i][0]+b[i][1])return actions[i];
     }
     if(row==5) {
         if(col>=r.w-15 && col<r.w-7)return MUSIC_REFRESH;
@@ -148,9 +154,10 @@ static void mac_music_draw(void) {
     mac_music_text([NSString stringWithFormat:@"%@ · %u:%02u / %u:%02u",state,pos/60,pos%60,duration/60,duration%60],1,r.w-1,y+2,g_look.detail);
     wchar_t bar[128];int n=chrome_min(r.w-4,120),fill=(int)(fmax(0,fmin(1,[s[@"progress"] doubleValue]))*n);
     bar[0]='[';for(int i=0;i<n;i++)bar[i+1]=i<fill?'=':' ';bar[n+1]=']';bar[n+2]=0;chrome_label(bar,1,r.w-1,y+3,g_look.detail);
-    mac_music_button(L"Prev",1,7,y+4,MUSIC_PREVIOUS);
-    mac_music_button([s[@"playing"] boolValue]?L"Ⅱ Pause":L"▶ Play",9,7,y+4,MUSIC_PLAY);
-    mac_music_button(L"Next",17,7,y+4,MUSIC_NEXT);mac_music_button(L"Stop",25,5,y+4,MUSIC_STOP);
+    const int (*b)[2]=mac_music_transport();
+    mac_music_button(L"Prev",b[0][0],b[0][1],y+4,MUSIC_PREVIOUS);
+    mac_music_button([s[@"playing"] boolValue]?L"Ⅱ Pause":L"▶ Play",b[1][0],b[1][1],y+4,MUSIC_PLAY);
+    mac_music_button(L"Next",b[2][0],b[2][1],y+4,MUSIC_NEXT);mac_music_button(L"Stop",b[3][0],b[3][1],y+4,MUSIC_STOP);
     chrome_label(L"Episodes",1,r.w-16,y+5,g_look.dim);
     mac_music_button(L"Refresh",r.w-15,8,y+5,MUSIC_REFRESH);mac_music_button(L"Site",r.w-6,5,y+5,MUSIC_SITE);
     int current=[s[@"index"] intValue];

@@ -157,6 +157,12 @@ static void mac_camera_layout(Term *term) {
     }
     mac_camera_preview_sync();UI_DONE;
 }
+/* Recording buttons: {column, width}, packed tighter in a narrow grid rail. */
+static const int g_camera_controls_wide[4][2]={{1,7},{9,7},{17,5},{23,7}};
+static const int g_camera_controls_narrow[4][2]={{1,5},{7,6},{14,4},{19,7}};
+static const int (*mac_camera_controls(void))[2] {
+    return g_camera_rect.w<32?g_camera_controls_narrow:g_camera_controls_wide;
+}
 static int mac_camera_hit(int x,int y) {
     if(!g_camera_visible || !g_camera_placed || x<0 || y<0)return MAC_CAMERA_NONE;
     UI_FONT;
@@ -167,10 +173,9 @@ static int mac_camera_hit(int x,int y) {
     if(row==r.h-1 && col>=r.w-3)return MAC_CAMERA_RESIZE;
     if(g_camera_clips)return mac_clips_hit(col,row);
     if(row==r.h-4) {
-        if(col>=1 && col<8)return MAC_CAMERA_RECORD;
-        if(col>=9 && col<16)return MAC_CAMERA_PAUSE;
-        if(col>=17 && col<22)return MAC_CAMERA_SAVE;
-        if(col>=23 && col<30)return MAC_CAMERA_DISCARD;
+        const int (*b)[2]=mac_camera_controls();
+        static const int actions[4]={MAC_CAMERA_RECORD,MAC_CAMERA_PAUSE,MAC_CAMERA_SAVE,MAC_CAMERA_DISCARD};
+        for(int i=0;i<4;i++)if(col>=b[i][0] && col<b[i][0]+b[i][1])return actions[i];
     }
     if(row==r.h-3) {
         if(col>=1 && col<17)return MAC_CAMERA_CAPTIONS;
@@ -216,10 +221,11 @@ static void mac_camera_draw(void) {
         if(state==HCCameraCaptureFailed)chrome_label(L"Close and reopen cam to retry",2,r.w-2,r.y+3,g_look.dim);
     }
     int row=r.y+r.h-4;
-    mac_camera_label(L"● Rec",1,7,row,!busy && state==HCCameraCaptureReady?g_look.red:g_look.dim,MAC_CAMERA_RECORD);
-    mac_camera_label(paused?L"Resume":L"Pause",9,7,row,recording||paused?g_look.text:g_look.dim,MAC_CAMERA_PAUSE);
-    mac_camera_label(L"Save",17,5,row,recording||paused||state==HCCameraCaptureFailed?AMBER:g_look.dim,MAC_CAMERA_SAVE);
-    mac_camera_label(L"Discard",23,7,row,busy && (recording||paused||state==HCCameraCaptureFailed)?g_look.text_lo:g_look.dim,MAC_CAMERA_DISCARD);
+    const int (*b)[2]=mac_camera_controls();
+    mac_camera_label(L"● Rec",b[0][0],b[0][1],row,!busy && state==HCCameraCaptureReady?g_look.red:g_look.dim,MAC_CAMERA_RECORD);
+    mac_camera_label(paused?L"Resume":L"Pause",b[1][0],b[1][1],row,recording||paused?g_look.text:g_look.dim,MAC_CAMERA_PAUSE);
+    mac_camera_label(L"Save",b[2][0],b[2][1],row,recording||paused||state==HCCameraCaptureFailed?AMBER:g_look.dim,MAC_CAMERA_SAVE);
+    mac_camera_label(L"Discard",b[3][0],b[3][1],row,busy && (recording||paused||state==HCCameraCaptureFailed)?g_look.text_lo:g_look.dim,MAC_CAMERA_DISCARD);
     row++;
     mac_camera_label(g_camera_capture.captionsEnabled?L"[x] Captions":L"[ ] Captions",1,16,row,busy?g_look.dim:g_look.text_lo,MAC_CAMERA_CAPTIONS);
     wchar_t library[32];
@@ -227,7 +233,8 @@ static void mac_camera_draw(void) {
     mac_camera_label(library,19,8,row,g_look.text_lo,MAC_CAMERA_LIBRARY);
     if(mac_record_exports_active()) {
         wchar_t drip[2]={g_ndrip?g_drip[(GetTickCount()/DRIP_MS)%g_ndrip]:0x2800,0};
-        chrome_label(drip,28,29,row,AMBER);
+        int at=r.w<32?17:28;   /* between Captions and Clips when narrow */
+        chrome_label(drip,at,at+1,row,AMBER);
     }
     NSString *status=g_record_status.length?g_record_status:g_camera_capture.stateDescription;
     if(g_camera_capture.lastError)status=g_camera_capture.lastError.localizedDescription;

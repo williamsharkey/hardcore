@@ -79,6 +79,7 @@ static void chrome_tv_reflow_apply(Term *t,HcTvRect rect,const HcTvRect *prior,i
     for(int i=0;i<count;i++)assert(!hc_tv_rect_overlap(rect,prior[i]));
     test_reflow_count++;test_reflow_rect=rect;
 }
+static int g_grid_on;
 #import "../hardcore_camera_panel.m"
 
 @interface HCTestWheelEvent:NSObject

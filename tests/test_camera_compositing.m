@@ -75,6 +75,7 @@ static void fill_rect(float a,float b,float c,float d,uint32_t color,float alpha
 static void utf8_to_wide(const char *s,wchar_t *out,int capacity){(void)s;if(capacity)out[0]=0;}
 static int chrome_tv_cost(HcTvRect r,HcTvCost *cost,void *opaque){(void)r;(void)cost;(void)opaque;return 1;}
 static void chrome_tv_reflow_apply(Term *t,HcTvRect rect,const HcTvRect *prior,int count){(void)t;(void)rect;(void)prior;(void)count;}
+static int g_grid_on;
 #import "../hardcore_camera_panel.m"
 
 /* Constructing HCCameraCapture only creates queues and an unattached preview

@@ -12,7 +12,7 @@ static void mac_grid_transition(int entering) {
         g_camera_rect=rects[HC_TV_COUNT+1];g_camera_placement=placements[HC_TV_COUNT+1];saved=0;
     }
 }
-/* Grid utilities occupy a stable side rail; opening them never resizes panes. */
+/* Grid utilities occupy a stable side rail as wide as the tab menu; opening them never resizes panes. */
 static void mac_grid_browser_sync(void) {mac_browser_sync();}
 static int g_grid_utility_choice,g_grid_utility_mask,g_grid_utility_row=-1,g_grid_utility_x;
 static const wchar_t *g_grid_utility_names[]={L"Config",L"Music",L"Cam",L"CAF"};

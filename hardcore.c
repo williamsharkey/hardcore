@@ -3200,6 +3200,8 @@ static void chrome_preview_cancel(void) {
 #define SCROLLBAR_W (6 * g_scale)
 /* Chrome uses the same cell grid as terminal text. Underlays occupy no PTY columns. */
 #define SB_COLS 28
+/* Grid utilities share the tab menu's width; music and camera pack to fit. */
+static int grid_utility_columns(void) { return SB_COLS; }
 #define UI_FONT const Font *ui_was_ = g_cf; g_cf = g_font
 #define UI_DONE g_cf = ui_was_
 static int sidebar_w(void) { return SB_COLS * cell_w(g_font); }

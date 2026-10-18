@@ -3,6 +3,7 @@
 static int g_grid_on,g_grid_expand_id,g_grid_hidden[MAX_TABS],g_grid_nhidden;
 static int g_grid_ids[MAX_TABS],g_grid_count,g_grid_left,g_grid_top=1,g_grid_rail=48;
 static HcGrid g_grid;
+static int grid_utility_columns(void);
 static int g_grid_drag_axis,g_grid_drag_boundary;
 static int grid_hidden(int id) {
     for(int i=0;i<g_grid_nhidden;i++)if(g_grid_hidden[i]==id)return 1;
@@ -31,7 +32,8 @@ static void grid_measure(int cols,int rows) {
     for(int i=0;i<g_ntabs;i++)if(!grid_hidden(g_tabs[i]->id))ids[count++]=g_tabs[i]->id;
     /* Prune closed IDs; they must not crowd out future hide choices. */
     for(int i=g_grid_nhidden-1;i>=0;i--)if(!tab_by_id(g_grid_hidden[i]))grid_set_hidden(g_grid_hidden[i],0);
-    g_grid_rail=cols>=100?48:cols>=65?32:28;
+    /* The rail is only as wide as what it holds: panes get every other column. */
+    g_grid_rail=grid_utility_columns();
     if(g_grid_rail>cols-10)g_grid_rail=hc_grid_max(1,cols/3);
     g_grid_left=g_tab_underlay==2?g_grid_rail:0;
     hc_grid_build(&g_grid,count,cols-g_grid_rail,hc_grid_max(1,rows-g_grid_top));
