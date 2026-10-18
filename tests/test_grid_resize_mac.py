@@ -3,11 +3,14 @@
 stand-in redraws on SIGWINCH as Claude Code 2.1 does on the main screen: it
 erases from the top, redraws bottom-up with a blank row under its status
 lines, hides the cursor while it draws and writes the frame in two pieces.
-Every frame the window paints during divider drags and window resizes in the
-grid must
-show one of its frames whole, at the size it was drawn for: the prompt five
-rows above the bottom, rules exactly as wide as the screen. Rewrapping the
-old screen before the program answers painted it a line or two off."""
+Two of them share a 2x2 grid, one above the other, so dragging the middle
+divider moves the bottom of one and the top of the other. Every frame the
+window paints during divider drags and window resizes must show each of them
+whole and in its place: the prompt five rows above the pane's bottom, rules
+as wide as the screen they were drawn for. Rewrapping the old screen before
+the program answered painted it a line or two off; showing it from the top
+while the answer was on its way bobbed the lower pane a row and left blank
+rows at the bottom of a pane that grew."""
 import sys, tempfile, time
 from pathlib import Path
 from test_chrome_mac import NativeApp, ROOT, wait_for
@@ -34,34 +37,44 @@ while True:
 
 
 def frames(path):
+    """Each frame's panes: (header, columns drawn, pane rows, the rows shown)"""
     lines = path.read_text(encoding='utf-8').split('\n')
-    i = 0
+    frame, i = None, 0
     while i < len(lines):
-        if lines[i].startswith('frame '):
+        if lines[i].startswith(('frame ', 'pane ')):
+            if lines[i].startswith('frame '):
+                if frame: yield frame
+                frame = []
             head = lines[i].split()
-            cols, rows = map(int, head[4].split('x'))
-            width, height = map(int, head[6].split('x'))
-            yield lines[i], min(cols, width), rows, lines[i + 1:i + 1 + height]
+            cols, _ = map(int, head[-3].split('x'))
+            width, height = map(int, head[-1].split('x'))
+            frame.append((lines[i], min(cols, width), height, lines[i + 1:i + 1 + height]))
             i += height
         i += 1
+    if frame: yield frame
 
 
 def check(path, what):
     seen = 0
-    for head, cols, rows, shown in frames(path):   # (a screen waiting on its answer is cropped to its pane)
+    for frame in frames(path):
         seen += 1
-        prompt = [y for y, line in enumerate(shown) if line.startswith('❯')]
-        assert prompt == [rows - 5], (what, 'the prompt off its row: a rewrapped or half-drawn frame', head, prompt, shown)
-        for y in (rows - 6, rows - 4):
-            assert shown[y].rstrip() == '─' * cols, (what, 'a rule not as wide as its screen', head, shown[y])
+        tuis = 0
+        for head, cols, rows, shown in frame:   # (a screen waiting on its answer is cropped or padded to its pane)
+            if not any('status two' in line for line in shown): continue
+            tuis += 1
+            prompt = [y for y, line in enumerate(shown) if line.startswith('❯')]
+            assert prompt == [rows - 5], (what, 'the prompt off its row: a rewrapped, half-drawn or misplaced frame', head, prompt, shown)
+            for y in (rows - 6, rows - 4):
+                assert shown[y].rstrip() == '─' * cols, (what, 'a rule not as wide as its screen', head, shown[y])
+        assert tuis == 2, (what, 'a pane without its program: blank or half-drawn', frame[0][0], tuis)
     assert seen >= 5, (what, seen)
     return seen
 
 
-def drag(app, x, y, dx, dy, steps):
+def drag(app, x, y, dx, dy, steps, pause):
     app.send(f'cmd pointer down {x},{y}')
     for k in steps:
-        app.send(f'cmd pointer drag {x + k * dx},{y + k * dy}'); time.sleep(.02)
+        app.send(f'cmd pointer drag {x + k * dx},{y + k * dy}'); time.sleep(pause)
     app.send(f'cmd pointer up {x},{y}'); time.sleep(.3)
 
 
@@ -71,11 +84,12 @@ def run():
         with NativeApp(Path(root), 2, artifacts) as app:
             (app.root / 'tui.py').write_text(TUI)
             app.send('cmd resize 1400,800'); app.send('cmd focus 1')
-            app.send('cmd newtab'); app.send(f'type {sys.executable} {app.root / "tui.py"}\\n')
             for _ in range(2):
-                app.send('cmd newtab'); app.send('type sleep 600\\n')
-            app.send('cmd tab 1')
-            wait_for(lambda: any('status two' in line for line in app.chrome()['source']), description='stand-in TUI drawn')
+                app.send('cmd newtab'); app.send(f'type {sys.executable} {app.root / "tui.py"}\\n')
+            app.send('cmd newtab'); app.send('type sleep 600\\n')
+            for k in (1, 2):
+                app.send(f'cmd tab {k}')
+                wait_for(lambda: any('status two' in line for line in app.chrome()['source']), description='stand-in TUI drawn')
             app.send('cmd grid'); time.sleep(.5)
             c = app.chrome(); cw, ch = c['cell']['width'], c['cell']['height']
             ident = app.state()['tabs'][1]['id']
@@ -84,11 +98,13 @@ def run():
             app.send('cmd tab 1'); time.sleep(.3)
             steps = list(range(1, 7)) + list(range(5, -7, -1)) + list(range(-5, 1))
             counts = []
-            for name, x, y, dx, dy in (('rows', (pane['x'] + 3) * cw, below['y'] * ch, 0, ch),
-                                       ('columns', pane['x'] * cw, (pane['y'] + 3) * ch, cw, 0)):
-                log = app.root / f'frames-{name}.txt'
+            # (faster than the panes answer, too: frames go out without waiting for them)
+            for name, x, y, dx, dy, pause in (('rows', (pane['x'] + 3) * cw, below['y'] * ch, 0, ch, .02),
+                                              ('rows quickly', (pane['x'] + 3) * cw, below['y'] * ch, 0, ch, .004),
+                                              ('columns', pane['x'] * cw, (pane['y'] + 3) * ch, cw, 0, .02)):
+                log = app.root / f'frames-{name.replace(" ", "-")}.txt'
                 app.send(f'cmd framelog {log}')
-                drag(app, x, y, dx, dy, steps)
+                drag(app, x, y, dx, dy, steps, pause)
                 app.send('cmd framelog ')
                 counts.append(check(log, f'dragging the divider across {name}'))
             # The window itself, around the grid

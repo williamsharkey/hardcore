@@ -599,6 +599,7 @@ typedef struct Tab {
     int want_cols, want_rows;    /* the size it should have: told once nothing is in flight */
     DWORD redraw_at;             /* when it took that size, answering, with the cursor showing */
     int mute;                    /* didn't answer the last one: resized without waiting */
+    DWORD answer_ms;             /* how long its answers take, on average (0: none yet) */
 } Tab;
 
 enum { TK_WSL, TK_PS, TK_CMD, TK_BROWSER };
@@ -3323,9 +3324,16 @@ static void tab_set_size(Tab *tb, int cols, int rows);   /* tell the pty */
    doesn't answer within RESIZE_HOLD is rewrapped without it, and from then
    on at once, until it prints again. Grid panes only: the normal view lays
    its menus and panels out over the tab's screen, which must have the
-   window's size. */
+   window's size.
+   The frame waits up to ANSWER_WAIT for the answers too: Claude Code's comes
+   6-11 ms after it's told, and painting before it showed every drag step
+   twice, the divider moved but the text not yet. But only for an answer due
+   by then: in a fast drag Claude Code answers every 15 ms or so (it redraws
+   at most 60 times a second), and frames that waited for it went out at
+   30-38 fps; they go out on time instead, showing what it last drew. */
 #define RESIZE_HOLD 100
 #define REDRAW_HOLD 50
+#define ANSWER_WAIT 8           /* (under half a refresh: a frame that waits keeps its slot) */
 
 static DWORD tick_mark(void) { DWORD now = GetTickCount(); return now ? now : 1; }   /* (0 = not set) */
 
@@ -3349,10 +3357,34 @@ static int tab_redrawing(Tab *tb) {
 
 /* The size in flight, before the bytes written for it are parsed */
 static void tab_take_size(Tab *tb) {
+    DWORD took;
     if (!tb->hold_at) return;
+    took = GetTickCount() - tb->hold_at;
+    tb->answer_ms = tb->answer_ms ? (tb->answer_ms * 3 + took) / 4 : took ? took : 1;
     tb->hold_at = 0;
     tb->redraw_at = tb->t.m_cursor_vis ? tick_mark() : 0;
     term_resize(&tb->t, tb->hold_cols, tb->hold_rows);
+}
+
+/* Where a screen waiting on its answer sits in a pane `height` rows tall: as
+   the rewrap would place it, against its last line, with the rows above from
+   scrollback. Lines under the cursor are a TUI's status lines, which it keeps
+   at the bottom with whatever is under them (Claude Code's blank row).
+   Shown from the top instead, a pane whose top edge moved (under a dragged
+   divider) jumped a row and back, and one that grew showed blank rows. */
+static int tab_hold_shift(const Tab *tb, int height) {
+    const Term *t = &tb->t;
+    int last = t->cy, y, x, s;
+    if (!tb->hold_at || t->alt || t->view || height == t->rows) return 0;
+    for (y = t->rows - 1; y > last; y--) {
+        for (x = 0; x < t->cols && row_is_blank_default(&t->row[0][y][x]); x++) {}
+        if (x < t->cols) break;
+    }
+    if (y > t->cy) last = t->rows - 1;
+    s = last + 1 - height;
+    if (s > t->cy) s = t->cy;    /* (never the cursor off the top) */
+    if (s < -t->hcount) s = -t->hcount;
+    return s;
 }
 
 static void resize_hold_arm(void) {
@@ -3418,14 +3450,23 @@ static void tab_fit(Tab *tb) {
     if(!tb->hold_at && (tb->t.cols!=cols || tb->t.rows!=rows))tab_tell(tb, cols, rows);
 }
 
-/* A frame waits for the rest of a redraw in progress on screen, but never
-   long, even while a drag keeps tabs answering */
-static DWORD g_present_at;
+/* A frame waits for the answers of tabs on screen just told a size, and for
+   the rest of a redraw in progress, but never long, even while a drag keeps
+   telling them new ones */
+static DWORD g_put_off;          /* when the frame on its way was first put off for a resize (0: it wasn't) */
 static int resize_redrawing(void) {
-    int wait = 0;
-    for (int i = 0; i < g_ntabs; i++)
-        if (tab_redrawing(g_tabs[i]) && (g_grid_on ? grid_index(g_tabs[i]->id) >= 0 : g_tabs[i] == active_tab())) wait = 1;
-    return wait && GetTickCount() - g_present_at < REDRAW_HOLD;
+    int redrawing = 0, answering = 0;
+    DWORD since = g_put_off ? g_put_off : GetTickCount();
+    for (int i = 0; i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        if (!(g_grid_on ? grid_index(tb->id) >= 0 : tb == active_tab())) continue;
+        if (tab_redrawing(tb)) redrawing = 1;
+        else if (tb->hold_at && (int)(since - tb->hold_at) >= 0 && (int)(tb->hold_at + tb->answer_ms - since) < ANSWER_WAIT)
+            answering = 1;
+    }   /* (a size told after the frame was put off, once the last answer came, is the next frame's) */
+    if (!redrawing && !answering) return 0;
+    if (!g_put_off) g_put_off = tick_mark();
+    return GetTickCount() - g_put_off < (redrawing ? REDRAW_HOLD : ANSWER_WAIT);
 }
 
 /* The size a tab has, or is on its way to */
@@ -5039,6 +5080,13 @@ static void paint_now(void) {
         plat_timer(TIMER_SYNC, 20);
         return;
     }
+#ifndef _WIN32
+    if (g_grid_on) {
+        int w, h;
+        plat_client_size(&w, &h);
+        grid_fit(w, h);
+    }
+#endif
     if (resize_redrawing()) {
         plat_timer(TIMER_SYNC, 2);
         return;
@@ -5071,7 +5119,7 @@ static void paint_now(void) {
 #endif
     r_present();
     g_presented++;
-    g_present_at = GetTickCount();
+    g_put_off = 0;
 #ifdef _WIN32
     slurp_commit_all();
     if (g_perf) {

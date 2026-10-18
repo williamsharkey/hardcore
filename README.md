@@ -214,10 +214,13 @@ and leaves focus where it was, and right or middle clicks and drops go to the
 pane under the pointer. A pane whose tab wants you shows **!** after its
 number. A window too short for every pane's text narrows the panes first, and a
 divider you dragged returns to where you put it after the window is briefly
-too narrow for that layout. While a divider or the window moves, a pane keeps
-its text where it was until its program redraws for the new size, so Claude
+too narrow for that layout. While a divider or the window moves, each frame
+waits a few milliseconds for the panes' programs to redraw for the new size, so
+the edge and the text move together; a pane whose program hasn't answered yet
+keeps its text, against the pane's bottom as the redraw will put it, so Claude
 Code and other full-screen programs follow the edge instead of bobbing a line
-(a program that doesn't redraw is rewrapped after 100 ms). Settings, music, camera,
+or showing blank rows (a program that doesn't redraw is rewrapped after
+100 ms). Settings, music, camera,
 and CAF use a reserved side rail so opening them leaves the terminal grid fixed.
 When height is tight, Config/Music/Cam/CAF selectors share the rail between open panels.
 Duplicate Cutie previews resume on returning to Normal. Browser panes use cached
@@ -1587,9 +1590,10 @@ comparison.
   size; `tests/test_grid_stress_mac.py` puts a 12-pane grid with real programs
   through a resize storm, tiny windows, extreme divider drags, focus and mouse
   reports, scrolling, output floods, closing and hiding.
-  `tests/test_grid_resize_mac.py` drags dividers and resizes the grid's window
-  under a stand-in that redraws as Claude Code does, and checks every painted frame
-  shows its prompt and rules where the program drew them.
+  `tests/test_grid_resize_mac.py` drags dividers (slowly and faster than the
+  panes answer) and resizes the grid's window under two stand-ins, one above the
+  other, that redraw as Claude Code does, and checks every painted frame shows
+  both with their prompt and rules where the program drew them.
   `tests/test_input_mac.py` checks keys during input-method composition, Ctrl
   on a Cyrillic layout, F13–F20, motion reports, descriptors a shell inherits
   and a shell that exits with a job still writing.

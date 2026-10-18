@@ -83,7 +83,7 @@ static void grid_draw_cells(Tab *tb,int index,HcGridRect rect) {
     Term *t=&tb->t;int width=rect.w,height=rect.h-1;
     if(width<1 || height<1)return;
     int x0=rect.x*CW,y0=(rect.y+1)*CH;
-    Cell *browser=NULL;
+    Cell *browser=NULL;int shift=tab_hold_shift(tb,height);
     if(tb->kind==TK_BROWSER) {
         int count=width*height;
         if(g_grid_browser_id[index]!=tb->id){g_grid_browser_scroll[index]=0;g_grid_browser_id[index]=tb->id;}
@@ -101,7 +101,7 @@ static void grid_draw_cells(Tab *tb,int index,HcGridRect rect) {
     for(int y=0;y<height;y++) {
         const Cell *cells=NULL;int n=0,wrapped;
         if(browser){cells=browser+y*width;n=width;}
-        else if(tb->kind!=TK_BROWSER)term_line(t,t->hcount-t->view+y,&cells,&n,&wrapped);
+        else if(tb->kind!=TK_BROWSER)term_line(t,t->hcount-t->view+y+shift,&cells,&n,&wrapped);
         n=chrome_min(n,width);
         for(int x=0;x<width;x++) {
             const Cell *c=x<n?cells+x:NULL;uint32_t fg=DEF_FG,bg=DEF_BG;
@@ -122,16 +122,22 @@ static void grid_draw_cells(Tab *tb,int index,HcGridRect rect) {
             if(c->attr&A_STRIKE)fill_rect(px,py+CH/2,px+w*CW,py+CH/2+1,fg,1);
         }
     }
-    if(tb==active_tab() && tb->kind!=TK_BROWSER && !t->view && t->m_cursor_vis && t->cx<width && t->cy<height) {
-        int x=x0+t->cx*CW,y=y0+t->cy*CH;
+    if(tb==active_tab() && tb->kind!=TK_BROWSER && !t->view && t->m_cursor_vis && t->cx<width && t->cy-shift>=0 && t->cy-shift<height) {
+        int x=x0+t->cx*CW,y=y0+(t->cy-shift)*CH;
         fill_rect(x,y+CH-2,x+CW,y+CH,AMBER,1);
         draw_preedit(x,y,width-t->cx);
     }
 }
-static void render_grid(int win_w,int win_h) {
+/* Each pane's tab to its pane, told before the frame that shows it (paint_now waits for the answers) */
+static void grid_fit(int win_w,int win_h) {
     UI_FONT;
     grid_measure(win_w/CW,win_h/CH);
     for(int i=0;i<g_grid_count;i++){Tab *tb=tab_by_id(g_grid_ids[i]);if(tb)tab_fit(tb);}
+    UI_DONE;
+}
+static void render_grid(int win_w,int win_h) {
+    UI_FONT;
+    grid_fit(win_w,win_h);
     tab_layout();mac_grid_utilities();
     g_display_term=NULL;g_draw_alpha=1;g_chrome_x=0;
     int clip_w=g_clip_w,clip_h=g_clip_h;

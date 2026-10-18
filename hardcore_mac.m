@@ -1883,8 +1883,14 @@ static void paint_scheduled(void) {
         return;
     }
     g_paint_pending = 0;
-    g_painted_at = uptime_ms();
+    unsigned frames = g_presented;
     paint_view_now();
+    /* (A frame put off, waiting on a resize's answer, retries in 2 ms. One
+       that went out late keeps its slot: during a drag, frames wait a few ms
+       for answers, and counting the period from when each went out
+       measured 45 fps instead of 60.) */
+    if (g_presented != frames)
+        g_painted_at = now - g_painted_at - g_refresh_ms < g_refresh_ms / 2 ? g_painted_at + g_refresh_ms : now;
 }
 
 static void plat_invalidate(void) {
@@ -2957,13 +2963,25 @@ static NSString *ctl_unescape(const char *s) {
 static void framelog_paint(void) {
     Tab *tb=active_tab();if(!tb || tb->kind==TK_BROWSER)return;
     Term *t=&tb->t;int w=t->cols,h=t->rows;
-    if(g_grid_on){HcGridRect r=grid_rect(tb->id);w=r.w;h=r.h-1;}
+    int shift=0;
+    if(g_grid_on){HcGridRect r=grid_rect(tb->id);w=r.w;h=r.h-1;shift=tab_hold_shift(tb,h);}
     fprintf(g_framelog,"frame %u %.1f term %dx%d pane %dx%d\n",g_paints,clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1e6,t->cols,t->rows,w,h);
     for(int y=0;y<h;y++) {
         const Cell *cells;int n=0,wrapped;char utf[8];
-        term_line(t,t->hcount-t->view+y,&cells,&n,&wrapped);
+        term_line(t,t->hcount-t->view+y+shift,&cells,&n,&wrapped);
         for(int x=0;x<w;x++){int k=utf8_encode(x<n && cells[x].ch?cells[x].ch:' ',utf);fwrite(utf,1,k,g_framelog);}
         fputc('\n',g_framelog);
+    }
+    if(g_grid_on)for(int i=0;i<g_grid_count;i++) {   /* then every other pane */
+        Tab *o=tab_by_id(g_grid_ids[i]);if(!o || o==tb || o->kind==TK_BROWSER)continue;
+        HcGridRect r=grid_rect(o->id);Term *ot=&o->t;
+        fprintf(g_framelog,"pane %d term %dx%d pane %dx%d\n",o->id,ot->cols,ot->rows,r.w,r.h-1);
+        for(int y=0;y<r.h-1;y++) {
+            const Cell *cells;int n=0,wrapped;char utf[8];
+            term_line(ot,ot->hcount-ot->view+y+tab_hold_shift(o,r.h-1),&cells,&n,&wrapped);
+            for(int x=0;x<r.w;x++){int k=utf8_encode(x<n && cells[x].ch?cells[x].ch:' ',utf);fwrite(utf,1,k,g_framelog);}
+            fputc('\n',g_framelog);
+        }
     }
     fflush(g_framelog);
 }
