@@ -51,6 +51,17 @@ FONTS = [
     ('g', 'Fixed',    'font/misc-fixed/10x20.bdf.gz',   10, 20, 1,  0,   None,     None),
     ('p', 'UW ttyp0', 'font/uw-ttyp0/t0-17-uni.bdf.gz', 9, 17, 1,  0,   None,     None),
     ('q', 'UW ttyp0', 'font/uw-ttyp0/t0-18-uni.bdf.gz', 9, 18, 1,  0,   None,     None),
+    ('h', 'Hairline', 'font/hairline/hairline-12x28.bdf.gz', 12, 28, 1, 0, None, None),
+    ('i', 'Hairline', 'font/hairline/hairline-12x30.bdf.gz', 12, 30, 1, 0, None, None),
+    ('j', 'Hairline', 'font/hairline/hairline-12x32.bdf.gz', 12, 32, 1, 0, None, None),
+    ('k', 'Hairline', 'font/hairline/hairline-12x34.bdf.gz', 12, 34, 1, 0, None, None),
+    ('l', 'Hairline', 'font/hairline/hairline-13x28.bdf.gz', 13, 28, 1, 0, None, None),
+    ('m', 'Hairline', 'font/hairline/hairline-14x28.bdf.gz', 14, 28, 1, 0, None, None),
+    ('n', 'Hairline', 'font/hairline/hairline-15x28.bdf.gz', 15, 28, 1, 0, None, None),
+    ('o', 'Hairline', 'font/hairline/hairline-16x26.bdf.gz', 16, 26, 1, 0, None, None),
+    ('r', 'Hairline', 'font/hairline/hairline-13x25.bdf.gz', 13, 25, 1, 0, None, None),
+    ('s', 'Hairline', 'font/hairline/hairline-13x26.bdf.gz', 13, 26, 1, 0, None, None),
+    ('u', 'Hairline', 'font/hairline/hairline-13x27.bdf.gz', 13, 27, 1, 0, None, None),
 ]
 FONT_NOTICES = [
     ('X11 Courier font permission notice', 'font/courier/COPYING'),

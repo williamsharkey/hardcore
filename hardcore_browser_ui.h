@@ -10,9 +10,8 @@ static BrowserNav browser_nav_geometry(int cols,int lights,int baseRows) {
     return n;
 }
 static BrowserNav browser_nav(void) {
-    int w,h;plat_client_size(&w,&h);int cols=MAX(10,w/CW),lights=0;
-    for(int i=0;i<3;i++){NSRect r=mac_title_button_rect(i);int end=(int)ceil(NSMaxX(r)/CW)+1;if(end>lights)lights=end;}
-    return browser_nav_geometry(cols,lights,MAX(1,(mac_title_native_height()+CH-1)/CH));
+    int w,h;plat_client_size(&w,&h);
+    return browser_nav_geometry(MAX(10,w/CW),0,1);
 }
 static int mac_browser_title_height(void) {
     if(!browser_for(active_tab()))return 0;
@@ -58,7 +57,7 @@ static void browser_ui_begin_edit(HCBrowser *b,int kind,NSString *value) {
     browser_ui_menu_clear(b);[g_win makeFirstResponder:g_view];
     /* Programmatic navigation focus has no pointer target: (0,0) may now be
        occupied by the docked menu, which correctly suppresses title hover. */
-    if(kind==1)mac_title_hover_at(-1,-1);plat_invalidate();
+    if(kind==1)mac_browser_nav_hover_at(-1,-1);plat_invalidate();
 }
 static void mac_browser_begin_control(Tab *tb,int node,int revision,int documentEpoch,NSDictionary *info) {
     HCBrowser *b=browser_for(tb);if(!b)return;
@@ -215,7 +214,7 @@ static int mac_browser_ui_mouse(int mx,int my) {
         }
         plat_invalidate();return 1;
     }
-    if(g_mac_title_hover) {
+    if(g_browser_nav_hover) {
         BrowserNav n=browser_nav();
         if(row==n.controlsRow) {
             if(col>=n.back && col<n.back+3){mac_browser_command(1);return 1;}
@@ -239,7 +238,7 @@ static int mac_browser_ui_mouse(int mx,int my) {
         }
         browser_ui_end_edit(b);
     }
-    if(b->editKind==1 && !mac_title_contains(mx,my)){browser_ui_end_edit(b);mac_title_hover_at(mx,my);}
+    if(b->editKind==1 && !mac_browser_nav_contains(mx,my)){browser_ui_end_edit(b);mac_browser_nav_hover_at(mx,my);}
     return 0;
 }
 static int mac_browser_ui_contains(int mx,int my) {
@@ -288,7 +287,7 @@ static void mac_browser_draw_nav(void) {
     /* A preview has no interactive browser toolbar or edit cursor. Its
        real tab keeps its own responder and draft until a deliberate click. */
     if(chrome_preview_active())return;
-    Tab *tb=active_tab();HCBrowser *b=browser_for(tb);if(!b || !g_mac_title_hover)return;
+    Tab *tb=active_tab();HCBrowser *b=browser_for(tb);if(!b || !g_browser_nav_hover)return;
     BrowserNav n=browser_nav();
     browser_ui_text(@"[←]",n.back,n.controlsRow,3,b->web.canGoBack ? DEF_FG : g_look.dim);
     browser_ui_text(@"[→]",n.forward,n.controlsRow,3,b->web.canGoForward ? DEF_FG : g_look.dim);
@@ -337,7 +336,7 @@ static void mac_browser_draw_overlay(void) {
 }
 static int mac_browser_hover_link(void) {
     if(chrome_preview_active())return 0;
-    Tab *tb=active_tab();HCBrowser *b=browser_for(tb);if(!b || tb->browser_native || g_mac_title_hover || b->menuKind || b->editKind || over_chrome(g_mouse_x,g_mouse_y))return 0;
+    Tab *tb=active_tab();HCBrowser *b=browser_for(tb);if(!b || tb->browser_native || g_browser_nav_hover || b->menuKind || b->editKind || over_chrome(g_mouse_x,g_mouse_y))return 0;
     int x=g_mouse_x/CW,y=g_mouse_y/CH;
     if(g_mouse_x<0 || g_mouse_y<0 || x>=tb->t.cols || y>=b->pageRows)return 0;
     return tb->t.row[0][y][x].link;
@@ -403,7 +402,7 @@ static int mac_browser_ui_move(int mx,int my) {
         if(col>b->menuX && col<b->menuX+b->menuWidth-1 && row>b->menuY && row<=b->menuY+cap && at>=0 && at<(int)b->menuItems.count){b->menuSelected=at;plat_invalidate();}
         [[NSCursor arrowCursor] set];return 1;
     }
-    if(g_mac_title_hover && mac_title_contains(mx,my)){
+    if(g_browser_nav_hover && mac_browser_nav_contains(mx,my)){
         BrowserNav nav=browser_nav();
         if(row==nav.urlRow && col>=nav.url && col<nav.go-1)[[NSCursor IBeamCursor] set];
         else if((row==nav.controlsRow && ((col>=nav.back && col<nav.forward+3) || col>=nav.close)) || (row==nav.urlRow && col>=nav.go && col<nav.go+4))[[NSCursor pointingHandCursor] set];

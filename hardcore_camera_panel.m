@@ -300,6 +300,7 @@ static int mac_camera_mouse(NSEvent *event,int x,int y) {
     g_mouse_x=x;g_mouse_y=y;g_camera_down=1;g_camera_pending_action=0;
     HCCameraCaptureState state=g_camera_capture.state;
     BOOL busy=mac_record_active();
+    if(g_grid_on && (hit==MAC_CAMERA_MOVE || hit==MAC_CAMERA_RESIZE))return 1;
     if(hit==MAC_CAMERA_MOVE || hit==MAC_CAMERA_RESIZE) {
         mac_cutie_blur();chrome_preview_cancel();g_sel_drag=g_sb_drag=0;
         g_camera_drag=hit;g_camera_drag_origin=g_camera_rect;g_camera_drag_x=x;g_camera_drag_y=y;

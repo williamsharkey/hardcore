@@ -71,7 +71,11 @@ FONTS_SRC = font/terminus/ter-u24n.bdf.gz font/terminus/ter-u28n.bdf.gz font/ter
             font/misc-fixed/9x18.bdf.gz font/misc-fixed/10x20.bdf.gz font/misc-fixed/COPYING \
             font/uw-ttyp0/t0-17-uni.bdf.gz font/uw-ttyp0/t0-18-uni.bdf.gz font/uw-ttyp0/LICENSE \
             font/courier/courier-75dpi-24.bdf.gz font/courier/courier-100dpi-24.bdf.gz font/courier/COPYING \
-            font/hairline/hairline-12x26.bdf.gz font/hairline/OFL.txt
+            font/hairline/hairline-12x26.bdf.gz font/hairline/hairline-12x28.bdf.gz font/hairline/hairline-12x30.bdf.gz \
+            font/hairline/hairline-12x32.bdf.gz font/hairline/hairline-12x34.bdf.gz \
+            font/hairline/hairline-13x28.bdf.gz font/hairline/hairline-14x28.bdf.gz \
+            font/hairline/hairline-15x28.bdf.gz font/hairline/hairline-16x26.bdf.gz \
+            font/hairline/hairline-13x25.bdf.gz font/hairline/hairline-13x26.bdf.gz font/hairline/hairline-13x27.bdf.gz font/hairline/OFL.txt
 
 # One recipe owns both outputs. Apple's make 3.81 does not support grouped
 # targets (&:), which otherwise runs two writers during a parallel build.
@@ -116,7 +120,7 @@ build/slurp-version.h: build/slurp-linux
 # which commit a build is (hardcore --version); the release number is HARDCORE_VERSION in hardcore.c
 BUILD := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
-hardcore.exe: hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
+hardcore.exe: hardcore.c hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c build/res.o $(LIBS)
 
@@ -125,6 +129,9 @@ win-test: hardcore.exe reflow-test
 	python3 tests/run_xtermjs.py
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
+	python3 tests/test_hairline_sizes.py
+	python3 tests/test_hairline_widths.py
+	python3 tests/test_hairline_compact.py
 	python3 tests/test_small_fonts.py
 	python3 tests/test_default_theme.py
 	$(MAKE) --no-print-directory selftest
@@ -168,7 +175,7 @@ build/hardcore: hardcore.c $(HERE_HEADERS) build/font.bin build/fonts.bin build/
 else
 build/hardcore: hardcore_mac_launch.h $(HERE_HEADERS) tools/ExecutableInfo.plist
 
-build/hardcore: hardcore_mac_music.m hardcore_music_panel.m hardcore_recording_view_geometry.h hardcore_clips_panel.m hardcore_recording_jobs.m hardcore_camera_capture.h hardcore_camera_capture.m hardcore_camera_panel.m hardcore_recording.m hardcore_recording_library.m build/browser.inc hardcore_browser_image_geometry.h hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
+build/hardcore: hardcore_mac_music.m hardcore_music_panel.m hardcore_recording_view_geometry.h hardcore_clips_panel.m hardcore_recording_jobs.m hardcore_camera_capture.h hardcore_camera_capture.m hardcore_camera_panel.m hardcore_recording.m hardcore_recording_library.m build/browser.inc hardcore_browser_image_geometry.h hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_INFO_FLAGS) $(MAC_LIBS)
 
 endif
@@ -224,6 +231,9 @@ mac-test: build/hardcore reflow-test browser-test
 	python3 tests/test_mac_update_dispatch.py
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
+	python3 tests/test_hairline_sizes.py
+	python3 tests/test_hairline_widths.py
+	python3 tests/test_hairline_compact.py
 	python3 tests/test_small_fonts.py
 	python3 tests/test_default_theme.py
 	build/hardcore --selftest build/selftest.txt; rc=$$?; cat build/selftest.txt; exit $$rc
@@ -254,6 +264,9 @@ mac-offline-test: mac-release reflow-test browser-test here-test recording-test 
 	python3 tests/test_mac_update_dispatch.py
 	python3 tests/test_courier_fonts.py
 	python3 tests/test_hairline_font.py
+	python3 tests/test_hairline_sizes.py
+	python3 tests/test_hairline_widths.py
+	python3 tests/test_hairline_compact.py
 	python3 tests/test_small_fonts.py
 	python3 tests/test_default_theme.py
 	$(MAKE) claude-adapter-test
@@ -315,7 +328,7 @@ mac-update-test: $(APP)
 	python3 tests/test_update_mac.py
 
 # Opt-in desktop integration: disposable real application sessions in Windows Terminal.
-build/slurp-driver.exe: tests/slurp_driver.c hardcore.c hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
+build/slurp-driver.exe: tests/slurp_driver.c hardcore.c hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-o $@ tests/slurp_driver.c build/res.o $(filter-out -mwindows,$(LIBS))
 
@@ -332,6 +345,8 @@ font-settings-test: hardcore.exe
 .PHONY: reflow-test chrome-test
 reflow-test:
 	@mkdir -p build
+	cc -std=c99 -O2 -Wall -Wextra tests/test_grid_layout.c -o build/test-grid-layout
+	build/test-grid-layout
 	cc -std=c99 -O2 -Wall -Wextra tests/test_reflow.c -o build/test-reflow
 	build/test-reflow
 	cc -std=c99 -O2 -Wall -Wextra tests/test_reflow_records.c -o build/test-reflow-records
@@ -355,6 +370,8 @@ reflow-test:
 	build/test-tab-preview
 
 chrome-test: $(APP)
+	python3 tests/test_titlebar_folder_mac.py
+	python3 tests/test_grid_mac.py
 	python3 tests/test_header_cursor_mac.py
 	python3 tests/test_chrome_float_mac.py
 	python3 tests/test_chrome_mac.py

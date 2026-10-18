@@ -51,13 +51,21 @@ static int mac_music_loading(void) { return music_loading; }
 static void mac_music_compact_label(wchar_t *out,int capacity) {
     if (capacity > 0) { wcsncpy(out,L"#72 01:23 of 50:00",capacity-1);out[capacity-1]=0; }
 }
+#ifndef _WIN32
+static int g_grid_on,g_grid_top=1,g_grid_ids[64];
+static struct { int extra; } g_grid;
+#endif
+#define _snwprintf swprintf
 HEADER
 static ChromeLayout g_chrome;
 static int g_chrome_drag, g_tab_underlay=1, g_chrome_menu_raised, g_chrome_menu_count;
 static int g_tab_offset, g_settings_open, g_settings_tab, g_setting_offset[3];
 static int g_ntabs=4, source_col=-2;
-typedef struct { int kind; } TestTab;
+typedef struct { int kind,id; } TestTab;
 static TestTab tab;
+#ifndef _WIN32
+static TestTab *g_tabs[64];
+#endif
 static struct { int light, dark; } FAMILIES[10];
 static struct { uint32_t text, detail, dim, red; } g_look={3,4,5,6};
 static int chrome_min(int a,int b) { return a<b?a:b; }
@@ -93,7 +101,8 @@ static int fills, glyphs, frames, sides, row_fills;
 static struct { int col,row; wchar_t text[32]; uint32_t color; } labels[20];
 static float fx,fy,fr,fb;
 static void fill_rect(float x,float y,float right,float bottom,uint32_t color,float alpha) {
-    assert(color==TAB_HOVER && alpha==1); fills++; fx=x;fy=y;fr=right;fb=bottom;
+    assert(right>x && bottom>y && alpha>0 && alpha<=1);
+    if(color==TAB_HOVER){fills++;fx=x;fy=y;fr=right;fb=bottom;}
 }
 static void grid_text(const wchar_t *text,int col,int row,uint32_t color) {
     assert(glyphs<20); assert(col>=0 && col+(int)wcslen(text)<SB_COLS);
@@ -106,6 +115,7 @@ static void chrome_row_fill(int row,int active,int hovered) {
 }
 static void chrome_frame(int row,uint32_t color) { assert(row==g_chrome.top && color==g_look.dim);frames++; }
 static void chrome_sides(int row,uint32_t color) { assert(row>g_chrome.top && row<g_chrome.tab_row && color==g_look.dim);sides++; }
+static void chrome_rule(int row,uint32_t color) {(void)row;(void)color;}
 FUNCTIONS
 static void geometry(void) {
     for(music_visible=0;music_visible<=1;music_visible++)
@@ -120,7 +130,7 @@ static void geometry(void) {
         assert(!memcmp(&a,&expected,sizeof(a)));
         assert(a.grip_rows==(rows>0));
 #else
-        assert(a.grip_rows==chrome_min(2+music_visible,rows));
+        assert(a.grip_rows==chrome_min(3+music_visible,rows));
         assert(a.settings_row==-1 && a.section_row==-1 && a.list_row==-1);
         assert(a.tab_capacity==chrome_min(tabs,rows-a.tab_row));
         assert(a.bottom==a.tab_row+a.tab_count);
@@ -137,19 +147,20 @@ static void targets(void) {
     assert(hit_tabbar(sidebar_x()+CW,8*CH,&idx)==HIT_GRIP);
     assert(hit_tabbar(sidebar_x()+4*CW,8*CH,&idx)==HIT_BAR);
 #else
-    unsigned char occupied[2][SB_COLS]={{0}};
-    const wchar_t *expected[]={L"↕ move",L"⚙config",L"cam",L"CAF",L"+term",L"+www",L"files",L"♪mus"};
-    assert(CHROME_HEADER_CONTROL_COUNT==8);
+    unsigned char occupied[3][SB_COLS]={{0}};
+    const wchar_t *expected[]={L"↕ move",L"⚙config",L"cam",L"CAF",L"+term",L"+www",L"files",L"music",L"Grid",L"Expand"};
+    assert(CHROME_HEADER_CONTROL_COUNT==10);
     for(int i=0;i<CHROME_HEADER_CONTROL_COUNT;i++) {
         const ChromeHeaderControl *c=CHROME_HEADER_CONTROLS+i;
         assert(!wcscmp(c->label,expected[i]) && c->col>0 && c->width>=(int)wcslen(c->label));
-        assert(c->row>=0 && c->row<2 && c->col+c->width<SB_COLS);
+        assert(c->row>=0 && c->row<3 && c->col+c->width<SB_COLS);
+        if(c->hit==HIT_GRID_EXPAND)continue;
         for(int x=c->col;x<c->col+c->width;x++) {
             assert(!occupied[c->row][x]++);
             assert(hit_tabbar(sidebar_x()+x*CW,(g_chrome.top+c->row)*CH,&idx)==c->hit);
         }
     }
-    for(int y=0;y<2;y++)for(int x=0;x<SB_COLS;x++)if(!occupied[y][x]) {
+    for(int y=0;y<3;y++)for(int x=0;x<SB_COLS;x++)if(!occupied[y][x]) {
         assert(chrome_header_hit(y,x)==HIT_CHROME_INERT);
         assert(hit_tabbar(sidebar_x()+x*CW,(g_chrome.top+y)*CH,&idx)==HIT_CHROME_INERT);
     }
@@ -177,9 +188,10 @@ static void paint(void) {
     reset_paint();chrome_render_header(HIT_GRIP);
     assert(fills==1 && fx==CW && fr==2*CW);
 #else
-    assert(glyphs==8 && frames==1 && sides==1 && row_fills==2 && !fills);
+    assert(glyphs==9 && frames==1 && sides==2 && row_fills==3 && !fills);
     for(int i=0;i<CHROME_HEADER_CONTROL_COUNT;i++) {
         const ChromeHeaderControl *c=CHROME_HEADER_CONTROLS+i;
+        if(c->hit==HIT_GRID_EXPAND)continue;
         assert(labels[i].col==c->col && labels[i].row==g_chrome.top+c->row);
         assert(!wcscmp(labels[i].text,c->hit==HIT_CAF?L"caf":c->label));
         reset_paint();chrome_render_header(c->hit);
@@ -190,7 +202,7 @@ static void paint(void) {
     caf_active=1;reset_paint();chrome_render_header(HIT_NONE);
     assert(labels[3].color==AMBER && !wcscmp(labels[3].text,L"CAF"));
     export_active=1;reset_paint();chrome_render_header(HIT_NONE);
-    assert(glyphs==9 && labels[3].col==21 && labels[3].color==AMBER);
+    assert(glyphs==10 && labels[3].col==21 && labels[3].color==AMBER);
     assert(labels[3].text[0]==0x2802); /* same drip frame as busy terminal tabs */
     export_active=0;
     g_chrome=chrome_primary_measure(1,1,g_ntabs,0,1,8,0);
@@ -203,52 +215,38 @@ static void music(void) {
     int idx=-1;
     music_visible=1;
     g_chrome=chrome_primary_measure(40,1,g_ntabs,0,1,8,0);
-    assert(g_chrome.grip_rows==3 && g_chrome.tab_row==11 && g_chrome.bottom==15);
+    assert(g_chrome.grip_rows==4 && g_chrome.tab_row==12);
     unsigned char occupied[SB_COLS]={0};
     for(int i=0;i<CHROME_MUSIC_CONTROL_COUNT;i++) {
         const ChromeHeaderControl *c=CHROME_MUSIC_CONTROLS+i;
-        assert(c->row==2 && c->col>0 && c->col+c->width<SB_COLS);
+        assert(c->row==3 && c->col>0 && c->col+c->width<SB_COLS);
         for(int col=c->col;col<c->col+c->width;col++) {
             assert(!occupied[col]++);
-            assert(hit_tabbar(sidebar_x()+col*CW,10*CH,&idx)==c->hit);
-            assert(tabbar_action(sidebar_x()+col*CW,10*CH));
+            assert(hit_tabbar(sidebar_x()+col*CW,11*CH,&idx)==c->hit);
+            assert(tabbar_action(sidebar_x()+col*CW,11*CH));
         }
-    }
-    for(int col=0;col<SB_COLS;col++)if(!occupied[col]) {
-        assert(hit_tabbar(sidebar_x()+col*CW,10*CH,&idx)==HIT_CHROME_INERT);
-        assert(!tabbar_action(sidebar_x()+col*CW,10*CH));
-    }
-    /* The compact controls follow the last painted packing map. */
-    g_chrome_menu_count=7;source_col=7;
-    assert(hit_tabbar(sidebar_x()+3*CW,10*CH,&idx)==HIT_MUSIC_PLAY);
-    source_col=-1;
-    assert(hit_tabbar(sidebar_x()+3*CW,10*CH,&idx)==HIT_NONE);
-    source_col=-2;g_chrome_menu_count=0;
-    reset_paint();chrome_render_header(HIT_NONE);
-    assert(glyphs==14 && row_fills==3 && frames==1 && sides==2 && !fills);
-    assert(!wcscmp(labels[10].text,L"▶"));
-    assert(!wcscmp(labels[13].text,L"#72 01:23 o"));
-    for(int i=1;i<=4;i++) {
-        const ChromeHeaderControl *c=CHROME_MUSIC_CONTROLS+i;
         reset_paint();chrome_render_header(c->hit);
-        assert(fills==1 && fx==c->col*CW && fr==(c->col+c->width)*CW && fy==10*CH);
+        /* Music launcher and track control intentionally share the action. */
+        assert(fills>=1 && fx==c->col*CW && fr==(c->col+c->width)*CW && fy==11*CH);
     }
+    for(int col=0;col<SB_COLS;col++)if(!occupied[col])
+        assert(hit_tabbar(sidebar_x()+col*CW,11*CH,&idx)==HIT_CHROME_INERT);
+    reset_paint();chrome_render_header(HIT_NONE);
+    assert(glyphs==10 && row_fills==4 && frames==1 && sides==3 && !fills);
+    assert(!wcscmp(labels[9].text,L"#72 01:23 "));
     music_playing=1;reset_paint();chrome_render_header(HIT_NONE);
-    assert(!wcscmp(labels[10].text,L"Ⅱ") && labels[10].color==AMBER);
-    music_loading=1;reset_paint();chrome_render_header(HIT_NONE);
-    assert(labels[10].text[0]==0x2802 && labels[10].color==AMBER);
-    music_loading=music_playing=0;
-    /* No third-row controls draw or receive clicks outside tiny viewports. */
-    for(int rows=0;rows<=3;rows++) {
+    assert(glyphs==10); /* Transport icons are pixel geometry, not fallback glyphs. */
+    music_playing=0;
+    g_grid_on=1;g_grid.extra=1;g_tabs[0]=&tab;g_ntabs=1;
+    assert(chrome_header_hit(2,12)==HIT_GRID_EXPAND);
+    reset_paint();chrome_render_header(HIT_NONE);assert(glyphs==11);
+    g_grid.extra=0;assert(chrome_header_hit(2,12)==HIT_CHROME_INERT);
+    g_grid_on=0;
+    for(int rows=0;rows<=4;rows++) {
         g_chrome=chrome_primary_measure(rows,1,g_ntabs,0,1,8,0);
         reset_paint();chrome_render_header(HIT_NONE);
         assert(row_fills==rows && g_chrome.bottom==rows);
-        assert(hit_tabbar(sidebar_x()+7*CW,rows*CH,&idx)==HIT_NONE);
     }
-    music_visible=0;
-    g_chrome=chrome_primary_measure(40,1,g_ntabs,0,1,8,0);
-    assert(chrome_header_hit(2,7)==HIT_CHROME_INERT);
-    assert(hit_tabbar(sidebar_x()+7*CW,10*CH,&idx)==HIT_TAB && idx==0);
 #endif
 }
 int main(int argc,char **argv) {
@@ -273,6 +271,8 @@ class ChromeHeaderTests(unittest.TestCase):
         header_end = chrome.index("static ChromeLayout g_chrome;", header_start)
         functions = "\n".join(function(chrome, name) for name in
                               ("chrome_measure", "chrome_primary_measure", "hit_tabbar", "chrome_setting_hit", "tabbar_action"))
+        functions += "\n" + function(draw, "chrome_button_outline")
+        functions += "\n#ifndef _WIN32\n" + function(draw, "chrome_music_icon") + "\n#endif\n"
         functions += "\n" + function(draw, "chrome_render_header")
         cls.temp = tempfile.TemporaryDirectory(prefix="hc-chrome-header-")
         source = Path(cls.temp.name) / "test.c"

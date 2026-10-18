@@ -63,7 +63,31 @@ typedef uint32_t DWORD;
 #define MAX_PATH 1024
 #define _strdup strdup
 #define _stricmp strcasecmp
-#define _snwprintf swprintf      /* same argument order; wchar_t is UTF-32 here */
+/* swprintf converts through the C locale, where any non-ASCII %ls argument
+   ("↳ ", an accented title) fails and leaves the buffer stale. Format with a
+   UTF-8 character type instead; wchar_t is UTF-32 here. */
+#include <locale.h>
+#include <wchar.h>
+#include <stdarg.h>
+#ifdef __APPLE__
+#include <xlocale.h>
+#endif
+static int hc_swprintf(wchar_t *out, size_t cap, const wchar_t *format, ...) {
+    static locale_t utf8;
+    locale_t was;
+    va_list args;
+    int n;
+    if (!utf8) utf8 = newlocale(LC_CTYPE_MASK, "C.UTF-8", NULL);
+    if (!utf8) utf8 = newlocale(LC_CTYPE_MASK, "UTF-8", NULL);
+    if (!utf8) utf8 = newlocale(LC_CTYPE_MASK, "en_US.UTF-8", NULL);
+    was = utf8 ? uselocale(utf8) : NULL;
+    va_start(args, format);
+    n = vswprintf(out, cap, format, args);
+    va_end(args);
+    if (was) uselocale(was);
+    return n;
+}
+#define _snwprintf hc_swprintf
 static DWORD GetTickCount(void) {
 #ifdef __APPLE__
     return (DWORD)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000);
@@ -372,6 +396,11 @@ static void palette_init(void) {
 
 static int g_tab_underlay = 1; /* 1: right underlay, 2: left underlay */
 static int g_chrome_reflow = 1, g_chrome_debug, g_dock_row;
+
+/* A fresh install starts in Hairline 13x27; a saved font= replaces it. */
+static void config_default_font(void) {
+    if (font_by_key('u')) g_font = g_tfont = g_cf = font_by_key('u');
+}
 
 /* config.ini's font= and theme=: a letter each */
 static void config_look(const char *key, const char *v) {
@@ -2932,6 +2961,7 @@ static void config_load(void) {
     else _snwprintf(g_cfg_dir, MAX_PATH, L"%ls\\hardcore", la ? la : L".");
     g_cfg_dir[MAX_PATH - 1] = 0;
     CreateDirectoryW(g_cfg_dir, NULL);
+    config_default_font();
     config_path(path);
     f = _wfopen(path, L"rb");
     if (!f) return;
@@ -2996,6 +3026,8 @@ static void set_clipboard_utf8(const char *s, int n) {
 
 /* ── window, input, rendering ─────────────────────────────────────── */
 
+#include "hardcore_grid_state.h"
+
 static int g_focused = 1;
 static int g_mouse_x = -1, g_mouse_y = -1;
 #ifdef _WIN32
@@ -3015,12 +3047,14 @@ static Tab *input_tab(void) {
     if(g_cutie_focus_id && cutie_focus_valid())return tab_by_id(g_cutie_focus_id);
     if(g_cutie_focus_id)mac_cutie_blur();
 #endif
+    if(g_grid_on && active_tab() && grid_index(active_tab()->id)<0)return NULL;
     return active_tab();
 }
 
 #include "hardcore_tab_preview.h"
 static TabPreview g_tab_preview;
 static int chrome_preview_active(void) {
+    if(g_grid_on)return 0;
     Tab *selected=active_tab();
     tab_preview_validate(&g_tab_preview,selected?selected->id:0,
         tab_by_id(g_tab_preview.target_id)!=NULL,g_focused);
@@ -3044,7 +3078,7 @@ static int sidebar_w(void) { return SB_COLS * cell_w(g_font); }
 #ifdef _WIN32
 static int caption_h(void) { return cell_h(g_font); }   /* the glass buttons' height */
 #else
-static int caption_h(void) { return 0; }   /* macOS keeps its own traffic lights, over the tab column */
+static int caption_h(void) { return 0; }   /* AppKit keeps the title bar outside the content view. */
 #endif
 /* The chrome overlays the right edge; it never changes the pty grid. */
 static int sidebar_x(void) {
@@ -3059,11 +3093,11 @@ static int in_sidebar(int x) { return x >= sidebar_x() && x < sidebar_x() + side
 #endif
 /* (0,0) is the native drawable surface, inside any system-owned border.
    Rounded corners may obscure cells; they never shift the grid. */
-static int term_ox(void) { return 0; }
-static int term_oy(void) { return 0; }
+static int term_ox(void) { Tab *tb=active_tab();return g_grid_on && tb?grid_rect(tb->id).x*CW:0; }
+static int term_oy(void) { Tab *tb=active_tab();return g_grid_on && tb?(grid_rect(tb->id).y+1)*CH:0; }
 
 static void compute_grid(int w, int h, int *cols, int *rows) {
-    *cols = (w - term_ox()) / CW;
+    *cols = w / CW;
     *rows = h / CH;
     if (*cols < 10) *cols = 10;
     if (*rows < 3) *rows = 3;
@@ -3082,7 +3116,7 @@ static const Term *g_display_term;
 static int g_display_view, g_display_hcount;
 /* A displayed cell retains its original terminal address for selection/copy. */
 static int display_source(const Term *t, int col, int row) {
-    if (g_tab_underlay && g_chrome_reflow && g_display_term == t && g_display.cells &&
+    if (!g_grid_on && g_tab_underlay && g_chrome_reflow && g_display_term == t && g_display.cells &&
         g_display.cols == t->cols && g_display.rows == t->rows &&
         g_display_view == t->view && g_display_hcount == t->hcount &&
         col >= 0 && col < t->cols && row >= 0 && row < t->rows)
@@ -3094,10 +3128,12 @@ static void tab_set_size(Tab *tb, int cols, int rows);   /* tell the pty */
 
 /* A tab (and its pty) to the window's grid, if it isn't there yet. */
 static void tab_fit(Tab *tb) {
-    if (!tb || (tb->t.cols == g_cols && tb->t.rows == g_rows)) return;
+    if(!tb)return;
+    int cols=g_cols,rows=g_rows;grid_tab_size(tb,&cols,&rows);
+    if(tb->t.cols==cols && tb->t.rows==rows)return;
     tab_drain(tb);
-    term_resize(&tb->t, g_cols, g_rows);
-    tab_set_size(tb, g_cols, g_rows);
+    term_resize(&tb->t, cols, rows);
+    tab_set_size(tb, cols, rows);
 }
 
 /* While the window is being resized only the tab you see follows each step.
@@ -3116,6 +3152,7 @@ static void resize_all(void) {
 #endif
     g_cols = cols;
     g_rows = rows;
+    grid_measure(cols,rows);
     g_sel_on = 0;
     if (g_ntabs) tab_fit(g_tabs[g_active]);
     plat_timer(TIMER_SETTLE, 250);   /* re-armed by every step: fires once the resizing stops */
@@ -3135,7 +3172,8 @@ static void settle_all(void) {
     }
     for (i = 0; i <= g_ntabs; i++) {
         tb = i < g_ntabs ? g_tabs[i] : g_spare;
-        if (tb && (tb->t.cols != g_cols || tb->t.rows != g_rows)) {
+        int cols=g_cols,rows=g_rows;if(tb)grid_tab_size(tb,&cols,&rows);
+        if (tb && (tb->t.cols != cols || tb->t.rows != rows)) {
             tab_fit(tb);
             plat_timer(TIMER_SETTLE, 16);
             return;
@@ -4096,7 +4134,7 @@ static void chrome_preview_pointer(int mx,int my) {
     int index=-1,hit=hit_tabbar(mx,my,&index);
     Tab *selected=active_tab();
     int target=(hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_CUTIE) && index>=0 && index<g_ntabs?g_tabs[index]->id:0;
-    int eligible=g_focused && !g_sel_drag && !g_chrome_drag && !g_sb_drag;
+    int eligible=!g_grid_on && g_focused && !g_sel_drag && !g_chrome_drag && !g_sb_drag;
 #ifndef _WIN32
     eligible=eligible && g_tv_drag_slot<0;
 #endif
@@ -4218,11 +4256,7 @@ static void grid_text(const wchar_t *s, int col, int row, uint32_t rgb) {
 }
 
 #ifndef _WIN32
-static uint32_t plat_title_mix(uint32_t fg, uint32_t bg, float alpha);
-static uint32_t plat_title_background_color(uint32_t bg);
-static void plat_render_title_background(float x0, float y0, float x1, float y1, uint32_t bg, uint32_t base);
-static void plat_render_title_underlay(void);
-static void plat_render_title_overlay(void);
+static void mac_browser_render_nav_overlay(void);
 static void mac_camera_draw(void);
 static void mac_camera_layout(Term *t);
 static void mac_music_draw(void);
@@ -4283,22 +4317,6 @@ static int unit_underlay(FILE *f) {
         row[0].attr = row[2].attr = A_HIDDEN;
         fails += chrome_terminal_span(row, 4, &left, &right) != 0;
     }
-#ifndef _WIN32
-    /* There must be no invisible midpoint, nor an excessive shift, on any
-       gray background. Sample the RGB cube too, including saturated colors. */
-    for (int gray = 0; gray < 256; gray++) {
-        uint32_t color = plat_title_background_color((uint32_t)gray * 0x010101);
-        int delta = abs((int)(color & 255) - gray);
-        fails += delta < 16 || delta > 32;
-        fails += ((color >> 16) & 255) != (color & 255) || ((color >> 8) & 255) != (color & 255);
-    }
-    for (int r = 0; r <= 255; r += 17) for (int g = 0; g <= 255; g += 17) for (int b = 0; b <= 255; b += 17) {
-        uint32_t color = plat_title_background_color((uint32_t)(r << 16 | g << 8 | b));
-        int before = (77*r + 150*g + 29*b) / 256;
-        int after = (77*((color >> 16) & 255) + 150*((color >> 8) & 255) + 29*(color & 255)) / 256;
-        fails += abs(after - before) < 15 || abs(after - before) > 33;
-    }
-#endif
     const Font *saved_font = g_cf;
     int fi;
     for (fi = 0; fi < NFONTS; fi++) {
@@ -4399,12 +4417,11 @@ static void render_terminal_backgrounds(const Term *t, int ox, int oy) {
             if (bg == DEF_BG) continue;
             float x0 = (float)(ox + x*CW);
             fill_rect(x0, y0, x0+CW, y0+CH, bg, 1);
-#ifndef _WIN32
-            plat_render_title_background(x0, y0, x0+CW, y0+CH, bg, bg);
-#endif
         }
     }
 }
+
+#include "hardcore_grid_draw.h"
 
 static void render(void) {
     struct { int right, bottom; } r;
@@ -4414,12 +4431,15 @@ static void render(void) {
     int overlay = g_tab_underlay || (tb && tb->kind == TK_BROWSER);
     plat_client_size(&r.right, &r.bottom);
 #ifndef _WIN32
-    if (tb && tb->kind == TK_BROWSER) mac_browser_prepare(tb);
+    if (!g_grid_on && tb && tb->kind == TK_BROWSER) mac_browser_prepare(tb);
     int browser_hover = tb && tb->kind==TK_BROWSER ? mac_browser_hover_link() : 0;
 #endif
     g_clip_w = r.right / CW * CW;
     g_clip_h = r.bottom / CH * CH;
     r_begin(r.right, r.bottom);
+#ifndef _WIN32
+    if(g_grid_on){render_grid(r.right,r.bottom);return;}
+#endif
     /* Browser/native and empty-window paths do not prepare a terminal grid.
        They must still end an old tab's fade and discard its pending target. */
     if (!tb || (tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active())) {
@@ -4435,17 +4455,14 @@ static void render(void) {
         render_cuties(r.right);
         mac_camera_draw();
         mac_music_draw();
-        plat_render_title_overlay();
+        mac_browser_render_nav_overlay();
         return;
     }
-#endif
-#ifndef _WIN32
-    plat_render_title_underlay();
 #endif
 #ifdef _WIN32
     if (!tb) { render_tabbar(r.right, r.bottom); render_caption_buttons(r.right); return; }
 #else
-    if (!tb) { render_tabbar(r.right, r.bottom); plat_render_title_overlay(); return; }
+    if (!tb) { render_tabbar(r.right, r.bottom); mac_browser_render_nav_overlay(); return; }
 #endif
     t = &tb->t;
     chrome_prepare_display(t);
@@ -4472,11 +4489,6 @@ static void render(void) {
             if (display_selected(t, x, y)) bg = SEL_BG;
             r_color(bg, 1);
             quad((float)(ox + x * CW), y0, (float)(ox + (x + 1) * CW), y0 + CH);
-#ifndef _WIN32
-            /* Quiet title circles tint the resolved background, including
-               selection, but never the glyphs/decorations drawn afterward. */
-            plat_render_title_background((float)(ox + x * CW), y0, (float)(ox + (x + 1) * CW), y0 + CH, bg, bg);
-#endif
         }
         for (x = 0; x < n; x++) {
             const Cell *c = &cells[x];
@@ -4576,7 +4588,7 @@ static void render(void) {
     render_cuties(r.right);
     mac_camera_draw();
     mac_music_draw();
-    plat_render_title_overlay();
+    mac_browser_render_nav_overlay();
 #endif
 }
 
@@ -4788,6 +4800,7 @@ static void activate(int i) {
     chrome_preview_cancel();
     term_settle(&g_tabs[i]->t);  /* a tab not caught up since a resize: before it shows */
     g_active = i;
+    if(g_grid_on){grid_set_hidden(g_tabs[i]->id,0);grid_measure(g_cols,g_rows);}
     resize_all();
     tab_fit(g_tabs[i]);          /* still at an old size if the window changed while it was hidden */
     g_tabs[i]->activity = 0;

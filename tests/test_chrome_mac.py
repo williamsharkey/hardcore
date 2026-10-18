@@ -598,101 +598,31 @@ def test_visible_whitespace_and_rules(app):
     print("PASS: invisible styled spaces reveal chrome; borders collapse to one pixel, settings omit row rules, right edge is open")
 
 
-def test_title_underlay(app):
-    c = app.chrome()
-    app.feed([""] * c["rows"])
-    c = app.hover(-1, -1)
-    title = c["titlebar"]
-    assert 0 < title["height"] < 5 * c["cell"]["height"], title
-    assert not title["hovered"] and not title["buttons_visible"], title
-    cw, ch = c["cell"]["width"], c["cell"]["height"]
-    title_rows = (title["height"] + ch - 1) // ch
-
-    def fixture(background, character, foreground="", selected=False):
-        lines = [""] * c["rows"]
-        for row in range(title_rows):
-            if isinstance(background, tuple):
-                lines[row] = "".join(background[col % len(background)] + foreground + character
-                                     for col in range(c["cols"])) + "\x1b[0m"
-            else:
-                lines[row] = background + foreground + character * c["cols"] + "\x1b[0m"
-        app.feed(lines)
-        if selected:
-            app.send(f"cmd sel 0 0 {title_rows - 1} {c['cols'] - 1}")
-
-    def assert_background_only(blank, text, label, period=1):
-        # A distant identical cell provides the original foreground and the
-        # actual background after ANSI inverse/selection have been resolved.
-        # Only pixels belonging to the circle may change that background.
-        for button in title["button_rects"]:
-            center_x = int(button["x"] + button["width"] / 2)
-            center_y = int(button["y"] + button["height"] / 2)
-            center = pixel(blank, center_x, center_y)
-            background = pixel(blank, 40*cw + center_x % (period*cw), center_y)
-            contrast = max(abs(a - b) for a, b in zip(center[:3], background[:3]))
-            assert 8 <= contrast <= 64, (label, "circle contrast is absent or excessive", center, background)
-            foreground_count = margin_count = 0
-            for y in range(int(button["y"]), int(button["y"] + button["height"])):
-                for x in range(int(button["x"]), int(button["x"] + button["width"])):
-                    reference_x = 40*cw + x % (period*cw)
-                    reference_bg = pixel(blank, reference_x, y)
-                    reference_fg = pixel(text, reference_x, y)
-                    circle_bg = pixel(blank, x, y)
-                    actual = pixel(text, x, y)
-                    if reference_fg != reference_bg:
-                        assert actual == reference_fg, (label, "circle changed glyph or decoration", x, y, actual, reference_fg)
-                        foreground_count += circle_bg != reference_bg
-                    else:
-                        assert actual == circle_bg, (label, "glyph cell margin erased circle", x, y, actual, circle_bg)
-                        margin_count += circle_bg != reference_bg
-            assert foreground_count and margin_count, (label, "fixture did not overlap both glyphs and their margins", button)
-
-    # Midgray specifically catches a fixed gray blend's invisible fixed point.
-    # Colored ANSI backgrounds, inverse video and real terminal selection must
-    # participate just like the canvas color, rather than erase whole circles.
-    cases = (
-        ("default", "", "", False),
-        ("black", "\x1b[38;2;220;220;220;48;2;0;0;0m", "", False),
-        ("midgray", "\x1b[38;2;230;230;230;48;2;128;128;128m", "", False),
-        ("light", "\x1b[38;2;20;20;20;48;2;245;245;245m", "", False),
-        ("colored", "\x1b[38;2;230;230;230;48;2;55;125;205m", "", False),
-        ("inline-highlight", ("\x1b[38;2;230;230;230;48;2;45;55;75m",
-                              "\x1b[38;2;230;230;230;48;2;128;128;128m"), "", False),
-        ("inverse", "\x1b[38;2;180;150;70;48;2;15;20;25;7m", "", False),
-        ("decorated", "\x1b[38;2;230;220;210;48;2;60;70;80m", "\x1b[1;2;3;4;9m", False),
-        ("selected", "\x1b[38;2;230;220;210;48;2;60;70;80m", "", True),
-    )
-    for label, background, foreground, selected in cases:
-        fixture(background, " ", selected=selected)
-        blank = app.snap(f"title-{label}-background")
-        fixture(background, "X", foreground, selected)
-        text = app.snap(f"title-{label}-glyphs")
-        assert_background_only(blank, text, label, len(background) if isinstance(background, tuple) else 1)
-    print("PASS: traffic lights adapt subtly to default, ANSI, gray, inverse and selected backgrounds; glyphs and decorations remain exact")
-
-    fixture("", "X")
-    text = app.snap("title-text-over-circles")
-    app.send(f"cmd hover {c['cols'] * cw // 2},{title['height'] // 2}")
-    c = app.chrome()
-    assert c["titlebar"]["hovered"] and c["titlebar"]["buttons_visible"], c["titlebar"]
-    front = app.snap("title-hover-smoke")
-    assert front.crop(40*cw, 0, cw, ch) != text.crop(40*cw, 0, cw, ch), "full-width title band did not smoke terminal text"
-    app.hover(-1, -1)
-    # Create scrollback and drag a real selection upwards into/out of the band.
-    app.feed([""] * c["rows"], "history line\r\n" * (c["rows"] * 2))
-    x = 40 * cw
-    app.send(f"cmd pointer down {x},{title['height'] + 3*ch}")
-    app.send(f"cmd pointer drag {x},{title['height'] // 2}")
-    c = app.chrome()
-    assert c["titlebar"]["selection_drag"] and c["titlebar"]["selection_on"], c["titlebar"]
-    assert not c["titlebar"]["hovered"] and not c["titlebar"]["buttons_visible"], c["titlebar"]
-    app.send(f"cmd pointer drag {x},-5")
-    assert app.state()["tabs"][0]["view"] > 0, "upward selection stopped scrolling"
-    app.send(f"cmd pointer up {x},-5")
-    c = app.chrome()
-    assert not c["titlebar"]["selection_drag"] and not c["titlebar"]["buttons_visible"], c["titlebar"]
-    app.hover(-1, -1)
-    print("PASS: top hover smokes full width; upward selection keeps traffic lights beneath text, controls hidden and scrolling active")
+def test_native_titlebar(app):
+    c=app.feed(['X'*70]*4)
+    c=app.hover(-1,-1)
+    title=c['titlebar'];cw,ch=c['cell']['width'],c['cell']['height']
+    assert title['height']>0 and title['buttons_visible'] and not title['title_hidden'] and title['proxy_visible'],title
+    assert not title['full_size_content'] and not title['transparent'] and not title['hovered'],title
+    for button in title['button_rects']:
+        assert button['width']>0 and button['height']>0 and button['y']+button['height']<=0,button
+    before=app.snap('native-titlebar-content-before-hover')
+    app.hover(40,0)
+    c=app.chrome();after=app.snap('native-titlebar-content-after-hover')
+    assert c['titlebar']['buttons_visible'] and not c['titlebar']['hovered']
+    assert before.crop(30*cw,0,40*cw,4*ch)==after.crop(30*cw,0,40*cw,4*ch),'top hover changed terminal pixels'
+    app.feed(['']*c['rows'],'history line\r\n'*(c['rows']*2))
+    x=40*cw
+    app.send(f'cmd pointer down {x},{3*ch}')
+    app.send(f'cmd pointer drag {x},2')
+    c=app.chrome()
+    assert c['titlebar']['selection_drag'] and c['titlebar']['buttons_visible']
+    app.send(f'cmd pointer drag {x},-5')
+    assert app.state()['tabs'][0]['view']>0
+    app.send(f'cmd pointer up {x},-5')
+    assert app.chrome()['titlebar']['buttons_visible']
+    app.hover(-1,-1)
+    print('PASS: native folder title bar and visible traffic lights outside content; no hover painting; upward selection works')
 
 
 def test_drag_and_quiet_tabs(app):
@@ -764,7 +694,7 @@ def main():
                     test_codex_records(app)
                     if mode == 1:
                         test_visible_whitespace_and_rules(app)
-                        test_title_underlay(app)
+                        test_native_titlebar(app)
                     test_hover(app)
                     if mode == 1:
                         test_drag_and_quiet_tabs(app)

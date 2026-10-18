@@ -361,7 +361,7 @@ int main(int argc, const char **argv) {
                 }
             }
             unsigned char fallback[40*40] = {0}, expected[SLOT*SLOT] = {0};
-            int width = mac_dock_glyph(@"invalid", 'I', fallback, 40);
+            int width = mac_dock_glyph(@"?invalid", 'I', fallback, 40);
             require(width == glyph_bits(FONTS, 'I', expected) && !memcmp(fallback, expected, sizeof(fallback)), "invalid font identity must use real Unifont fallback");
         } else if (!strcmp(which, "native-fitting")) {
             for (NSString *key in @[@"H", @"C", @"R"]) {
@@ -492,6 +492,7 @@ class MacDockTests(unittest.TestCase):
                    production_function(ROOT/'hardcore.c', 'static void look_set(const Scheme *s)'),
                    'static int g_tab_underlay, g_chrome_reflow = 1, g_chrome_debug, g_dock_row;',
                    production_function(ROOT/'hardcore.c', 'static void config_look(const char *key, const char *v)'),
+                   production_function(ROOT/'hardcore.c', 'static void config_default_font(void)'),
                    production_function(ROOT/'hardcore.c', 'static void config_look_save(FILE *f)'),
                    widths.stdout,
                    production_function(ROOT/'hardcore.c', 'static int in_ranges(uint32_t cp, const uint32_t (*r)[2], int n)'),

@@ -5,7 +5,7 @@ enum {
     HIT_SCHEME, HIT_STAB, HIT_SCLOSE, HIT_UNDERLAY, HIT_TABPAGE, HIT_SETPAGE,
     HIT_REFLOW, HIT_REFLOW_DEBUG, HIT_DOCK_ROW, HIT_CHROME_INERT, HIT_GRIP,
     HIT_WEB, HIT_FILES, HIT_CAF, HIT_CAMERA, HIT_TV, HIT_TV_CLOSE, HIT_CUTIE, HIT_TV_GRIP, HIT_TV_RESIZE, HIT_TV_EXPAND,
-    HIT_MUSIC, HIT_MUSIC_PREV, HIT_MUSIC_PLAY, HIT_MUSIC_NEXT, HIT_MUSIC_STOP
+    HIT_MUSIC, HIT_MUSIC_PREV, HIT_MUSIC_PLAY, HIT_MUSIC_NEXT, HIT_MUSIC_STOP, HIT_GRID, HIT_GRID_EXPAND, HIT_GRID_HIDE
 };
 static int plat_lights_bottom(void);
 static void plat_settings_shown(void);
@@ -54,25 +54,27 @@ static const ChromeHeaderControl CHROME_HEADER_CONTROLS[] = {
     {"term", L"+term", 1, 1, 6, HIT_PLUS},
     {"web", L"+www", 1, 8, 5, HIT_WEB},
     {"files", L"files", 1, 14, 6, HIT_FILES},
-    {"music", L"♪mus", 1, 21, 6, HIT_MUSIC},
+    {"music", L"music", 1, 21, 6, HIT_MUSIC},
+    {"grid", L"Grid", 2, 1, 7, HIT_GRID},
+    {"expand", L"Expand", 2, 10, 17, HIT_GRID_EXPAND},
 };
 #define CHROME_HEADER_CONTROL_COUNT ((int)(sizeof(CHROME_HEADER_CONTROLS) / sizeof(CHROME_HEADER_CONTROLS[0])))
 static const ChromeHeaderControl CHROME_MUSIC_CONTROLS[] = {
-    {"music", L"♪", 2, 1, 2, HIT_MUSIC},
-    {"previous", L"|‹", 2, 4, 2, HIT_MUSIC_PREV},
-    {"play", L"▶", 2, 7, 2, HIT_MUSIC_PLAY},
-    {"next", L"›|", 2, 10, 2, HIT_MUSIC_NEXT},
-    {"stop", L"■", 2, 13, 2, HIT_MUSIC_STOP},
-    {"track", L"", 2, 16, 11, HIT_MUSIC},
+    {"previous", L"", 3, 1, 3, HIT_MUSIC_PREV},
+    {"play", L"", 3, 5, 3, HIT_MUSIC_PLAY},
+    {"next", L"", 3, 9, 3, HIT_MUSIC_NEXT},
+    {"stop", L"", 3, 13, 3, HIT_MUSIC_STOP},
+    {"track", L"", 3, 17, 10, HIT_MUSIC},
 };
 #define CHROME_MUSIC_CONTROL_COUNT ((int)(sizeof(CHROME_MUSIC_CONTROLS) / sizeof(CHROME_MUSIC_CONTROLS[0])))
-static int chrome_header_rows(void) { return 2 + !!mac_music_menu_visible(); }
+static int chrome_header_rows(void) { return 3 + !!mac_music_menu_visible(); }
 static int chrome_header_hit(int row, int col) {
     for (int i = 0; i < CHROME_HEADER_CONTROL_COUNT; i++) {
         const ChromeHeaderControl *c = CHROME_HEADER_CONTROLS + i;
+        if(c->hit==HIT_GRID_EXPAND && (!g_grid_on || !g_grid.extra))continue;
         if (row == c->row && col >= c->col && col < c->col + c->width) return c->hit;
     }
-    if (mac_music_menu_visible() && row == 2) {
+    if (mac_music_menu_visible() && row == 3) {
         for (int i = 0; i < CHROME_MUSIC_CONTROL_COUNT; i++) {
             const ChromeHeaderControl *c = CHROME_MUSIC_CONTROLS + i;
             if (col >= c->col && col < c->col + c->width) return c->hit;
@@ -117,7 +119,7 @@ static int chrome_pager_geometry(int offset, int capacity, int total, int tab,
     if (capacity <= 0 || total <= capacity) return 0;
     _snwprintf(counter, 24, L"%d/%d", offset / capacity + 1, (total + capacity - 1) / capacity);
     counter[23] = 0;
-    *counter_col = SB_COLS - (tab ? 5 : 1) - (int)wcslen(counter);
+    *counter_col = SB_COLS - (tab ? (g_grid_on ? 8 : 5) : 1) - (int)wcslen(counter);
     *next_col = *counter_col - 4;
     return 1;
 }
@@ -126,7 +128,7 @@ static int chrome_page_hit(int col, int offset, int capacity, int total, int tab
     if (!chrome_pager_geometry(offset, capacity, total, tab, &next_col, &counter_col)) return 0;
     if (col >= 1 && col < 5) { *direction = -1; return 1; }
     if (col >= next_col && col < counter_col) { *direction = 1; return 1; }
-    return col >= counter_col && col < SB_COLS - (tab ? 5 : 1) ? 2 : 0;
+    return col >= counter_col && col < SB_COLS - (tab ? (g_grid_on ? 8 : 5) : 1) ? 2 : 0;
 }
 
 #include "hardcore_font_menu.h"
@@ -192,6 +194,11 @@ static ChromeLayout chrome_primary_measure(int rows,int lights,int tabs,int open
     a.top = underlay ? chrome_min(chrome_max(dock, 0), chrome_max(0, rows - minimum_height)) : 0;
     a.tab_row = a.top + a.grip_rows;
     a.tab_capacity = a.tab_count = chrome_min(tabs, rows - a.tab_row);
+    if(g_grid_on) {
+        a.top=chrome_min(g_grid_top+1,chrome_max(0,rows-a.grip_rows));
+        a.tab_row=a.top+a.grip_rows;
+        a.tab_capacity=a.tab_count=chrome_min(tabs,chrome_min(chrome_max(1,rows/4),chrome_max(0,rows-a.tab_row)));
+    }
     a.bottom = a.tab_row + a.tab_count;
     (void)lights;(void)open;(void)items;
     return a;
@@ -210,7 +217,7 @@ static void tab_layout(void) {
     items = chrome_item_total();
     plat_client_size(&win_w, &win_h);
 #ifndef _WIN32
-    if(active_tab() && active_tab()->kind==TK_BROWSER)win_h=mac_browser_page_rows(active_tab())*CH;
+    if(!g_grid_on && active_tab() && active_tab()->kind==TK_BROWSER)win_h=mac_browser_page_rows(active_tab())*CH;
 #endif
     g_chrome = chrome_primary_measure(win_h / CH, first_row(), g_ntabs, g_settings_open,
                               g_tab_underlay, g_dock_row, items);
@@ -227,7 +234,7 @@ static void tab_layout(void) {
             if (items == previous && capacity == g_chrome.list_capacity) break;
         }
     }
-    if (g_tab_underlay) g_dock_row = g_chrome.top;
+    if (g_tab_underlay && !g_grid_on) g_dock_row = g_chrome.top;
     if (g_active != g_layout_active || g_ntabs != g_layout_ntabs) {
         if (g_active >= 0) g_tab_offset = g_active;
         g_layout_active = g_active; g_layout_ntabs = g_ntabs;
@@ -290,7 +297,8 @@ static int hit_tabbar(int mx, int my, int *idx) {
     for (i = 0; i < g_chrome.tab_count; i++) {
         if (row != g_chrome.tab_row + i) continue;
         #ifndef _WIN32
-        if (col == SB_COLS - 4) { *idx = g_tab_offset + i; UI_DONE; return HIT_CUTIE; }
+        if(g_grid_on && col>=SB_COLS-7 && col<SB_COLS-3){*idx=g_tab_offset+i;UI_DONE;return HIT_GRID_HIDE;}
+        if (!g_grid_on && col == SB_COLS - 4) { *idx = g_tab_offset + i; UI_DONE; return HIT_CUTIE; }
         #endif
         if (col == SB_COLS - 2) { *idx = g_tab_offset + i; UI_DONE; return HIT_CLOSE; }
         if (!i && (page_hit = chrome_page_hit(col, g_tab_offset, g_chrome.tab_capacity, g_ntabs, 1, idx))) {
@@ -333,7 +341,7 @@ static int tabbar_action(int mx, int my) {
     int idx = -1, hit = hit_tabbar(mx, my, &idx);
     return (chrome_setting_hit(hit) && hit != HIT_CHROME_INERT) || hit == HIT_PLUS || hit == HIT_CLOSE || hit == HIT_CUTIE ||
         hit == HIT_WEB || hit == HIT_FILES || hit == HIT_CAF || hit == HIT_CAMERA || hit == HIT_TAB || hit == HIT_TV_EXPAND ||
-        hit == HIT_MUSIC || hit == HIT_MUSIC_PREV || hit == HIT_MUSIC_PLAY || hit == HIT_MUSIC_NEXT || hit == HIT_MUSIC_STOP;
+        hit == HIT_GRID || hit == HIT_GRID_EXPAND || hit == HIT_GRID_HIDE || hit == HIT_MUSIC || hit == HIT_MUSIC_PREV || hit == HIT_MUSIC_PLAY || hit == HIT_MUSIC_NEXT || hit == HIT_MUSIC_STOP;
 }
 static void resize_all(void);
 static void settings_point(void) {
@@ -387,6 +395,7 @@ static void chrome_drag_position(int mx, int my, int width, int rows, int cell_h
                       chrome_max(0, rows - height));
 }
 static int chrome_drag_begin(int mx, int my) {
+    if(g_grid_on)return 0;
     int idx = -1;
     if (hit_tabbar(mx, my, &idx) != HIT_GRIP) return 0;
     g_chrome_drag = 1;

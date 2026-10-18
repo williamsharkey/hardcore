@@ -125,6 +125,7 @@ static void mac_music_text(NSString *text,int col,int end,int row,uint32_t color
     wchar_t s[512];utf8_to_wide(text.UTF8String ?: "",s,512);chrome_label(s,col,end,row,color);
 }
 static void mac_music_button(const wchar_t *text,int col,int width,int row,int action) {
+    if(action==MUSIC_PREVIOUS || action==MUSIC_PLAY || action==MUSIC_NEXT || action==MUSIC_STOP)chrome_button_outline(col,width,row);
     if(mac_music_hit(g_mouse_x,g_mouse_y)==action)fill_rect(col*CW,row*CH,(col+width)*CW,(row+1)*CH,TAB_HOVER,1);
     chrome_label(text,col,col+width,row,g_look.text);
 }
@@ -138,7 +139,7 @@ static void mac_music_draw(void) {
     fill_rect(0,y*CH,r.w*CW,y*CH+1,g_look.dim,1);
     fill_rect(0,(y+r.h)*CH-1,r.w*CW,(y+r.h)*CH,g_look.dim,1);
     fill_rect(0,y*CH,1,(y+r.h)*CH,g_look.dim,1);fill_rect(r.w*CW-1,y*CH,r.w*CW,(y+r.h)*CH,g_look.dim,1);
-    chrome_label(L"↕ ♪ Music for Programming",1,r.w-3,y,g_look.text);
+    chrome_label(g_grid_on?L"Music for Programming":L"↕ Music for Programming",1,r.w-3,y,g_look.text);
     mac_music_button(L"−",r.w-2,1,y,MUSIC_MINIMIZE);
     NSDictionary *s=mac_music_status();NSArray *items=mac_music_items();
     mac_music_text([s[@"title"] length]?s[@"title"]:@"Choose a mix below",1,r.w-1,y+1,AMBER);
@@ -147,16 +148,16 @@ static void mac_music_draw(void) {
     mac_music_text([NSString stringWithFormat:@"%@ · %u:%02u / %u:%02u",state,pos/60,pos%60,duration/60,duration%60],1,r.w-1,y+2,g_look.detail);
     wchar_t bar[128];int n=chrome_min(r.w-4,120),fill=(int)(fmax(0,fmin(1,[s[@"progress"] doubleValue]))*n);
     bar[0]='[';for(int i=0;i<n;i++)bar[i+1]=i<fill?'=':' ';bar[n+1]=']';bar[n+2]=0;chrome_label(bar,1,r.w-1,y+3,g_look.detail);
-    mac_music_button(L"|< Prev",1,7,y+4,MUSIC_PREVIOUS);
+    mac_music_button(L"Prev",1,7,y+4,MUSIC_PREVIOUS);
     mac_music_button([s[@"playing"] boolValue]?L"Ⅱ Pause":L"▶ Play",9,7,y+4,MUSIC_PLAY);
-    mac_music_button(L"Next >|",17,7,y+4,MUSIC_NEXT);mac_music_button(L"Stop",25,5,y+4,MUSIC_STOP);
+    mac_music_button(L"Next",17,7,y+4,MUSIC_NEXT);mac_music_button(L"Stop",25,5,y+4,MUSIC_STOP);
     chrome_label(L"Episodes",1,r.w-16,y+5,g_look.dim);
     mac_music_button(L"Refresh",r.w-15,8,y+5,MUSIC_REFRESH);mac_music_button(L"Site",r.w-6,5,y+5,MUSIC_SITE);
     int current=[s[@"index"] intValue];
     for(int i=0;i<mac_music_capacity() && g_music_offset+i<(int)items.count;i++) {
         int at=g_music_offset+i;NSDictionary *item=items[at];int row=y+6+i;
         if(current==at || mac_music_hit(g_mouse_x,g_mouse_y)==MUSIC_ITEM+at)fill_rect(CW,row*CH,(r.w-1)*CW,(row+1)*CH,TAB_HOVER,1);
-        NSString *text=[NSString stringWithFormat:@"%@ %@",current==at?@"♪":@" ",item[@"title"] ?: @""];
+        NSString *text=[NSString stringWithFormat:@"%@ %@",current==at?@">":@" ",item[@"title"] ?: @""];
         mac_music_text(text,1,r.w-1,row,current==at?AMBER:g_look.text_lo);
     }
     NSString *message=[s[@"error"] length]?s[@"error"]:[s[@"catalogError"] length]?s[@"catalogError"]:[s[@"loading"] boolValue]?@"Loading episode list…":@"musicforprogramming.net · click a mix to play";
@@ -195,6 +196,7 @@ static int mac_music_mouse(NSEvent *event,int x,int y) {
     if(type==NSEventTypeMouseMoved){g_mouse_x=x;g_mouse_y=y;plat_invalidate();return 0;}
     if(type!=NSEventTypeLeftMouseDown)return 0;
     mac_cutie_blur();chrome_preview_cancel();mac_music_cancel_press();g_music_down=1;g_sel_drag=g_sb_drag=0;
+    if(g_grid_on && (hit==MUSIC_MOVE || hit==MUSIC_RESIZE))return 1;
     if(hit==MUSIC_MOVE || hit==MUSIC_RESIZE){g_music_drag=hit;g_music_drag_origin=g_music_rect;g_music_drag_x=x;g_music_drag_y=y;}
     else if(hit!=MUSIC_BODY) {
         g_music_pending=hit;

@@ -129,7 +129,7 @@ the large **●** marks the selected tab. A spinner or **!** can replace these
 markers while a program is busy or needs attention. Native browser tabs preview
 their cached text projection without navigating or moving keyboard focus.
 
-The macOS header uses two rows of controls in the selected bitmap font:
+The macOS header uses three rows of controls in the selected bitmap font:
 
 | Control | Action |
 |---|---|
@@ -140,10 +140,25 @@ The macOS header uses two rows of controls in the selected bitmap font:
 | **+term** | New terminal in the current folder |
 | **+www** | Open a new website tab |
 | **files** | Open the current folder in the bundled file browser |
+| **music** | Open the music player |
+| **Grid / Normal** | Tile tabs inside this window, or return to the normal view |
 
 The move handle, config, cam, and CAF occupy the first row; new-tab actions occupy
-the second. Gaps between controls are inert. Drag the normal window title band
+the second, alongside music. Grid occupies the third row; an active music player adds a fourth transport row. Gaps between controls are inert. Drag the normal window title band
 to move the app window; its pointer stays an arrow.
+
+**Grid** arranges visible tabs across each row before starting the next. Drag the
+hairline dividers to resize columns and rows. Each pane has one title/action row:
+**Solo** returns to the normal view on that tab, and **Hide** removes it from the
+grid without closing its session. Use **show** in the tab menu to bring it back.
+When the last row would have empty cells, the first pane spans the extra space;
+**Expand** on another pane or **Expand: N** in the menu changes that choice.
+Expansion controls appear only when spare cells exist. Settings, music, camera,
+and CAF use a reserved side rail so opening them leaves the terminal grid fixed.
+When height is tight, Config/Music/Cam/CAF selectors share the rail between open panels.
+Duplicate Cutie previews resume on returning to Normal. Browser panes use cached
+text with clickable links/buttons; clicking an editor opens the full browser.
+Grid is local to one Hardcore window; separate macOS windows keep their positions.
 
 Isolated right-aligned status lines can slide into blank space on their own
 row to expose the menu or a TV, preserving colors, links, and spacing. They
@@ -350,7 +365,7 @@ survives a live update.
 
 ## Music for Programming on macOS
 
-Click **♪mus** in the tab-menu header to open a music TV in Hardcore's current
+Click **music** in the tab-menu header to open a music TV in Hardcore's current
 font and theme. It lists mixes from the official
 [Music for Programming feed](https://musicforprogramming.net/rss.xml).
 Opening the list does not start audio; click a mix or **Play** to stream it.
@@ -361,7 +376,7 @@ in a Hardcore browser tab.
 Drag the title row to move the TV, or its bottom-right grip to resize it.
 **−** minimizes it while playback continues. A single transport row stays in
 the tab menu with previous, play/pause, next, stop, and the episode/time;
-click the note or episode/time to reopen the TV. Previous/next follows the
+click **music** or the episode/time to reopen the TV. Previous/next follows the
 list's newest-first order and preserves whether playback is paused. Playback
 automatically advances at the end of a mix. Live updates preserve the selection,
 position, and play/pause state, with a brief buffering interruption possible.
@@ -1216,14 +1231,13 @@ experimental takeover suite are documented in
   `dir=` in `~/Library/Application Support/hardcore/config.ini`, or with
   `hardcore.app/Contents/MacOS/hardcore DIR`. A folder dropped on the Dock
   icon opens a tab there.
-- **The window's traffic lights** rest as subtle neutral circles beneath terminal
-  text. They lighten dark backgrounds and darken light ones, including colored
-  highlights and text selections, without changing glyph pixels. Middle gray
-  retains contrast too. Hovering the native title area reveals the real controls and smokes the
-  full-width band; drag there to move the window or double-click to zoom. An
-  upward text-selection drag keeps the controls and band hidden and continues
-  scrolling. The terminal still starts at the drawable origin. The empty
-  part of the column still drags the window, and double-clicking it zooms.
+- **Standard macOS title bar.** The AppKit title bar sits above the
+  terminal, with the normal close, minimize, and zoom controls always visible
+  in windowed mode. AppKit handles dragging, double-clicking, and full screen.
+  The title bar is separate from the bitmap renderer and has no hover reveal.
+  It shows the active terminal’s folder name and native draggable folder icon;
+  Command-click the name for the folder hierarchy. Browser tabs inherit their
+  parent terminal’s folder.
 - **Mac keys:**
 
   | Keys | Action |
@@ -1334,23 +1348,26 @@ fit. Back/forward buttons and the page count share the first actual item row;
 the label between them still selects that item. Fonts, themes, and tabs keep
 independent page positions. Menu lists do not scroll.
 
-- **font**: sizes are grouped beside their family name. Click a size to apply
-  it; the selected size has an amber background. The menu shows width × height
-  when the family fits, or just heights in compact rows. Long families continue
-  on the next row, and repeat their name at a page boundary. Every size remains
-  selectable when the menu is paginated. Sizes reflect device pixels, including
-  the current display scale for the three legacy scaled cuts.
+- **font**: a table of families. Each family name has its own row, with its
+  sizes on indented rows beneath it; a family with one size shows that size at
+  the right of its name. Hairline is a width × height grid: one row per width
+  (`12×`, `13×`, …) and one column per height, so equal heights line up.
+  Other families list full width × height sizes in aligned columns. Click a
+  size to apply it; the selected size has an amber background. A page never
+  starts with bare sizes: it repeats the family name. Sizes reflect device
+  pixels, including the current display scale for the three legacy scaled cuts.
+  A new install starts in Hairline 13×27 (`u`).
 
   | Family | Cells, in size order | Saved preference keys |
   |---|---|---|
-  | GNU Unifont 18 (default) | 8×16, scaled | `U` |
+  | GNU Unifont 18 | 8×16, scaled | `U` |
   | Tamzen | 8×15 scaled; 8×16; 10×20 | `Z`, `z`, `x` |
   | Fixed (X11) | 7×13 scaled; 9×18; 10×20 | `F`, `f`, `g` |
   | Terminus | 8×16; 10×18; 10×20; 11×22; 12×24; 14×28; 16×32 | `a`, `b`, `c`, `d`, `t`, `M`, `T` |
   | Sony (X11) | 12×24 | `Y` |
   | ETL (GNU intlfonts) | 12×24 | `E` |
   | Courier (X11) | 15×24; 20×29 | `C`, `R` |
-  | Hairline (Terminus-derived) | 12×26 | `H` |
+  | Hairline (Terminus-derived; 13×27 is the default) | 12×26; 12×28; 12×30; 12×32; 12×34; 13×28; 14×28; 15×28; 16×26; 13×25; 13×26; 13×27 | `H`, `h`, `i`, `j`, `k`, `l`, `m`, `n`, `o`, `r`, `s`, `u` |
   | UW ttyp0 | 9×17; 9×18 | `p`, `q` |
 
   "Scaled" fonts are multiplied by the display scale like Unifont is: each
@@ -1365,12 +1382,15 @@ independent page positions. Menu lists do not scroll.
   letter stems and bars, even on Retina displays. Curves, serifs, and joins
   can be wider. Its missing or overhanging glyphs use Unifont fitted to the
   selected cell; the 20×29 font also supports 40-pixel-wide Unicode fallback.
-  Hairline is the saved Terminus-derived design with lowercase x-height +2,
-  capital/digit height +3, and a 26-pixel cell. It preserves one-pixel strokes
-  and the original `f` hook, and fills the taller cell with continuous box and
-  block graphics. Select **H · Hairline · 12×26** in the font menu, or use
-  `font=H` in `config.ini`. Other source letters and punctuation retain their
-  original contours; only ASCII letters and digits have enlarged bodies.
+  Hairline offers twelve native bitmap sizes under one family.
+  The original 26px design (`H`) is unchanged. The 28/30/32/34px cuts (`h`/`i`/`j`/`k`)
+  enlarge the glyph bodies while keeping one-device-pixel letter strokes, with
+  reviewed ascenders, dots, crossbars, punctuation, accents and terminal symbols.
+  Wider variations of 12×28 add 13×28, 14×28, 15×28 and 16×26 (`l`/`m`/`n`/`o`),
+  with widened counters, one-pixel stems and reviewed common characters.
+  Compact 13×25/26/27 cuts (`r`/`s`/`u`) derive directly from Terminus 12×24.
+  Select a size in **Settings → Font → Hairline**, or set its key in `config.ini`.
+  See the [design notes and glyph proofs](font/hairline/README.md).
 - **theme**: a row per family, with the dark scheme's letter and, for the
   families that have one, the light one's: `h` hardcore (Campbell with an
   amber cursor), `d` Dracula, `m` Monokai, `n` Nord, `g`/`G`
@@ -1497,9 +1517,8 @@ The other fonts are BDFs in `font/`, packed by `tools/gen_fonts.py` into
   Its 28 and 32 sizes draw box lines 2 pixels wide, so their box drawing is
   redrawn from the Unicode names with 1-pixel lines on Terminus's own center
   lines.
-- Hairline 12×26 (`font/hairline/`, SIL OFL 1.1), a modified Terminus 24
-  with the selected +2 lowercase / +3 capitals design and adapted terminal
-  graphics. It uses a distinct family name, retains the original attribution,
+- Hairline 12×26/28/30/32/34 and 13×25/26/27/28, 14×28/15×28/16×26 (`font/hairline/`, SIL OFL 1.1), modified Terminus 24
+  designs with single-pixel letter strokes and adapted terminal graphics. It uses a distinct family name, retains the original attribution,
   and embeds the complete OFL notice. See its [design and regeneration notes](font/hairline/README.md).
 - Tamzen 8×15 by Suraj N. Kurapati, from Tamsyn by Scott Fial (`font/tamzen/`,
   free to use, copy, modify and distribute).

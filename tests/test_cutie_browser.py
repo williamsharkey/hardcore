@@ -43,6 +43,7 @@ static NSString *browser_string(id value) {return [value isKindOfClass:NSString.
 static id browser_world(void) {return nil;}
 static Tab *tab_by_id(int identity) {for(int i=0;i<g_ntabs;i++)if(g_tabs[i] && g_tabs[i]->id==identity)return g_tabs[i];return NULL;}
 static void activate(int at) {active=at;}
+static int g_grid_on;static void grid_toggle(void) {g_grid_on=!g_grid_on;}
 static void mac_browser_begin_control(Tab *tb,int node,int revision,int epoch,NSDictionary *info) {
     assert(tb==g_tabs[active] && revision==tb->browser->generation && epoch==tb->browser->epoch && info);
     control_calls++;control_node=node;

@@ -29,6 +29,7 @@
     #hardcore-font-lab .fl-settings-row { display: flex; flex-wrap: wrap; align-items: end; gap: 16px; margin-top: 10px; }
     #hardcore-font-lab .fl-settings-text { margin-top: 12px; }
     #hardcore-font-lab .fl-glyph-area { display: flex; flex-wrap: wrap; gap: 14px; align-items: start; }
+    #hardcore-font-lab #fl-glyph-comparison { touch-action:none; cursor:ns-resize; }
     #hardcore-font-lab .fl-grid { display: block; max-width: none; max-height: none; }
     #hardcore-font-lab .fl-metrics { display: grid; gap: 7px; padding-top: 5px; }
     #hardcore-font-lab .fl-metric { display: flex; align-items: center; gap: 7px; }
@@ -39,20 +40,188 @@
     #hardcore-font-lab .fl-sources { margin-top: 20px; }
     #hardcore-font-lab .fl-source-list { display: grid; gap: 10px; margin-top: 10px; }
     #hardcore-font-lab [hidden] { display: none !important; }
+    #hardcore-font-lab .fl-workspace { margin: 18px 0; padding: 14px 0; border-block: 1px solid var(--border); }
+    #hardcore-font-lab .fl-workspace h3 { margin: 0 0 8px; }
+    #hardcore-font-lab .fl-inline { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:10px 0; }
+    #hardcore-font-lab .fl-inline label { display:flex; gap:6px; align-items:center; }
+    #hardcore-font-lab .fl-inline input[type=number] { width:70px; }
+    #hardcore-font-lab .fl-guide-table { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px 18px; }
+    #hardcore-font-lab .fl-guide-row { display:flex; align-items:center; gap:6px; font-size:12px; }
+    #hardcore-font-lab .fl-guide-row > label:first-child { flex:1; }
+    #hardcore-font-lab .fl-guide-row > label:not(:first-child) { flex:0 0 34px; }
+    #hardcore-font-lab .fl-guide-row input[type=number] { width:62px; }
+    #hardcore-font-lab textarea { width:100%; box-sizing:border-box; resize:vertical; }
+    #hardcore-font-lab .fl-screen-wrap { overflow:auto; max-height:460px; }
+    #hardcore-font-lab .fl-guide-help { font-size:12px; color:var(--muted-foreground); margin:8px 0; }
+    #hardcore-font-lab .fl-change-status { padding:10px 0; color:var(--foreground); font-weight:500; }
+    #hardcore-font-lab .fl-presets { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 16px; }
     @container (max-width: 580px) {
+      #hardcore-font-lab .fl-guide-table { grid-template-columns: minmax(0,1fr); }
       #hardcore-font-lab .fl-pair { grid-template-columns: minmax(0,1fr); gap: 20px; }
       #hardcore-font-lab .fl-adjustments { grid-template-columns: minmax(0,1fr); gap: 10px; }
       #hardcore-font-lab .fl-head { padding-right: 90px; }
     }
+
+    /* Desktop workbench: controls, glyph manipulation, continuous text proof. */
+    #hardcore-font-lab { font-size:12px; }
+    #hardcore-font-lab .fl-head { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:0; margin:0 0 14px; }
+    #hardcore-font-lab .fl-head h2 { font-size:21px; margin:0; }
+    #hardcore-font-lab h3 { font-size:14px; margin:0 0 10px; }
+    #hardcore-font-lab .fl-presets { margin:0; gap:5px; }
+    #hardcore-font-lab .fl-desktop { display:grid; grid-template-columns:250px minmax(390px,1.15fr) minmax(290px,1fr); gap:18px; align-items:start; }
+    #hardcore-font-lab .fl-column { min-width:0; }
+    #hardcore-font-lab .fl-controls, #hardcore-font-lab .fl-inspector { border-right:1px solid var(--border); padding-right:18px; }
+    #hardcore-font-lab .btn { padding:4px 7px; }
+    #hardcore-font-lab input[type=number], #hardcore-font-lab select { padding:4px 5px; min-height:28px; }
+    #hardcore-font-lab .fl-overall { display:flex; align-items:center; justify-content:space-between; font-size:14px; font-weight:600; }
+    #hardcore-font-lab #fl-overall { width:70px; font-size:18px; }
+    #hardcore-font-lab .fl-workspace { border:0; padding:0; margin:0 0 12px; }
+    #hardcore-font-lab .fl-guide-table { grid-template-columns:1fr; gap:5px; }
+    #hardcore-font-lab .fl-guide-row { gap:4px; }
+    #hardcore-font-lab .fl-guide-row > label:not(:first-child) { flex-basis:25px; font-size:10px; }
+    #hardcore-font-lab .fl-guide-row input[type=number] { width:49px; }
+    #hardcore-font-lab .fl-guide-row input[type=checkbox] { margin:0 2px 0 0; vertical-align:middle; }
+    #hardcore-font-lab .fl-guide-help { font-size:11px; line-height:1.45; margin:7px 0 12px; }
+    #hardcore-font-lab .fl-inspector-head { margin:0 0 12px; align-items:center; justify-content:space-between; }
+    #hardcore-font-lab .fl-inspector-head h3 { margin:0; }
+    #hardcore-font-lab .fl-glyph-field { width:auto; display:flex; align-items:center; gap:8px; }
+    #hardcore-font-lab #fl-glyph { width:60px; margin:0; }
+    #hardcore-font-lab .fl-arrow-dock { display:flex; gap:8px; }
+    #hardcore-font-lab .fl-drag-tool { flex:1; display:flex; align-items:center; justify-content:center; gap:7px; border:1px solid var(--border); border-radius:5px; background:#20272e; padding:6px; cursor:grab; touch-action:none; }
+    #hardcore-font-lab .fl-drag-tool span { font-size:24px; line-height:1.2; }
+    #hardcore-font-lab .fl-up { color:#80b8f0; } #hardcore-font-lab .fl-down { color:#ebaa60; }
+    #hardcore-font-lab .fl-bin { flex:.65; color:var(--muted-foreground); }
+    #hardcore-font-lab .fl-bin.fl-drop-active { color:#ffd5ce; background:#68382e; border-color:#efab95; }
+    #hardcore-font-lab .fl-new-scope { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:0 0 10px; font-size:11px; }
+    #hardcore-font-lab .fl-glyph-pair { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    #hardcore-font-lab .fl-pane-heading { font-size:11px; margin-bottom:6px; gap:4px; }
+    #hardcore-font-lab .fl-glyph-area { display:block; max-height:420px; overflow:auto; }
+    #hardcore-font-lab .fl-grid-stage { position:relative; width:max-content; }
+    #hardcore-font-lab .fl-arrow-handles { position:absolute; inset:0; pointer-events:none; }
+    #hardcore-font-lab .fl-arrow-handle { position:absolute; pointer-events:auto; border:1px solid currentColor; border-radius:3px; width:20px; height:18px; padding:0; line-height:14px; background:#20272e; cursor:grab; touch-action:none; font-size:13px; }
+    #hardcore-font-lab .fl-arrow-handle[aria-pressed=true] { background:#354859; box-shadow:0 0 0 1px currentColor; z-index:2; }
+    #hardcore-font-lab .fl-metrics { gap:2px; padding:8px 0 0; font-size:10px; }
+    #hardcore-font-lab .fl-change-status { font-size:12px; padding:10px 0 5px; }
+    #hardcore-font-lab .fl-seam-status { font-size:11px; margin:0; }
+    #hardcore-font-lab .fl-preview textarea { font-size:12px; height:92px; min-height:58px; }
+    #hardcore-font-lab .fl-inline { gap:5px; margin:7px 0; }
+    #hardcore-font-lab .fl-inline label { font-size:11px; }
+    #hardcore-font-lab .fl-toolbar { display:grid; grid-template-columns:minmax(0,1fr) 108px; gap:8px; margin:10px 0; }
+    #hardcore-font-lab .fl-preview-pair { display:grid; gap:12px; }
+    #hardcore-font-lab .fl-source { display:none; }
+    #hardcore-font-lab .fl-screen-wrap { max-height:120px; }
+    #hardcore-font-lab .fl-status { margin:8px 0; font-size:10px; }
+    #hardcore-font-lab .fl-settings, #hardcore-font-lab .fl-sources, #hardcore-font-lab .fl-options { margin-top:10px; font-size:11px; }
+    #hardcore-font-lab .fl-box-option { margin:12px 0 0; font-size:11px; }
+    #hardcore-font-lab .fl-settings textarea { height:110px; }
+    #hardcore-font-lab .fl-seam-field { flex-basis:100%; }
+    #hardcore-font-lab .fl-seam-controls, #hardcore-font-lab .fl-seam-actions { gap:5px; }
+    #hardcore-font-lab #fl-drag-ghost { position:fixed; z-index:999; pointer-events:none; padding:5px 9px; border-radius:4px; background:#324653; color:white; border:1px solid #9db5c8; font-size:16px; }
+    #hardcore-font-lab .fl-grid-stage.fl-drop-active { outline:1px solid #8caed4; outline-offset:3px; }
+    @media (min-width:1000px) and (max-height:760px) { #hardcore-font-lab .fl-guide-help { margin:5px 0 8px; } #hardcore-font-lab .fl-screen-wrap { max-height:100px; } }
+    @media (min-width:1000px) { body { padding:16px !important; } main { max-width:1500px !important; } }
+    @container (max-width:999px) {
+      #hardcore-font-lab .fl-desktop { grid-template-columns:230px minmax(370px,1fr); }
+      #hardcore-font-lab .fl-preview { grid-column:1/-1; display:grid; grid-template-columns:1fr 1fr; gap:8px 20px; }
+      #hardcore-font-lab .fl-preview h3 { grid-column:1/-1; }
+      #hardcore-font-lab .fl-inspector { border:0; padding:0; }
+    }
+    @container (max-width:650px) {
+      #hardcore-font-lab .fl-desktop { grid-template-columns:1fr; }
+      #hardcore-font-lab .fl-controls { border:0; padding:0; }
+      #hardcore-font-lab .fl-guide-table { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      #hardcore-font-lab .fl-preview { display:block; }
+      #hardcore-font-lab .fl-head { flex-wrap:wrap; }
+    }
+    @container (max-width:400px) { #hardcore-font-lab .fl-guide-table { grid-template-columns:1fr; } #hardcore-font-lab .fl-glyph-pair { overflow:auto; } }
   </style>
 
-  <div class="fl-head">
-    <h2>Hairline font bench</h2>
-    <div class="text-small text-muted">Actual bitmap pixels</div>
+  <header class="fl-head"><div><h2>Hairline font bench</h2><span class="text-small text-muted">Editing Terminus 12×24</span></div>
+    <div class="fl-presets" aria-label="Starting points"><button class="btn" id="fl-preset24">Reset 24px</button></div>
+  </header>
+  <div class="fl-desktop">
+    <aside class="fl-column fl-controls" aria-label="Size and guides">
+      <div class="fl-overall"><label for="fl-overall">Canvas height <span class="text-muted">px</span></label><input id="fl-overall" type="number" min="1" step="1" value="24"></div>
+      <p class="fl-guide-help">Only this number changes the canvas height.</p>
+  <section class="fl-workspace" aria-label="Shape lines">
+    <h3>Shape lines</h3>
+<p class="fl-guide-help">Rows run from 0 to the last pixel. Move any line anywhere; the canvas stays fixed. L / R shows each guide.</p>
+    <div id="fl-guides" class="fl-guide-table"></div>
+  </section>
+<details class="fl-options"><summary>Arrow values & keyboard controls</summary>  <div id="fl-seam-editor">
+
+    <div class="fl-seam-controls">
+      <label for="fl-insertion" class="form-label fl-seam-field">Select arrow (selection only)
+        <select id="fl-insertion" class="form-select"></select>
+      </label>
+      <button id="fl-arrow-add" type="button" class="btn">+ Insert arrow</button>
+      <button id="fl-arrow-remove" type="button" class="btn">Remove arrow</button>
+    </div>
+    <div class="fl-inline">
+      <label>Source line <input id="fl-global-row" type="number" min="0" max="24" value="11"></label>
+      <label>Search <select id="fl-global-direction" class="form-select"><option value="up">↑ Upward</option><option value="down">↓ Downward</option></select></label>
+      <label>Applies to <select id="fl-arrow-scope" class="form-select"><option value="all">All letters + digits</option><option value="lower">Lowercase</option><option value="caps">Capitals + digits</option></select></label>
+    </div>
+    <div class="fl-seam-actions">
+      <button id="fl-insertion-up" type="button" class="btn">↑ Move arrow up</button>
+      <button id="fl-insertion-down" type="button" class="btn">↓ Move arrow down</button>
+      <button id="fl-insertion-auto" type="button" class="btn btn-ghost">Redistribute arrows</button>
+    </div>
+</div>
+</details>  <div class="fl-box-option" id="fl-box-option">
+    <label class="form-check"><input id="fl-boxes" type="checkbox" class="form-check-input" checked><span class="form-check-label">Extend box strokes to cell edges</span></label>
   </div>
 
+
+    </aside>
+    <section class="fl-column fl-inspector" aria-label="Glyph workspace">
+      <div class="fl-inspector-head"><h3>Glyphs</h3>    <label class="form-label fl-glyph-field" for="fl-glyph">Character
+      <select id="fl-glyph" class="form-select">
+        <optgroup label="Lowercase"><option>a</option><option>b</option><option>c</option><option>d</option><option>e</option><option>f</option><option>g</option><option>h</option><option>i</option><option>j</option><option>k</option><option>l</option><option>m</option><option>n</option><option>o</option><option>p</option><option>q</option><option>r</option><option>s</option><option>t</option><option>u</option><option>v</option><option>w</option><option>x</option><option>y</option><option>z</option></optgroup>
+        <optgroup label="Uppercase"><option>A</option><option>B</option><option>C</option><option>D</option><option>E</option><option>F</option><option>G</option><option>H</option><option selected>I</option><option>J</option><option>K</option><option>L</option><option>M</option><option>N</option><option>O</option><option>P</option><option>Q</option><option>R</option><option>S</option><option>T</option><option>U</option><option>V</option><option>W</option><option>X</option><option>Y</option><option>Z</option></optgroup>
+        <optgroup label="Digits"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></optgroup>
+        <optgroup label="Box strokes"><option>│</option><option>─</option><option>┌</option><option>┐</option><option>└</option><option>┘</option><option>├</option><option>┤</option><option>┬</option><option>┴</option><option>┼</option></optgroup>
+      </select>
+    </label>
+</div>
+      <div class="fl-arrow-dock" aria-label="Arrow tools">
+        <button type="button" class="fl-drag-tool fl-up" id="fl-tool-up" aria-label="Drag upward rounding arrow" title="Drag onto a glyph to insert; click to insert at selected source row"><span>↑↦</span>Round up</button>
+        <button type="button" class="fl-drag-tool fl-down" id="fl-tool-down" aria-label="Drag downward rounding arrow" title="Drag onto a glyph to insert; click to insert at selected source row"><span>↓↦</span>Round down</button>
+        <button type="button" class="fl-drag-tool fl-bin" id="fl-bin" aria-label="Delete selected arrow" title="Drop an arrow here to remove it, or click to remove the selection"><span>⌫</span>Bin</button>
+      </div>
+      <p class="fl-guide-help">Drag ↑↦ or ↓↦ onto a row. Move an arrow to reposition; drop it in the bin to remove.</p>
+      <label class="fl-new-scope">New arrows <select id="fl-new-scope" aria-label="New arrow scope"><option value="all">All letters + digits</option><option value="lower">Lowercase</option><option value="caps">Caps + ascenders</option></select></label>
+  <div class="fl-pair fl-glyph-pair">
+    <section class="fl-pane" aria-label="Original glyph pixel grid">
+      <div class="fl-pane-heading"><span class="fl-name" id="fl-reference-glyph-name">Reference</span><span id="fl-original-glyph-size" class="text-small text-muted tabular-nums"></span></div>
+      <div class="fl-glyph-area"><div class="fl-grid-stage" id="fl-stage-original"><canvas id="fl-glyph-original" class="fl-grid" role="img" aria-label="Original glyph pixel grid"></canvas><div class="fl-arrow-handles" id="fl-handles-original"></div></div><div class="fl-metrics text-small tabular-nums" id="fl-metrics-original"></div></div>
+    </section>
+    <section class="fl-pane" aria-label="Comparison glyph pixel grid">
+      <div class="fl-pane-heading"><span class="fl-name" id="fl-glyph-comparison-name">Hairline Lab</span><span id="fl-comparison-glyph-size" class="text-small text-muted tabular-nums"></span></div>
+      <div class="fl-glyph-area"><div class="fl-grid-stage" id="fl-stage-comparison"><canvas id="fl-glyph-comparison" class="fl-grid" role="img" aria-label="Comparison glyph pixel grid"></canvas><div class="fl-arrow-handles" id="fl-handles-comparison"></div></div><div class="fl-metrics text-small tabular-nums" id="fl-metrics-comparison"></div></div>
+    </section>
+  </div>
+<div id="fl-change-status" class="fl-change-status" aria-live="polite">Drag an arrow onto either glyph to begin.</div>
+      <div id="fl-seam-status" class="fl-seam-status text-small text-muted" aria-live="polite"></div>
+      <canvas id="fl-live-comparison" hidden></canvas>
+    </section>
+    <section class="fl-column fl-preview" aria-label="Text comparison">
+      <h3>Text preview</h3>  <section class="fl-workspace" aria-label="Live text and temporary saves">
+    <label for="fl-preview-text" class="form-label">Preview text (multiline)</label>
+    <textarea id="fl-preview-text" class="form-control" rows="4" maxlength="12000" spellcheck="false"></textarea>
+    <div class="fl-inline">
+      <label><input id="fl-custom-text" type="checkbox" checked>Use my text</label>
+      <button class="btn" id="fl-save-a">Save A</button><button class="btn" id="fl-load-a">Load A</button>
+      <button class="btn" id="fl-save-b">Save B</button><button class="btn" id="fl-load-b">Load B</button>
+      <button class="btn" id="fl-ab">Compare A / B</button>
+    </div>
+    <div id="fl-snapshot-status" class="text-small text-muted" aria-live="polite">A / B saves stay in this browser.</div>
+  </section>
   <div class="fl-toolbar">
-    <label class="form-label fl-font-field" for="fl-comparison">Compare with
+    <label class="form-label fl-font-field" for="fl-reference">Compare with
+      <select id="fl-reference" class="form-select"></select>
+    </label>
+    <label class="form-label fl-font-field" for="fl-comparison" hidden>Working font
       <select id="fl-comparison" class="form-select"></select>
     </label>
     <label class="form-label fl-scale-field" for="fl-scale">Preview scale
@@ -63,27 +232,9 @@
     </label>
   </div>
 
-  <div class="fl-adjustments" id="fl-adjustments">
-    <label class="form-label" for="fl-x-height">
-      <span class="fl-range-heading"><span>Lowercase x-height</span><output id="fl-x-value" class="tabular-nums" for="fl-x-height">+2 px</output></span>
-      <input id="fl-x-height" class="form-range" type="range" min="0" max="6" value="2" step="1">
-    </label>
-    <label class="form-label" for="fl-cap-height">
-      <span class="fl-range-heading"><span>Cap height / digits</span><output id="fl-cap-value" class="tabular-nums" for="fl-cap-height">+2 px</output></span>
-      <input id="fl-cap-height" class="form-range" type="range" min="0" max="6" value="2" step="1">
-    </label>
-    <label class="form-label" for="fl-cell-height">
-      <span class="fl-range-heading"><span>Cell / line height</span><output id="fl-cell-value" class="tabular-nums" for="fl-cell-height">26 px</output></span>
-      <input id="fl-cell-height" class="form-range" type="range" min="24" max="32" value="26" step="1">
-    </label>
-  </div>
-  <div class="fl-box-option" id="fl-box-option">
-    <label class="form-check"><input id="fl-boxes" type="checkbox" class="form-check-input" checked><span class="form-check-label">Extend box strokes to cell edges</span></label>
-  </div>
-
-  <div class="fl-pair">
+  <div class="fl-preview-pair">
     <section class="fl-pane" aria-label="Original font terminal preview">
-      <div class="fl-pane-heading"><span class="fl-name">Original Terminus</span><span class="text-small text-muted tabular-nums" id="fl-original-size">12 × 24</span></div>
+      <div class="fl-pane-heading"><span class="fl-name" id="fl-reference-name">Your Hairline 12×26</span><span class="text-small text-muted tabular-nums" id="fl-original-size">12 × 24</span></div>
       <div class="fl-screen-wrap" id="fl-original-wrap"><canvas id="fl-original" class="fl-screen" role="img" aria-label="Sample terminal interface rendered in the original Terminus bitmap"></canvas></div>
       <div id="fl-original-note" class="fl-source text-small text-muted"></div>
     </section>
@@ -95,41 +246,6 @@
   </div>
   <div class="fl-status text-small text-muted tabular-nums" id="fl-pixel-status" aria-live="polite"></div>
 
-  <hr>
-  <div class="fl-inspector-head">
-    <div class="fl-inspector-title"><h3>Inspect a glyph</h3><div class="text-small text-muted">One square = one bitmap pixel</div></div>
-    <label class="form-label fl-glyph-field" for="fl-glyph">Character
-      <select id="fl-glyph" class="form-select">
-        <optgroup label="Lowercase"><option>a</option><option>b</option><option>c</option><option>d</option><option>e</option><option>f</option><option>g</option><option>h</option><option>i</option><option>j</option><option>k</option><option>l</option><option>m</option><option>n</option><option>o</option><option>p</option><option>q</option><option>r</option><option>s</option><option>t</option><option>u</option><option>v</option><option>w</option><option>x</option><option>y</option><option>z</option></optgroup>
-        <optgroup label="Uppercase"><option>A</option><option>B</option><option>C</option><option>D</option><option>E</option><option>F</option><option>G</option><option>H</option><option selected>I</option><option>J</option><option>K</option><option>L</option><option>M</option><option>N</option><option>O</option><option>P</option><option>Q</option><option>R</option><option>S</option><option>T</option><option>U</option><option>V</option><option>W</option><option>X</option><option>Y</option><option>Z</option></optgroup>
-        <optgroup label="Digits"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></optgroup>
-        <optgroup label="Box strokes"><option>│</option><option>─</option><option>┌</option><option>┐</option><option>└</option><option>┘</option><option>├</option><option>┤</option><option>┬</option><option>┴</option><option>┼</option></optgroup>
-      </select>
-    </label>
-  </div>
-  <div id="fl-seam-editor">
-    <div class="fl-seam-controls">
-      <label for="fl-insertion" class="form-label fl-seam-field">Expansion arrow
-        <select id="fl-insertion" class="form-select"></select>
-      </label>
-      <div class="fl-seam-actions">
-        <button id="fl-insertion-up" type="button" class="btn" aria-label="Move selected expansion arrow up to the next safe row">↑ Move up</button>
-        <button id="fl-insertion-down" type="button" class="btn" aria-label="Move selected expansion arrow down to the next safe row">↓ Move down</button>
-        <button id="fl-insertion-auto" type="button" class="btn btn-ghost">Automatic placement</button>
-      </div>
-    </div>
-    <div id="fl-seam-status" class="fl-seam-status text-small text-muted" aria-live="polite"></div>
-  </div>
-  <div class="fl-pair">
-    <section class="fl-pane" aria-label="Original glyph pixel grid">
-      <div class="fl-pane-heading"><span class="fl-name">Original</span><span id="fl-original-glyph-size" class="text-small text-muted tabular-nums"></span></div>
-      <div class="fl-glyph-area"><canvas id="fl-glyph-original" class="fl-grid" role="img" aria-label="Original glyph pixel grid"></canvas><div class="fl-metrics text-small tabular-nums" id="fl-metrics-original"></div></div>
-    </section>
-    <section class="fl-pane" aria-label="Comparison glyph pixel grid">
-      <div class="fl-pane-heading"><span class="fl-name" id="fl-glyph-comparison-name">Hairline Lab</span><span id="fl-comparison-glyph-size" class="text-small text-muted tabular-nums"></span></div>
-      <div class="fl-glyph-area"><canvas id="fl-glyph-comparison" class="fl-grid" role="img" aria-label="Comparison glyph pixel grid"></canvas><div class="fl-metrics text-small tabular-nums" id="fl-metrics-comparison"></div></div>
-    </section>
-  </div>
   <details class="fl-settings">
     <summary>Save or load tuning</summary>
     <div class="fl-settings-row">
@@ -147,6 +263,10 @@
     <summary>Font sources and licenses</summary>
     <div id="fl-source-list" class="fl-source-list"></div>
   </details>
+
+    </section>
+  </div>
+  <div id="fl-drag-ghost" hidden></div>
   <div id="fl-error" class="text-destructive" role="alert" hidden></div>
 </div>
 
@@ -165,7 +285,17 @@
   }
   const fonts = data.fonts;
   const base = fonts.find(font => font.id === "terminus24") || fonts[0];
-  const defaults = {fontId:"experiment", xHeightDelta:2, capHeightDelta:2, cellHeight:26, scale:1, glyph:"e", redrawBoxes:true, glyphSeams:{}, selectedInsertion:0};
+  const guideDefs = [
+    ['capTop','Cap top','#5da5ef'], ['xTop','x-height top','#ebaa60'],
+    ['baseline','Baseline','#76bd91'], ['descender','Descender bottom','#ca8bce'],
+    ['ascender','Ascender top','#8bbbd6'], ['dot','i / j dot top','#d8bd6d'],
+    ['eBar','e crossbar','#ce9292'], ['numeral','Numeral top','#a4b4e2'],
+    ['cellTop','Cell top','#999999'], ['cellBottom','Cell bottom','#999999']
+  ];
+  const defaultGuides = () => Object.fromEntries(guideDefs.map(([key],i)=>[key,{row:null,left:i<4,right:i<4}]));
+  const defaults = {fontId:"experiment", referenceId:"terminus24", xHeightDelta:0, capHeightDelta:0, cellHeight:24, scale:1, glyph:"d", redrawBoxes:false, glyphSeams:{}, selectedInsertion:0,
+    arrows:[], fixedCanvas:true, lineRows:{capTop:4,xTop:8,baseline:18,descender:22,ascender:4,dot:4,eBar:13,numeral:4}, linkAscenders:true, globalSeams:[], placementMode:"global", ascenderRaise:0, dotRaise:0, eBarShift:0, descenderDelta:0,
+    previewText:"The quick brown fox jumps over the lazy dog.\nHAMBURGEFONTS 0123456789\nminimum / illij / aeogjy / {} [] () <>\n$ make test", customText:true, guides:defaultGuides()};
   let state = {...defaults};
   let rendered = {};
   let renderPending = false;
@@ -178,30 +308,55 @@
     if (value.glyphSeams && typeof value.glyphSeams === "object" && !Array.isArray(value.glyphSeams)) {
       for (const character of "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") {
         const cp = String(character.codePointAt(0)), seams = value.glyphSeams[cp];
-        if (Array.isArray(seams) && seams.length && seams.length<=6 && seams.every(y=>Number.isInteger(y) && y>=0 && y<=24)) glyphSeams[cp]=seams.slice();
+        if (Array.isArray(seams) && seams.length && seams.length<=12 && seams.every(y=>Number.isInteger(y) && y>=0 && y<=24)) glyphSeams[cp]=seams.slice();
       }
     }
     return {
       fontId: value.fontId === "experiment" || fonts.some(f => f.id === value.fontId) ? value.fontId : defaults.fontId,
-      xHeightDelta: integer(value.xHeightDelta,0,6,defaults.xHeightDelta),
-      capHeightDelta: integer(value.capHeightDelta,0,6,defaults.capHeightDelta),
-      cellHeight: integer(value.cellHeight,24,32,defaults.cellHeight),
+      xHeightDelta: integer(value.xHeightDelta,0,12,defaults.xHeightDelta),
+      capHeightDelta: integer(value.capHeightDelta,0,12,defaults.capHeightDelta),
+      cellHeight: integer(value.cellHeight,1,Number.MAX_SAFE_INTEGER,defaults.cellHeight),
+      fixedCanvas:value.fixedCanvas===true, lineRows:value.lineRows&&typeof value.lineRows==='object'?{...value.lineRows}:null,
       scale: value.scale === 2 ? 2 : 1,
       glyph: allowedGlyphs.includes(value.glyph) ? value.glyph : defaults.glyph,
       redrawBoxes: typeof value.redrawBoxes === "boolean" ? value.redrawBoxes : true,
       glyphSeams,
-      selectedInsertion: integer(value.selectedInsertion,0,5,0)
+      referenceId: fonts.some(f=>f.id===value.referenceId) || ['snapshotA','snapshotB'].includes(value.referenceId) ? value.referenceId : defaults.referenceId,
+      arrows: Array.isArray(value.arrows) ? value.arrows.map(a=>({...a})) : null,
+      globalSeams: Array.isArray(value.globalSeams) ? value.globalSeams.slice(0,12).map(a=>({row:integer(a?.row,0,24,11),direction:a?.direction==='down'?'down':'up'})) : [],
+      placementMode: value.placementMode === 'glyph' ? 'glyph' : 'global',
+      linkAscenders:value.linkAscenders===true,
+      ascenderRaise:integer(value.ascenderRaise,0,4,0), dotRaise:integer(value.dotRaise,0,4,0),
+      eBarShift:integer(value.eBarShift,-2,2,0),descenderDelta:integer(value.descenderDelta,0,6,0),
+      previewText:typeof value.previewText==='string'?value.previewText.slice(0,12000):defaults.previewText,
+      customText:value.customText!==false,
+      guides:Object.fromEntries(guideDefs.map(([key],i)=>{const g=value.guides?.[key];return [key,{row:g?.row==null?null:integer(g.row,0,60,0),left:typeof g?.left==='boolean'?g.left:i<4,right:typeof g?.right==='boolean'?g.right:i<4}];})),
+      selectedInsertion: integer(value.selectedInsertion,0,Number.MAX_SAFE_INTEGER,0)
     };
   }
   function applyStored(value) {
     const choices = value && (value.modelContent || value.privateContent || value);
     if (choices) state = cleanState(choices);
+    for(const slot of ['A','B']) if(value?.privateContent?.snapshots?.[slot]) snapshots[slot]=cleanState(value.privateContent.snapshots[slot]);
   }
+  let snapshots = {};
+  try {
+    if(!localStorage.getItem('hairline-lab-v2')) {
+      const legacy=localStorage.getItem('codex:visualization-widget-state-v2:'+JSON.stringify([location.pathname,location.search]));
+      if(legacy)applyStored(JSON.parse(legacy));
+    }
+  } catch {}
+  try { const saved=JSON.parse(localStorage.getItem('hairline-lab-v2') || 'null');
+    if(saved?.state) applyStored(saved.state);
+    for(const slot of ['A','B']) if(saved?.snapshots?.[slot]) snapshots[slot]=cleanState(saved.snapshots[slot]);
+  } catch {}
   applyStored(window.openai && window.openai.widgetState);
   function remember() {
+    try { localStorage.setItem('hairline-lab-v2', JSON.stringify({state,snapshots})); }
+    catch { if(!window.openai?.setWidgetState) el('fl-snapshot-status').textContent='Browser storage unavailable. A/B saves last for this page session; export JSON to keep them.'; }
     if (window.openai && typeof window.openai.setWidgetState === "function") {
-      const result = window.openai.setWidgetState({modelContent:{...state},privateContent:null});
-      if (result && typeof result.catch === "function") result.catch(() => {});
+      const result = window.openai.setWidgetState({modelContent:{...state},privateContent:{snapshots}});
+      if (result && typeof result.catch === "function") result.catch(() => {el("fl-snapshot-status").textContent="Could not persist this tuning. Export JSON to keep a copy.";});
     }
   }
   const experimentOption = document.createElement("option");
@@ -228,6 +383,19 @@
     row.append(name, document.createTextNode(" — " + (font.license || "See upstream license")));
     el("fl-source-list").append(row);
   }
+  for (const font of fonts) {
+    const option=document.createElement('option');option.value=font.id;option.textContent=font.name;
+    el('fl-reference').append(option);
+  }
+  for(const slot of ['A','B']) {
+    const option=document.createElement('option');option.value='snapshot'+slot;option.textContent='Saved '+slot;option.disabled=!snapshots[slot];
+    el('fl-reference').append(option);
+  }
+  function referenceFont() {
+    const saved=snapshots[state.referenceId.slice(-1)];
+    if(state.referenceId.startsWith('snapshot') && saved) return saved.fontId==='experiment' ? HairlineVariant.makeFont(base,saved) : fonts.find(f=>f.id===saved.fontId) || base;
+    return fonts.find(f=>f.id===state.referenceId) || base;
+  }
   function bitmap(font, character) {
     return font.glyphs[String(character.codePointAt(0))] || font.glyphs[character] || null;
   }
@@ -238,25 +406,31 @@
     return {top: bottom < 0 ? 0 : top, bottom};
   }
   function metrics(font) {
+    if(font.fixedLines)return {...font.fixedLines,cellTop:0,cellBottom:font.height-1};
     const cap = bounds(font,"H"), lower = bounds(font,"x");
     return {
       baseline: font.metrics?.baseline ?? (cap.bottom + 1),
       capTop: font.metrics?.capTop ?? cap.top,
-      xTop: font.metrics?.xTop ?? lower.top
+      xTop: font.metrics?.xTop ?? lower.top,
+      descender: Math.max(...['y','g','j','p','q'].map(c=>bounds(font,c).bottom))+1,
+      ascender: bounds(font,'h').top, dot:bounds(font,'i').top,
+      numeral:bounds(font,'0').top, cellTop:0, cellBottom:font.height,
+      eBar: (()=>{const rows=bitmap(font,'e')||[];const top=rows.findIndex(Boolean);let best=top+2,n=0;
+        rows.forEach((row,y)=>{const bits=row.toString(2).replaceAll('0','').length;if(y>top+1 && y<bounds(font,'e').bottom-1 && bits>n){best=y;n=bits;}});return best;})()
     };
   }
   function syncControls() {
     el("fl-comparison").value = state.fontId;
+    el('fl-reference').value=state.referenceId;
+    el('fl-preview-text').value=state.previewText;
+    el('fl-custom-text').checked=state.customText;
+    for(const slot of ['A','B']) el('fl-load-'+slot.toLowerCase()).disabled=!snapshots[slot];
+    el('fl-ab').disabled=!snapshots.A || !snapshots.B;
+    for(const option of el('fl-reference').options) if(option.value.startsWith('snapshot')) option.disabled=!snapshots[option.value.slice(-1)];
     el("fl-scale").value = String(state.scale);
-    el("fl-x-height").value = String(state.xHeightDelta);
-    el("fl-cap-height").value = String(state.capHeightDelta);
-    el("fl-cell-height").value = String(state.cellHeight);
+    if(document.activeElement!==el("fl-overall"))el("fl-overall").value=selectedFont().height;
     el("fl-glyph").value = state.glyph;
     el("fl-boxes").checked = state.redrawBoxes;
-    el("fl-x-value").value = "+" + state.xHeightDelta + " px";
-    el("fl-cap-value").value = "+" + state.capHeightDelta + " px";
-    el("fl-cell-value").value = state.cellHeight + " px";
-    el("fl-adjustments").hidden = state.fontId !== "experiment";
     el("fl-box-option").hidden = state.fontId !== "experiment";
   }
   function selectedFont() {
@@ -268,46 +442,90 @@
     const cp=String(state.glyph.codePointAt(0));
     return {seams:font.experiment?.placements?.[cp] || [],safeBoundaries:font.experiment?.safeBoundaries?.[cp] || []};
   }
+  function resetFeedback(message='Change a line or arrow to edit the working font.') {el('fl-change-status').textContent=message;}
+  const scopeLabel = scope => ({all:'all letters',lower:'lowercase',caps:'caps + digits'}[scope]);
+  function globalArrows() { return HairlineVariant.editingArrows(base,state); }
   function updateInsertionControls(font) {
     currentPlan=insertionPlan(font);
-    const seams=currentPlan.seams;
-    state.selectedInsertion=Math.min(state.selectedInsertion,Math.max(0,seams.length-1));
-    el("fl-seam-editor").hidden=state.fontId!=="experiment";
-    const select=el("fl-insertion");
-    select.replaceChildren();
-    if (!seams.length) {
-      const option=document.createElement("option");option.value="0";option.textContent="No inserted rows";select.append(option);
-    }
-    seams.forEach((seam,index)=>{
-      const option=document.createElement("option");option.value=String(index);
-      option.textContent="Arrow "+(index+1)+" · source row "+seam.actual;
-      select.append(option);
+    const arrows=globalArrows();
+    state.selectedInsertion=Math.min(state.selectedInsertion,Math.max(0,arrows.length-1));
+    el('fl-seam-editor').hidden=state.fontId!=='experiment';
+    const select=el('fl-insertion');select.replaceChildren();
+    arrows.forEach((arrow,i)=>{const o=document.createElement('option');o.value=i;
+      const actual=currentPlan.seams.find(a=>a.globalIndex===i);
+      o.textContent='Arrow '+(i+1)+' · '+(arrow.direction==='up'?'↑':'↓')+' '+arrow.row+' · '+scopeLabel(arrow.scope)+(actual?' → '+state.glyph+' row '+actual.actual:'');
+      select.append(o);
     });
-    select.value=String(state.selectedInsertion);
-    select.disabled=!seams.length;
-    const selected=seams[state.selectedInsertion], cp=String(state.glyph.codePointAt(0));
-    const safe=currentPlan.safeBoundaries;
-    el("fl-insertion-up").disabled=!selected || !safe.some(y=>y<selected.actual);
-    el("fl-insertion-down").disabled=!selected || !safe.some(y=>y>selected.actual);
-    el("fl-insertion-auto").disabled=!Object.prototype.hasOwnProperty.call(state.glyphSeams,cp);
-    const alphanumeric=/^[a-zA-Z0-9]$/.test(state.glyph);
-    const mode=Object.prototype.hasOwnProperty.call(state.glyphSeams,cp) ? "Custom placement" : "Balanced placement";
-    el("fl-seam-status").textContent=!alphanumeric ? "Box strokes follow the cell height." : !seams.length ? "Increase "+(/[a-z]/.test(state.glyph)?"x-height":"cap height")+" to add expansion arrows to "+state.glyph+"." :
-      mode+" · "+seams.length+" inserted row"+(seams.length===1?"":"s")+" · arrows move between safe stroke rows";
+    if(!arrows.length){const o=document.createElement('option');o.textContent='No arrows — drag one in or move a line';select.append(o);}
+    select.value=state.selectedInsertion;select.disabled=!arrows.length;
+    const arrow=arrows[state.selectedInsertion];
+    el('fl-global-row').value=arrow?.row ?? 11;
+    el('fl-global-direction').value=arrow?.direction ?? 'up';
+    el('fl-arrow-scope').value=arrow?.scope ?? 'all';
+    for(const id of ['fl-global-row','fl-global-direction','fl-arrow-scope','fl-arrow-remove','fl-insertion-up','fl-insertion-down'])el(id).disabled=!arrow;
+    const lower=arrows.filter(a=>a.scope!=='caps').length,caps=arrows.filter(a=>a.scope!=='lower').length;
+    el('fl-arrow-add').disabled=false;
+    const actual=currentPlan.seams.find(a=>a.globalIndex===state.selectedInsertion);
+    el('fl-seam-status').textContent=lower+' lowercase arrows · '+caps+' capital arrows · fixed '+font.height+'px canvas. '+
+      (arrow?(actual?'Selected arrow: source '+arrow.row+' → '+state.glyph+' safe row '+actual.actual+(actual.fallback?' (no safe row in preferred direction; nearest used).':'.'):(state.linkAscenders&&arrow.scope==='caps'&&'bdhkl'.includes(state.glyph)?'This arrow shapes capitals; select a capital to see its placement.':'This arrow does not apply to '+state.glyph+'.')):'');
+  }
+  function commitEdit(changes, label) {
+    const before=selectedFont(), next=cleanState({...state,...changes,fontId:'experiment'});
+    let after;
+    try {after=HairlineVariant.makeFont(base,next);}catch(error){render();el('fl-change-status').textContent=error.message;return;}
+    const changed=HairlineVariant.changedGlyphs(before,after);
+    state=next;
+    render();remember();
+    const cp=String(state.glyph.codePointAt(0)), preview=new Set(Array.from(state.previewText,c=>String(c.codePointAt(0))));
+    const visible=changed.filter(c=>preview.has(c)).length;
+    el('fl-change-status').textContent=label+' · '+changed.length+' glyphs changed; '+visible+' in your text. '+
+      (changed.includes(cp)?state.glyph+' changed.':state.glyph+' is unchanged at this position.')+
+      (!changed.length?' The request resolves to identical pixels. Try the move buttons to skip to a visible change.':'');
+  }
+  function editGlobal(changes) {
+    const arrows=globalArrows();if(!arrows.length)return;
+    arrows[state.selectedInsertion]={...arrows[state.selectedInsertion],...changes};
+    commitEdit({arrows},'Arrow '+(state.selectedInsertion+1)+' updated');
   }
   function moveInsertion(direction) {
-    if (!currentPlan) return;
-    const selected=currentPlan.seams[state.selectedInsertion];
-    if (!selected) return;
-    const candidates=currentPlan.safeBoundaries.filter(y=>direction<0 ? y<selected.actual : y>selected.actual);
-    if (!candidates.length) return;
-    const next=direction<0 ? Math.max(...candidates) : Math.min(...candidates);
-    const cp=String(state.glyph.codePointAt(0));
-    const overrides=(state.glyphSeams[cp] || []).slice();
-    for(let index=0;index<currentPlan.seams.length;index++) if(!Number.isInteger(overrides[index])) overrides[index]=currentPlan.seams[index].actual;
-    overrides[state.selectedInsertion]=next;
-    state.glyphSeams={...state.glyphSeams,[cp]:overrides};
-    render();remember();
+    const result=HairlineVariant.nextArrowMove(base,state,state.selectedInsertion,direction,state.glyph.codePointAt(0));
+    if(!result){el('fl-change-status').textContent='No further pixel-changing position in this direction. Move a guide to change the letter’s extent.';return;}
+    commitEdit({arrows:result.arrows},'Arrow moved '+(direction<0?'up':'down'));
+  }
+  function lineValue(key,font) { return metrics(font)[key]; }
+  function fixedState(value) {
+    if(value.fixedCanvas)return value;
+    const font=HairlineVariant.makeFont(base,value),m=metrics(font);
+    return cleanState({...value,fixedCanvas:true,cellHeight:font.height,arrows:HairlineVariant.editingArrows(base,value),
+      lineRows:{capTop:m.capTop,xTop:m.xTop,baseline:m.baseline-1,descender:m.descender-1,ascender:m.ascender,dot:m.dot,eBar:m.eBar,numeral:m.numeral}});
+  }
+  function fitArrows(arrows,scope,count) {
+    const other=scope==='lower'?'caps':'lower';
+    let current=arrows.filter(a=>a.scope!==other).length;
+    for(let i=arrows.length-1;i>=0&&current>count;i--)if(arrows[i].scope!==other){if(arrows[i].scope==='all')arrows[i]={...arrows[i],scope:other};else arrows.splice(i,1);current--;}
+    while(current<count){arrows.push({row:Math.round(10+6*(current+1)/(count+1)),direction:'up',scope});current++;}
+    return arrows;
+  }
+  function editLine(key,value) {
+    if(['cellTop','cellBottom'].includes(key))return;
+    const font=selectedFont(), lineRows={...font.fixedLines,[key]:Math.max(0,Math.min(font.height-1,value))};
+    if(key==='capTop'){lineRows.ascender=lineRows.capTop;lineRows.numeral=lineRows.capTop;}
+    const arrows=globalArrows();
+    if(['capTop','xTop','baseline'].includes(key)) {
+      if(key!=='xTop')fitArrows(arrows,'caps',Math.max(0,Math.abs(lineRows.baseline-lineRows.capTop)-14));
+      if(key!=='capTop')fitArrows(arrows,'lower',Math.max(0,Math.abs(lineRows.baseline-lineRows.xTop)-10));
+    }
+    commitEdit({fixedCanvas:true,lineRows,arrows},'Line moved to row '+lineRows[key]);
+  }
+  function previewRows(columns) {
+    if(!state.customText)return terminalRows(columns);
+    const rows=[];
+    for(const line of state.previewText.replace(/\r\n?/g,'\n').split('\n')) {
+      const chars=Array.from(line.replace(/\t/g,'    '));
+      if(!chars.length)rows.push({text:'',tone:'fg'});
+      for(let i=0;i<chars.length;i+=columns)rows.push({text:chars.slice(i,i+columns).join(''),tone:'fg'});
+    }
+    return rows;
   }
   function terminalRows(columns) {
     const inner = columns - 2;
@@ -381,9 +599,9 @@
   }
   function drawGlyph(canvas,font,metricTarget,dpr,colors,isOriginal) {
     const bits = bitmap(font,state.glyph) || [];
-    const step = Math.max(3,Math.round(6*dpr));
-    const originX=3*step;
-    const ctx = setupCanvas(canvas,(font.width+4)*step,(font.height+2)*step,dpr);
+    const step = Math.max(1,Math.round(Math.max(1,Math.min(8,320/(font.height+2)))*dpr));
+    const originX=Math.round(80*dpr);
+    const ctx = setupCanvas(canvas,originX+(font.width+1)*step,(font.height+2)*step,dpr);
     ctx.fillStyle = colors.bg;
     ctx.fillRect(0,0,canvas.width,canvas.height);
     ctx.fillStyle = colors.grid;
@@ -393,22 +611,20 @@
     bits.forEach((mask,y) => {
       for (let x=0;x<font.width;x++) if ((mask >>> (font.width-1-x)) & 1) ctx.fillRect(originX+x*step+1,(y+1)*step+1,step-1,step-1);
     });
+    ctx.fillStyle=colors.arrow;ctx.font=Math.round(6*dpr)+'px monospace';
+    for(let y=0;y<font.height;y++)ctx.fillText(String(y),originX-2*step,(y+1.75)*step);
     const m = metrics(font);
-    for (const [height,color] of [[m.capTop,colors.cap],[m.xTop,colors.x],[m.baseline,colors.baseline]]) {
-      ctx.fillStyle = color;
-      ctx.fillRect(originX,(height+1)*step,font.width*step,Math.max(1,Math.round(dpr)));
+    for (const [key,label,color] of guideDefs) {
+      const guide=state.guides[key], height=m[key];
+      if(!guide[isOriginal?'left':'right'] || height>font.height)continue;
+      ctx.fillStyle=color;ctx.fillRect(originX,(height+1)*step,font.width*step,Math.max(1,Math.round(dpr)));
     }
-    const seams=(currentPlan?.seams || []).map((seam,index)=>({...seam,index}));
-    seams.sort((a,b)=>(a.index===state.selectedInsertion)-(b.index===state.selectedInsertion));
-    for(const seam of seams) {
-      const y=Math.round((isOriginal ? seam.actual+1 : seam.targetRow+1.5)*step);
-      ctx.fillStyle=seam.index===state.selectedInsertion ? colors.fg : colors.arrow;
-      const unit=Math.max(1,Math.round(dpr));
-      ctx.fillRect(0,y-unit,Math.max(unit,originX-5*unit),2*unit);
-      for(let i=0;i<4;i++) ctx.fillRect(originX-(5-i)*unit,y-(4-i)*unit,unit,(8-2*i)*unit);
+    if(!isOriginal) {
+      const selected=currentPlan?.seams.find(a=>a.globalIndex===state.selectedInsertion);
+      if(selected){ctx.strokeStyle='#5da5ef';ctx.lineWidth=Math.max(1,dpr);ctx.strokeRect(originX,(selected.targetRow+1)*step,font.width*step,step);}
     }
     metricTarget.replaceChildren();
-    const fields = [["cap","Cap height",m.baseline-m.capTop],["x","x-height",m.baseline-m.xTop],["baseline","Baseline",m.baseline]];
+    const fields = [["cap","Top row",m.capTop],["x","x-top row",m.xTop],["baseline","Bottom row",font.fixedLines?m.baseline:m.baseline-1]];
     for (const [kind,label,value] of fields) {
       const line = document.createElement("div");
       line.className = "fl-metric";
@@ -418,38 +634,46 @@
       line.append(mark,document.createTextNode(label+" "+value+" px"));
       metricTarget.append(line);
     }
-    canvas.setAttribute("aria-label",state.glyph+" in "+font.name+", "+font.width+" by "+font.height+" pixels; cap height "+(m.baseline-m.capTop)+", x-height "+(m.baseline-m.xTop));
+    canvas.setAttribute("aria-label",state.glyph+" in "+font.name+", "+font.width+" by "+font.height+" pixels; top row "+m.capTop+", bottom row "+(font.fixedLines?m.baseline:m.baseline-1));
     snapOrigin(canvas,dpr);
   }
   function render() {
     renderPending = false;
+    if(state.fontId==='experiment')state=fixedState(state);
     syncControls();
-    const font = selectedFont();
+    const font = selectedFont(), reference=referenceFont();
+    if(!el('fl-guides').contains(document.activeElement)) buildGuideControls(reference,font);
     updateInsertionControls(font);
-    if(state.fontId==="experiment" && font.height!==state.cellHeight) el("fl-cell-value").value=state.cellHeight+" → "+font.height+" px";
+    for(const [key] of guideDefs){const input=el('guide-'+key),limits=lineLimits(font)[key];if(input){if(input!==document.activeElement)input.value=lineValue(key,font);input.min=limits?.[0]??0;input.max=limits?.[1]??40;}}
+
     const dpr = Math.max(0.5,window.devicePixelRatio || 1);
     const paneWidth = Math.min(el("fl-original-wrap").clientWidth,el("fl-comparison-wrap").clientWidth);
-    const columns = Math.min(64,Math.max(3,Math.floor((paneWidth-1)*dpr/(Math.max(base.width,font.width)*state.scale))));
-    const rows = terminalRows(columns);
-    const originalMissing = drawTerminal(el("fl-original"),base,rows,columns,dpr);
+    const columns = Math.min(64,Math.max(3,Math.floor((paneWidth-1)*dpr/(Math.max(reference.width,font.width)*state.scale))));
+    const allRows = previewRows(columns), rows=allRows.slice(0,256);
+    const originalMissing = drawTerminal(el("fl-original"),reference,rows,columns,dpr);
+    el('fl-original').setAttribute('aria-label','Live text in '+reference.name);
     const comparisonMissing = drawTerminal(el("fl-comparison-canvas"),font,rows,columns,dpr);
+    drawTerminal(el("fl-live-comparison"),font,rows,columns,dpr);
     const label = state.fontId === "experiment" ? "Hairline Lab" : font.name;
     el("fl-comparison-name").textContent = label;
     el("fl-glyph-comparison-name").textContent = label;
-    el("fl-original-size").textContent = base.width+" × "+base.height;
+    el('fl-reference-glyph-name').textContent=reference.name;
+    el('fl-reference-name').textContent=(state.referenceId.startsWith('snapshot')?'Saved '+state.referenceId.slice(-1)+' · ':'')+reference.name;
+    el("fl-original-size").textContent = reference.width+" × "+reference.height;
     el("fl-comparison-size").textContent = font.width+" × "+font.height;
-    el("fl-original-note").textContent = base.note || "Single-pixel main stems";
+    el("fl-original-note").textContent = (reference.note || "Saved working configuration")+(originalMissing.length?" · missing: "+originalMissing.join(" "):"");
     const sizeNote=state.fontId==="experiment" && font.height!==state.cellHeight ? " · "+font.height+" px needed for taller letters" : "";
     const changed = state.fontId === "experiment" ? "a–z, A–Z, 0–9; "+(state.redrawBoxes ? "box strokes extended" : "original box glyphs")+sizeNote : (font.note || "Original bitmap strike");
     const boxNote = font.syntheticCodepoints?.length ? " · box strokes: generated fallback" : "";
     el("fl-comparison-note").textContent = changed + boxNote + (comparisonMissing.length ? " · missing: "+comparisonMissing.join(" ") : "");
-    el("fl-pixel-status").textContent = state.scale+"×: 1 bitmap pixel = "+state.scale+" device pixel"+(state.scale>1?"s":"")+" · DPR "+Number(dpr.toFixed(3))+" · "+columns+" columns";
+    el("fl-pixel-status").textContent = state.scale+"×: 1 bitmap pixel = "+state.scale+" device pixel"+(state.scale>1?"s":"")+" · DPR "+Number(dpr.toFixed(3))+" · "+columns+" columns"+(allRows.length>256?" · showing first 256 preview rows":"");
     const colors = {fg:themeColor("--foreground"),bg:themeColor("--background"),grid:themeColor("--border"),cap:themeColor("--blue"),x:themeColor("--orange"),baseline:themeColor("--green"),arrow:themeColor("--muted-foreground")};
-    drawGlyph(el("fl-glyph-original"),base,el("fl-metrics-original"),dpr,colors,true);
+    drawGlyph(el("fl-glyph-original"),reference,el("fl-metrics-original"),dpr,colors,true);
     drawGlyph(el("fl-glyph-comparison"),font,el("fl-metrics-comparison"),dpr,colors,false);
-    el("fl-original-glyph-size").textContent = base.width+" × "+base.height;
+    el("fl-original-glyph-size").textContent = reference.width+" × "+reference.height;
     el("fl-comparison-glyph-size").textContent = font.width+" × "+font.height;
-    for (const id of ["fl-original","fl-comparison-canvas","fl-glyph-original","fl-glyph-comparison"]) snapOrigin(el(id),dpr);
+    renderArrowHandles();
+    for (const id of ["fl-original","fl-comparison-canvas","fl-live-comparison","fl-glyph-original","fl-glyph-comparison"]) snapOrigin(el(id),dpr);
     const canvasInfo = id => {
       const canvas = el(id), rect = canvas.getBoundingClientRect();
       return {id,width:canvas.width,height:canvas.height,cssWidth:rect.width,cssHeight:rect.height,
@@ -458,58 +682,200 @@
     };
     rendered = {columns,rows:rows.length,dpr,fontId:state.fontId,fontWidth:font.width,fontHeight:font.height,originalMissing,comparisonMissing,
       devicePixelsPerBitmapPixel:state.scale,placements:currentPlan.seams.map(seam=>({...seam})),safeBoundaries:currentPlan.safeBoundaries.slice(),requestedCellHeight:state.cellHeight,
-      canvases:["fl-original","fl-comparison-canvas","fl-glyph-original","fl-glyph-comparison"].map(canvasInfo)};
+      canvases:["fl-original","fl-comparison-canvas","fl-live-comparison","fl-glyph-original","fl-glyph-comparison"].map(canvasInfo)};
   }
   function scheduleRender() {
     if (!renderPending) {renderPending=true;requestAnimationFrame(render);}
   }
-  for (const [id,key] of [["fl-x-height","xHeightDelta"],["fl-cap-height","capHeightDelta"],["fl-cell-height","cellHeight"],["fl-scale","scale"]]) {
-    el(id).addEventListener("input",event => {state[key]=Number(event.target.value);render();remember();});
-  }
-  el("fl-comparison").addEventListener("change",event => {state.fontId=event.target.value;render();remember();});
-  el("fl-glyph").addEventListener("change",event => {state.glyph=event.target.value;render();remember();});
+  el('fl-scale').addEventListener('input',event=>{state.scale=Number(event.target.value);render();remember();});
+  el("fl-comparison").addEventListener("change",event => {state.fontId=event.target.value;render();remember();resetFeedback();});
+  el("fl-glyph").addEventListener("change",event => {state.glyph=event.target.value;render();remember();resetFeedback("Selected "+state.glyph+". Move or insert an arrow to edit its shape.");});
   el("fl-boxes").addEventListener("change",event => {state.redrawBoxes=event.target.checked;render();remember();});
-  el("fl-insertion").addEventListener("change",event=>{state.selectedInsertion=Number(event.target.value);render();remember();});
+  el("fl-insertion").addEventListener("change",event=>{state.selectedInsertion=Number(event.target.value);render();remember();resetFeedback("Selected arrow "+(state.selectedInsertion+1)+". Move it or edit its source line to change pixels.");});
   el("fl-insertion-up").addEventListener("click",()=>moveInsertion(-1));
   el("fl-insertion-down").addEventListener("click",()=>moveInsertion(1));
-  el("fl-insertion-auto").addEventListener("click",()=>{
-    const overrides={...state.glyphSeams};delete overrides[String(state.glyph.codePointAt(0))];
-    state.glyphSeams=overrides;render();remember();
+  el('fl-insertion-auto').addEventListener('click',()=>{
+    const arrows=globalArrows();
+    for(const scope of ['all','lower','caps']) {
+      const indices=arrows.map((a,i)=>a.scope===scope?i:-1).filter(i=>i>=0);
+      const suggested=indices.map((_,i)=>({row:Math.round(10+6*(i+1)/(indices.length+1)),direction:'up'}));
+      indices.forEach((index,i)=>{arrows[index]={...suggested[i],scope};});
+    }
+    commitEdit({arrows},'Arrows redistributed');
   });
+  el('fl-arrow-add').addEventListener('click',()=>{
+    const arrows=globalArrows(), lower=arrows.filter(a=>a.scope!=='caps').length,caps=arrows.filter(a=>a.scope!=='lower').length;
+    const scope=el('fl-arrow-scope').value;
+    arrows.push({row:integer(el('fl-global-row').value,0,24,13),direction:el('fl-global-direction').value,scope});
+    commitEdit({arrows,selectedInsertion:arrows.length-1},'Inserted one arrow');
+  });
+  el('fl-arrow-remove').addEventListener('click',()=>{const arrows=globalArrows();arrows.splice(state.selectedInsertion,1);commitEdit({arrows},'Removed one arrow');});
   el("fl-settings-export").addEventListener("click",()=>{
-    el("fl-settings-json").value=JSON.stringify({format:"hardcore-hairline-design",version:1,settings:state},null,2)+"\n";
+    el("fl-settings-json").value=JSON.stringify({format:"hardcore-hairline-design",version:4,settings:state},null,2)+"\n";
     el("fl-settings-status").textContent="Current tuning is ready to copy.";
     el("fl-error").hidden=true;
   });
   el("fl-settings-import").addEventListener("click",()=>{
     try {
       const text=el("fl-settings-json").value;
-      if(text.length>32768 || new TextEncoder().encode(text).length>32768) throw new Error("Tuning JSON must be no larger than 32 KB.");
+      if(text.length>131072 || new TextEncoder().encode(text).length>131072) throw new Error("Tuning JSON must be no larger than 128 KB.");
       let design;
       try {design=JSON.parse(text);} catch {throw new Error("Paste valid Hairline Lab tuning JSON before loading.");}
-      if(design?.format!=="hardcore-hairline-design" || design.version!==1 || !design.settings || typeof design.settings!=="object" || Array.isArray(design.settings)) throw new Error("Use Hairline Lab tuning JSON, version 1.");
+      if(design?.format!=="hardcore-hairline-design" || ![1,2,3,4].includes(design.version) || !design.settings || typeof design.settings!=="object" || Array.isArray(design.settings)) throw new Error("Use Hairline Lab tuning JSON, version 1, 2, 3 or 4.");
       const settings=design.settings;
-      const known=new Set(Object.keys(defaults));
-      if(Object.keys(settings).some(key=>!known.has(key))) throw new Error("The tuning JSON contains unsupported settings.");
-      for(const [key,min,max] of [["xHeightDelta",0,6],["capHeightDelta",0,6],["cellHeight",24,32]]) {
-        if(!Number.isInteger(settings[key]) || settings[key]<min || settings[key]>max) throw new Error(key+" must be an integer from "+min+" to "+max+".");
-      }
-      if(settings.fontId!=="experiment" && !fonts.some(font=>font.id===settings.fontId)) throw new Error("The tuning JSON names an unavailable font.");
-      if(![1,2].includes(settings.scale) || !allowedGlyphs.includes(settings.glyph) || typeof settings.redrawBoxes!=="boolean") throw new Error("The tuning JSON contains an invalid scale, glyph, or box setting.");
-      if(settings.selectedInsertion!==undefined && (!Number.isInteger(settings.selectedInsertion) || settings.selectedInsertion<0 || settings.selectedInsertion>5)) throw new Error("The selected expansion arrow must be from 0 to 5.");
-      if(settings.glyphSeams!==undefined) {
-        const seams=settings.glyphSeams;
-        const allowed=new Set(Array.from("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",character=>String(character.codePointAt(0))));
-        if(!seams || typeof seams!=="object" || Array.isArray(seams) || Object.entries(seams).some(([key,rows])=>!allowed.has(key) || !Array.isArray(rows) || rows.length>6 || rows.some(y=>!Number.isInteger(y) || y<0 || y>24))) throw new Error("Each letter or digit may have up to six expansion rows from 0 to 24.");
-      }
-      state=cleanState(settings);render();remember();
-      el("fl-settings-status").textContent="Tuning loaded · "+Object.keys(state.glyphSeams).length+" custom glyphs";
+      HairlineVariant.makeFont(base,settings);
+      const next=cleanState({...defaults,...settings,placementMode:settings.placementMode ?? 'glyph'});
+      state=next;render();remember();resetFeedback("Tuning loaded. Move a line or arrow to edit it.");
+      el("fl-settings-status").textContent="Tuning loaded · "+globalArrows().length+" insertion arrows";
       el("fl-error").hidden=true;
     } catch(error) {
       el("fl-error").textContent=error.message;el("fl-error").hidden=false;
       el("fl-settings-status").textContent="Tuning was not loaded; the preview and JSON are unchanged.";
     }
   });
+  el('fl-reference').addEventListener('change',e=>{state.referenceId=e.target.value;render();remember();});
+  el('fl-preview-text').addEventListener('input',e=>{state.previewText=e.target.value;state.customText=true;render();remember();});
+  el('fl-custom-text').addEventListener('change',e=>{state.customText=e.target.checked;render();remember();});
+  el('fl-global-row').addEventListener('input',e=>{if(e.target.value!=='' && e.target.validity.valid)editGlobal({row:integer(e.target.value,0,24,11)});});
+  el('fl-global-row').addEventListener('blur',()=>{el('fl-global-row').value=globalArrows()[state.selectedInsertion]?.row ?? 11;});
+  el('fl-global-direction').addEventListener('change',e=>editGlobal({direction:e.target.value}));
+  el('fl-arrow-scope').addEventListener('change',e=>editGlobal({scope:e.target.value}));
+  for(const slot of ['A','B']) {
+    el('fl-save-'+slot.toLowerCase()).addEventListener('click',()=>{snapshots[slot]=cleanState(state);render();remember();el('fl-snapshot-status').textContent='Saved '+slot+' · '+selectedFont().height+'px. Load it or select it as the left reference.';});
+    el('fl-load-'+slot.toLowerCase()).addEventListener('click',()=>{if(!snapshots[slot])return;state=cleanState({...snapshots[slot],previewText:state.previewText,customText:state.customText});render();remember();el('fl-snapshot-status').textContent='Loaded '+slot;resetFeedback('Loaded '+slot+'. Changes now affect the working copy.');});
+  }
+  el('fl-ab').addEventListener('click',()=>{if(!snapshots.A||!snapshots.B)return;state=cleanState({...snapshots.B,referenceId:'snapshotA',previewText:state.previewText,customText:state.customText});render();remember();el('fl-snapshot-status').textContent='A on the left / B on the right. Editing now changes the working copy of B.';resetFeedback('A / B loaded. Move a line or arrow to edit the working copy of B.');});
+  el('fl-preset24').addEventListener('click',()=>{
+    state=cleanState({...defaults,previewText:state.previewText,customText:state.customText,guides:state.guides,scale:state.scale,glyph:state.glyph});
+    render();remember();resetFeedback('Terminus 12×24 loaded. Canvas height stays fixed until you edit its number.');
+  });
+  el('fl-overall').addEventListener('input',e=>{if(e.target.value!==''&&e.target.validity.valid)commitEdit({fixedCanvas:true,cellHeight:Number(e.target.value)},'Canvas height changed');});
+  el('fl-overall').addEventListener('blur',()=>{el('fl-overall').value=selectedFont().height;});
+  function lineLimits(font) {return Object.fromEntries(guideDefs.map(([key])=>[key,[0,font.height-1]]));}
+  function buildGuideControls(reference,font) {
+    el('fl-guides').replaceChildren();
+    const labels={capTop:'Top row · caps + d',xTop:'x-height top row',baseline:'Bottom row · baseline',descender:'Descender bottom row',ascender:'Ascender top row',dot:'Dot top row',eBar:'e crossbar row',numeral:'Numeral top row',cellTop:'First canvas row',cellBottom:'Last canvas row'};
+    const limits=lineLimits(font);
+    for(const [key,label,color] of guideDefs) {
+      const row=document.createElement('div');row.className='fl-guide-row';
+      const title=document.createElement('label');title.textContent=labels[key];title.style.color=color;title.htmlFor='guide-'+key;
+      const position=document.createElement('input');position.type='number';position.id='guide-'+key;
+      position.min=limits[key]?.[0]??0;position.max=limits[key]?.[1]??40;position.value=lineValue(key,font);
+      position.disabled=state.fontId!=='experiment'||['cellTop','cellBottom'].includes(key);
+      position.addEventListener('input',()=>{if(position.value!=='' && position.validity.valid)editLine(key,Number(position.value));});
+      position.addEventListener('blur',()=>{position.value=lineValue(key,selectedFont());});
+      row.append(title,position);
+      for(const side of ['left','right']) {
+        const labelEl=document.createElement('label'),input=document.createElement('input');input.type='checkbox';input.checked=state.guides[key][side];input.setAttribute('aria-label',label+' on '+side);
+        input.addEventListener('change',()=>{state.guides[key][side]=input.checked;render();remember();});labelEl.append(input,document.createTextNode(side==='left'?'L':'R'));row.append(labelEl);
+      }
+      el('fl-guides').append(row);
+    }
+  }
+  let dragEdit=null, suppressToolClick=false;
+  const workingGrid=el('fl-glyph-comparison');
+  function renderArrowHandles() {
+    for(const side of ['original','comparison']) {
+      const host=el('fl-handles-'+side); host.replaceChildren();
+      const font=side==='original'?referenceFont():selectedFont();
+      if(side==='original'&&font.id!=='terminus24')continue;
+      const step=el('fl-glyph-'+side).getBoundingClientRect().height/(font.height+2);
+      const arrows=globalArrows(), occupied=[];
+      arrows.forEach((arrow,index)=>{
+        const seam=currentPlan.seams.find(s=>s.globalIndex===index);
+        if(side==='comparison'&&!seam)return;
+        const row=side==='original'?arrow.row:seam.targetRow+.5;
+        const y=(row+1)*step-9;
+        let lane=0;while(occupied.some(a=>a.lane===lane&&Math.abs(a.y-y)<18))lane++;
+        occupied.push({y,lane});
+        const handle=document.createElement('button');handle.type='button';
+        handle.className='fl-arrow-handle '+(arrow.direction==='up'?'fl-up':'fl-down');
+        handle.style.left=(lane%3)*22+'px';handle.style.top=y+'px';
+        handle.textContent=arrow.direction==='up'?'↑↦':'↓↦';
+        handle.title='Arrow '+(index+1)+' · '+scopeLabel(arrow.scope)+' · source '+arrow.row+' · drag to move or bin';
+        handle.setAttribute('aria-label', 'Arrow '+(index+1)+' on '+(side==='original'?'source':'working')+' glyph');
+        handle.setAttribute('aria-pressed',String(state.selectedInsertion===index));
+        handle.addEventListener('pointerdown',e=>startArrowDrag(e,{kind:'arrow',index,arrow:{...arrow}}));
+        handle.addEventListener('click',()=>{if(suppressToolClick)return;state.selectedInsertion=index;render();remember();});
+        handle.addEventListener('keydown',e=>{state.selectedInsertion=index;if(e.key==='Delete'||e.key==='Backspace'){e.preventDefault();removeArrow(index);}else if(['ArrowUp','ArrowDown'].includes(e.key)){e.preventDefault();moveInsertion(e.key==='ArrowUp'?-1:1);}});
+        host.append(handle);
+      });
+    }
+  }
+  function removeArrow(index) {const arrows=globalArrows();if(!arrows[index])return;arrows.splice(index,1);commitEdit({arrows},'Removed arrow');}
+  function addArrow(direction,row) {
+    const arrows=globalArrows(), scope=el('fl-new-scope')?.value||'all';
+    arrows.push({row,direction,scope});commitEdit({arrows,selectedInsertion:arrows.length-1},'Inserted '+direction+' arrow');
+  }
+  function startArrowDrag(event,details) {
+    if(event.button!==0)return;
+    dragEdit={...details,startX:event.clientX,startY:event.clientY,moved:false};
+    event.preventDefault();
+  }
+  function dropTarget(event) {
+    for(const side of ['original','comparison']) {
+      if(side==='original'&&referenceFont().id!=='terminus24')continue;
+      const canvas=el('fl-glyph-'+side),rect=canvas.getBoundingClientRect();
+      if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)continue;
+      const font=side==='original'?referenceFont():selectedFont(), step=rect.height/(font.height+2);
+      const y=(event.clientY-rect.top)/step-1;
+      let row=Math.round(y);
+      if(side==='comparison') {
+        const map=font.experiment?.rowMaps?.[state.glyph.codePointAt(0)];
+        row=map?map.reduce((best,at,i)=>Math.abs(at-y)<Math.abs(map[best]-y)?i:best,0):Math.round(y);
+      }
+      return {side,row:Math.max(0,Math.min(24,row))};
+    }
+    return null;
+  }
+  function insideBin(event) {const r=el('fl-bin').getBoundingClientRect();return event.clientX>=r.left&&event.clientX<=r.right&&event.clientY>=r.top&&event.clientY<=r.bottom;}
+  for(const direction of ['up','down']) {
+    const tool=el('fl-tool-'+direction);
+    tool.addEventListener('pointerdown',e=>startArrowDrag(e,{kind:'new',direction}));
+    tool.addEventListener('click',()=>{if(!suppressToolClick)addArrow(direction,Number(el('fl-global-row').value)||11);});
+  }
+  el('fl-bin').addEventListener('click',()=>removeArrow(state.selectedInsertion));
+  workingGrid.addEventListener('pointerdown',event=>{
+    const rect=workingGrid.getBoundingClientRect(),font=selectedFont(),m=metrics(font),step=rect.height/(font.height+2),row=(event.clientY-rect.top)/step-1;
+    if(event.clientX<rect.left+80)return;
+    const key=guideDefs.map(([key])=>key).filter(key=>state.guides[key].right&&!['cellTop','cellBottom'].includes(key)).sort((a,b)=>Math.abs(m[a]-row)-Math.abs(m[b]-row))[0];
+    if(!key||Math.abs(m[key]-row)>.8)return;
+    dragEdit={kind:'line',key,startY:event.clientY,start:lineValue(key,font),step,last:0};event.preventDefault();
+  });
+  document.addEventListener('pointermove',event=>{
+    if(!dragEdit)return;
+    if(dragEdit.kind==='line') {
+      const delta=Math.round((event.clientY-dragEdit.startY)/dragEdit.step);
+      if(delta===dragEdit.last)return;dragEdit.last=delta;
+      editLine(dragEdit.key,dragEdit.start+delta);return;
+    }
+    if(Math.hypot(event.clientX-dragEdit.startX,event.clientY-dragEdit.startY)>3)dragEdit.moved=true;
+    if(!dragEdit.moved)return;
+    const target=dropTarget(event),bin=insideBin(event),ghost=el('fl-drag-ghost');
+    ghost.hidden=false;ghost.style.left=(event.clientX+12)+'px';ghost.style.top=(event.clientY+12)+'px';
+    ghost.textContent=bin?'Remove arrow':(dragEdit.direction||dragEdit.arrow.direction)==='up'?'↑↦':'↓↦';
+    if(target)ghost.textContent+=' row '+target.row;
+    el('fl-bin').classList.toggle('fl-drop-active',bin);
+    for(const side of ['original','comparison'])el('fl-stage-'+side).classList.toggle('fl-drop-active',target?.side===side);
+  });
+  function finishDrag(event,cancel=false) {
+    if(!dragEdit)return;const drag=dragEdit;dragEdit=null;
+    el('fl-drag-ghost').hidden=true;el('fl-bin').classList.remove('fl-drop-active');
+    for(const side of ['original','comparison'])el('fl-stage-'+side).classList.remove('fl-drop-active');
+    if(drag.kind==='line')return;
+    suppressToolClick=true;setTimeout(()=>suppressToolClick=false,0);
+    if(cancel)return;
+    if(!drag.moved){if(drag.kind==='new')addArrow(drag.direction,Number(el('fl-global-row').value)||11);else{state.selectedInsertion=drag.index;render();remember();}return;}
+    const target=dropTarget(event);
+    if(insideBin(event)&&drag.kind==='arrow')removeArrow(drag.index);
+    else if(target) {
+      if(drag.kind==='new')addArrow(drag.direction,target.row);
+      else {const arrows=globalArrows();arrows[drag.index]={...arrows[drag.index],row:target.row};commitEdit({arrows,selectedInsertion:drag.index},'Arrow moved');}
+    }
+  }
+  document.addEventListener('pointerup',e=>finishDrag(e));
+  document.addEventListener('pointercancel',e=>finishDrag(e,true));
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&dragEdit)finishDrag(e,true);});
   window.addEventListener("openai:set_globals",event => {
     if (event.detail?.globals?.widgetState) {applyStored(event.detail.globals.widgetState);render();}
   });
@@ -529,7 +895,7 @@
   window.fontLab = {
     get state() {return JSON.parse(JSON.stringify(state));},
     getRenderInfo:() => ({...rendered}),
-    getDesign:()=>({format:"hardcore-hairline-design",version:1,settings:JSON.parse(JSON.stringify(state))}),
+    getDesign:()=>({format:"hardcore-hairline-design",version:4,settings:JSON.parse(JSON.stringify(state))}),
     render,
     setState:changes => {state=cleanState({...state,...changes});render();remember();},
     selectFont:id => {state=cleanState({...state,fontId:id});render();remember();}

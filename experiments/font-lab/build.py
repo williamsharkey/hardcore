@@ -37,6 +37,10 @@ LIGHT_ARMS = {
 }
 
 FONT_SPECS = [
+    dict(id="hairline26", name="Your Hairline 12×26", width=12, height=26,
+         file="font/hairline/hairline-12x26.bdf.gz", stemPixels=1, licenseId="terminus",
+         source="https://terminus-font.sourceforge.net/",
+         note="Your exact shipped hairline bitmap: +2 lowercase, +3 capitals, 26-pixel cell. Derived from Terminus 12×24."),
     dict(id="terminus24", name="Terminus 12×24", width=12, height=24,
          file="font/terminus/ter-u24n.bdf.gz", stemPixels=1, licenseId="terminus",
          source="https://terminus-font.sourceforge.net/",
@@ -67,6 +71,7 @@ FONT_SPECS = [
          note="Native 100dpi Courier bitmap: 20×29 line cell from ascent 23 + descent 6; BDF PIXEL_SIZE is 34. One-pixel straight stems; some curve joins are wider. Native boxes are retained; six overhanging block/shade symbols are omitted, not clipped."),
 ]
 SOURCE_SHA256 = {
+    "hairline26": "6c9d9e081e0ca7cfc8cb2a3a8f04f909fd9fcde310c884fb7f3d9aea199158af",
     "terminus24": "ff640e9e097983355e8f70ed8fb645bd850184a0d590de17f6fc9ceec1bf8eaf",
     "terminus28": "f9e9da69986002a9a3d0b54f5bb1db487914821204a9a75151260fff45642723",
     "terminus32": "5ad01972d58adfee75077e2c65ba5947e260043031664cb8ad8f98b5473b23a4",
@@ -205,6 +210,7 @@ def build_data() -> dict:
         fonts.append(font)
     return dict(
         version=1, fonts=fonts, licenses=licenses,
+        hairlineRecipe=json.loads((ROOT / "font/hairline/design.json").read_text())["settings"],
         scope="Original ASCII, available box drawing and selected symbols. Missing basic light boxes are explicitly marked lab fallbacks. No resampling or silent clipping.",
         bitOrder="Most significant cell bit is leftmost; bit (width - 1 - x).",
     )

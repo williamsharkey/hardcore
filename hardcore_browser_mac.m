@@ -415,9 +415,9 @@ static void mac_browser_sync(void) {
             [browser_for(tb) load:browser_url([NSString stringWithUTF8String:tb->browser_url]) ?: @"hardcore:welcome"];
         }
         HCBrowser *b=browser_for(tb);
-        if (b) { b->web.hidden=tb!=active; if (tb==active) b->dirty=1; }
+        if (b) { b->web.hidden=g_grid_on || tb!=active; if (tb==active) b->dirty=1; }
     }
-    BOOL native=active && active->kind==TK_BROWSER && active->browser_native;
+    BOOL native=!g_grid_on && active && active->kind==TK_BROWSER && active->browser_native;
     g_layer.opaque=!native;
     HCBrowser *current=browser_for(active);
     [g_win makeFirstResponder:native && current && !current->editKind && !current->menuKind ? (NSView *)current->web : (NSView *)g_view];
@@ -474,7 +474,7 @@ static int mac_browser_cutie_generation(Tab *tb) {
     HCBrowser *b=browser_for(tb);return b ? b->cutieGeneration : 0;
 }
 static int mac_browser_cutie_project(Tab *tb,Cell *output,int cols,int rows,int scroll) {
-    if(!output || cols<4 || cols>256 || rows<1 || rows>128)return 0;
+    if(!output || cols<4 || cols>1000 || rows<1 || rows>500)return 0;
     HCBrowser *b=browser_for(tb);
     /* This layout owns no source state: no Term writes, source scroll changes,
        geometry cache changes, DOM evaluation, image resizing, or focus sync. */
@@ -590,6 +590,7 @@ static void mac_browser_cutie_action(Tab *tb,int action) {
         BOOL editor=[tag isEqual:@"SELECT"] || [tag isEqual:@"TEXTAREA"] ||
             ([tag isEqual:@"INPUT"] && ![@[@"checkbox",@"radio",@"button",@"submit",@"reset",@"image",@"hidden"] containsObject:type]);
         if(editor) {
+            if(g_grid_on)grid_toggle();
             /* Editing controls need the normal browser workspace. Activation
                is explicit here; simple links/buttons keep keyboard ownership. */
             for(int i=0;i<g_ntabs;i++)if(g_tabs[i]==live){activate(i);break;}

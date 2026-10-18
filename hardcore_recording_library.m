@@ -71,7 +71,7 @@ static NSString *record_browser_json(id value) {
     if(!NSEqualRects(web.frame,rect))mac_browser_resize(tb);
 }
 - (NSRect)contentRect:(NSRect)bounds {
-    UI_FONT;int title=mac_title_height();UI_DONE;
+    UI_FONT;int title=mac_browser_nav_height();UI_DONE;
     return hc_recording_content_rect(bounds,[g_win backingScaleFactor],title,sidebar_w(),cell_w(g_font),g_tab_underlay==1,[g_browser_root isFlipped]);
 }
 - (WKWebViewConfiguration *)configuration {

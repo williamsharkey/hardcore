@@ -28,7 +28,7 @@ HARNESS=r'''
 #define CH 26
 #define SB_COLS 28
 #include "hardcore_tv.h"
-enum{HIT_NONE,HIT_TAB,HIT_CLOSE,HIT_CUTIE,HIT_TABPAGE,HIT_CHROME_INERT,HIT_TV,HIT_FONT,HIT_SCHEME};
+enum{HIT_NONE,HIT_TAB,HIT_CLOSE,HIT_CUTIE,HIT_GRID_HIDE,HIT_TABPAGE,HIT_CHROME_INERT,HIT_TV,HIT_FONT,HIT_SCHEME};
 typedef struct{int top,bottom;}ChromeLayout;
 typedef struct{HcTvState state;HcTvMotion motion;}ChromeTv;
 static ChromeLayout g_chrome;

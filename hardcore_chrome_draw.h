@@ -238,10 +238,6 @@ static void chrome_row_fill(int row, int selected, int hovered) {
     chrome_begin_row(row);
     if (hovered || selected) {
         fill_rect(0, row_y(row), (float)chrome_draw_width(), row_y(row + 1), hovered ? TAB_HOVER : DEF_BG, 1);
-#ifndef _WIN32
-        plat_render_title_background(0, row_y(row), (float)chrome_draw_width(), row_y(row + 1),
-                                     hovered ? TAB_HOVER : DEF_BG, plat_title_mix(BAR_BG, DEF_BG, g_draw_alpha));
-#endif
     }
 }
 static void chrome_label(const wchar_t *s, int left, int right, int row, uint32_t color) {
@@ -302,6 +298,7 @@ static void render_settings(int hover, int hidx) {
                 utf8_to_wide(FONTS[fonts->family].name, buf, 96);
                 chrome_label(buf, fonts->name_left, fonts->name_right, row, selected ? AMBER : off);
             }
+            if (fonts->prefix[0]) grid_text(fonts->prefix, fonts->prefix_left, row, g_look.dim);
             for (k = 0; k < fonts->count; k++) {
                 const FontMenuSize *size = &fonts->sizes[k];
                 int current = &FONTS[size->font] == g_font;
@@ -329,9 +326,29 @@ static void render_settings(int hover, int hidx) {
 #include "hardcore_tv_draw.h"
 
 static int chrome_tab_hover(int hit,int row) {
-    return (hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_CUTIE || hit==HIT_TABPAGE || hit==HIT_CHROME_INERT) &&
+    return (hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_GRID_HIDE || hit==HIT_CUTIE || hit==HIT_TABPAGE || hit==HIT_CHROME_INERT) &&
         g_mouse_x>=g_chrome_x && g_mouse_x<g_chrome_x+sidebar_w() && g_mouse_y/CH==row;
 }
+static void chrome_button_outline(int col,int width,int row) {
+    int x=col*CW-1,right=(col+width)*CW,y=row*CH,bottom=(row+1)*CH;
+    fill_rect(x,y,right,y+1,g_look.dim,.45f);fill_rect(x,bottom-1,right,bottom,g_look.dim,.45f);
+    fill_rect(x,y,x+1,bottom,g_look.dim,.45f);fill_rect(right-1,y,right,bottom,g_look.dim,.45f);
+}
+#ifndef _WIN32
+/* Pixel-drawn transport icons avoid mixed fallback font widths/baselines. */
+static void chrome_music_icon(int action,int col,int width,int row,uint32_t color) {
+    int cx=(col*2+width)*CW/2,cy=row*CH+CH/2,r=chrome_min(6,chrome_max(3,CH/5));
+    if(action==HIT_MUSIC_PLAY && mac_music_playing()) {
+        fill_rect(cx-4,cy-r,cx-2,cy+r+1,AMBER,1);fill_rect(cx+2,cy-r,cx+4,cy+r+1,AMBER,1);
+    } else if(action==HIT_MUSIC_STOP)fill_rect(cx-r+1,cy-r+1,cx+r,cy+r,color,1);
+    else {
+        int back=action==HIT_MUSIC_PREV;
+        for(int y=-r;y<=r;y++){int n=r-abs(y);fill_rect(back?cx-n:cx-r,cy+y,back?cx+r:cx+n+1,cy+y+1,color,1);}
+        if(action==HIT_MUSIC_PREV)fill_rect(cx-r-3,cy-r,cx-r-2,cy+r+1,color,1);
+        if(action==HIT_MUSIC_NEXT)fill_rect(cx+r+3,cy-r,cx+r+4,cy+r+1,color,1);
+    }
+}
+#endif
 static void chrome_render_header(int hover) {
     if (!g_chrome.grip_rows) return;
 #ifdef _WIN32
@@ -345,41 +362,39 @@ static void chrome_render_header(int hover) {
     for (int row = 0; row < g_chrome.grip_rows; row++) {
         int y = g_chrome.top + row;
         chrome_row_fill(y, 0, 0);
-        if (row == 2 && mac_music_menu_visible()) {
+        if (row == 3 && mac_music_menu_visible()) {
+            chrome_rule(y,g_look.dim);
             for (int i = 0; i < CHROME_MUSIC_CONTROL_COUNT; i++) {
-                const ChromeHeaderControl *c = CHROME_MUSIC_CONTROLS + i;
-                int highlighted = hover == c->hit;
-                if (highlighted) fill_rect((float)(c->col * CW), row_y(y),
-                    (float)((c->col + c->width) * CW), row_y(y + 1), TAB_HOVER, 1);
-                wchar_t status[12] = {0}, drip[2] = {0};
-                const wchar_t *label = c->label;
-                uint32_t color = highlighted ? g_look.text : g_look.detail;
-                if (c->hit == HIT_MUSIC_PLAY) {
-                    label = mac_music_playing() ? L"Ⅱ" : L"▶";
-                    if (mac_music_playing()) color = AMBER;
-                    if (mac_music_loading()) {
-                        drip[0] = g_ndrip ? g_drip[(GetTickCount() / DRIP_MS) % g_ndrip] : 0x2800;
-                        label = drip; color = AMBER;
-                    }
-                } else if (c->col == 16) {
-                    mac_music_compact_label(status, sizeof(status) / sizeof(status[0]));
-                    status[c->width] = 0;
-                    label = status;
-                }
-                grid_text(label, c->col, y, color);
+                const ChromeHeaderControl *c=CHROME_MUSIC_CONTROLS+i;
+                int highlighted=hover==c->hit;
+                if(highlighted)fill_rect(c->col*CW,row_y(y),(c->col+c->width)*CW,row_y(y+1),TAB_HOVER,1);
+                chrome_button_outline(c->col,c->width,y);
+                uint32_t color=highlighted?g_look.text:g_look.detail;
+                if(c->hit==HIT_MUSIC) {
+                    wchar_t status[12]={0};mac_music_compact_label(status,12);status[c->width]=0;
+                    grid_text(status,c->col,y,color);
+                } else chrome_music_icon(c->hit,c->col,c->width,y,color);
             }
-            chrome_sides(y, g_look.dim);
+            chrome_sides(y,g_look.dim);
             continue;
         }
         for (int i = 0; i < CHROME_HEADER_CONTROL_COUNT; i++) {
             const ChromeHeaderControl *c = CHROME_HEADER_CONTROLS + i;
-            if (c->row != row) continue;
+            if (c->row != row || (c->hit==HIT_GRID_EXPAND && (!g_grid_on || !g_grid.extra))) continue;
             int highlighted = hover == c->hit || (c->hit == HIT_GRIP && g_chrome_drag);
             if (highlighted) fill_rect((float)(c->col * CW), row_y(y),
                 (float)((c->col + c->width) * CW), row_y(y + 1), TAB_HOVER, 1);
             uint32_t color = highlighted ? g_look.text : c->hit == HIT_CAF ?
                 (mac_caf_active() ? AMBER : g_look.dim) : g_look.detail;
             const wchar_t *label = c->hit == HIT_CAF && !mac_caf_active() ? L"caf" : c->label;
+            wchar_t expanded[24];
+            if(c->hit==HIT_GRIP && g_grid_on)label=L"Menu";
+            if(c->hit==HIT_GRID)label=g_grid_on?L"Normal":L"Grid";
+            if(c->hit==HIT_GRID_EXPAND) {
+                int tab=0;for(int k=0;k<g_ntabs;k++)if(g_tabs[k]->id==g_grid_ids[0])tab=k+1;
+                _snwprintf(expanded,24,L"Expand: %d",tab);label=expanded;
+            }
+            if(c->hit==HIT_GRID || c->hit==HIT_GRID_EXPAND)chrome_button_outline(c->col,c->width,y);
             if(c->hit==HIT_CAMERA && mac_record_active()){label=L"REC";color=g_look.red;}
             grid_text(label, c->col, y, color);
             if(c->hit==HIT_CAMERA && mac_record_exports_active()) {
@@ -408,20 +423,19 @@ static void render_tabbar(int win_w, int win_h) {
     for (i = g_chrome.top; i < g_chrome.bottom; i++) {
         chrome_begin_row(i);
         fill_rect(0, row_y(i), (float)chrome_draw_width(), row_y(i + 1), BAR_BG, 1);
-#ifndef _WIN32
-        plat_render_title_background(0, row_y(i), (float)chrome_draw_width(), row_y(i + 1), BAR_BG, DEF_BG);
-#endif
     }
     chrome_render_header(hover);
     for (i = 0; i < g_chrome.tab_count; i++) {
         int tab = g_tab_offset + i, row = g_chrome.tab_row + i, left = 1, right = SB_COLS - 5;
         int active = tab == g_active, hovered = chrome_tab_hover(hover,row);
+        if(g_grid_on)right=SB_COLS-8;
         Tab *tb = g_tabs[tab];
         wchar_t label[256];
-        uint32_t fg = active ? AMBER : g_look.text_lo;
+        uint32_t fg = g_grid_on && grid_hidden(tb->id)?g_look.dim:active ? AMBER : g_look.text_lo;
         chrome_row_fill(row, active, hovered);
         if (!i) chrome_pager_draw(row, g_tab_offset, g_chrome.tab_capacity, g_ntabs, 1,
                                   hover == HIT_TABPAGE, idx, &left, &right);
+        if(g_grid_on)right=chrome_min(right,SB_COLS-8);
         tab_label_fit(tb, label, 256, right-left-1);
         chrome_label(label, left + 1, right, row, hovered ? g_look.text : fg);
         r_color(tb->t.ps_state == PS_ERROR ? g_look.red : tb->attention || tb->t.ps_state == PS_BLOCKED || tb->busy ? AMBER : fg, 1);
@@ -429,7 +443,8 @@ static void render_tabbar(int win_w, int win_h) {
                    (float)(left * CW), row_y(row), 1, g_scale);
         #ifndef _WIN32
         int cutie_open=chrome_tv_slot_for(tb->id)>=0;
-        if (hovered || cutie_open)
+        if(g_grid_on)grid_text(grid_hidden(tb->id)?L"show":L"hide",SB_COLS-7,row,hover==HIT_GRID_HIDE && idx==tab?AMBER:g_look.detail);
+        if (!g_grid_on && (hovered || cutie_open))
             grid_text(hovered && cutie_open?L"−":L"□", SB_COLS - 4, row,
                       hover == HIT_CUTIE && idx == tab ? AMBER : g_look.text_lo);
         #endif
@@ -452,7 +467,7 @@ static void render_tabbar(int win_w, int win_h) {
         fill_rect(0, row_y(g_chrome.bottom) - 1, (float)chrome_draw_width(), row_y(g_chrome.bottom), g_look.dim, 1);
     }
     chrome_round_edges();
-    chrome_capture_end(chrome_hovered() || !g_tab_underlay);
+    chrome_capture_end(g_grid_on || chrome_hovered() || !g_tab_underlay);
 #ifndef _WIN32
     render_tvs();
 #endif

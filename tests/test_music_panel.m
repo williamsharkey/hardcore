@@ -70,6 +70,8 @@ static void grid_text(const wchar_t *s,int col,int row,uint32_t color){chrome_la
 static void mac_cutie_blur(void){}
 static void chrome_preview_cancel(void){}
 static NSCursor *mac_tv_resize_cursor(void){return NSCursor.arrowCursor;}
+static int g_grid_on;
+static void chrome_button_outline(int col,int width,int row){(void)col;(void)width;(void)row;}
 #include "../hardcore_music_panel.m"
 
 static NSEvent *event(NSEventType type){

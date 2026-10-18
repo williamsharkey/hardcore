@@ -18,7 +18,7 @@ static NSWindow *g_win;static NSView *g_browser_root;static void *g_font;
 #define UI_FONT
 #define UI_DONE
 #define CH 20
-static int mac_title_height(void){return 40;}
+static int mac_browser_nav_height(void){return 40;}
 static int sidebar_w(void){return 280;}
 static int cell_w(void *font){(void)font;return 10;}
 static int mac_browser_page_rows(Tab *tb){return tb->t.rows;}

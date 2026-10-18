@@ -300,10 +300,10 @@ test('source objects are never mutated or shared with generated bitmaps', () => 
 });
 
 test('invalid dimensions, options and malformed bitmaps fail visibly', () => {
-  for (const options of [{cellHeight: 23}, {cellHeight: 33}, {cellHeight: 24.5},
-    {xHeightDelta: -1}, {capHeightDelta: 7}, {xHeightDelta: NaN}, {capHeightDelta: '2'}, {redrawBoxes: 1},
+  for (const options of [{cellHeight: 23}, {cellHeight: 37}, {cellHeight: 24.5},
+    {xHeightDelta: -1}, {capHeightDelta: 13}, {xHeightDelta: NaN}, {capHeightDelta: '2'}, {redrawBoxes: 1},
     {glyphSeams: null}, {glyphSeams: []}, {glyphSeams: {101: [25]}}, {glyphSeams: {101: [-1]}},
-    {glyphSeams: {101: [11.5]}}, {glyphSeams: {101: Array(7).fill(10)}}, {glyphSeams: {101: '11'}}]) {
+    {glyphSeams: {101: [11.5]}}, {glyphSeams: {101: Array(13).fill(10)}}, {glyphSeams: {101: '11'}}]) {
     assert.throws(() => makeFont(base, options));
   }
   for (const overrides of [{width: 14}, {height: 28}, {ascent: 20},
@@ -311,4 +311,206 @@ test('invalid dimensions, options and malformed bitmaps fail visibly', () => {
     assert.throws(() => makeFont({...base, ...overrides}));
   }
   assert.throws(() => makeFont({...base, glyphs: {65: Array(24).fill(4095)}}, {capHeightDelta: 1}), /safe one-pixel seam/);
+});
+
+test('global directions search the requested side and report unavoidable fallback', () => {
+  for(const direction of ['up','down']) for(let row=0;row<=24;row++) {
+    const settings={xHeightDelta:12,capHeightDelta:12,cellHeight:36,placementMode:'global',globalSeams:Array(12).fill({row,direction})};
+    const font=makeFont(base,settings);
+    for(const c of alnum) {
+      const plan=getGlyphPlan(base,c.codePointAt(0),settings);
+      const directional=plan.safeBoundaries.filter(y=>direction==='up'?y<=row:y>=row);
+      for(const seam of plan.seams) {
+        assert.equal(seam.direction,direction);
+        assert.equal(seam.fallback,!directional.length);
+        assert.equal(seam.actual,(directional.length?directional:plan.safeBoundaries).reduce((a,b)=>Math.abs(a-row)<=Math.abs(b-row)?a:b));
+      }
+      assert.equal(components(bitmap(font,c)),components(bitmap(base,c)),`${c} ${direction} ${row}`);
+      assert.equal(solidBlocks(bitmap(font,c)),solidBlocks(bitmap(base,c)),`${c} acquired a heavy block`);
+    }
+  }
+});
+
+test('30 to 36 pixel designs retain one-pixel stems and independent dots', () => {
+  for(let delta=7;delta<=12;delta++) {
+    const font=makeFont(base,{xHeightDelta:delta,capHeightDelta:delta,cellHeight:36});
+    for(const c of alnum) {
+      assert.equal(components(bitmap(font,c)),components(bitmap(base,c)),c);
+      assert.equal(solidBlocks(bitmap(font,c)),solidBlocks(bitmap(base,c)),c);
+    }
+    assert.equal(font.height,36);
+  }
+});
+
+test('feature adjustments move dots, extend descenders, and raise ascenders without clipping', () => {
+  for(const xHeightDelta of [0,2,6,12]) for(const ascenderRaise of [0,1,4]) for(const dotRaise of [0,1,4]) for(const descenderDelta of [0,1,6]) {
+    const font=makeFont(base,{xHeightDelta,capHeightDelta:xHeightDelta,cellHeight:36,ascenderRaise,dotRaise,descenderDelta});
+    for(const c of alnum) {
+      assert.equal(bitmap(font,c).length,font.height);
+      assert.equal(components(bitmap(font,c)),components(bitmap(base,c)),`${c}, x=${xHeightDelta}, asc=${ascenderRaise}, dot=${dotRaise}, desc=${descenderDelta}`);
+      assert.equal(solidBlocks(bitmap(font,c)),solidBlocks(bitmap(base,c)),`${c} new block`);
+    }
+    assert.equal(bitmap(font,'g').findLastIndex(Boolean),font.height-2);
+  }
+});
+
+test('crossbar adjustment preserves e connectivity and single-pixel weight', () => {
+  for(let xHeightDelta=0;xHeightDelta<=12;xHeightDelta++) for(const eBarShift of [-2,-1,0,1,2]) {
+    const font=makeFont(base,{xHeightDelta,cellHeight:36,eBarShift});
+    assert.equal(components(bitmap(font,'e')),1,`x=${xHeightDelta}, shift=${eBarShift}`);
+    assert.equal(solidBlocks(bitmap(font,'e')),0,`x=${xHeightDelta}, shift=${eBarShift}`);
+  }
+});
+
+test('malformed global arrows and feature controls are rejected', () => {
+  for(const options of [{globalSeams:{}},{globalSeams:[{row:25,direction:'up'}]}, {globalSeams:[{row:12,direction:'left'}]}, {placementMode:'anything'}, {descenderDelta:7},{dotRaise:5},{ascenderRaise:-1},{eBarShift:3}]) assert.throws(()=>makeFont(base,options));
+});
+
+test('a smaller lowercase insertion count shares evenly spaced global arrows', () => {
+  const plan=getGlyphPlan(base,101,{xHeightDelta:2,capHeightDelta:3,placementMode:'global',globalSeams:[{row:11,direction:'up'},{row:13,direction:'down'},{row:15,direction:'down'}]});
+  assert.deepEqual(plan.seams.map(a=>a.globalIndex),[0,2]);
+  assert.deepEqual(plan.seams.map(a=>a.actual),[11,15]);
+});
+
+test('global suggestions consider the shared alphabet and feed the renderer unchanged', () => {
+  for(const count of [0,2,6,12]) {
+    const options={xHeightDelta:count,capHeightDelta:count,cellHeight:36,placementMode:'global'};
+    const arrows=globalThis.HairlineVariant.suggestGlobalSeams(base,options);
+    assert.equal(arrows.length,count);
+    const font=makeFont(base,{...options,globalSeams:arrows});
+    for(const c of alnum) assert.equal(components(bitmap(font,c)),components(bitmap(base,c)));
+    assert.deepEqual(arrows,globalThis.HairlineVariant.suggestGlobalSeams(base,options));
+  }
+});
+
+test('descender controls retain all source glyph headroom at the minimum requested cell', () => {
+  for(let descenderDelta=0;descenderDelta<=6;descenderDelta++) {
+    const font=makeFont(base,{cellHeight:24,descenderDelta});
+    assert.ok(font.metrics.topOffset>=0);
+    for(const [cp,rows] of Object.entries(glyphs)) {
+      assert.equal(font.glyphs[cp].length,font.height);
+      if(!'gjpqy'.includes(String.fromCodePoint(Number(cp)))) assert.deepEqual(font.glyphs[cp],Array(font.metrics.topOffset).fill(0).concat(rows,Array(descenderDelta).fill(0)));
+    }
+  }
+});
+
+test('explicit arrows, rather than legacy height sliders, determine inserted row counts', () => {
+  const arrows=[{scope:'all',row:11,direction:'up'},{scope:'caps',row:15,direction:'down'}];
+  const font=makeFont(base,{arrows,xHeightDelta:12,capHeightDelta:12,cellHeight:32});
+  assert.equal(font.experiment.xHeightDelta,1);
+  assert.equal(font.experiment.capHeightDelta,2);
+  assert.equal(font.experiment.placements[101].length,1);
+  assert.equal(font.experiment.placements[72].length,2);
+  const more=makeFont(base,{arrows:[...arrows,{scope:'all',row:15,direction:'down'}],cellHeight:32});
+  assert.equal(more.metrics.baseline-more.metrics.xTop,13);
+  assert.equal(more.metrics.baseline-more.metrics.capTop,18);
+  assert.notDeepEqual(bitmap(font,'e'),bitmap(more,'e'));
+  assert.deepEqual(makeFont(base,{arrows:[]}).glyphs,base.glyphs);
+});
+
+test('line-height edits add or remove arrows while retaining manual placements in the other group', () => {
+  const options={arrows:[{scope:'all',row:11,direction:'down'},{scope:'all',row:15,direction:'up'}],cellHeight:32};
+  const lower=globalThis.HairlineVariant.resizeArrows(base,options,'lower',1);
+  const before=makeFont(base,options),after=makeFont(base,{...options,arrows:lower});
+  assert.deepEqual(bitmap(before,'H'),bitmap(after,'H'));
+  assert.equal(after.experiment.xHeightDelta,1);
+  assert.equal(after.experiment.capHeightDelta,2);
+  assert.deepEqual(lower,[{scope:'all',row:11,direction:'down'},{scope:'caps',row:15,direction:'up'}]);
+  const raised=globalThis.HairlineVariant.resizeArrows(base,{...options,arrows:lower},'lower',4);
+  assert.equal(raised.filter(a=>a.scope!=='caps').length,4);
+  assert.deepEqual(raised.slice(0,2),lower);
+});
+
+test('migration of existing global placements preserves every bitmap exactly', () => {
+  for(const xHeightDelta of [0,2,8,12])for(const capHeightDelta of [0,3,9,12]) {
+    const options={placementMode:'global',xHeightDelta,capHeightDelta,cellHeight:36};
+    const arrows=globalThis.HairlineVariant.editingArrows(base,options);
+    assert.deepEqual(makeFont(base,{...options,arrows}).glyphs,makeFont(base,options).glyphs);
+  }
+});
+
+test('move-arrow buttons skip no-op positions and change the selected glyph where possible', () => {
+  const options={arrows:[{scope:'all',row:9,direction:'up'}],cellHeight:32};
+  const next=globalThis.HairlineVariant.nextArrowMove(base,options,0,1,101);
+  assert.ok(next);
+  assert.ok(next.arrows[0].row>9);
+  assert.ok(next.changed.includes('101'));
+  assert.notDeepEqual(bitmap(makeFont(base,options),'e'),bitmap(makeFont(base,{...options,arrows:next.arrows}),'e'));
+  assert.equal(globalThis.HairlineVariant.nextArrowMove(base,{...options,arrows:[{scope:'all',row:24,direction:'down'}]},0,1,101),null);
+});
+
+test('explicit arrow validation rejects invalid scope, direction, and excessive growth', () => {
+  for(const arrows of [[{scope:'typo',row:11,direction:'up'}],[{scope:'all',row:25,direction:'up'}],Array(13).fill({scope:'all',row:11,direction:'up'})])assert.throws(()=>makeFont(base,{arrows}));
+});
+
+test('linked cap height raises d and plain lowercase ascenders with connected single-pixel stems', () => {
+  const original = makeFont(base, {linkAscenders:true});
+  for (let growth=1; growth<=12; growth++) {
+    const font = makeFont(base, {capHeightDelta:growth, linkAscenders:true});
+    for(const c of 'bdhkl') {
+      assert.equal(font.ascent-top(bitmap(font,c)), original.ascent-top(bitmap(original,c))+growth, c+' rises with caps');
+      assert.equal(components(bitmap(font,c)), components(bitmap(base,c)), c+' stays connected');
+      assert.equal(solidBlocks(bitmap(font,c)), solidBlocks(bitmap(base,c)), c+' retains stroke weight');
+    }
+    assert.deepEqual(bitmap(font,'x').slice(font.metrics.topOffset), bitmap(base,'x'));
+  }
+});
+
+test('overall size grows actual caps, lowercase and linked ascenders and reverses cleanly', () => {
+  const options={cellHeight:24,arrows:[],linkAscenders:true};
+  for(const height of [26,30,32,36]) {
+    const resized={...options,...HairlineVariant.resizeOverall(base,options,height)};
+    const font=makeFont(base,resized);
+    assert.equal(font.height,height);
+    for(const c of 'Hdx') assert.equal(font.ascent-top(bitmap(font,c)), base.ascent-top(bitmap(base,c))+height-24);
+    for(const c of alnum) assert.equal(components(bitmap(font,c)),components(bitmap(base,c)), c);
+    const restored=makeFont(base,{...resized,...HairlineVariant.resizeOverall(base,resized,24)});
+    assert.deepEqual(restored.glyphs,base.glyphs);
+  }
+});
+
+test('fixed canvas starts with exact Terminus and accepts every height from 1 to 100', () => {
+  assert.deepEqual(makeFont(base,{fixedCanvas:true,cellHeight:24}).glyphs,base.glyphs);
+  for(let height=1;height<=100;height++) {
+    const font=makeFont(base,{fixedCanvas:true,cellHeight:height});
+    assert.equal(font.height,height);
+    for(const rows of Object.values(font.glyphs))assert.equal(rows.length,height);
+    assert.ok(bitmap(font,'d').some(Boolean));
+  }
+  assert.equal(makeFont(base,{fixedCanvas:true,cellHeight:150}).height,150);
+});
+
+test('d reaches both extreme rows without automatic padding or canvas growth', () => {
+  for(const height of [1,2,7,24,36,100]) {
+    const lines={capTop:0,ascender:0,xTop:Math.floor((height-1)/3),baseline:height-1,descender:height-1};
+    const font=makeFont(base,{fixedCanvas:true,cellHeight:height,lineRows:lines});
+    assert.equal(font.height,height);
+    assert.equal(top(bitmap(font,'d')),0);
+    assert.equal(bitmap(font,'d').findLastIndex(Boolean),height-1);
+    assert.equal(components(bitmap(font,'d')),1);
+    if(height>=24)assert.equal(solidBlocks(bitmap(font,'d')),solidBlocks(bitmap(base,'d')));
+  }
+});
+
+test('all guide rows can cross or reach either edge while the canvas stays fixed', () => {
+  for(const key of ['capTop','xTop','baseline','descender','ascender','dot','eBar','numeral'])for(const row of [0,23]) {
+    const font=makeFont(base,{fixedCanvas:true,cellHeight:24,lineRows:{[key]:row}});
+    assert.equal(font.fixedLines[key],row);
+    assert.equal(font.height,24);
+    assert.ok(Object.values(font.glyphs).every(rows=>rows.length===24));
+  }
+});
+
+test('fixed canvas arrows redistribute contours without changing canvas or guide positions', () => {
+  const options={fixedCanvas:true,cellHeight:24};
+  const a=makeFont(base,{...options,arrows:[{row:11,direction:'up',scope:'all'}]});
+  const b=makeFont(base,{...options,arrows:[{row:16,direction:'down',scope:'all'}]});
+  assert.equal(a.height,24);assert.equal(b.height,24);
+  assert.deepEqual(a.fixedLines,b.fixedLines);
+  assert.ok(HairlineVariant.changedGlyphs(a,b).length>0);
+  const many=makeFont(base,{...options,arrows:Array.from({length:100},()=>({row:13,direction:'up',scope:'all'}))});
+  assert.equal(many.height,24);
+  assert.equal(many.experiment.placements[100].length,100);
+  assert.equal(getGlyphPlan(base,100,{...options,cellHeight:100}).cellHeight,100);
+  assert.deepEqual(makeFont(base,{...options,arrows:[]}).glyphs,base.glyphs);
 });

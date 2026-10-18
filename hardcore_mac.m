@@ -17,8 +17,7 @@
  *     same vertex array and glyph atlas as the Direct3D path, one draw per
  *     frame. Frames are built on the main thread and drawn by a render
  *     thread, which is the one that waits for a drawable.
- *   - The standard traffic lights over the tab column instead of hardcore's
- *     own glass caption buttons.
+ *   - A standard AppKit title bar and traffic lights above the content view.
  *
  * Mac keys follow Mac habits: Cmd+T / Cmd+W / Cmd+C / Cmd+V, Cmd+1…9,
  * Cmd+Shift+[ ], Cmd+J, Cmd+↑/↓. Left Option is Meta (ESC prefix, what Claude
@@ -84,8 +83,7 @@ static int g_quitting;           /* skip the "programs are running" question: la
 static int g_paint_pending;      /* a frame is wanted (see plat_invalidate) */
 static double uptime_ms(void);
 static NSTimer *g_timers[8];
-static int g_mac_title_hover;
-static int g_mac_title_drag;
+static int g_browser_nav_hover;
 static int g_browser_native_drag;
 static id g_mac_title_monitor;
 static void mac_browser_address(void);
@@ -252,11 +250,21 @@ static void plat_kill_timer(int id) {
 }
 
 static void plat_set_title(const wchar_t *title) {
-    NSString *s;
     if (!g_win) return;
-    s = [[NSString alloc] initWithBytes:title length:wcslen(title) * sizeof(wchar_t) encoding:NSUTF32LittleEndianStringEncoding];
-    [g_win setTitle:s ? s : @"hardcore"];
-    [s release];
+    Tab *tb=active_tab();
+    if(tb && tb->kind==TK_BROWSER)tb=tab_by_id(tb->parent_id);
+    NSString *folder=nil;
+    if(tb && tb->kind!=TK_BROWSER) {
+        const char *path=tb->t.cwd[0]?tb->t.cwd:tb->start_dir;
+        if(path[0]=='/')folder=[NSString stringWithUTF8String:path];
+    }
+    NSURL *url=folder.length?[NSURL fileURLWithPath:folder isDirectory:YES]:nil;
+    if(![g_win.representedURL isEqual:url])[g_win setRepresentedURL:url];
+    NSString *label=folder.length?[[NSFileManager defaultManager] displayNameAtPath:folder]:nil;
+    if(!label.length)label=[[[NSString alloc] initWithBytes:title length:wcslen(title)*sizeof(wchar_t)
+        encoding:NSUTF32LittleEndianStringEncoding] autorelease];
+    if(![g_win.title isEqual:label])[g_win setTitle:label.length?label:@"hardcore"];
+    [[g_win standardWindowButton:NSWindowDocumentIconButton] setToolTip:folder];
     mac_dock_update(0);
 }
 
@@ -409,7 +417,7 @@ static void r_begin(int w, int h) {
     g_build->w = w;
     g_build->h = h;
     Tab *tb = active_tab();
-    g_build->transparent = tb && tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active();
+    g_build->transparent = !g_grid_on && tb && tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active();
 }
 
 static void write_bmp(const char *path, const void *px, int w, int h) {
@@ -1229,6 +1237,7 @@ static void config_load(void) {
     if (getenv("HARDCORE_TEST_CONFIG")) snprintf(g_cfg_dir, sizeof(g_cfg_dir), "%s", getenv("HARDCORE_TEST_CONFIG"));
     else snprintf(g_cfg_dir, sizeof(g_cfg_dir), "%s/Library/Application Support/hardcore", home ? home : "/tmp");
     mkdir(g_cfg_dir, 0755);
+    config_default_font();
     snprintf(path, sizeof(path), "%s/config.ini", g_cfg_dir);
     if (!(f = fopen(path, "rb"))) return;
     while (fgets(line, sizeof(line), f)) {
@@ -1282,146 +1291,41 @@ static void plat_settings_shown(void) {
     plat_invalidate();
 }
 
-/* Native buttons float above a full-size content view. Keep them hidden until
-   the whole title band is hovered; their quiet counterparts are Metal circles
-   below the terminal. No title geometry consumes terminal grid rows. */
+/* AppKit owns the title bar above the content view. Browser navigation is
+   an independent content overlay and never controls the window buttons. */
 static const NSWindowButton mac_title_buttons[] = {
     NSWindowCloseButton, NSWindowMiniaturizeButton, NSWindowZoomButton
 };
-
 static int mac_title_native_height(void) {
-    NSRect layout;
-    if (!g_win || !g_view || ([g_win styleMask] & NSWindowStyleMaskFullScreen)) return 0;
-    layout = [(NSView *)g_view convertRect:[g_win contentLayoutRect] fromView:nil];
-    /* AppKit may not have laid out the titlebar yet during initial creation. */
-    CGFloat height = NSMinY(layout);
-    if (height < 1) height = 22;
-    return (int)(height * [g_win backingScaleFactor] + .5);
+    if(!g_win || ([g_win styleMask]&NSWindowStyleMaskFullScreen))return 0;
+    NSRect content=[g_win contentRectForFrameRect:g_win.frame];
+    return (int)((NSHeight(g_win.frame)-NSHeight(content))*g_win.backingScaleFactor+.5);
 }
-
-static int mac_title_height(void) { return MAX(mac_title_native_height(),mac_browser_title_height()); }
-
-static int mac_title_contains(int x, int y) {
-    int w, h;
-    plat_client_size(&w, &h);
-    return x >= 0 && x < w && y >= 0 && y < mac_title_height();
+static int mac_browser_nav_height(void) { return g_grid_on?0:mac_browser_title_height(); }
+static int mac_browser_nav_contains(int x,int y) {
+    int w,h;plat_client_size(&w,&h);
+    return x>=0 && x<w && y>=0 && y<mac_browser_nav_height();
 }
-
-static void mac_title_sync_buttons(void) {
-    /* Full screen retains AppKit's own auto-hiding titlebar behavior. */
-    BOOL visible = g_mac_title_hover || ([g_win styleMask] & NSWindowStyleMaskFullScreen);
-    for (int i = 0; i < 3; i++)
-        [[g_win standardWindowButton:mac_title_buttons[i]] setHidden:!visible];
-}
-
-static void mac_title_hover_at(int x, int y) {
-    int chrome = over_chrome(x, y);
-    int hover = !g_chrome_drag && g_tv_drag_slot<0 && !chrome && !g_sel_drag && !g_sb_drag && !g_browser_native_drag && mac_title_contains(x, y);
-    /* An explicitly focused address editor remains visible until committed or
-       dismissed, even if the pointer happens to cross the menu. */
-    if ((g_mac_title_drag || mac_browser_nav_editing()) && !g_chrome_drag && g_tv_drag_slot<0) hover = 1;
-    if (hover == g_mac_title_hover) return;
-    g_mac_title_hover = hover;
-    mac_title_sync_buttons();
-    plat_invalidate();
+static void mac_browser_nav_hover_at(int x,int y) {
+    int hover=!g_chrome_drag && g_tv_drag_slot<0 && !over_chrome(x,y) && !g_sel_drag && !g_sb_drag && !g_browser_native_drag && mac_browser_nav_contains(x,y);
+    if(!g_grid_on && mac_browser_nav_editing() && !g_chrome_drag && g_tv_drag_slot<0)hover=1;
+    if(hover==g_browser_nav_hover)return;
+    g_browser_nav_hover=hover;plat_invalidate();
 }
 
 static NSRect mac_title_button_rect(int i) {
     NSButton *button = [g_win standardWindowButton:mac_title_buttons[i]];
     if (!button || !g_view) return NSZeroRect;
-    NSRect r = [button convertRect:[button bounds] toView:nil];
-    CGFloat scale = [g_win backingScaleFactor];
-    /* Standard button views sit in AppKit's unflipped titlebar hierarchy.
-       Convert window coordinates explicitly, as all renderer coordinates start
-       at the drawable's top left (including a full-size content view). */
-    r.origin.y = [(NSView *)g_view bounds].size.height - NSMaxY(r);
-    return NSMakeRect(r.origin.x*scale, r.origin.y*scale,
-                      r.size.width*scale, r.size.height*scale);
+    NSRect r=[button convertRect:button.bounds toView:(NSView *)g_view];
+    CGFloat scale=g_win.backingScaleFactor;
+    return NSMakeRect(r.origin.x*scale,r.origin.y*scale,r.size.width*scale,r.size.height*scale);
 }
-
-static int plat_lights_bottom(void) { return mac_title_height(); }
-
-typedef struct { float cx, cy, radius; int left, top, right, bottom; } MacTitleCircle;
-static MacTitleCircle g_mac_title_circles[3];
-static int g_mac_title_circle_count, g_mac_title_circle_right, g_mac_title_circle_bottom;
-
-static uint32_t plat_title_mix(uint32_t fg, uint32_t bg, float alpha) {
-    int a = (int)(alpha * 255 + .5f);
-    uint32_t out = 0;
-    for (int shift = 0; shift <= 16; shift += 8)
-        out |= (uint32_t)((((fg >> shift) & 255)*a + ((bg >> shift) & 255)*(255-a) + 127) / 255) << shift;
-    return out;
-}
-
-static uint32_t plat_title_background_color(uint32_t bg) {
-    int r = (bg >> 16) & 255, g = (bg >> 8) & 255, b = bg & 255;
-    /* A neutral 1/8 shift toward white on dark backgrounds, black on light
-       ones. Choosing the direction gives at least 16 levels on every gray,
-       including middle gray: exclusion or blending toward gray has a null
-       point there. Colored backgrounds keep their hue with less saturation. */
-    int light = 77*r + 150*g + 29*b < 128*256;
-    r += light ? (255-r+4)/8 : -(r+4)/8;
-    g += light ? (255-g+4)/8 : -(g+4)/8;
-    b += light ? (255-b+4)/8 : -(b+4)/8;
-    return (uint32_t)(r << 16 | g << 8 | b);
-}
-
-/* Called immediately after a background fill, before any foreground strokes.
-   Geometry is cached once per frame; most cells reject at the first check.
-   Resolve coverage against the background explicitly so a later cell/menu
-   fill replaces, rather than repeatedly blends, an existing circle edge. */
-static void plat_render_title_background(float x0, float y0, float x1, float y1, uint32_t bg, uint32_t base) {
-    int translation = g_chrome_x;
-    float alpha = g_draw_alpha;
-    x0 += translation; x1 += translation;
-    if (!g_mac_title_circle_count || x0 >= g_mac_title_circle_right || y0 >= g_mac_title_circle_bottom || x1 <= 0 || y1 <= 0) return;
-    bg = plat_title_mix(bg, base, alpha);
-    uint32_t color = plat_title_background_color(bg);
-    g_chrome_x = 0;
-    g_draw_alpha = 1;
-    for (int i = 0; i < g_mac_title_circle_count; i++) {
-        const MacTitleCircle *c = &g_mac_title_circles[i];
-        int left = (int)fmaxf(x0, c->left), right = (int)fminf(x1, c->right);
-        int top = (int)fmaxf(y0, c->top), bottom = (int)fminf(y1, c->bottom);
-        for (int y = top; y < bottom; y++) {
-            for (int x = left; x < right; x++) {
-                float dx = x + .5f - c->cx, dy = y + .5f - c->cy;
-                float coverage = c->radius + .5f - sqrtf(dx*dx + dy*dy);
-                if (coverage <= 0) continue;
-                if (coverage > 1) coverage = 1;
-                fill_rect(x, y, x+1, y+1, plat_title_mix(color, bg, coverage), 1);
-            }
-        }
-    }
-    g_chrome_x = translation;
-    g_draw_alpha = alpha;
-}
-
-static void plat_render_title_underlay(void) {
-    g_mac_title_circle_count = g_mac_title_circle_right = g_mac_title_circle_bottom = 0;
-    if (!g_win || !g_view || g_mac_title_hover || !mac_title_height()) return;
-    for (int i = 0; i < 3; i++) {
-        NSRect r = mac_title_button_rect(i);
-        float radius = (NSWidth(r) / 2) - [g_win backingScaleFactor];
-        if (radius <= 0) continue;
-        MacTitleCircle *c = &g_mac_title_circles[g_mac_title_circle_count++];
-        c->cx = NSMidX(r); c->cy = NSMidY(r); c->radius = radius;
-        c->left = (int)floorf(c->cx-radius); c->right = (int)ceilf(c->cx+radius);
-        c->top = (int)floorf(c->cy-radius); c->bottom = (int)ceilf(c->cy+radius);
-        if (c->right > g_mac_title_circle_right) g_mac_title_circle_right = c->right;
-        if (c->bottom > g_mac_title_circle_bottom) g_mac_title_circle_bottom = c->bottom;
-    }
-    plat_render_title_background(0, 0, g_clip_w, g_clip_h, DEF_BG, DEF_BG);
-}
-
-static void plat_render_title_overlay(void) {
-    if (!g_mac_title_hover || g_sel_drag || g_sb_drag || g_chrome_drag || g_tv_drag_slot>=0) return;
-    int w, h, clip = g_clip_w;
-    plat_client_size(&w, &h);
-    g_clip_w = w; /* The native title band covers even a partial rightmost cell. */
-    fill_rect(0, 0, w, mac_title_height(), BAR_BG, .91f);
-    g_clip_w = clip;
-    mac_browser_draw_nav();
+static int plat_lights_bottom(void) { return 0; }
+static void mac_browser_render_nav_overlay(void) {
+    if(!g_browser_nav_hover || g_grid_on || g_sel_drag || g_sb_drag || g_chrome_drag || g_tv_drag_slot>=0)return;
+    int w,h,clip=g_clip_w;plat_client_size(&w,&h);g_clip_w=w;
+    fill_rect(0,0,w,mac_browser_nav_height(),BAR_BG,.91f);
+    g_clip_w=clip;mac_browser_draw_nav();
 }
 
 /* ── clipboard, drops, links ───────────────────────────────────────── */
@@ -1579,8 +1483,50 @@ static void mac_record_file_viewer(NSString *path) {
         path=path.stringByDeletingLastPathComponent;
     if(path.length)mac_files_at(path.fileSystemRepresentation);
 }
+static int g_grid_mouse_consumed;
+static int mac_grid_down(int mx,int my) {
+    if(!g_grid_on)return 0;
+    if(mac_grid_utility_click(mx,my)){g_grid_mouse_consumed=1;return 1;}
+    int boundary,axis=grid_divider_at(mx,my,&boundary);
+    if(axis){g_grid_drag_axis=axis;g_grid_drag_boundary=boundary;g_grid_mouse_consumed=1;g_sel_on=g_sel_drag=0;return 1;}
+    int index=grid_pane_at(mx,my);if(index<0)return 0;
+    Tab *tb=g_tabs[index];HcGridRect r=grid_rect(tb->id);
+    if(my<(r.y+1)*CH) {
+        int action=grid_title_action(r,mx);g_grid_mouse_consumed=1;
+        if(action==2){grid_hide_tab(index);return 1;}
+        activate(index);
+        if(action==1)grid_toggle();
+        else if(action==3){g_grid_expand_id=tb->id;grid_refit();}
+        return 1;
+    }
+    if(index!=g_active)activate(index);
+    if(tb->kind==TK_BROWSER) {
+        g_grid_mouse_consumed=1;int col=mx/CW-r.x,row=my/CH-r.y-1,at=row*r.w+col;
+        if(g_grid_browser_id[index]==tb->id && g_grid_browser_generation[index]==mac_browser_cutie_generation(tb) &&
+           at>=0 && at<g_grid_browser_capacity[index] && g_grid_browser_cells[index])
+            mac_browser_cutie_action(tb,g_grid_browser_cells[index][at].link);
+        return 1;
+    }
+    return 0;
+}
+static void mac_grid_drag(int mx,int my) {
+    if(!g_grid_drag_axis)return;
+    hc_grid_move(&g_grid,g_grid_drag_axis==1,g_grid_drag_boundary,
+        g_grid_drag_axis==1?mx/CW-g_grid_left:my/CH-g_grid_top);
+    grid_refit();
+}
+static int mac_grid_cursor(int mx,int my) {
+    if(!g_grid_on)return 0;
+    int boundary,axis=g_grid_drag_axis?g_grid_drag_axis:grid_divider_at(mx,my,&boundary);
+    if(axis){[(axis==1?[NSCursor resizeLeftRightCursor]:[NSCursor resizeUpDownCursor]) set];return 1;}
+    int index=grid_pane_at(mx,my);
+    if(index>=0 && my<(grid_rect(g_tabs[index]->id).y+1)*CH){[[NSCursor pointingHandCursor] set];return 1;}
+    return 0;
+}
 static int mac_header_action(int hit) {
-    if(hit==HIT_PLUS)new_tab_mac();
+    if(hit==HIT_GRID)grid_toggle();
+    else if(hit==HIT_GRID_EXPAND)grid_expand_next();
+    else if(hit==HIT_PLUS)new_tab_mac();
     else if(hit==HIT_WEB)mac_browser_open_welcome();
     else if(hit==HIT_FILES)mac_files_new();
     else if(hit==HIT_CAMERA)mac_camera_toggle();
@@ -1660,6 +1606,7 @@ static void mac_tv_drag_end(void) {
     [[NSCursor arrowCursor] set];plat_invalidate();
 }
 static int mac_tv_drag_begin(int mx,int my) {
+    if(g_grid_on)return 0;
     int slot=-1,hit=chrome_tv_hit(mx,my,&slot);
     if(slot<0 || slot>=HC_TV_COUNT || (hit!=HIT_TV_GRIP && hit!=HIT_TV_RESIZE))return 0;
     mac_cutie_blur();chrome_preview_cancel();
@@ -1799,6 +1746,7 @@ static void view_px(NSEvent *e, int *x, int *y) {
    mouseMoved's arrow. All cursor-update, motion and modifier paths now agree
    on the same geometry. Native WebKit retains ownership of its page body. */
 static void mac_pointer_cursor_at(int x,int y,NSEventModifierFlags flags) {
+    if(mac_grid_cursor(x,y))return;
     if(mac_music_cursor(x,y))return;
     if(mac_camera_cursor(x,y))return;
     if(g_tv_drag_slot>=0){[(g_tv_drag_mode?mac_tv_resize_cursor():[NSCursor closedHandCursor]) set];return;}
@@ -1807,15 +1755,16 @@ static void mac_pointer_cursor_at(int x,int y,NSEventModifierFlags flags) {
     if(x<0 || y<0 || x>=w || y>=h)return;
     if(over_chrome(x,y) || chrome_any_tv_contains(x,y)) {
         int idx=-1,hit=hit_tabbar(x,y,&idx);
+        if(g_grid_on && (hit==HIT_GRIP || hit==HIT_TV_GRIP || hit==HIT_TV_RESIZE)){[[NSCursor arrowCursor] set];return;}
         [(hit==HIT_TV_RESIZE?mac_tv_resize_cursor():
           (hit==HIT_TV_GRIP || hit==HIT_GRIP)?[NSCursor openHandCursor]:
           tabbar_action(x,y)?[NSCursor pointingHandCursor]:[NSCursor arrowCursor]) set];
         return;
     }
-    if(mac_browser_ui_move(x,y))return;
-    if(mac_title_contains(x,y) && !g_sel_drag && !g_sb_drag) {[[NSCursor arrowCursor] set];return;}
+    if(!g_grid_on && mac_browser_ui_move(x,y))return;
+    if(mac_browser_nav_contains(x,y) && !g_sel_drag && !g_sb_drag) {[[NSCursor arrowCursor] set];return;}
     Tab *tb=active_tab();
-    if(tb && tb->kind==TK_BROWSER && tb->browser_native && !chrome_preview_active())return;
+    if(!g_grid_on && tb && tb->kind==TK_BROWSER && tb->browser_native && !chrome_preview_active())return;
     int col,row;char url[2048];mouse_cell(x,y,&col,&row);
     if(tb && tb->kind==TK_BROWSER && col>=0 && col<tb->t.cols && row>=0 && row<tb->t.rows && tb->t.row[0][row][col].link) {
         [[NSCursor pointingHandCursor] set];return;
@@ -1848,8 +1797,9 @@ static NSEvent *mac_title_event(NSEvent *e) {
                 if([e type]==NSEventTypeLeftMouseDown && cutie_at(x,y)<0)mac_cutie_blur();
                 if ([e type]==NSEventTypeScrollWheel) return g_tv_drag_slot>=0?nil:e;
                 if ([e type]==NSEventTypeKeyDown) {
+                    if(g_grid_drag_axis && [e keyCode]==53){g_grid_drag_axis=0;return nil;}
                     if(g_tv_drag_slot>=0){if([e keyCode]==53)mac_tv_drag_end();return nil;}
-                    if (!g_cutie_focus_id && tb && tb->kind==TK_BROWSER && tb->browser_native) {
+                    if (!g_cutie_focus_id && !g_grid_on && tb && tb->kind==TK_BROWSER && tb->browser_native) {
                         NSString *key=[e charactersIgnoringModifiers];
                         if (([e modifierFlags]&NSEventModifierFlagCommand) && key.length==1) {
                             unichar ch=[key characterAtIndex:0];
@@ -1877,23 +1827,23 @@ static NSEvent *mac_title_event(NSEvent *e) {
                 if([e type]==NSEventTypeRightMouseUp && (g_cutie_aux_buttons&2)){g_cutie_aux_buttons&=~2;return nil;}
                 if([e type]==NSEventTypeOtherMouseUp && (g_cutie_aux_buttons&1)){g_cutie_aux_buttons&=~1;return nil;}
                 if ([e type] == NSEventTypeLeftMouseDown && chrome_drag_begin(x, y)) {
-                    mac_title_hover_at(x, y); [[NSCursor closedHandCursor] set]; return nil;
+                    mac_browser_nav_hover_at(x, y); [[NSCursor closedHandCursor] set]; return nil;
                 }
                 if ([e type] == NSEventTypeLeftMouseDragged && g_chrome_drag) {
                     chrome_drag_move(x, y); [[NSCursor closedHandCursor] set]; return nil;
                 }
                 if ([e type] == NSEventTypeLeftMouseUp && g_chrome_drag) {
-                    chrome_drag_move(x, y); chrome_drag_end(); mac_title_hover_at(x, y);
+                    chrome_drag_move(x, y); chrome_drag_end(); mac_browser_nav_hover_at(x, y);
                     [[NSCursor openHandCursor] set]; return nil;
                 }
-                if ([e type]==NSEventTypeLeftMouseDown && tb && tb->kind==TK_BROWSER && tb->browser_native)
-                    g_browser_native_drag=!over_chrome(x,y) && !mac_title_contains(x,y);
+                if ([e type]==NSEventTypeLeftMouseDown && !g_grid_on && tb && tb->kind==TK_BROWSER && tb->browser_native)
+                    g_browser_native_drag=!over_chrome(x,y) && !mac_browser_nav_contains(x,y);
                 if ([e type]==NSEventTypeLeftMouseUp) g_browser_native_drag=0;
-                if([e type]==NSEventTypeLeftMouseDown && mac_browser_nav_editing() && !mac_title_contains(x,y))mac_browser_ui_mouse(x,y);
-                mac_title_hover_at(x, y);
+                if([e type]==NSEventTypeLeftMouseDown && !g_grid_on && mac_browser_nav_editing() && !mac_browser_nav_contains(x,y))mac_browser_ui_mouse(x,y);
+                mac_browser_nav_hover_at(x, y);
                 if([e type]==NSEventTypeMouseMoved || [e type]==NSEventTypeMouseEntered)
                     mac_pointer_cursor_at(x,y,[e modifierFlags]);
-                if (tb && tb->kind==TK_BROWSER && tb->browser_native && !g_sel_drag) {
+                if (!g_grid_on && tb && tb->kind==TK_BROWSER && tb->browser_native && !g_sel_drag) {
                     int before=chrome_hovered() || chrome_any_tv_hovered();
                     g_mouse_x=x; g_mouse_y=y;
                     NSSize bounds=[g_view bounds].size;CGFloat scale=[g_win backingScaleFactor];
@@ -1905,7 +1855,7 @@ static NSEvent *mac_title_event(NSEvent *e) {
                     if(before || after){settings_point();plat_invalidate();}
                 }
             } else if ([e type] == NSEventTypeMouseMoved || [e type] == NSEventTypeLeftMouseDown) {
-                mac_title_hover_at(-1, -1);
+                mac_browser_nav_hover_at(-1, -1);
             }
             return e;
 }
@@ -1917,7 +1867,6 @@ static void mac_title_track_events(void) {
         NSEventMaskRightMouseDown | NSEventMaskRightMouseDragged | NSEventMaskRightMouseUp |
         NSEventMaskOtherMouseDown | NSEventMaskOtherMouseDragged | NSEventMaskOtherMouseUp
         handler:^NSEvent *(NSEvent *e) { return mac_title_event(e); }];
-    mac_title_sync_buttons();
 }
 
 static int ev_mods(NSEvent *e) {
@@ -1948,14 +1897,14 @@ static int plain_layout(void) {
 @implementation HCView
 
 - (BOOL)isFlipped { return YES; }
-- (BOOL)isOpaque { Tab *tb=active_tab(); return chrome_preview_active() || !(tb && tb->kind==TK_BROWSER && tb->browser_native); }
+- (BOOL)isOpaque { Tab *tb=active_tab(); return chrome_preview_active() || !(!g_grid_on && tb && tb->kind==TK_BROWSER && tb->browser_native); }
 - (NSView *)hitTest:(NSPoint)point {
     Tab *tb=active_tab();
-    if (tb && tb->kind==TK_BROWSER && tb->browser_native) {
+    if (!g_grid_on && tb && tb->kind==TK_BROWSER && tb->browser_native) {
         NSPoint p=[self convertPoint:point fromView:self.superview];
         CGFloat scale=[g_win backingScaleFactor];
         int x=(int)(p.x*scale), y=(int)(p.y*scale);
-        if (!over_chrome(x,y) && !mac_title_contains(x,y) && !mac_browser_ui_contains(x,y)) return nil;
+        if (!over_chrome(x,y) && !mac_browser_nav_contains(x,y) && !mac_browser_ui_contains(x,y)) return nil;
     }
     return [super hitTest:point];
 }
@@ -2023,7 +1972,7 @@ static int plain_layout(void) {
 
 - (void)cursorUpdate:(NSEvent *)e {
     int x,y;view_px(e,&x,&y);
-    mac_title_hover_at(x,y);
+    mac_browser_nav_hover_at(x,y);
     mac_pointer_cursor_at(x,y,[e modifierFlags]);
 }
 
@@ -2167,8 +2116,8 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if(g_cutie_focus_id && [e keyCode]==53 && !(f&NSEventModifierFlagOption)){mac_cutie_blur();return;}
     Tab *tb = input_tab();
     if (!tb) return;
-    if(!g_cutie_focus_id && mac_browser_ui_key(e))return;
-    if(!g_cutie_focus_id && mac_browser_editing() && !(f&NSEventModifierFlagCommand)){[self interpretKeyEvents:@[e]];return;}
+    if(!g_grid_on && !g_cutie_focus_id && mac_browser_ui_key(e))return;
+    if(!g_grid_on && !g_cutie_focus_id && mac_browser_editing() && !(f&NSEventModifierFlagCommand)){[self interpretKeyEvents:@[e]];return;}
     if (g_lat && !g_lat_key) {
         g_lat_key = [e timestamp] * 1000.0;
         g_lat_down = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
@@ -2191,6 +2140,19 @@ static int key_mods(NSEventModifierFlags f, int meta) {
         }
         [self specialKey:e];     /* Cmd+←/→/Backspace; other Cmd keys belong to the menus or nobody */
         return;
+    }
+    if (tb->kind==TK_BROWSER && g_grid_on) {
+        int delta=0;
+        switch([e keyCode]) {
+        case 126:delta=-1;break;case 125:delta=1;break;
+        case 116:delta=1-tb->t.rows;break;case 121:case 49:delta=tb->t.rows-1;break;
+        case 115:delta=-20000;break;case 119:delta=20000;break;
+        case 48:if(f&NSEventModifierFlagControl){[self specialKey:e];return;}
+            /* Editing and keyboard link navigation use the full browser. */
+        case 36:case 76:grid_toggle();return;
+        default:return;
+        }
+        g_grid_browser_scroll[g_active]=chrome_max(0,g_grid_browser_scroll[g_active]+delta);plat_invalidate();return;
     }
     if (tb->kind==TK_BROWSER) {
         switch ([e keyCode]) {
@@ -2248,7 +2210,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     int x=(int)(p.x*s),y=(int)(p.y*s);
     /* The isolated test channel supplies a coordinate-bearing pointer event. */
     if([e type]!=NSEventTypeFlagsChanged)view_px(e,&x,&y);
-    mac_title_hover_at(x,y);
+    mac_browser_nav_hover_at(x,y);
     mac_pointer_cursor_at(x,y,[e modifierFlags]);
 }
 
@@ -2301,27 +2263,18 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     int mx, my, idx = -1, col, row, hit, w, h, mods = ev_mods(e);
     Tab *tb = active_tab();
     view_px(e, &mx, &my);
+    if(mac_grid_down(mx,my))return;
+    tb=active_tab();
     if(mac_tv_drag_begin(mx,my))return;
     if(mac_cutie_click(mx,my,mods))return;
     mac_cutie_blur();
-    if (chrome_drag_begin(mx, my)) { mac_title_hover_at(mx, my); [[NSCursor closedHandCursor] set]; return; }
-    mac_title_hover_at(mx, my);
-    if((!over_chrome(mx,my) || mac_browser_nav_editing()) && mac_browser_ui_mouse(mx,my))return;
-    if (g_mac_title_hover && mac_title_contains(mx,my)) {
-        if ([e clickCount] == 2) [g_win performZoom:nil];
-        else {
-            g_mac_title_drag = 1;
-            [g_win performWindowDragWithEvent:e];
-            g_mac_title_drag = 0;
-            NSPoint p = [self convertPoint:[g_win mouseLocationOutsideOfEventStream] fromView:nil];
-            CGFloat scale = [g_win backingScaleFactor];
-            mac_title_hover_at((int)(p.x*scale), (int)(p.y*scale));
-        }
-        return;
-    }
+    if (chrome_drag_begin(mx, my)) { mac_browser_nav_hover_at(mx, my); [[NSCursor closedHandCursor] set]; return; }
+    mac_browser_nav_hover_at(mx, my);
+    if(!g_grid_on && (!over_chrome(mx,my) || mac_browser_nav_editing()) && mac_browser_ui_mouse(mx,my))return;
     hit = hit_tabbar(mx, my, &idx);
     if(hit!=HIT_NONE){g_cutie_mouse_consumed=1;g_cutie_mouse_id=0;}
     if (hit == HIT_CUTIE) { g_cutie_mouse_consumed=1;g_cutie_mouse_id=0;if(idx>=0 && idx<g_ntabs){int slot=cutie_slot_for(g_tabs[idx]->id);if(slot>=0){mac_cutie_blur();chrome_tv_close_slot(slot);}else if(chrome_tv_open_tab(g_tabs[idx]->id)<0)NSBeep();} return; }
+    if (hit == HIT_GRID_HIDE) {grid_hide_tab(idx);return;}
     if (hit == HIT_TAB) { activate(idx); return; }
     if (hit == HIT_CLOSE) { user_close_tab(idx); return; }
     if (mac_header_action(hit)) return;
@@ -2335,7 +2288,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     }
     if (!tb) return;
     mouse_cell(mx, my, &col, &row);
-    if (tb->kind==TK_BROWSER && !(mods&M_SHIFT) && col>=0 && col<tb->t.cols && row>=0 && row<tb->t.rows) {
+    if (!g_grid_on && tb->kind==TK_BROWSER && !(mods&M_SHIFT) && col>=0 && col<tb->t.cols && row>=0 && row<tb->t.rows) {
         int action=tb->t.row[0][row][col].link;
         if (action) { mac_browser_action(tb,action); return; }
     }
@@ -2357,6 +2310,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 }
 
 - (void)mouseDragged:(NSEvent *)e {
+    if(g_grid_mouse_consumed){int x,y;view_px(e,&x,&y);mac_grid_drag(x,y);return;}
     if(g_tv_drag_slot>=0){int x,y;view_px(e,&x,&y);mac_tv_drag_move(x,y);return;}
     if(g_cutie_mouse_consumed)return;
     int mx, my, col, row;
@@ -2364,7 +2318,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     view_px(e, &mx, &my);
     g_mouse_x = mx;
     g_mouse_y = my;
-    mac_title_hover_at(mx, my);
+    mac_browser_nav_hover_at(mx, my);
     if (g_chrome_drag) { chrome_drag_move(mx, my); [[NSCursor closedHandCursor] set]; return; }
     if (g_sb_drag) { scrollbar_set(my); return; }
     if (g_sel_drag && tb) {
@@ -2381,6 +2335,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 }
 
 - (void)mouseUp:(NSEvent *)e {
+    if(g_grid_mouse_consumed){int x,y;view_px(e,&x,&y);mac_grid_drag(x,y);g_grid_drag_axis=g_grid_mouse_consumed=0;return;}
     if(g_tv_drag_slot>=0){int x,y;view_px(e,&x,&y);mac_tv_drag_move(x,y);mac_tv_drag_end();mac_cutie_release();return;}
     if(g_cutie_mouse_consumed){mac_cutie_release();return;}
     int mx, my;
@@ -2447,15 +2402,15 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     int mx, my, was_bar = over_chrome(g_mouse_x,g_mouse_y) || chrome_any_tv_contains(g_mouse_x,g_mouse_y), on_bar;
     Tab *tb = active_tab();
     view_px(e, &mx, &my);
-    mac_title_hover_at(mx, my);
+    mac_browser_nav_hover_at(mx, my);
     on_bar = over_chrome(mx, my) || chrome_any_tv_contains(mx,my);
     g_mouse_x = mx;
     g_mouse_y = my;
     chrome_preview_pointer(mx,my);
-    if (was_bar || on_bar) plat_invalidate();    if (was_bar || on_bar) settings_point();
+    if (was_bar || on_bar || g_grid_on) plat_invalidate();    if (was_bar || on_bar) settings_point();
     mac_pointer_cursor_at(mx,my,[e modifierFlags]);
     if(tb && tb->kind==TK_BROWSER)plat_invalidate();
-    if (!on_bar && !mac_title_contains(mx,my) && tb && tb->t.m_mouse == 1003) mouse_report(3, 1, 1, mx, my, ev_mods(e));
+    if (!on_bar && !mac_browser_nav_contains(mx,my) && tb && tb->t.m_mouse == 1003) mouse_report(3, 1, 1, mx, my, ev_mods(e));
 }
 
 - (void)mouseEntered:(NSEvent *)e { [self mouseMoved:e]; }
@@ -2466,7 +2421,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     chrome_preview_cancel();
     int x, y;
     view_px(e, &x, &y);
-    mac_title_hover_at(x, y);
+    mac_browser_nav_hover_at(x, y);
     g_mouse_x = g_mouse_y = -1;
     settings_point();
     plat_invalidate();
@@ -2475,6 +2430,19 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (void)scrollAtX:(int)mx y:(int)my delta:(CGFloat)dy precise:(BOOL)precise mods:(int)mods {
     if(g_tv_drag_slot>=0)return;
     chrome_preview_cancel();
+    if(g_grid_on) {
+        int index=grid_pane_at(mx,my);
+        if(index>=0) {
+            if(g_tabs[index]->kind==TK_BROWSER) {
+                /* Same pace as terminal panes: trackpads report many small deltas. */
+                scroll_acc+=precise?(float)(dy*[g_win backingScaleFactor]/CH):(float)(dy*3);
+                int lines=(int)scroll_acc;scroll_acc-=lines;
+                if(lines){g_grid_browser_scroll[index]=chrome_max(0,g_grid_browser_scroll[index]-lines);plat_invalidate();}
+                return;
+            }
+            if(index!=g_active)activate(index);
+        }
+    }
     Tab *tb = active_tab();
     int lines, i;
     if (!tb) return;
@@ -2491,7 +2459,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     scroll_acc += precise ? (float)(dy * [g_win backingScaleFactor] / CH) : (float)(dy * 3);
     lines = (int)scroll_acc;
     if (!lines) return;
-    if(mac_browser_ui_scroll(mx,my,-lines)){scroll_acc-=lines;return;}
+    if(!g_grid_on && mac_browser_ui_scroll(mx,my,-lines)){scroll_acc-=lines;return;}
     scroll_acc -= lines;
     if (tb->t.m_mouse && !(mods & M_SHIFT)) {
         for (i = 0; i < abs(lines); i++) mouse_report(lines > 0 ? 64 : 65, 1, 0, mx, my, mods);
@@ -2579,6 +2547,7 @@ static void record_jobs_changed(void) {update_busy(0);plat_invalidate();}
 static void mac_music_changed(void) {update_busy(0);plat_invalidate();}
 #include "hardcore_mac_music.m"
 #include "hardcore_music_panel.m"
+#include "hardcore_grid_mac.m"
 
 /* ── window and app ────────────────────────────────────────────────── */
 
@@ -2603,10 +2572,10 @@ static void focus_changed(int focused) {
 - (void)windowDidBecomeKey:(NSNotification *)n { (void)n; trace("window key"); focus_changed(1); }
 - (void)windowDidResignKey:(NSNotification *)n { (void)n;mac_record_hide_pointer(); if (g_chrome_drag) chrome_drag_end(); focus_changed(0); }
 - (void)windowDidEnterFullScreen:(NSNotification *)n {
-    (void)n; g_mac_title_hover = 0; mac_title_sync_buttons(); plat_invalidate();
+    (void)n; g_browser_nav_hover = 0; plat_invalidate();
 }
 - (void)windowDidExitFullScreen:(NSNotification *)n {
-    (void)n; g_mac_title_hover = 0; mac_title_sync_buttons(); plat_invalidate();
+    (void)n; g_browser_nav_hover = 0; plat_invalidate();
 }
 - (BOOL)windowShouldClose:(NSWindow *)w {
     (void)w;
@@ -2765,7 +2734,8 @@ static void ctl_chrome(const char *path) {
     Tab *tb = display_tab();
     if (!tb) return;
     Term *t = &tb->t;
-    chrome_prepare_display(t);
+    if(g_grid_on){tab_layout();mac_grid_utilities();g_display_term=NULL;}
+    else chrome_prepare_display(t);
     NSMutableArray *source = [NSMutableArray array], *display = [NSMutableArray array];
     NSMutableArray *markers = [NSMutableArray array], *tab_rows = [NSMutableArray array];
     for (int y = 0; y < t->rows; y++) {
@@ -2778,13 +2748,13 @@ static void ctl_chrome(const char *path) {
             char utf[8]; int count = utf8_encode(cp, utf);
             NSString *part = [[[NSString alloc] initWithBytes:utf length:count encoding:NSUTF8StringEncoding] autorelease];
             [a appendString:part ?: @"?"];
-            cp = g_display.cells ? g_display.cells[y*t->cols+x].ch : cp;
+            cp = !g_grid_on && g_display.cells ? g_display.cells[y*t->cols+x].ch : cp;
             count = utf8_encode(cp ? cp : ' ', utf);
             part = [[[NSString alloc] initWithBytes:utf length:count encoding:NSUTF8StringEncoding] autorelease];
             [b appendString:part ?: @"?"];
         }
         [source addObject:a]; [display addObject:b];
-        [markers addObject:@(g_display.cells ? g_display.markers[y] : -1)];
+        [markers addObject:@(!g_grid_on && g_display.cells ? g_display.markers[y] : -1)];
     }
     for (int i = 0; i < g_ntabs; i++) [tab_rows addObject:@(g_row_y[i])];
     NSMutableDictionary *state = [@{
@@ -2802,7 +2772,11 @@ static void ctl_chrome(const char *path) {
         [button_rects addObject:@{@"x":@(NSMinX(r)), @"y":@(NSMinY(r)),
                                  @"width":@(NSWidth(r)), @"height":@(NSHeight(r))}];
     }
-    state[@"titlebar"] = @{@"height":@(mac_title_height()), @"hovered":@(g_mac_title_hover),
+    state[@"titlebar"] = @{@"height":@(mac_title_native_height()), @"hovered":@NO,
+        @"full_size_content":@((g_win.styleMask&NSWindowStyleMaskFullSizeContentView)!=0),
+        @"transparent":@(g_win.titlebarAppearsTransparent), @"title_hidden":@(g_win.titleVisibility==NSWindowTitleHidden),
+        @"title":g_win.title?:@"", @"folder":g_win.representedURL.path?:@"",
+        @"proxy_visible":@([g_win standardWindowButton:NSWindowDocumentIconButton]!=nil && ![g_win standardWindowButton:NSWindowDocumentIconButton].hidden),
         @"buttons_visible":@(![[g_win standardWindowButton:NSWindowCloseButton] isHidden]),
         @"button_rects":button_rects, @"selection_drag":@(g_sel_drag), @"selection_on":@(g_sel_on)};
     NSCursor *pointer=[NSCursor currentCursor];
@@ -2813,7 +2787,7 @@ static void ctl_chrome(const char *path) {
     NSMutableArray *header_controls=[NSMutableArray array],*header_hits=[NSMutableArray array];
     for(int i=0;i<CHROME_HEADER_CONTROL_COUNT;i++) {
         const ChromeHeaderControl *c=CHROME_HEADER_CONTROLS+i;
-        if(c->row>=g_chrome.grip_rows)continue;
+        if(c->row>=g_chrome.grip_rows || (c->hit==HIT_GRID_EXPAND && (!g_grid_on || !g_grid.extra)))continue;
         const wchar_t *text=c->hit==HIT_CAF && !mac_caf_active()?L"caf":c->label;
         NSString *label=[[[NSString alloc] initWithBytes:text length:wcslen(text)*sizeof(*text)
             encoding:NSUTF32LittleEndianStringEncoding] autorelease];
@@ -2888,6 +2862,31 @@ static void ctl_chrome(const char *path) {
     state[@"tvs"]=tvs;state[@"caf_active"]=@(mac_caf_active());
     state[@"camera"]=mac_camera_status();state[@"exports"]=mac_record_jobs();
     state[@"music"]=mac_music_panel_status();
+    NSMutableArray *panes=[NSMutableArray array];
+    for(int i=0;i<g_grid_count && g_grid_on;i++) {
+        HcGridRect r=grid_rect(g_grid_ids[i]);
+        NSMutableArray *lines=[NSMutableArray array];
+        for(int tab=0;tab<g_ntabs;tab++)if(g_tabs[tab]->id==g_grid_ids[i] && g_tabs[tab]->kind==TK_BROWSER &&
+            g_grid_browser_id[tab]==g_grid_ids[i] && g_grid_browser_capacity[tab]>=r.w*(r.h-1)) {
+            for(int y=0;y<r.h-1;y++) {
+                NSMutableString *line=[NSMutableString string];
+                for(int x=0;x<r.w;x++) {
+                    uint32_t cp=g_grid_browser_cells[tab][y*r.w+x].ch;char utf[8];int n=utf8_encode(cp?cp:' ',utf);
+                    NSString *part=[[[NSString alloc] initWithBytes:utf length:n encoding:NSUTF8StringEncoding] autorelease];
+                    [line appendString:part?:@"?"];
+                }
+                [lines addObject:line];
+            }
+        }
+        NSString *title=@"";
+        for(int tab=0;tab<g_ntabs;tab++)if(g_tabs[tab]->id==g_grid_ids[i]) {
+            wchar_t text[280];char utf[1200];int n=0;grid_pane_title(g_tabs[tab],tab,r,text);
+            for(int k=0;text[k] && n<(int)sizeof(utf)-8;k++)n+=utf8_encode(text[k],utf+n);
+            utf[n]=0;title=[NSString stringWithUTF8String:utf]?:@"";
+        }
+        [panes addObject:@{@"id":@(g_grid_ids[i]),@"x":@(r.x),@"y":@(r.y),@"width":@(r.w),@"height":@(r.h),@"browser":lines,@"title":title}];
+    }
+    state[@"grid"]=@{@"enabled":@(g_grid_on),@"cols":@(g_grid.cols),@"rows":@(g_grid.rows),@"extra":@(g_grid.extra),@"panes":panes};
     Tab *selected=active_tab(),*shown=display_tab();
     state[@"preview"]=@{@"active_id":@(selected?selected->id:0),@"display_id":@(shown?shown->id:0),
         @"preview_id":@(g_tab_preview.target_id)};
@@ -2955,6 +2954,9 @@ static void ctl_line(char *s) {
                 mac_preview_event(e);
             }
         }
+        else if (!strcmp(c,"grid"))grid_toggle();
+        else if (!strncmp(c,"grid-hide ",10))grid_hide_tab(atoi(c+10));
+        else if (!strcmp(c,"grid-expand"))grid_expand_next();
         else if (!strcmp(c, "newtab")) { g_trace_tab_t = uptime_ms(); trace("ctl newtab"); new_tab_mac(); }
         else if (!strcmp(c, "nexttab") && g_ntabs) activate((g_active + 1) % g_ntabs);
         else if (!strcmp(c, "closetab")) close_tab(g_active);
@@ -3009,7 +3011,7 @@ static void ctl_line(char *s) {
         } else if (!strncmp(c, "hover ", 6)) {
             g_mouse_x = atoi(c + 6);
             g_mouse_y = strchr(c + 6, ',') ? atoi(strchr(c + 6, ',') + 1) : -1;
-            mac_title_hover_at(g_mouse_x, g_mouse_y);
+            mac_browser_nav_hover_at(g_mouse_x, g_mouse_y);
             chrome_preview_pointer(g_mouse_x,g_mouse_y);
             settings_point();
         } else if(!strncmp(c,"wheel ",6)) {
@@ -3049,7 +3051,7 @@ static void ctl_line(char *s) {
                 else if(kind==NSEventTypeOtherMouseDown)[g_view otherMouseDown:e];
                 else if(kind==NSEventTypeOtherMouseUp)[g_view otherMouseUp:e];
                 else if (kind == NSEventTypeLeftMouseDown && hit != HIT_BAR &&
-                    (!mac_title_contains(x, y) || hit != HIT_NONE)) [g_view mouseDown:e];
+                    (!mac_browser_nav_contains(x, y) || hit != HIT_NONE)) [g_view mouseDown:e];
                 else if (kind == NSEventTypeLeftMouseDragged) [g_view mouseDragged:e];
                 else if (kind == NSEventTypeLeftMouseUp) [g_view mouseUp:e];
             }
@@ -3390,7 +3392,7 @@ int main(int argc, char **argv) {
                        (36 * CH) / (CGFloat)g_scale);
     g_win = [[NSWindow alloc] initWithContentRect:frame
                                         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
-                                                  NSWindowStyleMaskResizable | NSWindowStyleMaskFullSizeContentView
+                                                  NSWindowStyleMaskResizable
                                           backing:NSBackingStoreBuffered defer:NO];
     [g_win center];
     [g_win setFrameAutosaveName:@"hardcore"];
@@ -3398,9 +3400,9 @@ int main(int argc, char **argv) {
     else if (g_mac_placement) [g_win setFrame:NSRectFromString(g_mac_placement[@"frame"]) display:NO];
     g_scale = (int)([g_win backingScaleFactor] + 0.5);
     if (g_scale < 1) g_scale = 1;
-    /* Full-size terminal canvas; native controls are revealed by top-band hover. */
-    [g_win setTitlebarAppearsTransparent:YES];
-    [g_win setTitleVisibility:NSWindowTitleHidden];
+    /* Native folder title and proxy icon, outside the renderer and browser canvas. */
+    [g_win setTitlebarAppearsTransparent:NO];
+    [g_win setTitleVisibility:NSWindowTitleVisible];
     [g_win setBackgroundColor:[NSColor colorWithSRGBRed:((DEF_BG >> 16) & 255) / 255.0 green:((DEF_BG >> 8) & 255) / 255.0
                                                    blue:(DEF_BG & 255) / 255.0 alpha:1]];
     [g_win setAppearance:[NSAppearance appearanceNamed:g_shown->dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua]];
@@ -3460,8 +3462,9 @@ int main(int argc, char **argv) {
     }
     if (!getenv("HARDCORE_NO_ACTIVATE") && (!g_mac_adopt || [g_mac_adopt[@"focused"] boolValue])) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
     mac_adopt_ready();
-    if(g_mac_adopt)mac_music_view_restore(g_mac_adopt[@"music"]);
+    if(g_mac_adopt){mac_music_view_restore(g_mac_adopt[@"music"]);mac_grid_restore(g_mac_adopt[@"grid"]);}
     mac_refresh_programs();
+    update_title();
     g_mac_dock_ready = 1;
     mac_dock_update(1);
     NSTimer *program_timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {

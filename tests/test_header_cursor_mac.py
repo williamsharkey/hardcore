@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two-row header hit geometry and native cursor ownership in an owned app."""
+"""Three-row header hit geometry and native cursor ownership in an owned app."""
 import argparse
 from collections import Counter
 from pathlib import Path
@@ -22,12 +22,13 @@ def test_header(app):
     app.hover(-1,-1)
     c=app.chrome()
     controls={item["name"]:item for item in c["header_controls"]}
-    expected={"move":(0,1,7,"↕ move"),"settings":(0,11,3,"⚙"),"caf":(0,21,4,"caf"),
-              "term":(1,1,7,"+term"),"web":(1,10,6,"+www"),"files":(1,19,7,"files")}
+    expected={"move":(0,1,7,"↕ move"),"settings":(0,9,8,"⚙config"),"camera":(0,18,4,"cam"),"caf":(0,24,3,"caf"),
+              "term":(1,1,6,"+term"),"web":(1,8,5,"+www"),"files":(1,14,6,"files"),"music":(1,21,6,"music"),
+              "grid":(2,1,7,"Grid")}
     assert set(controls)==set(expected),controls
-    assert c["pages"]["tabs"]["row"]==c["dock"]["y"]+2
+    assert c["pages"]["tabs"]["row"]==c["dock"]["y"]+3
     occupied=set()
-    assert len(c["header_hits"])==2 and all(len(row)==c["dock"]["width"] for row in c["header_hits"])
+    assert len(c["header_hits"])==3 and all(len(row)==c["dock"]["width"] for row in c["header_hits"])
     for name,(row,col,width,label) in expected.items():
         control=controls[name]
         assert (control["row"],control["col"],control["width"],control["label"])==(row,col,width,label),control
@@ -35,11 +36,11 @@ def test_header(app):
             assert (x,row) not in occupied,"header controls overlap"
             assert c["header_hits"][row][x]==control["hit"],(name,x,"rendered label and native action disagree")
             occupied.add((x,row))
-    gaps={c["header_hits"][row][col] for row in range(2) for col in range(c["dock"]["width"])
+    gaps={c["header_hits"][row][col] for row in range(3) for col in range(c["dock"]["width"])
           if (col,row) not in occupied}
     assert len(gaps)==1 and not gaps.intersection({0,4}|{control["hit"] for control in controls.values()}), \
         ("header gap is not inert or falls through to terminal/window drag",gaps)
-    image=app.snap("two-row-header-labels")
+    image=app.snap("three-row-header-labels")
     cw,ch=c["cell"]["width"],c["cell"]["height"]
     for name,control in controls.items():
         x,y=app.header_point(c,name)
@@ -53,7 +54,7 @@ def test_header(app):
     dock=dict(c["dock"])
     # Every spacer cell is tested through native pointer down/drag/up. A
     # spacer must not turn into the old window-drag or shell-input fallback.
-    for row in range(2):
+    for row in range(3):
         for col in range(1,dock["width"]-1):
             if (col,row) in occupied:continue
             x=int((dock["x"]+col+.5)*cw);y=int((dock["y"]+row+.5)*ch)
@@ -70,7 +71,7 @@ def test_header(app):
             assert not c["preview"]["preview_id"] and c["input_tab_id"]==selected_id
             assert state["first_responder"]==initial["first_responder"]
     app.hover(-1,-1)
-    print("PASS: two-row header labels and nonoverlapping controls render; every interior gap stays inert without moving window/menu or changing input")
+    print("PASS: three-row header labels and nonoverlapping controls render; every interior gap stays inert without moving window/menu or changing input")
 
 
 def test_cursor(app):
@@ -83,7 +84,7 @@ def test_cursor(app):
     cw,ch=c["cell"]["width"],c["cell"]["height"]
     grip_col,grip_row=app.header_point(c,"move")
     settings_col,settings_row=app.header_point(c,"settings")
-    regions=(("title",40*cw,c["titlebar"]["height"]//2,"arrow"),
+    regions=(("top content",40*cw,ch//2,"ibeam"),
              ("terminal",40*cw,10*ch,"ibeam"),
              ("move",int((grip_col+.5)*cw),int((grip_row+.5)*ch),"open-hand"),
              ("settings",int((settings_col+.5)*cw),int((settings_row+.5)*ch),"pointing-hand"))

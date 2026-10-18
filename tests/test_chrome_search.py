@@ -48,6 +48,7 @@ typedef struct {
     int settings_row, section_row, list_row, list_capacity, list_count, bottom;
 } ChromeLayout;
 static ChromeLayout g_chrome;
+static int g_grid_on,g_grid_top=1;
 static int g_tab_underlay = 1, g_ntabs = 7, g_settings_open, fixture_items;
 static uint32_t tick, tick_step;
 static int chrome_min(int a, int b) { return a < b ? a : b; }
