@@ -1,4 +1,3 @@
-#ifndef _WIN32
 static void activate(int index);
 static void mac_grid_utilities(void);
 static void mac_grid_utility_draw(void);
@@ -168,4 +167,3 @@ static void render_grid(int win_w,int win_h) {
     render_tabbar(win_w,win_h);mac_grid_utility_draw();mac_camera_draw();mac_music_draw();
     mac_browser_render_nav_overlay();UI_DONE;
 }
-#endif

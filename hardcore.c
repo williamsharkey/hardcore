@@ -151,8 +151,15 @@ __asm__(
     ".global openconsole_exe_end\n"
     "openconsole_exe_end:\n"
     ".byte 0\n"
+    ".balign 16\n"
+    ".global files_py\n"            /* the Files browser, run by WSL's python3 */
+    "files_py:\n"
+    ".incbin \"tools/files.py\"\n"
+    ".global files_py_end\n"
+    "files_py_end:\n"
+    ".byte 0\n"
     ".text\n");
-extern const unsigned char conpty_dll[], conpty_dll_end[], openconsole_exe[], openconsole_exe_end[];
+extern const unsigned char conpty_dll[], conpty_dll_end[], openconsole_exe[], openconsole_exe_end[], files_py[], files_py_end[];
 #endif
 
 /* ── fonts: the settings panel's upper grid ────────────────────────────
@@ -709,6 +716,12 @@ static void plat_close_window(void);
 static void set_clipboard_utf8(const char *s, int n);
 static void config_save(void);
 static Tab *tab_create(const char *dir, int spare);
+#ifdef _WIN32
+static Tab *files_tab_new(const char *dir);
+static void ui_pack(char *out, size_t cap);
+static void ui_restore(const char *v);
+static void ui_apply(void);
+#endif
 static void tab_destroy_async(Tab *tb);
 static int tab_drain(Tab *tb);
 static void tab_feed(Tab *tb, const unsigned char *d, int n);
@@ -2812,6 +2825,16 @@ static void write_rc(void) {
         fclose(f);
     }
     (void)wpath;
+    {   /* Files: written beside rc.bash, like it, so the exe stays the only thing installed */
+        wchar_t files[MAX_PATH];
+        _snwprintf(files, MAX_PATH, L"%ls\\files.py", g_cfg_dir);
+        files[MAX_PATH - 1] = 0;
+        if ((f = _wfopen(files, L"wb"))) {
+            fwrite(files_py, 1, (size_t)(files_py_end - files_py), f);
+            fclose(f);
+        }
+        SetEnvironmentVariableW(L"HARDCORE_FILES", files);
+    }
     /* WSLENV's /p flag hands rc.bash's path to Linux translated for whatever
        mount root the distro uses; no /mnt assumption on our side */
     {
@@ -2821,7 +2844,7 @@ static void write_rc(void) {
         SetEnvironmentVariableW(L"HARDCORE_RC", path);
         GetModuleFileNameW(NULL, exe, MAX_PATH);   /* for rc.bash's `hardcore` (new window, update) */
         SetEnvironmentVariableW(L"HARDCORE_EXE", exe);
-        _snwprintf(wslenv, 2200, L"%ls%lsHARDCORE_RC/p:HARDCORE_EXE/p", old, n ? L":" : L"");
+        _snwprintf(wslenv, 2200, L"%ls%lsHARDCORE_RC/p:HARDCORE_EXE/p:HARDCORE_FILES/p", old, n ? L":" : L"");
         wslenv[2199] = 0;
         SetEnvironmentVariableW(L"WSLENV", wslenv);
     }
@@ -2970,6 +2993,12 @@ static int tab_spawn(Tab *tb) {
     if (tb->slurp_command[0]) {
         wcscpy(wcmd, tb->slurp_command);
         wdir[0] = 0;
+    } else if (!strcmp(tb->run, "files:")) {
+        /* the Files browser, in place of a shell: WSL's python3 runs the bundled script */
+        snprintf(cmd, sizeof(cmd), "wsl.exe%s%s%s --cd \"%s\" -e sh -c \"exec python3 -I -B \\\"$HARDCORE_FILES\\\" .\"",
+                 g_distro[0] ? " -d \"" : "", g_distro, g_distro[0] ? "\"" : "", tb->start_dir[0] ? tb->start_dir : "~");
+        MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wcmd, 4096);
+        wdir[0] = 0;
     } else if (tb->kind == TK_PS) {
         powershell_cmd(wcmd, 4096);
         to_windows_dir(tb->start_dir, wdir, MAX_PATH * 2);
@@ -2992,7 +3021,10 @@ static int tab_spawn(Tab *tb) {
     /* tabs are only spawned from the UI thread, so a temporary env var is safe;
        WSLENV carries it across into Linux */
     if (tb->kind == TK_CMD) SetEnvironmentVariableW(L"PROMPT", L"$e]9;9;$P$e\\$e]133;A$e\\$P$G");
-    if (tb->spare || ((tb->run[0] || tb->hist[0]) && (tb->kind == TK_WSL || tb->kind == TK_PS))) {
+    if (!strcmp(tb->run, "files:")) {
+        ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                            NULL, NULL, &si.StartupInfo, &pi);
+    } else if (tb->spare || ((tb->run[0] || tb->hist[0]) && (tb->kind == TK_WSL || tb->kind == TK_PS))) {
         wchar_t old[2048] = L"", wslenv[2100], run[620];
         const wchar_t *name = tb->spare ? L"HARDCORE_SPARE" : tb->run[0] ? L"HARDCORE_RUN" : L"HARDCORE_HIST";
         DWORD n = GetEnvironmentVariableW(L"WSLENV", old, 2048);
@@ -3221,16 +3253,14 @@ static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
 /* The grid pane a wheel event is over, while it scrolls without taking focus */
 static Tab *g_pointer_tab;
 static Tab *pointer_tab(void) { return g_pointer_tab ? g_pointer_tab : active_tab(); }
-#ifndef _WIN32
 static int g_cutie_focus_id;
 static int cutie_focus_valid(void);
 static void cutie_input_follow(void);
-#endif
+static void mac_cutie_blur(void);
+static int mac_input_held(Tab *tb);
 static Tab *input_tab(void) {
-#ifndef _WIN32
     if(g_cutie_focus_id && cutie_focus_valid())return tab_by_id(g_cutie_focus_id);
     if(g_cutie_focus_id)mac_cutie_blur();
-#endif
     if(g_grid_on && active_tab() && grid_index(active_tab()->id)<0)return NULL;
     return active_tab();
 }
@@ -3486,9 +3516,7 @@ static void resize_all(void) {
     compute_grid(w, h, &cols, &rows);
     if (cols == g_cols && rows == g_rows) return;
     chrome_preview_cancel();
-#ifndef _WIN32
     mac_cutie_blur();
-#endif
     g_cols = cols;
     g_rows = rows;
     grid_measure(cols,rows);
@@ -3585,15 +3613,9 @@ static void sel_copy(void) {
 static void send_to_active(const char *s, int n) {
     Tab *tb = input_tab();
     if (!tb) return;
-#ifndef _WIN32
     if (mac_input_held(tb)) return;
     cutie_input_follow();
-#endif
-    if (tb->t.view
-#ifndef _WIN32
-        && !g_cutie_focus_id
-#endif
-    ) {
+    if (tb->t.view && !g_cutie_focus_id) {
         tb->t.view = 0;
         plat_invalidate();
     }
@@ -4484,7 +4506,6 @@ static void drip_init(void) {
 static int caption_btn_w(void) { return 46 * g_scale; }
 #endif
 
-#ifndef _WIN32
 static int mac_caf_active(void);
 static int mac_record_active(void);
 static int mac_record_exports_active(void);
@@ -4495,7 +4516,11 @@ static void mac_music_compact_label(wchar_t *,int);
 static int mac_caf_toggle(void);
 static double mac_caf_elapsed(void);
 static const char *mac_caf_power(void);
-#endif
+static void mac_tv_drag_end(void);
+static int mac_browser_page_rows(Tab *tb);
+static int mac_browser_cutie_generation(Tab *tb);
+static int mac_browser_cutie_project(Tab *tb,Cell *output,int cols,int rows,int scroll);
+static void mac_browser_sync(void);
 #include "hardcore_chrome.h"
 #include "hardcore_cutie.h"
 static void chrome_preview_pointer(int mx,int my) {
@@ -4503,9 +4528,7 @@ static void chrome_preview_pointer(int mx,int my) {
     Tab *selected=active_tab();
     int target=(hit==HIT_TAB || hit==HIT_CLOSE || hit==HIT_CUTIE) && index>=0 && index<g_ntabs?g_tabs[index]->id:0;
     int eligible=!g_grid_on && g_focused && !g_sel_drag && !g_chrome_drag && !g_sb_drag;
-#ifndef _WIN32
     eligible=eligible && g_tv_drag_slot<0;
-#endif
     if(tab_preview_point(&g_tab_preview,selected?selected->id:0,target,eligible))plat_invalidate();
 }
 
@@ -4623,13 +4646,11 @@ static void grid_text(const wchar_t *s, int col, int row, uint32_t rgb) {
         if (cps[i] != ' ') draw_glyph(cps[i], (float)(col * CW), row_y(row), ws[i], g_scale);
 }
 
-#ifndef _WIN32
 static void mac_browser_render_nav_overlay(void);
 static void mac_camera_draw(void);
 static void mac_camera_layout(Term *t);
 static void mac_music_draw(void);
 static void mac_music_layout(Term *t);
-#endif
 static int chrome_intrusion_span(int row, int *left, int *right);
 static int chrome_intrusion_span_at(int row,int dock,int top,int bottom,int *left,int *right);
 #include "hardcore_chrome_draw.h"
@@ -4822,9 +4843,13 @@ static void render(void) {
     g_clip_w = r.right / CW * CW;
     g_clip_h = r.bottom / CH * CH;
     r_begin(r.right, r.bottom);
-#ifndef _WIN32
-    if(g_grid_on){render_grid(r.right,r.bottom);return;}
+    if(g_grid_on){
+        render_grid(r.right,r.bottom);
+#ifdef _WIN32
+        render_caption_buttons(r.right);
 #endif
+        return;
+    }
     /* Browser/native and empty-window paths do not prepare a terminal grid.
        They must still end an old tab's fade and discard its pending target. */
     if (!tb || (tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active())) {
@@ -4971,8 +4996,11 @@ static void render(void) {
 #ifdef _WIN32
     if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
         fill_rect(0, 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
+    if (overlay && (chrome_hovered() || chrome_any_tv_hovered() || chrome_preview_active())) render_tabbar(r.right, r.bottom);
+    render_cuties(r.right);
+    mac_camera_draw();
+    mac_music_draw();
     render_caption_buttons(r.right);
-    if (overlay && (chrome_hovered() || chrome_preview_active())) render_tabbar(r.right, r.bottom);
 #else
     if (overlay && (chrome_hovered() || chrome_any_tv_hovered())) render_tabbar(r.right, r.bottom);
     mac_browser_draw_overlay();
@@ -5080,13 +5108,11 @@ static void paint_now(void) {
         plat_timer(TIMER_SYNC, 20);
         return;
     }
-#ifndef _WIN32
     if (g_grid_on) {
         int w, h;
         plat_client_size(&w, &h);
         grid_fit(w, h);
     }
-#endif
     if (resize_redrawing()) {
         plat_timer(TIMER_SYNC, 2);
         return;
@@ -5184,10 +5210,8 @@ static void update_busy(int tick) {
         }
         any |= b;
     }
-#ifndef _WIN32
     any |= mac_record_exports_active();
     any |= mac_music_loading();
-#endif
     if (any && !g_throb_on) plat_timer(TIMER_THROB, DRIP_MS);
     if (!any && g_throb_on) plat_kill_timer(TIMER_THROB);
     g_throb_on = any;
@@ -5206,9 +5230,7 @@ static int tab_hears_focus(Tab *tb) {
 }
 
 static void activate(int i) {
-#ifndef _WIN32
     mac_tv_drag_end();mac_cutie_blur();
-#endif
     if (i < 0 || i >= g_ntabs) return;
     chrome_preview_cancel();
     term_settle(&g_tabs[i]->t);  /* a tab not caught up since a resize: before it shows */
@@ -5351,6 +5373,11 @@ static void session_save(void) {
     fprintf(f, "# hardcore: the tabs open when the window closed, restored on the next start\n");
     fprintf(f, "active=%d\n", g_active);
     {
+        char ui[1200];
+        ui_pack(ui, sizeof(ui));
+        fprintf(f, "ui=%s\n", ui);
+    }
+    {
         WINDOWPLACEMENT wp = {sizeof(wp)};
         if (GetWindowPlacement(g_hwnd, &wp))
             fprintf(f, "placement=%u %ld %ld %ld %ld\n", wp.showCmd == SW_SHOWMINIMIZED ? SW_SHOWNORMAL : wp.showCmd,
@@ -5373,7 +5400,8 @@ static void session_save(void) {
             snprintf(cmd, sizeof(cmd), "%s", tb->t.claude[0] ? "" : tb->t.cmd);   /* Claude comes back on its own */
             for (k = 0; cmd[k]; k++) if (cmd[k] == '\r' || cmd[k] == '\n') cmd[k] = ' ';
             fprintf(f, "\n[tab]\nview=%d\nkind=%s\ndir=%s\nclaude=%s\nclaude_args=%s\ncmd=%s\ntext=tab%d.txt\n", tb->t.view,
-                    tb->kind == TK_PS ? "powershell" : tb->kind == TK_CMD ? "cmd" : "wsl", tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude,
+                    !strcmp(tb->run, "files:") ? "files" : tb->kind == TK_PS ? "powershell" : tb->kind == TK_CMD ? "cmd" : "wsl",
+                    tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude,
                     tb->t.claude[0] ? tb->t.claude_args : "", cmd, n);
         }
         n++;
@@ -5421,6 +5449,10 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
     size_t n = 0;
     Tab *tb;
     if (g_ntabs >= MAX_TABS || !dir[0]) return;
+    if (!strcmp(kind, "files")) {   /* Files starts fresh in its folder */
+        if ((tb = files_tab_new(dir_exists(dir) ? dir : ""))) g_tabs[g_ntabs++] = tb;
+        return;
+    }
     char kept[400];
     if (!session_args_ok(args)) args = "";
     session_args_filter(args, kept, sizeof(kept));
@@ -5496,10 +5528,12 @@ static int session_restore(void) {
         else if (!strcmp(line, "cmd")) snprintf(cmd, sizeof(cmd), "%s", v);
         else if (!strcmp(line, "view")) view = atoi(v);
         else if (!strcmp(line, "text")) snprintf(text, sizeof(text), "%s", v);
+        else if (!strcmp(line, "ui")) ui_restore(v);
     }
     if (intab) session_add_tab(kind, dir, claude, args, cmd, text, view);
     free(d);
     if (g_ntabs) activate(active >= 0 && active < g_ntabs ? active : 0);
+    if (g_ntabs) ui_apply();
     return g_ntabs;
 }
 
@@ -5619,6 +5653,11 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
     GetWindowPlacement(g_hwnd, &wp);
     sb_printf(&b, "HARDCORE-ADOPT 1\nplacement %u %ld %ld %ld %ld\nactive %d\n", wp.showCmd,
               wp.rcNormalPosition.left, wp.rcNormalPosition.top, wp.rcNormalPosition.right, wp.rcNormalPosition.bottom, active);
+    {
+        char ui[1200];
+        ui_pack(ui, sizeof(ui));
+        blob_line(&b, "ui", ui);
+    }
     for (i = 0; i < n; i++) {
         Tab *tb = live[i];
         Term *t = &tb->t;
@@ -5643,6 +5682,7 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         blob_line(&b, "claude", t->claude);
         blob_line(&b, "claude_args", t->claude_args);
         blob_line(&b, "cmd", t->cmd);
+        blob_line(&b, "run", tb->run);
         WideCharToMultiByte(CP_UTF8, 0, t->title, -1, tmp, sizeof(tmp), NULL, NULL);
         blob_line(&b, "title", tmp);
         sb_printf(&b, "ps %d %d %d %d\n", t->ps_state, t->ps_pct, t->ps_tasks, t->progress);
@@ -5729,6 +5769,7 @@ static int adopt_tabs(void) {
         p = nl + 1;
         v = strchr(line, ' ');
         if (v) *v++ = 0; else v = line + strlen(line);
+        if (!strcmp(line, "ui")) { ui_restore(v); continue; }
         if (!strcmp(line, "tab")) {
             if (g_ntabs >= MAX_TABS) break;
             tb = (Tab *)calloc(1, sizeof(Tab));
@@ -5757,6 +5798,7 @@ static int adopt_tabs(void) {
         else if (!strcmp(line, "claude")) snprintf(tb->t.claude, sizeof(tb->t.claude), "%s", v);
         else if (!strcmp(line, "claude_args")) snprintf(tb->t.claude_args, sizeof(tb->t.claude_args), "%s", v);
         else if (!strcmp(line, "cmd")) snprintf(tb->t.cmd, sizeof(tb->t.cmd), "%s", v);
+        else if (!strcmp(line, "run")) snprintf(tb->run, sizeof(tb->run), "%s", v);
         else if (!strcmp(line, "title")) utf8_to_wide(v, tb->t.title, 256);
         else if (!strcmp(line, "ps")) sscanf(v, "%d %d %d %d", &tb->t.ps_state, &tb->t.ps_pct, &tb->t.ps_tasks, &tb->t.progress);
         else if (!strcmp(line, "ps_kind")) snprintf(tb->t.ps_kind, sizeof(tb->t.ps_kind), "%s", v);
@@ -5790,6 +5832,7 @@ static int adopt_tabs(void) {
         int i;
         activate(g_adopt_active >= 0 && g_adopt_active < g_ntabs ? g_adopt_active : 0);
         for (i = 0; i < g_ntabs; i++) if (i != g_active) g_tabs[i]->activity = 0;
+        ui_apply();
     }
     return g_ntabs;
 }
@@ -5824,9 +5867,7 @@ static void close_tab(int i) {
     Tab *tb;
     if (i < 0 || i >= g_ntabs) return;
     tb = g_tabs[i];
-#ifndef _WIN32
     if(tb->id==g_cutie_focus_id)mac_cutie_blur();
-#endif
     memmove(&g_tabs[i], &g_tabs[i + 1], sizeof(Tab *) * (g_ntabs - i - 1));
     g_ntabs--;
     if (!g_ntabs) {             /* the last tab: its folder is where the next window opens */
@@ -5924,7 +5965,7 @@ static int handle_keydown(WPARAM vk) {
     int shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     int alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
     int m = mods_param();
-    Tab *tb = active_tab();
+    Tab *tb = input_tab() ? input_tab() : active_tab();   /* a Cutie with the keyboard: its modes */
     char buf[32];
     const char *seq = NULL;
     int n = 0;
@@ -5949,6 +5990,12 @@ static int handle_keydown(WPARAM vk) {
        AltGr+7/8/9/0 is how you type { [ ] }, so it's never a tab jump */
     if (ctrl && alt && !(GetKeyState(VK_RMENU) & 0x8000) && vk >= '1' && vk <= '9') { activate(vk == '9' ? g_ntabs - 1 : (int)(vk - '1')); return 1; }
     if (shift && !ctrl && !alt) {
+        int slot = cutie_slot_for(g_cutie_focus_id);
+        if (slot >= 0 && (vk == VK_PRIOR || vk == VK_NEXT)) {
+            chrome_tv_scroll(slot, (vk == VK_PRIOR ? 1 : -1) * chrome_max(1, g_tvs[slot].state.rect.h - 3));
+            return 1;
+        }
+        if (slot >= 0 && (vk == VK_HOME || vk == VK_END)) { chrome_tv_scroll(slot, vk == VK_HOME ? INT_MAX : -INT_MAX); return 1; }
         switch (vk) {
         case VK_PRIOR: scroll_view(tb->t.rows - 1); return 1;
         case VK_NEXT: scroll_view(-(tb->t.rows - 1)); return 1;
@@ -6189,9 +6236,7 @@ static int mouse_report(int button, int press, int motion, int mx, int my, int m
     char buf[64];
     int col, row, b = button, n;
     if (!tb || !tb->t.m_mouse || (mods & M_SHIFT)) return 0;
-#ifndef _WIN32
     if (mac_input_held(tb)) return 1;
-#endif
     if (motion && tb->t.m_mouse != 1003 && !(tb->t.m_mouse == 1002 && button != 3)) return 1;
     if (motion && tb->t.m_mouse == 9) return 1;
     mouse_cell(mx, my, &col, &row);
@@ -7290,6 +7335,7 @@ static int reflow_bench(const char *out_path) {
 
 
 #include "hardcore_slurp.h"
+#include "hardcore_win_menu.h"
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -7312,6 +7358,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return TRUE;
     case WM_DESTROY:
         for (int i = 0; i < g_ntabs; i++) if (g_tabs[i]->slurp_hwnd) slurp_detach(g_tabs[i]);
+        media_quit();            /* a recording in progress is saved, not lost */
         /* No per-tab teardown: when this process exits its pseudoconsoles
            close, and conhost takes the shells down with it. Closing stays instant. */
         PostQuitMessage(0);
@@ -7366,6 +7413,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return font_menu_test_state(buf + 9);
             } else if (!strncmp(buf, "click ", 6)) {
                 settings_click(atoi(buf + 6), strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1);
+            } else if (!strncmp(buf, "press ", 6)) {   /* a left click, through the same path as the mouse's */
+                int x = atoi(buf + 6), y = strchr(buf + 6, ',') ? atoi(strchr(buf + 6, ',') + 1) : -1;
+                SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
+                SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
             } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);
             else if (!strncmp(buf, "tophover ", 9)) g_top_hover = atoi(buf + 9);
             else if (!strncmp(buf, "sel ", 4) && tb) {   /* sel Y0 X0 Y1 X1: select, in screen rows */
@@ -7405,6 +7457,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         GetClientRect(hwnd, &r);
         int chrome_hit = hit_tabbar(pt.x, pt.y, &idx);
         if (g_chrome_drag || (chrome_hit != HIT_NONE && chrome_hit != HIT_BAR)) return HTCLIENT;
+        if (mac_music_hit(pt.x, pt.y) || mac_camera_hit(pt.x, pt.y) || cutie_at(pt.x, pt.y) >= 0) return HTCLIENT;
         if (!IsZoomed(hwnd) && pt.y < 5 * g_scale) {
             int corner = 16 * g_scale;
             return pt.x < corner ? HTTOPLEFT : pt.x >= r.right - corner ? HTTOPRIGHT : HTTOP;
@@ -7476,12 +7529,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             GetCursorPos(&pt);
             ScreenToClient(hwnd, &pt);
             mouse_cell(pt.x, pt.y, &col, &row);
-            int idx = -1, hit = hit_tabbar(pt.x, pt.y, &idx);
-            if (g_chrome_drag || hit == HIT_GRIP) SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL));
-            else if (over_chrome(pt.x, pt.y)) SetCursor(LoadCursorW(NULL, (LPCWSTR)(tabbar_action(pt.x, pt.y) ? IDC_HAND : IDC_ARROW)));
-            else if ((GetKeyState(VK_CONTROL) & 0x8000) && link_at(col, row, url, sizeof(url)))
-                SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
-            else SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM));
+            (void)col; (void)row; (void)url;
+            win_pointer_cursor_at(pt.x, pt.y);
             return TRUE;
         }
         break;
@@ -7508,6 +7557,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_TIMER:
         if (wp == TIMER_THROB) { update_busy(1); return 0; }
+        if (wp == TIMER_MEDIA) { media_tick(); return 0; }
         if (wp == TIMER_DISK) { check_disk(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
@@ -7562,6 +7612,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
+    case WM_APP_MUSIC:
+        music_catalog_done((MusicCatalog *)lp);
+        return 0;
+    case WM_APP_CAMERA:
+        camera_changed();
+        return 0;
     case WM_APP_SLURP:
         if (wp) InterlockedExchange(&g_slurp_running, 0);
         else if (lp) slurp_receive((SlurpTarget *)lp);
@@ -7653,6 +7709,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             QueryPerformanceCounter(&g_lat_key);
         }
         if (msg == WM_SYSKEYDOWN && (wp == VK_F4 || wp == VK_SPACE) && !(GetKeyState(VK_CONTROL) & 0x8000)) break;
+        if (wp == VK_ESCAPE) {   /* Escape lets go of a drag, and the press stays harmless */
+            if (g_grid_drag_axis) { g_grid_drag_axis = 0; return 0; }
+            if (g_tv_drag_slot >= 0) { mac_tv_drag_end(); return 0; }
+            if (g_music_down) { mac_music_cancel_press(); return 0; }
+            if (g_camera_drag || g_camera_pending_action) { mac_camera_cancel_press(); plat_invalidate(); return 0; }
+        }
         if (handle_keydown(wp)) {
             MSG m;
             while (PeekMessageW(&m, hwnd, WM_CHAR, WM_CHAR, PM_REMOVE)) {}
@@ -7672,14 +7734,24 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_MOUSEMOVE: {
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), col, row;
-        int was_bar = g_mouse_y >= 0 && in_sidebar(g_mouse_x), on_bar = over_chrome(mx, my);
+        int was_bar = over_chrome(g_mouse_x, g_mouse_y) || chrome_any_tv_contains(g_mouse_x, g_mouse_y), on_bar;
         Tab *tb = active_tab();
         TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&tme);
+        if (g_nc_hover) { g_nc_hover = 0; InvalidateRect(hwnd, NULL, FALSE); }
+        if (wp & MK_LBUTTON) {   /* a left drag: whoever took the press keeps it */
+            if (mac_music_mouse(MEV_DRAG, mx, my, 0) || mac_camera_mouse(MEV_DRAG, mx, my, 0)) return 0;
+            if (g_grid_mouse_consumed) { mac_grid_drag(mx, my); return 0; }
+            if (g_tv_drag_slot >= 0) { mac_tv_drag_move(mx, my); return 0; }
+            if (g_cutie_mouse_consumed) return 0;
+        }
+        on_bar = over_chrome(mx, my) || chrome_any_tv_contains(mx, my);
         g_mouse_x = mx;
         g_mouse_y = my;
-        if (g_nc_hover) { g_nc_hover = 0; InvalidateRect(hwnd, NULL, FALSE); }
-        if (was_bar || on_bar) InvalidateRect(hwnd, NULL, FALSE);
+        mac_music_mouse(MEV_MOVE, mx, my, 0);
+        mac_camera_mouse(MEV_MOVE, mx, my, 0);
+        chrome_preview_pointer(mx, my);
+        if (was_bar || on_bar || g_grid_on) InvalidateRect(hwnd, NULL, FALSE);
         if (was_bar || on_bar) settings_point();
         if (g_chrome_drag) { chrome_drag_move(mx, my); return 0; }
         if (g_sb_drag) { scrollbar_set(my); return 0; }
@@ -7693,6 +7765,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
+        if ((wp & MK_RBUTTON) && (g_cutie_aux_buttons & 2)) return 0;
+        if (g_grid_on && grid_pane_at(mx, my) != g_active) return 0;   /* over another pane: not this one's motion */
         if (!on_bar && (wp & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON)))
             mouse_report((wp & MK_LBUTTON) ? 0 : (wp & MK_MBUTTON) ? 1 : 2, 1, 1, mx, my, mouse_mods(wp));
         else if (!on_bar && tb && tb->t.m_mouse == 1003)
@@ -7700,26 +7774,44 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSELEAVE:
+        if (GetCapture() == hwnd) return 0;
+        chrome_preview_cancel();
         g_mouse_x = g_mouse_y = -1;
         settings_point();
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
-        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), idx = -1, col, row, hit;
-        RECT r;
-        Tab *tb = active_tab();
-        if (chrome_drag_begin(mx, my)) { SetCapture(hwnd); return 0; }
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), idx = -1, col, row, hit, mods = mouse_mods(wp);
+        Tab *tb;
+        chrome_preview_cancel();
+        SetCapture(hwnd);        /* every press is followed to its release, whoever takes it */
+        if (mac_music_mouse(MEV_DOWN, mx, my, 0) || mac_camera_mouse(MEV_DOWN, mx, my, 0)) return 0;
+        if (cutie_at(mx, my) < 0) mac_cutie_blur();
+        if (mac_grid_down(mx, my)) return 0;
+        tb = active_tab();
+        if (mac_tv_drag_begin(mx, my)) return 0;
+        if (mac_cutie_click(mx, my, mods)) return 0;
+        mac_cutie_blur();
+        if (chrome_drag_begin(mx, my)) return 0;
         hit = hit_tabbar(mx, my, &idx);
+        if (hit != HIT_NONE) { g_cutie_mouse_consumed = 1; g_cutie_mouse_id = 0; }
+        if (hit == HIT_CUTIE) {
+            if (idx >= 0 && idx < g_ntabs) {
+                int slot = cutie_slot_for(g_tabs[idx]->id);
+                if (slot >= 0) { mac_cutie_blur(); chrome_tv_close_slot(slot); }
+                else if (chrome_tv_open_tab(g_tabs[idx]->id) < 0) MessageBeep(MB_OK);
+            }
+            return 0;
+        }
+        if (hit == HIT_GRID_HIDE) { grid_hide_tab(idx); return 0; }
         if (hit == HIT_TAB) { activate(idx); return 0; }
         if (hit == HIT_CLOSE) { close_tab(idx); return 0; }
-        if (hit == HIT_PLUS) { new_tab_here(); return 0; }
+        if (mac_header_action(hit)) return 0;
         if (chrome_setting_hit(hit)) { settings_click(mx, my); return 0; }
-        if (hit == HIT_BAR) return 0;
-        GetClientRect(hwnd, &r);
-        if (tb && mx >= term_ox() + tb->t.cols * CW - SCROLLBAR_W && mx < term_ox() + tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
+        if (hit == HIT_BAR || hit == HIT_CHROME_INERT) return 0;
+        if (tb && !g_grid_on && mx >= term_ox() + tb->t.cols * CW - SCROLLBAR_W && mx < term_ox() + tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
             g_sb_drag = 1;
-            SetCapture(hwnd);
             scrollbar_set(my);
             return 0;
         }
@@ -7729,7 +7821,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char url[2048];
             if (link_at(col, row, url, sizeof(url))) { open_url(url); return 0; }
         }
-        if (mouse_report(0, 1, 0, mx, my, mouse_mods(wp))) return 0;
+        if (mouse_report(0, 1, 0, mx, my, mods)) return 0;
         if (msg == WM_LBUTTONDBLCLK) {
             select_word(col, row);
             InvalidateRect(hwnd, NULL, FALSE);
@@ -7739,40 +7831,55 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_sel_drag = 1;
         g_sel_a_row = g_sel_b_row = term_base(&tb->t) + tb->t.hcount - tb->t.view + row;
         g_sel_a_col = g_sel_b_col = col;
-        SetCapture(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     }
     case WM_CAPTURECHANGED:
+        /* capture lost mid-press (Alt+Tab, a dialog): end the drag where it is */
+        if ((HWND)lp == hwnd) return 0;
         if (g_chrome_drag) chrome_drag_end();
+        if (g_tv_drag_slot >= 0) mac_tv_drag_end();
+        if (g_music_down) { mac_music_cancel_press(); g_music_down = 0; }
+        if (g_camera_down || g_camera_drag) { mac_camera_cancel_press(); g_camera_down = 0; }
+        g_grid_drag_axis = g_grid_mouse_consumed = 0;
+        g_cutie_mouse_consumed = 0;
+        g_sb_drag = g_sel_drag = 0;
         return 0;
-    case WM_LBUTTONUP:
-        if (g_chrome_drag) {
-            chrome_drag_move(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); chrome_drag_end(); ReleaseCapture(); return 0;
-        }
-        if (g_sb_drag || g_sel_drag) {
-            g_sb_drag = g_sel_drag = 0;
-            ReleaseCapture();
-            return 0;
-        }
-        mouse_report(0, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
+    case WM_LBUTTONUP: {
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), took = 1;
+        if (mac_music_mouse(MEV_UP, mx, my, 0) || mac_camera_mouse(MEV_UP, mx, my, 0)) {}
+        else if (g_grid_mouse_consumed) { mac_grid_drag(mx, my); g_grid_drag_axis = g_grid_mouse_consumed = 0; }
+        else if (g_tv_drag_slot >= 0) { mac_tv_drag_move(mx, my); mac_tv_drag_end(); mac_cutie_release(); }
+        else if (g_cutie_mouse_consumed) mac_cutie_release();
+        else if (g_chrome_drag) { chrome_drag_move(mx, my); chrome_drag_end(); }
+        else if (g_sb_drag || g_sel_drag) g_sb_drag = g_sel_drag = 0;
+        else took = 0;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (!took) mouse_report(0, 0, 0, mx, my, mouse_mods(wp));
         return 0;
+    }
     case WM_MBUTTONDOWN: {
-        int idx = -1;
-        if (hit_tabbar(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &idx) == HIT_TAB ||
-            hit_tabbar(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &idx) == HIT_CLOSE) {
-            close_tab(idx);
-            return 0;
-        }
-        mouse_report(1, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), idx = -1, hit;
+        if (g_tv_drag_slot >= 0 || mac_music_mouse(MEV_OTHER, mx, my, 0) || mac_camera_mouse(MEV_OTHER, mx, my, 0)) { g_cutie_aux_buttons |= 1; return 0; }
+        hit = hit_tabbar(mx, my, &idx);
+        if (hit == HIT_TAB || hit == HIT_CLOSE || hit == HIT_CUTIE) { g_cutie_aux_buttons |= 1; close_tab(idx); return 0; }   /* middle-click closes a tab */
+        if (cutie_at(mx, my) >= 0 || over_chrome(mx, my)) { g_cutie_aux_buttons |= 1; return 0; }
+        mac_cutie_blur();
+        mac_grid_point(mx, my);
+        mouse_report(1, 1, 0, mx, my, mouse_mods(wp));
         return 0;
     }
     case WM_MBUTTONUP:
+        if (g_cutie_aux_buttons & 1) { g_cutie_aux_buttons &= ~1; return 0; }
         mouse_report(1, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
-    case WM_RBUTTONDOWN:
-        if (over_chrome(GET_X_LPARAM(lp), GET_Y_LPARAM(lp))) return 0;
-        if (mouse_report(2, 1, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp))) return 0;
+    case WM_RBUTTONDOWN: {
+        int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        if (g_tv_drag_slot >= 0 || mac_music_mouse(MEV_OTHER, mx, my, 0) || mac_camera_mouse(MEV_OTHER, mx, my, 0) ||
+            cutie_at(mx, my) >= 0 || over_chrome(mx, my)) { g_cutie_aux_buttons |= 2; return 0; }
+        mac_cutie_blur();
+        mac_grid_point(mx, my);
+        if (mouse_report(2, 1, 0, mx, my, mouse_mods(wp))) return 0;
         /* conhost habit: right-click copies a selection, or pastes */
         if (g_sel_on) {
             sel_copy();
@@ -7780,21 +7887,39 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, NULL, FALSE);
         } else paste();
         return 0;
+    }
     case WM_RBUTTONUP:
+        if (g_cutie_aux_buttons & 2) { g_cutie_aux_buttons &= ~2; return 0; }
         mouse_report(2, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_MOUSEWHEEL: {
         short delta = (short)HIWORD(wp);
-        int notches = delta / 120, i;
+        int notches = delta / 120, i, cutie;
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        Tab *tb = active_tab();
+        Tab *tb;
         if (!notches) notches = delta > 0 ? 1 : -1;
         ScreenToClient(hwnd, &pt);
-        if (!tb || over_chrome(pt.x, pt.y)) return 0;
+        if (g_tv_drag_slot >= 0) return 0;
+        chrome_preview_cancel();
+        if (mac_music_mouse(MEV_WHEEL, pt.x, pt.y, notches) || mac_camera_mouse(MEV_WHEEL, pt.x, pt.y, notches)) return 0;
+        if (g_grid_on) {   /* the pane under the pointer scrolls, without taking the focus */
+            int index = grid_pane_at(pt.x, pt.y);
+            if (index >= 0 && index != g_active && !g_pointer_tab) {
+                g_pointer_tab = g_tabs[index];
+                SendMessageW(hwnd, msg, wp, lp);
+                g_pointer_tab = NULL;
+                return 0;
+            }
+        }
+        tb = pointer_tab();
+        if (!tb) return 0;
+        if ((cutie = cutie_at(pt.x, pt.y)) >= 0) { chrome_tv_scroll(cutie, notches * 3); return 0; }
+        if (over_chrome(pt.x, pt.y)) return 0;
         if (tb->t.m_mouse && !(GET_KEYSTATE_WPARAM(wp) & MK_SHIFT)) {
             for (i = 0; i < abs(notches); i++)
                 mouse_report(notches > 0 ? 64 : 65, 1, 0, pt.x, pt.y, mouse_mods(GET_KEYSTATE_WPARAM(wp)));
         } else if (tb->t.alt) {
+            if (mac_input_held(tb)) return 0;
             /* alternate scroll: less, man, git log scroll with the wheel */
             const char *seq = notches > 0 ? (tb->t.m_appcursor ? "\x1bOA" : "\x1b[A") : (tb->t.m_appcursor ? "\x1bOB" : "\x1b[B");
             for (i = 0; i < abs(notches) * 3; i++) tab_write(tb, seq, 3);

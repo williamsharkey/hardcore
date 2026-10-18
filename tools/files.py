@@ -275,7 +275,15 @@ def open_external(path, preview=False):
     if sys.platform != "darwin":
         if preview:
             raise ValueError("Quick Look is available on macOS; press p for text preview")
-        command = ["xdg-open", str(absolute(path))]
+        if os.environ.get("WSL_DISTRO_NAME"):
+            # In hardcore on Windows: Windows opens it, with its default app
+            windows = subprocess.run(["wslpath", "-w", str(absolute(path))], stdin=subprocess.DEVNULL,
+                                     capture_output=True, text=True, timeout=5)
+            if windows.returncode or not windows.stdout.strip():
+                raise ValueError("Windows can't see this path")
+            command = ["explorer.exe", windows.stdout.strip()]
+        else:
+            command = ["xdg-open", str(absolute(path))]
     else:
         command = ["qlmanage", "-p", str(absolute(path))] if preview else ["open", str(absolute(path))]
     subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

@@ -1,6 +1,4 @@
-#ifndef _WIN32
 static void chrome_tv_prepare(Term *t);
-#endif
 /* Display-only chrome reflow. The terminal and scrollback remain authoritative;
    moved cells carry source addresses so selection and copying use real text. */
 static int chrome_background_safe(const Cell *c) {
@@ -238,9 +236,7 @@ static void chrome_autoplace_prepare(Term *t, const Cell *input, const unsigned 
     hash = chrome_motion_hash(hash, protected_rows, (size_t)t->rows);
     held = (!g_focused && !(getenv("HARDCORE_CTL") && test && !strcmp(test, "1"))) ||
            g_chrome_drag || chrome_hovered() || chrome_preview_active() || g_sel_on || g_sel_drag || g_sb_drag;
-#ifndef _WIN32
     held=held || chrome_any_tv_hovered() || g_cutie_focus_id>0 || g_tv_drag_slot>=0;
-#endif
     blocked = held || (uint32_t)(now - g_chrome_input_at) < 700;
     action = cm_observe(&g_chrome_motion, now, hash, chrome_motion_context(t),
                          g_tab_underlay, g_chrome.top, blocked);
@@ -335,16 +331,12 @@ static void chrome_prepare_display_at(Term *t, int dock_x, int dock_y, int dock_
     chrome_prepare_display_internal(t, dock_x, dock_y, dock_height, 0);
 }
 static void chrome_prepare_display(Term *t) {
-#ifndef _WIN32
     chrome_tv_clock();
-#endif
     tab_layout();
     chrome_prepare_display_internal(t, sidebar_x()/CW, g_chrome.top, g_chrome.bottom-g_chrome.top, 1);
-#ifndef _WIN32
     chrome_tv_prepare(t);
     mac_camera_layout(t);
     mac_music_layout(t);
-#endif
 }
 
 static void display_cursor_position(const Term *t, int *col, int *row) {

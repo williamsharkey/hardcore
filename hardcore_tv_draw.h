@@ -1,6 +1,5 @@
 /* Render each TV through the same bitmap/menu word-packing path. A surface
  * owns its last-frame hit map, opacity, geometry, and exposed corners. */
-#ifndef _WIN32
 static int chrome_cutie_highlighted(int slot) {
     if(slot<HC_TV_CUTIE_FIRST || slot>=HC_TV_COUNT)return 0;
     const ChromeTv *tv=g_tvs+slot;Tab *selected=active_tab();
@@ -121,4 +120,3 @@ static void render_cuties(int win_w) {
     render_tvs_range(HC_TV_CUTIE_FIRST,HC_TV_COUNT);
     g_chrome_base_alpha=base;g_draw_alpha=alpha;g_clip_w=clip;UI_DONE;
 }
-#endif

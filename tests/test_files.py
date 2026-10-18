@@ -252,6 +252,16 @@ class PreviewAndRenderingTests(OwnedFolder):
             files.open_external(path, preview=True)
             self.assertEqual(launch.call_args.args[0], ["qlmanage", "-p", str(path)])
 
+    def test_external_open_in_wsl_hands_windows_its_own_path(self):
+        path = self.root / "-$(touch INJECTION); café.txt"
+        done = mock.Mock(returncode=0, stdout="C:\\x\\-$(touch INJECTION); café.txt\n")
+        with mock.patch.object(files.sys, "platform", "linux"), mock.patch.dict(files.os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}), \
+             mock.patch.object(files.subprocess, "run", return_value=done) as convert, mock.patch.object(files.subprocess, "Popen") as launch:
+            files.open_external(path)
+            self.assertEqual(convert.call_args.args[0], ["wslpath", "-w", str(path)])
+            self.assertEqual(launch.call_args.args[0], ["explorer.exe", "C:\\x\\-$(touch INJECTION); café.txt"])
+            self.assertNotIn("shell", launch.call_args.kwargs)
+
 
 class BrowserTests(OwnedFolder):
     def test_history_and_selection_survive_back_and_forward(self):

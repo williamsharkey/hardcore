@@ -1,6 +1,5 @@
 /* Place secondary TVs against the primary display result. Twelve anchors per
  * surface, at most six surfaces, and one bounded reflow per accepted surface. */
-#ifndef _WIN32
 #include "hardcore_tv_reflow.h"
 static int chrome_tv_build(ChromeReflow *out,const Cell *input,int cols,int rows,
                            const unsigned char *protected_rows,int cursor,HcTvRect r,void *ctx) {
@@ -240,4 +239,3 @@ static void chrome_tv_prepare(Term *t) {
         plat_timer(TIMER_TV,(int)delay);
     }
 }
-#endif

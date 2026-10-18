@@ -1,6 +1,5 @@
 /* Persistent miniature views. Authoritative terminals and browser grids remain
  * untouched; only explicitly focused Cuties receive keyboard input. */
-#ifndef _WIN32
 #include "hardcore_cutie_project.h"
 typedef struct {
     HcCutieProjection view;
@@ -100,4 +99,3 @@ static int cutie_source_at(int slot,int mx,int my,int *col,int *row,int *node) {
     if(memcmp(c->input+source,t->row[t->alt][*row]+*col,sizeof(Cell)))return 0;
     return 1;
 }
-#endif

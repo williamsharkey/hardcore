@@ -20,7 +20,7 @@ UNAME := $(shell uname -s)
 CC      ?= x86_64-w64-mingw32-gcc
 WINDRES ?= x86_64-w64-mingw32-windres
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
-LIBS     = -mwindows -municode -ld3d11 -ldxgi -luuid -lgdi32 -luser32 -lkernel32 -lshell32 -lwinhttp -lbcrypt -static
+LIBS     = -mwindows -municode -ld3d11 -ldxgi -luuid -lmfuuid -lole32 -lgdi32 -luser32 -lkernel32 -lshell32 -lwinhttp -lbcrypt -static
 
 ifeq ($(origin CC),default)
 CC = x86_64-w64-mingw32-gcc
@@ -120,7 +120,7 @@ build/slurp-version.h: build/slurp-linux
 # which commit a build is (hardcore --version); the release number is HARDCORE_VERSION in hardcore.c
 BUILD := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
 
-hardcore.exe: hardcore.c hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
+hardcore.exe: hardcore.c hardcore_win_menu.h hardcore_win_music.h hardcore_win_camera.h hardcore_win_capture.h hardcore_win_browser.h tools/files.py hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		-DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c build/res.o $(LIBS)
 

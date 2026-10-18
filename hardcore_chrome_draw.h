@@ -62,7 +62,6 @@ static int chrome_join_mask(int x,int cols,int top,int bottom,int other_x,int ot
 }
 static void chrome_prepare_edges(ChromeLayout primary,int primary_x,float primary_alpha) {
     int mask=0;
-#ifndef _WIN32
     if(primary_alpha>0)
         mask|=chrome_join_mask(g_chrome_x,g_chrome_surface_cols,g_chrome.top,g_chrome.bottom,
                                primary_x,SB_COLS,primary.top,primary.bottom);
@@ -71,9 +70,6 @@ static void chrome_prepare_edges(ChromeLayout primary,int primary_x,float primar
         if(tv->state.open && tv->state.placed && tv->state.alpha*tv->motion.alpha>0)
             mask|=chrome_join_mask(g_chrome_x,g_chrome_surface_cols,g_chrome.top,g_chrome.bottom,r.x*CW,r.w,r.y,r.y+r.h);
     }
-#else
-    (void)primary;(void)primary_x;(void)primary_alpha;
-#endif
     g_chrome_join_top=mask&1;g_chrome_join_bottom=(mask&2)!=0;
 }
 static int chrome_corner_inset(int y) {
@@ -189,7 +185,6 @@ static void chrome_round_edges(void) {
         if(g_chrome_x+width<g_clip_w)fill_rect((float)(width-inset-1),(float)y,(float)(width-inset),(float)(y+1),g_look.dim,1);
     }
 }
-#ifndef _WIN32
 /* A second one-device-pixel outline leaves one untouched pixel between the
  * strokes. Its smaller corner radius shares the outer outline's center. */
 static void chrome_inner_frame(uint32_t color) {
@@ -220,7 +215,6 @@ static void chrome_inner_frame(uint32_t color) {
         }
     }
 }
-#endif
 static void chrome_sides(int row, uint32_t color) {
     float y = row_y(row), w = (float)chrome_draw_width();
     fill_rect(0, y, 1, y + CH, color, 1);
@@ -334,7 +328,6 @@ static void chrome_button_outline(int col,int width,int row) {
     fill_rect(x,y,right,y+1,g_look.dim,.45f);fill_rect(x,bottom-1,right,bottom,g_look.dim,.45f);
     fill_rect(x,y,x+1,bottom,g_look.dim,.45f);fill_rect(right-1,y,right,bottom,g_look.dim,.45f);
 }
-#ifndef _WIN32
 /* Pixel-drawn transport icons avoid mixed fallback font widths/baselines. */
 static void chrome_music_icon(int action,int col,int width,int row,uint32_t color) {
     int cx=(col*2+width)*CW/2,cy=row*CH+CH/2,r=chrome_min(6,chrome_max(3,CH/5));
@@ -348,17 +341,8 @@ static void chrome_music_icon(int action,int col,int width,int row,uint32_t colo
         if(action==HIT_MUSIC_NEXT)fill_rect(cx+r+3,cy-r,cx+r+4,cy+r+1,color,1);
     }
 }
-#endif
 static void chrome_render_header(int hover) {
     if (!g_chrome.grip_rows) return;
-#ifdef _WIN32
-    chrome_row_fill(g_chrome.top, 0, 0);
-    if (hover == HIT_GRIP || g_chrome_drag)
-        fill_rect((float)CW, row_y(g_chrome.top), (float)(2 * CW), row_y(g_chrome.top + 1), TAB_HOVER, 1);
-    grid_text(L"↕", 1, g_chrome.top, hover == HIT_GRIP || g_chrome_drag ? g_look.text : g_look.detail);
-    grid_text(L"hardcore", 3, g_chrome.top, g_look.detail);
-    chrome_frame(g_chrome.top, g_look.dim);
-#else
     for (int row = 0; row < g_chrome.grip_rows; row++) {
         int y = g_chrome.top + row;
         chrome_row_fill(y, 0, 0);
@@ -405,7 +389,6 @@ static void chrome_render_header(int hover) {
         if (!row) chrome_frame(y, g_look.dim);
         else chrome_sides(y, g_look.dim);
     }
-#endif
 }
 static void render_tabbar(int win_w, int win_h) {
     int i, idx = -1, hover = HIT_NONE;
@@ -441,13 +424,11 @@ static void render_tabbar(int win_w, int win_h) {
         r_color(tb->t.ps_state == PS_ERROR ? g_look.red : tb->attention || tb->t.ps_state == PS_BLOCKED || tb->busy ? AMBER : fg, 1);
         draw_glyph(tb->busy ? drip : tb->t.ps_state == PS_BLOCKED || tb->t.ps_state == PS_ERROR || tb->attention ? '!' : active ? 0x25CF : tb->activity ? 0x00B7 : ' ',
                    (float)(left * CW), row_y(row), 1, g_scale);
-        #ifndef _WIN32
         int cutie_open=chrome_tv_slot_for(tb->id)>=0;
         if(g_grid_on)grid_text(grid_hidden(tb->id)?L"show":L"hide",SB_COLS-7,row,hover==HIT_GRID_HIDE && idx==tab?AMBER:g_look.detail);
         if (!g_grid_on && (hovered || cutie_open))
             grid_text(hovered && cutie_open?L"−":L"□", SB_COLS - 4, row,
                       hover == HIT_CUTIE && idx == tab ? AMBER : g_look.text_lo);
-        #endif
         if (hovered) grid_text(L"×", SB_COLS - 2, row, hover == HIT_CLOSE && idx == tab ? g_look.red : g_look.dim);
         chrome_sides(row, g_look.dim);
         if (!i) chrome_rule(row, g_look.dim);
@@ -468,9 +449,7 @@ static void render_tabbar(int win_w, int win_h) {
     }
     chrome_round_edges();
     chrome_capture_end(g_grid_on || chrome_hovered() || !g_tab_underlay);
-#ifndef _WIN32
     render_tvs();
-#endif
     g_clip_w=clip;
     g_draw_alpha = saved_alpha;
 #ifdef _WIN32

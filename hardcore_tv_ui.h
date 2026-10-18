@@ -1,5 +1,4 @@
 /* Separate, bounded secondary chrome surfaces. Included after chrome helpers. */
-#ifndef _WIN32
 #include "hardcore_tv.h"
 typedef struct {
     ChromePackRow *rows;
@@ -173,4 +172,3 @@ static int chrome_tv_hit(int mx,int my,int *idx) {
     }
     return HIT_NONE;
 }
-#endif
