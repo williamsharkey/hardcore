@@ -33,5 +33,18 @@ int main(void) {
     hc_grid_move(&g,1,1,50);assert(g.x[1]==50);
     hc_grid_build(&g,9,240,120);assert(g.x[1]==100);
     hc_grid_build(&g,8,120,60);assert(g.extra==1 && g.rect[0].w==80);
-    puts("Grid geometry: coverage, bounds, no overlap, row order, expansion and resizing passed");
+    /* A dragged divider survives a window that narrows for a moment (wezterm#5011),
+       and the rows dragged with it */
+    memset(&g,0,sizeof(g));hc_grid_build(&g,9,120,60);
+    hc_grid_move(&g,1,1,50);hc_grid_move(&g,0,1,30);
+    hc_grid_build(&g,9,25,60);assert(g.cols==2 && g.rows==5);
+    hc_grid_build(&g,9,120,60);assert(g.x[1]==50 && g.y[1]==30);
+    /* No pane is left only a title row while narrower panes would fit (wezterm#4878) */
+    for(int n=1;n<=64;n++)for(int w=1;w<=250;w+=3)for(int h=1;h<=90;h+=3) {
+        memset(&g,0,sizeof(g));hc_grid_build(&g,n,w,h);check(&g);
+        if(n<=(w/6)*(h/2))for(int i=0;i<n;i++)assert(g.rect[i].h>=2 && g.rect[i].w>=6);
+    }
+    memset(&g,0,sizeof(g));hc_grid_build(&g,20,52,23);
+    for(int i=0;i<20;i++)assert(g.rect[i].h>=2);
+    puts("Grid geometry: coverage, bounds, no overlap, row order, expansion, resizing, kept layouts and readable panes passed");
 }

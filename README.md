@@ -207,7 +207,14 @@ hairline dividers to resize columns and rows. Each pane has one title/action row
 grid without closing its session. Use **show** in the tab menu to bring it back.
 When the last row would have empty cells, the first pane spans the extra space;
 **Expand** on another pane or **Expand: N** in the menu changes that choice.
-Expansion controls appear only when spare cells exist. Settings, music, camera,
+Expansion controls appear only when spare cells exist. Moving between panes
+moves focus as switching tabs does: programs that asked for focus events hear
+them. Mouse reports are relative to the pane. Scrolling over a pane scrolls it
+and leaves focus where it was, and right or middle clicks and drops go to the
+pane under the pointer. A pane whose tab wants you shows **!** after its
+number. A window too short for every pane's text narrows the panes first, and a
+divider you dragged returns to where you put it after the window is briefly
+too narrow for that layout. Settings, music, camera,
 and CAF use a reserved side rail so opening them leaves the terminal grid fixed.
 When height is tight, Config/Music/Cam/CAF selectors share the rail between open panels.
 Duplicate Cutie previews resume on returning to Normal. Browser panes use cached
@@ -859,7 +866,13 @@ precedence, and then sessions aren't tracked.
 
 The wrapper also remembers the flags you started Claude with
 (`--dangerously-skip-permissions`, `--model opus`, …), but not the session flags
-or the first prompt, so that prompt isn't sent again.
+or the first prompt, so that prompt isn't sent again. A restore starts Claude
+again with only the flags that choose a model or narrow what it may do
+(`--model`, `--effort`, `--fallback-model`, `--name`, `--disallowedTools`,
+`--max-budget-usd`, `--verbose`, `--debug`, …). The flags arrive in an escape
+sequence any program's output could also send, so ones that widen what Claude
+may do (permissions, system prompts, tools, settings, MCP, plugins, added
+directories) are yours to add again.
 
 On close, hardcore writes `%LOCALAPPDATA%\hardcore\session\`: `session.txt`
 (each tab's shell, folder, Claude session and flags) plus each tab's last 3,000
@@ -1333,7 +1346,7 @@ experimental takeover suite are documented in
   | Cmd+J | Jump to the tab that needs you |
   | Cmd+↑ / ↓ | Previous / next prompt or Claude turn |
   | Cmd+C, Cmd+V | Copy, paste (an image pastes as a saved PNG's path; Claude Code's own Ctrl+V image paste still works) |
-  | Cmd+click | Open a link |
+  | Cmd+click | Open a link. Web and mail links open; a file that would run when opened (`.command`, `.app`, …) is shown in Finder instead; any other scheme (`vscode:`, …) asks first |
   | Left Option | Meta: Option+B/F/D/Backspace, Option+←/→ by word, Option+Enter for a newline in Claude Code |
   | Right Option | Types é, ü, @, { and the rest, as usual |
   | Cmd+←/→, Cmd+Backspace | Start / end of line, delete to start of line |
@@ -1343,6 +1356,8 @@ experimental takeover suite are documented in
   with claude, vim or a build in the foreground asks before it closes. A
   tab sitting at a prompt just closes.
 - Pasted images go to `~/Library/Application Support/hardcore/pasted`.
+- A paste sends text, tabs and line ends. Control characters in it (ESC,
+  which could end bracketed paste early, and ^C, ^D, ^Z, DEL, C1) are dropped.
 
 `HARDCORE_CTL=/path/fifo` turns on a test channel. It's the Mac side of
 `termbench`: `type`, `key`, `cmd`, `snap` and `winid` lines drive a window
@@ -1389,7 +1404,7 @@ process with private settings and shell history.
 | Shift+Insert / Ctrl+Insert | Paste / copy |
 | Drag / double-click | Select / select word (hold Shift to select inside mouse-aware apps) |
 | Shift+PgUp / Shift+PgDn, mouse wheel | Scrollback |
-| Ctrl+click | Open a link: an OSC 8 hyperlink (dotted underline) or a URL in the text. `file:///mnt/c/…` opens in Explorer |
+| Ctrl+click | Open a link: an OSC 8 hyperlink (dotted underline) or a URL in the text. `file:///mnt/c/…` opens in Explorer; a program (`.exe`, `.bat`, `.lnk`, …) is selected in Explorer rather than run; any other scheme asks first |
 | Drop files from Explorer | Types their WSL paths, quoted if needed: `'/mnt/c/My Stuff/a.png'`, `\\wsl.localhost\Debian\home\x` → `/home/x` |
 | Shift+Enter | Sends ESC CR: a newline in Claude Code instead of submitting |
 | Ctrl+Backspace | Delete the previous word (^W) |
@@ -1547,8 +1562,10 @@ comparison.
   parser (`hardcore.exe --replay`) and diffs against screens captured from real
   xterm. All 71 pass.
 - `--unit` includes `unit_issues`: bug reports from the Ghostty, Alacritty/vte,
-  kitty and WezTerm trackers, as bytes in and the screen expected out. They
-  cover:
+  kitty and WezTerm trackers and esctest and libvterm, as bytes in and the
+  screen expected out. [issues/other-terminals.md](issues/other-terminals.md)
+  lists each round's sources, what is still open, and those projects' features
+  with a recommendation for each. They cover:
   - the pending wrap and `ESC 7` across a resize;
   - erase ending a row's soft wrap;
   - stray DCS strings and CAN/SUB;
@@ -1557,12 +1574,26 @@ comparison.
   - half wide characters;
   - the scrolled-back view with full scrollback;
   - repeated synchronized-output begins;
-  - long OSCs.
+  - long OSCs;
+  - VPA in origin mode, DECALN, RIS and the alternate screen, G1 with SO/SI;
+  - REP capped at a screenful, C1 controls sent as UTF-8;
+  - DECRQCRA unanswered outside tests, links that would run a program,
+    Claude flags a restore may start, pasted control characters;
+  - copying around a wrapped wide character.
+- `tests/test_grid_layout.c` checks grid geometry for every pane count and
+  size; `tests/test_grid_stress_mac.py` puts a 12-pane grid with real programs
+  through a resize storm, tiny windows, extreme divider drags, focus and mouse
+  reports, scrolling, output floods, closing and hiding.
+  `tests/test_input_mac.py` checks keys during input-method composition, Ctrl
+  on a Cyrillic layout, F13–F20, motion reports, descriptors a shell inherits
+  and a shell that exits with a job still writing.
 - `bench/compare-mac.py` measures hardcore against other terminals on a Mac.
   It times floods to the terminal's DSR answer and samples CPU and memory from
   outside, so it needs no Screen Recording or Accessibility permission.
 - `bench/run-esctest.sh` runs [esctest2](https://github.com/ThomasDickey/esctest2)
-  inside a live window: 273 passing, against 90 for Windows Terminal.
+  inside a live window: 273 passing, against 90 for Windows Terminal. esctest
+  reads the screen with DECRQCRA, which a window answers only when started with
+  `HARDCORE_ALLOW_READBACK=1`.
 - `bench/termbench.exe send|cmd|snap` drives a hardcore window over
   WM_COPYDATA. It types, opens tabs and snapshots hardcore's own back buffer,
   all without focus or synthetic input. Start the window with
@@ -1582,7 +1613,7 @@ hardcore grew out of dumbterm, an earlier terminal for Windows 7.
 | | dumbterm (W7) | hardcore (W11) |
 |---|---|---|
 | Child I/O | anonymous pipes + `--require` JS shim faking `isTTY` | ConPTY: a real pty for the WSL shell, using Windows Terminal's OpenConsole (bundled, MIT) rather than the slow inbox conhost |
-| VT parser | cursor/erase/SGR | adds scroll regions, IL/DL/ICH/DCH/ECH, SL/SR, DECIC/DECDC, tab stops, alt screen (1049), DEC line drawing, DECSC/DECRC, RIS/DECSTR, LNM, DSR/DA/DECRQM/DECRQCRA replies, mouse (1000/1002/1003/1006), bracketed paste, focus events, sync output (2026), OSC 0/2/7/8/9;9/10/11/52, cursor shapes |
+| VT parser | cursor/erase/SGR | adds scroll regions, IL/DL/ICH/DCH/ECH, SL/SR, DECIC/DECDC, tab stops, alt screen (1049), DEC line drawing (G0 and G1 with SO/SI), DECSC/DECRC, RIS/DECSTR, LNM, DSR/DA/DECRQM replies (DECRQCRA for esctest only), mouse (1000/1002/1003/1006), bracketed paste, focus events, sync output (2026), OSC 0/2/7/8/9;9/10/11/52, cursor shapes |
 | Glyphs | 609-glyph Unifont subset in a header | Unifont 18.0.01, planes 0–3 (115k glyphs, all 1,219 emoji-presentation characters), uploaded to a GPU atlas the first time each glyph is drawn |
 | Wide chars | squeezed into one cell | real 2-cell CJK and emoji widths; 16-px symbols in 1-cell slots are still shrunk the dumbterm way |
 | Renderer | immediate-mode GL, amber cursor and scrollbar | the same immediate-mode drawing on Direct3D 11 (flip-model swap chain, one Draw per frame); it redraws only when something changes |

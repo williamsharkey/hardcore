@@ -68,9 +68,16 @@ static int grid_title_action(HcGridRect r,int mx) {
     if(g_grid.extra && r.w>=24 && col>=r.w-19 && col<r.w-13)return 3;
     return 0;
 }
+/* The title's last column: left of whichever of Expand, Hide and Solo the pane shows */
+static int grid_title_end(HcGridRect r) {
+    return r.w>=24 && g_grid.extra?r.w-22:r.w>=14?r.w-13:chrome_max(1,r.w-7);
+}
 static void grid_pane_title(Tab *tb,int index,HcGridRect r,wchar_t *title) {
-    wchar_t label[256];tab_label_fit(tb,label,256,chrome_max(1,r.w-21));
-    _snwprintf(title,280,L"%d %ls",index+1,label);
+    /* A pane that wants you is marked as the tab menu marks it */
+    int mark=tb->attention || tb->t.ps_state==PS_BLOCKED || tb->t.ps_state==PS_ERROR;
+    wchar_t number[16];int digits=_snwprintf(number,16,mark?L"%d!":L"%d",index+1);
+    wchar_t label[256];tab_label_fit(tb,label,256,chrome_max(1,grid_title_end(r)-digits-1));
+    _snwprintf(title,280,L"%ls %ls",number,label);
 }
 static void grid_draw_cells(Tab *tb,int index,HcGridRect rect) {
     Term *t=&tb->t;int width=rect.w,height=rect.h-1;
@@ -118,6 +125,7 @@ static void grid_draw_cells(Tab *tb,int index,HcGridRect rect) {
     if(tb==active_tab() && tb->kind!=TK_BROWSER && !t->view && t->m_cursor_vis && t->cx<width && t->cy<height) {
         int x=x0+t->cx*CW,y=y0+t->cy*CH;
         fill_rect(x,y+CH-2,x+CW,y+CH,AMBER,1);
+        draw_preedit(x,y,width-t->cx);
     }
 }
 static void render_grid(int win_w,int win_h) {
@@ -136,8 +144,7 @@ static void render_grid(int win_w,int win_h) {
         int x=r.x*CW,y=r.y*CH,right=(r.x+r.w)*CW;
         fill_rect(x,y,right,y+CH,BAR_BG,1);
         wchar_t title[280];grid_pane_title(tb,index,r,title);
-        int end=r.w>=24?(g_grid.extra?r.w-22:r.w-14):chrome_max(1,r.w-14);
-        draw_label(title,x+CW,y,end*CW,tb==active_tab()?AMBER:g_look.text_lo);
+        draw_label(title,x+CW,y,grid_title_end(r)*CW,tb==active_tab()?AMBER:g_look.text_lo);
         draw_label(L"Solo",(r.x+r.w-5)*CW,y,4*CW,g_look.detail);
         if(r.w>=14)draw_label(L"Hide",(r.x+r.w-11)*CW,y,4*CW,g_look.detail);
         if(g_grid.extra && r.w>=24)draw_label(L"Expand",(r.x+r.w-19)*CW,y,6*CW,i?g_look.detail:AMBER);

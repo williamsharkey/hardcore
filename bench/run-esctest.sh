@@ -2,6 +2,8 @@
 # bench/run-esctest.sh NAME termbench-window-args...   (run from WSL, outside the terminal)
 # Types an esctest2 run into the target terminal and prints its summary.
 # esctest talks to the terminal through its own tty, so it must run inside it.
+# It reads the screen back with DECRQCRA, which hardcore answers only when the
+# window was started with HARDCORE_ALLOW_READBACK=1 in its environment.
 name=$1; shift
 [ -d /tmp/esctest2 ] || git clone -q --depth 1 https://github.com/ThomasDickey/esctest2.git /tmp/esctest2
 rm -f /tmp/esc-$name.done

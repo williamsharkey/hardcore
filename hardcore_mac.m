@@ -302,6 +302,7 @@ static int g_lat;                /* HARDCORE_LAT=1: per key, to stderr, when the
 static double g_lat_key, g_lat_out, g_lat_down, g_lat_written;
 static void trace(const char *what);
 static int g_tracing, g_frames, g_trace_commit;
+static unsigned g_paints;   /* frames drawn, for tests: output in a pane that isn't focused must cause one */
 static double g_trace_tab_t;     /* when the last Cmd+T came in */
 static double uptime_ms(void);
 static double g_t_exec;
@@ -978,9 +979,25 @@ static int spare_ok(void) {
 }
 
 /* in the child, after forkpty: start the shell in dir (a spare waits to be told) */
+/* The child keeps nothing of the app's but its pty: not the other tabs'
+   ptys, sockets, lock files or the test control FIFO (kitty, foot). Listed
+   rather than closed up to the limit, which can be 65536 calls. */
+static void close_inherited(void) {
+    struct proc_fdinfo fds[1024];
+    int bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fds, sizeof(fds)), i;
+    if (bytes > 0 && bytes < (int)sizeof(fds)) {
+        for (i = 0; i < bytes / (int)PROC_PIDLISTFD_SIZE; i++) if (fds[i].proc_fd > 2) close(fds[i].proc_fd);
+    } else {
+        struct rlimit rl;
+        int top = getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < 65536 ? (int)rl.rlim_cur : 65536;
+        for (i = 3; i < top; i++) close(i);
+    }
+}
+
 static void exec_shell(const char *dir, int spare, int tab_id) {
     char cwd[MAX_PATH], zdir[MAX_PATH], argv0[256], rc[MAX_PATH];
     const char *base = shell_base();
+    close_inherited();
     expand_home(dir, cwd, sizeof(cwd));
     if (chdir(cwd) != 0 && (!getenv("HOME") || chdir(getenv("HOME")) != 0)) chdir("/");
     child_env();
@@ -1259,11 +1276,12 @@ static void on_output(void) {
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         if (tab_drain(tb) <= 0) continue;
-        if(tb==display_tab() || cutie_slot_for(tb->id)>=0)changed=1;
+        int shown=grid_index(tb->id)>=0;   /* every grid pane is on screen */
+        if(tb==display_tab() || cutie_slot_for(tb->id)>=0 || shown)changed=1;
         if (i == g_active) {
             changed = 1;
             if (g_lat && g_lat_key && !g_lat_out) g_lat_out = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6;
-        } else if (!tb->activity) {
+        } else if (!tb->activity && !shown) {
             tb->activity = 1;
             changed = 1;
         }
@@ -1324,11 +1342,17 @@ static void on_tab_exited(int id, int code) {
     }
     if (!tb) return;             /* already closed: this was just the reaping */
     if (tb->fd >= 0) {           /* whatever it said last */
+        uint64_t until = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 50000000ull;
+        long total = 0;
+        int n;
         fcntl(tb->fd, F_SETFL, O_NONBLOCK);
         while (tb->fd >= 0) {
-            int before = tb->in_n;
             read_some(tb);
-            if (tb->in_n == before) break;
+            if (!(n = tab_drain(tb))) break;
+            /* the shell's last words get 50 ms or 8 MB: anything still writing
+               (macOS revokes the tty as the shell exits, so a job left behind
+               usually stops) mustn't keep the main queue reading forever */
+            if ((total += n) > PIN_MAX || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) > until) break;
         }
         stop_reading(tb);
     }
@@ -1535,9 +1559,25 @@ static void paste(void) {
 static void open_url(const char *url) {
     NSString *s = [NSString stringWithUTF8String:url];
     NSURL *u = s ? [NSURL URLWithString:s] : nil;
+    int action = link_action(url);
     if (!u && s && [s hasPrefix:@"file://"])    /* unescaped spaces and such */
         u = [NSURL fileURLWithPath:[[s substringFromIndex:7] stringByRemovingPercentEncoding] ?: [s substringFromIndex:7]];
-    if (u) [[NSWorkspace sharedWorkspace] openURL:u];
+    if (!u || action == LINK_REFUSE) { NSBeep(); return; }
+    /* a file with its execute bit (a script without an extension) runs when opened too */
+    if (action == LINK_OPEN && u.isFileURL) {
+        BOOL dir = NO;
+        if ([NSFileManager.defaultManager fileExistsAtPath:u.path isDirectory:&dir] && !dir &&
+            [NSFileManager.defaultManager isExecutableFileAtPath:u.path]) action = LINK_REVEAL;
+    }
+    if (action == LINK_REVEAL) { [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[u]]; return; }
+    if (action == LINK_ASK) {
+        NSAlert *a = [[[NSAlert alloc] init] autorelease];
+        a.messageText = @"Open this link?";
+        a.informativeText = [NSString stringWithFormat:@"It opens in the app registered for it:\n\n%@", s];
+        [a addButtonWithTitle:@"Open"]; [a addButtonWithTitle:@"Cancel"];
+        if ([a runModal] != NSAlertFirstButtonReturn) return;
+    }
+    [[NSWorkspace sharedWorkspace] openURL:u];
 }
 
 /* ── tabs the Mac way ──────────────────────────────────────────────── */
@@ -1608,12 +1648,17 @@ static void mac_record_file_viewer(NSString *path) {
         path=path.stringByDeletingLastPathComponent;
     if(path.length)mac_files_at(path.fileSystemRepresentation);
 }
-static int g_grid_mouse_consumed;
+static int g_grid_mouse_consumed,g_grid_drag_grab;
 static int mac_grid_down(int mx,int my) {
     if(!g_grid_on)return 0;
     if(mac_grid_utility_click(mx,my)){g_grid_mouse_consumed=1;return 1;}
     int boundary,axis=grid_divider_at(mx,my,&boundary);
-    if(axis){g_grid_drag_axis=axis;g_grid_drag_boundary=boundary;g_grid_mouse_consumed=1;g_sel_on=g_sel_drag=0;return 1;}
+    if(axis) {
+        g_grid_drag_axis=axis;g_grid_drag_boundary=boundary;g_grid_mouse_consumed=1;g_sel_on=g_sel_drag=0;
+        /* Grabbed a few pixels off the line: a click without a move leaves it where it is */
+        g_grid_drag_grab=axis==1?mx-(g_grid_left+g_grid.x[boundary])*CW:my-(g_grid_top+g_grid.y[boundary])*CH;
+        return 1;
+    }
     int index=grid_pane_at(mx,my);if(index<0)return 0;
     Tab *tb=g_tabs[index];HcGridRect r=grid_rect(tb->id);
     if(my<(r.y+1)*CH) {
@@ -1636,9 +1681,14 @@ static int mac_grid_down(int mx,int my) {
 }
 static void mac_grid_drag(int mx,int my) {
     if(!g_grid_drag_axis)return;
-    hc_grid_move(&g_grid,g_grid_drag_axis==1,g_grid_drag_boundary,
-        g_grid_drag_axis==1?mx/CW-g_grid_left:my/CH-g_grid_top);
+    int vertical=g_grid_drag_axis==1,at=(vertical?mx:my)-g_grid_drag_grab,cell=vertical?CW:CH;
+    hc_grid_move(&g_grid,vertical,g_grid_drag_boundary,(at+cell/2)/cell-(vertical?g_grid_left:g_grid_top));
     grid_refit();
+}
+/* Right and middle clicks, drops: the pane under the pointer, as a left click picks it */
+static void mac_grid_point(int mx,int my) {
+    int index=grid_pane_at(mx,my);
+    if(index>=0 && index!=g_active)activate(index);
 }
 static int mac_grid_cursor(int mx,int my) {
     if(!g_grid_on)return 0;
@@ -1850,6 +1900,7 @@ static void paint_view_now(void) {
     if (!g_layer || !g_layer.device) return;   /* the worker hasn't finished setting Metal up yet */
     t0 = g_lat ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6 : 0;
     paint_now();
+    g_paints++;
     if (g_lat) fprintf(stderr, "paint %.3f\n", clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6 - t0);
 }
 
@@ -2176,6 +2227,14 @@ static int key_mods(NSEventModifierFlags f, int meta) {
         n = m ? snprintf(buf, sizeof(buf), "\x1b[%d;%d~", codes[i], m) : snprintf(buf, sizeof(buf), "\x1b[%d~", codes[i]);
         break;
     }
+    case 105: case 107: case 113: case 106: case 64: case 79: case 80: case 90: {   /* F13-F20 (PC keyboards' PrtSc...) */
+        static const unsigned short kcs[] = {105, 107, 113, 106, 64, 79, 80, 90};
+        static const int codes[] = {25, 26, 28, 29, 31, 32, 33, 34};
+        int i;
+        for (i = 0; i < 8 && kcs[i] != kc; i++) {}
+        n = m ? snprintf(buf, sizeof(buf), "\x1b[%d;%d~", codes[i], m) : snprintf(buf, sizeof(buf), "\x1b[%d~", codes[i]);
+        break;
+    }
     case 36: case 76:            /* Return, keypad Enter: Shift/Option+Enter = ESC CR, Claude Code's newline */
         seq = (shift || (f & NSEventModifierFlagOption)) ? "\x1b\r" : "\r";
         break;
@@ -2198,6 +2257,14 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     return 1;
 }
 
+/* The letter on a key in the ANSI (US) position, for Ctrl on a layout whose
+   letters aren't Latin: Ctrl+C on a Russian or Greek layout is still ^C
+   (claude-code#19704) */
+static unichar mac_ansi_key(unsigned short kc) {
+    static const char keys[] = "asdfhgzxcv\0bqweryt123465=97-80]ou[ip\0lj'k;\\,/nm.";
+    return kc < sizeof(keys) - 1 ? (unichar)keys[kc] : 0;
+}
+
 /* Ctrl+key and Meta (left Option)+key, from the unmodified character */
 - (int)controlKey:(NSEvent *)e {
     NSEventModifierFlags f = [e modifierFlags];
@@ -2208,6 +2275,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     unichar c;
     if ((!ctrl && !meta) || [chars length] != 1) return 0;
     c = [chars characterAtIndex:0];
+    if (ctrl && c >= 0x80 && mac_ansi_key([e keyCode])) c = mac_ansi_key([e keyCode]);
     if (meta) buf[n++] = 0x1B;
     if (ctrl) {
         if (c >= 'a' && c <= 'z') buf[n++] = (char)(c - 'a' + 1);
@@ -2297,13 +2365,16 @@ static int key_mods(NSEventModifierFlags f, int meta) {
         return;
     }
     if (mac_input_held(tb)) { NSBeep(); return; }
-    if ([self specialKey:e] || [self controlKey:e]) return;
+    /* Mid-composition, Return, arrows, Backspace and Esc are the input method's
+       (confirm, pick a candidate, cancel), not the shell's (ghostty#4634) */
+    if (!(marked && [marked length]) && ([self specialKey:e] || [self controlKey:e])) return;
     /* Plain typing on a plain keyboard layout goes straight out: the text-input
        system (interpretKeyEvents) costs a few ms at p90, measured. Dead keys
        (no characters yet), input methods and anything mid-composition still
        take the long way. */
-    if (!marked && plain_layout() && [[e characters] length] == 1 && [[e characters] characterAtIndex:0] >= 0x20 &&
-        [[e characters] characterAtIndex:0] != 0x7F) {
+    unichar typed = [[e characters] length] ? [[e characters] characterAtIndex:0] : 0;
+    if (typed >= 0xF700 && typed <= 0xF8FF) return;   /* a function key AppKit has no sequence for: nothing to type */
+    if (!marked && plain_layout() && [[e characters] length] == 1 && typed >= 0x20 && typed != 0x7F) {
         send_str([[e characters] UTF8String]);
         return;
     }
@@ -2343,9 +2414,8 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (void)insertText:(id)s replacementRange:(NSRange)r {
     NSString *str = [s isKindOfClass:[NSAttributedString class]] ? [s string] : s;
     (void)r;
-    [marked release];
-    marked = nil;
-    if ([str length] && (g_cutie_focus_id || !mac_browser_insert(str))) send_str([str UTF8String]);
+    [self unmarkText];
+    if ([str length] && (g_cutie_focus_id || !mac_browser_insert(str))) send_str([str UTF8String] ?: "");
 }
 - (void)doCommandBySelector:(SEL)sel { (void)sel; }
 - (void)setMarkedText:(id)s selectedRange:(NSRange)a replacementRange:(NSRange)b {
@@ -2353,8 +2423,16 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     [marked release];
     marked = [s isKindOfClass:[NSAttributedString class]] ? [[NSMutableAttributedString alloc] initWithAttributedString:s]
                                                            : [[NSMutableAttributedString alloc] initWithString:s];
+    /* shown at the cursor while it's composed (see draw_preedit) */
+    NSData *u = [[marked string] dataUsingEncoding:NSUTF32LittleEndianStringEncoding];
+    g_preedit_n = (int)chrome_min((int)([u length] / 4), 64);
+    memcpy(g_preedit, [u bytes], (size_t)g_preedit_n * 4);
+    plat_invalidate();
 }
-- (void)unmarkText { [marked release]; marked = nil; }
+- (void)unmarkText {
+    [marked release]; marked = nil;
+    if (g_preedit_n) { g_preedit_n = 0; plat_invalidate(); }
+}
 - (NSRange)selectedRange { return NSMakeRange(NSNotFound, 0); }
 - (NSRange)markedRange { return marked ? NSMakeRange(0, [marked length]) : NSMakeRange(NSNotFound, 0); }
 - (BOOL)hasMarkedText { return marked && [marked length]; }
@@ -2406,7 +2484,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (chrome_setting_hit(hit)) { settings_click(mx, my); return; }
     if (hit == HIT_BAR || hit == HIT_CHROME_INERT) return;
     plat_client_size(&w, &h);
-    if (tb && mx >= term_ox() + tb->t.cols * CW - SCROLLBAR_W && mx < term_ox() + tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
+    if (tb && !g_grid_on && mx >= term_ox() + tb->t.cols * CW - SCROLLBAR_W && mx < term_ox() + tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
         g_sb_drag = 1;
         scrollbar_set(my);
         return;
@@ -2480,6 +2558,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     view_px(e, &mx, &my);
     if (cutie_at(mx,my)>=0 || over_chrome(mx, my)) {g_cutie_aux_buttons|=2;return;}
     mac_cutie_blur();
+    mac_grid_point(mx,my);
     if(active_tab() && active_tab()->kind==TK_BROWSER){mac_browser_context(mx,my);return;}
     if (mouse_report(2, 1, 0, mx, my, ev_mods(e))) return;
     m = [[[NSMenu alloc] init] autorelease];
@@ -2513,6 +2592,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (hit == HIT_TAB || hit == HIT_CLOSE || hit==HIT_CUTIE) { g_cutie_aux_buttons|=1;user_close_tab(idx); return; }   /* middle-click closes a tab */
     if(cutie_at(mx,my)>=0 || over_chrome(mx,my)){g_cutie_aux_buttons|=1;return;}
     mac_cutie_blur();
+    mac_grid_point(mx,my);
     mouse_report(1, 1, 0, mx, my, ev_mods(e));
 }
 
@@ -2535,6 +2615,7 @@ static int key_mods(NSEventModifierFlags f, int meta) {
     if (was_bar || on_bar || g_grid_on) plat_invalidate();    if (was_bar || on_bar) settings_point();
     mac_pointer_cursor_at(mx,my,[e modifierFlags]);
     if(tb && tb->kind==TK_BROWSER)plat_invalidate();
+    if(g_grid_on && grid_pane_at(mx,my)!=g_active)return;   /* over another pane: not this one's motion */
     if (!on_bar && !mac_browser_nav_contains(mx,my) && tb && tb->t.m_mouse == 1003) mouse_report(3, 1, 1, mx, my, ev_mods(e));
 }
 
@@ -2565,10 +2646,15 @@ static int key_mods(NSEventModifierFlags f, int meta) {
                 if(lines){g_grid_browser_scroll[index]=chrome_max(0,g_grid_browser_scroll[index]-lines);plat_invalidate();}
                 return;
             }
-            if(index!=g_active)activate(index);
+            /* Scroll the pane under the pointer; momentum across a divider must not move focus */
+            if(index!=g_active && !g_pointer_tab) {
+                g_pointer_tab=g_tabs[index];
+                [self scrollAtX:mx y:my delta:dy precise:precise mods:mods];
+                g_pointer_tab=NULL;return;
+            }
         }
     }
-    Tab *tb = active_tab();
+    Tab *tb = pointer_tab();
     int lines, i;
     if (!tb) return;
     int cutie=cutie_at(mx,my);
@@ -2607,6 +2693,10 @@ static int key_mods(NSEventModifierFlags f, int meta) {
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info { (void)info; return NSDragOperationCopy; }
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)info {
     [NSApp activateIgnoringOtherApps:YES];
+    if(g_grid_on) {
+        NSPoint p=[self convertPoint:[info draggingLocation] fromView:nil];CGFloat s=[g_win backingScaleFactor];
+        mac_grid_point((int)(p.x*s),(int)(p.y*s));
+    }
     if (paste_file_urls([info draggingPasteboard])) return YES;
     {
         NSString *s = [[info draggingPasteboard] stringForType:NSPasteboardTypeString];
@@ -3014,7 +3104,8 @@ static void ctl_chrome(const char *path) {
         }
         [panes addObject:@{@"id":@(g_grid_ids[i]),@"x":@(r.x),@"y":@(r.y),@"width":@(r.w),@"height":@(r.h),@"browser":lines,@"title":title}];
     }
-    state[@"grid"]=@{@"enabled":@(g_grid_on),@"cols":@(g_grid.cols),@"rows":@(g_grid.rows),@"extra":@(g_grid.extra),@"panes":panes};
+    state[@"grid"]=@{@"enabled":@(g_grid_on),@"cols":@(g_grid.cols),@"rows":@(g_grid.rows),@"extra":@(g_grid.extra),
+        @"window":@[@(g_cols),@(g_rows)],@"left":@(g_grid_left),@"top":@(g_grid_top),@"width":@(g_grid.width),@"height":@(g_grid.height),@"panes":panes};
     Tab *selected=active_tab(),*shown=display_tab();
     state[@"preview"]=@{@"active_id":@(selected?selected->id:0),@"display_id":@(shown?shown->id:0),
         @"preview_id":@(g_tab_preview.target_id)};
@@ -3082,6 +3173,11 @@ static void ctl_line(char *s) {
                 mac_preview_event(e);
             }
         }
+        /* an input method composing, for tests: mark TEXT, then commit TEXT or unmark */
+        else if(!strncmp(c,"mark ",5))[g_view setMarkedText:[NSString stringWithUTF8String:c+5]?:@"" selectedRange:NSMakeRange(0,0)
+                                                   replacementRange:NSMakeRange(NSNotFound,0)];
+        else if(!strncmp(c,"commit ",7))[g_view insertText:[NSString stringWithUTF8String:c+7]?:@"" replacementRange:NSMakeRange(NSNotFound,0)];
+        else if(!strcmp(c,"unmark"))[g_view unmarkText];
         else if (!strcmp(c,"grid"))grid_toggle();
         else if (!strncmp(c,"grid-hide ",10))grid_hide_tab(atoi(c+10));
         else if (!strcmp(c,"grid-expand"))grid_expand_next();
@@ -3112,12 +3208,12 @@ static void ctl_line(char *s) {
                 Tab *t = g_tabs[k];
                 [tabs addObject:@{@"pid":@(t->pid), @"fd":@(t->fd), @"view":@(t->t.view), @"hist":@(t->t.hcount),
                                   @"alt":@(t->t.alt), @"cols":@(t->t.cols), @"rows":@(t->t.rows),
-                                  @"cx":@(t->t.cx), @"cy":@(t->t.cy), @"parser":@(t->t.st),
+                                  @"cx":@(t->t.cx), @"cy":@(t->t.cy), @"parser":@(t->t.st), @"mouse":@(t->t.m_mouse), @"focus_events":@(t->t.m_focus),
                                   @"browser_scroll":@(browser_for(t)?browser_for(t)->scroll:0),
                                   @"id":@(t->id), @"activity":@(t->activity), @"attention":@(t->attention),
                                   @"program":[NSString stringWithUTF8String:t->program] ?: @""}];
             }
-            NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"pid":@(getpid()), @"active":@(g_active),
+            NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"pid":@(getpid()), @"active":@(g_active), @"paints":@(g_paints), @"preedit":@(g_preedit_n),
                 @"frame":NSStringFromRect([g_win frame]), @"tabs":tabs,
                 @"first_responder":[NSString stringWithFormat:@"%p:%@",[g_win firstResponder],NSStringFromClass([[g_win firstResponder] class])],
                 @"key_window":@([g_win isKeyWindow])} options:0 error:nil];
@@ -3192,7 +3288,9 @@ static void ctl_line(char *s) {
                 /* Allow grid controls at the top edge, but never enter AppKit's
                    modal window-drag loop from a synthetic titlebar down. */
                 int idx = -1, hit = hit_tabbar(x, y, &idx);
-                if(kind==NSEventTypeRightMouseDown && (over_chrome(x,y) || g_tv_drag_slot>=0))[g_view rightMouseDown:e];
+                int pane=grid_pane_at(x,y);   /* a pane that reports the mouse opens no (modal) menu */
+                if(kind==NSEventTypeRightMouseDown && (over_chrome(x,y) || g_tv_drag_slot>=0 || (pane>=0 && g_tabs[pane]->t.m_mouse)))
+                    [g_view rightMouseDown:e];
                 else if(kind==NSEventTypeRightMouseUp)[g_view rightMouseUp:e];
                 else if(kind==NSEventTypeOtherMouseDown)[g_view otherMouseDown:e];
                 else if(kind==NSEventTypeOtherMouseUp)[g_view otherMouseUp:e];

@@ -51,6 +51,8 @@ static void grid_tab_size(Tab *tb,int *cols,int *rows) {
         else {*cols=tb->t.cols;*rows=tb->t.rows;}
     }
 }
+#ifndef _WIN32   /* the grid's controls are macOS-only (hardcore_grid_draw.h) */
 static void grid_toggle(void);
 static void grid_hide_tab(int index);
 static void grid_expand_next(void);
+#endif

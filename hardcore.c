@@ -468,7 +468,7 @@ static const uint16_t DEC_GFX[31] = { /* ESC ( 0, chars 0x60..0x7e */
 enum { S_GROUND, S_ESC, S_ESC_INTER, S_CSI, S_OSC, S_OSC_ESC, S_STR, S_STR_ESC };
 
 typedef struct {
-    int cx, cy, wrapnext, g0dec, origin;
+    int cx, cy, wrapnext, g0dec, g1dec, shift_out, origin;
     Cell pen;
 } SavedCursor;
 
@@ -483,7 +483,8 @@ typedef struct {
     Cell pen;
     SavedCursor saved[2];
     int top, bot;
-    int g0dec;
+    int g0dec, g1dec;            /* DEC line drawing designated as G0 (ESC ( 0), G1 (ESC ) 0) */
+    int shift_out;               /* SO: G1 is in use; SI: G0 */
     uint32_t last_ch;            /* for REP; only valid right after a printed char */
     uint8_t *tabs;               /* per-column tab stop flags */
     char *links[MAX_LINKS];      /* OSC 8 targets; cell.link = index + 1 */
@@ -730,6 +731,11 @@ static void utf8_to_wide(const char *s, wchar_t *out, int cap) {
 
 /* A renderer/backend can own a Term without pretending to be a GUI Tab. */
 static void (*g_term_reply_backend)(Term *, const char *, int);
+/* DECRQCRA lets any program (an ssh host too) read the screen back a cell at a
+   time, so it answers only in tests, or with HARDCORE_ALLOW_READBACK=1 in the
+   window's environment for esctest (bench/run-esctest.sh). Konsole, VTE and
+   Windows Terminal ship it off too. */
+static int g_allow_readback;
 static void term_reply(Term *t, const char *s) {
     if (g_term_reply_backend) g_term_reply_backend(t, s, (int)strlen(s));
     else tab_write((Tab *)t, s, (int)strlen(s));
@@ -902,7 +908,7 @@ static void term_reset(Term *t) {
     t->m_cursor_vis = 1;
     t->m_origin = t->m_insert = t->m_appcursor = t->m_bracketed = t->m_newline = 0;
     t->m_mouse = t->m_mouse_sgr = t->m_focus = t->m_sync = 0;
-    t->g0dec = 0;
+    t->g0dec = t->g1dec = t->shift_out = 0;
     t->cursor_shape = 0;
     t->wrapnext = 0;
 }
@@ -1243,7 +1249,8 @@ static void insert_blanks(Term *t, int n) {
 static void term_put(Term *t, uint32_t cp) {
     int w;
     Cell *c;
-    if (t->g0dec && cp >= 0x60 && cp <= 0x7E) cp = DEC_GFX[cp - 0x60];
+    if ((t->shift_out ? t->g1dec : t->g0dec) && cp >= 0x5F && cp <= 0x7E) cp = cp == 0x5F ? ' ' : DEC_GFX[cp - 0x60];
+    if (cp >= 0x80 && cp < 0xA0) return;   /* C1 controls sent as UTF-8: no glyph (xterm, VTE) */
     w = cp_width(cp);
     if (w == 0) return;          /* combining marks: no cell of their own */
     if (t->wrapnext) {
@@ -1289,6 +1296,8 @@ static void save_cursor(Term *t) {
     s->cy = t->cy;
     s->wrapnext = t->wrapnext;
     s->g0dec = t->g0dec;
+    s->g1dec = t->g1dec;
+    s->shift_out = t->shift_out;
     s->origin = t->m_origin;
     s->pen = t->pen;
 }
@@ -1299,6 +1308,8 @@ static void restore_cursor(Term *t) {
     t->cy = s->cy < t->rows ? s->cy : t->rows - 1;
     t->wrapnext = 0;             /* xterm: DECRC never restores a pending wrap */
     t->g0dec = s->g0dec;
+    t->g1dec = s->g1dec;
+    t->shift_out = s->shift_out;
     t->m_origin = s->origin;
     t->pen = s->pen;
     if (!t->pen.ch) t->pen.ch = ' ';
@@ -1340,6 +1351,11 @@ static void shift_columns(Term *t, int x0, int n) {
         } else {
             for (x = x0; x < t->cols; x++) row[x] = (x - n < t->cols) ? row[x - n] : b;
         }
+        /* a wide char cut by the shift (at x0 or off the edge): neither half stays */
+        for (x = 0; x < t->cols; x++) {
+            if (row[x].wflag == W_CONT && (x == 0 || row[x - 1].wflag != W_WIDE)) row[x] = b;
+            if (row[x].wflag == W_WIDE && (x == t->cols - 1 || row[x + 1].wflag != W_CONT)) row[x] = b;
+        }
     }
 }
 
@@ -1352,9 +1368,11 @@ static void decaln(Term *t) {
             c->ch = 'E';
             row_used(t, y, x + 1);
         }
+    memset(t->wrapf[t->alt], 0, (size_t)t->rows);
     t->top = 0;
     t->bot = t->rows - 1;
     t->cx = t->cy = 0;
+    t->wrapnext = 0;
 }
 
 static void control(Term *t, int b) {
@@ -1374,6 +1392,8 @@ static void control(Term *t, int b) {
         t->wrapnext = 0;
         break;
     case 0x0D: t->cx = 0; t->wrapnext = 0; break;
+    case 0x0E: t->shift_out = 1; break;   /* SO */
+    case 0x0F: t->shift_out = 0; break;   /* SI */
     case 0x18: case 0x1A: t->st = S_GROUND; break;
     case 0x1B: t->st = S_ESC; break;
     }
@@ -1540,6 +1560,7 @@ static void csi_dispatch(Term *t, int f) {
         return;
     }
     if (t->inter == '*' && f == 'y') {               /* DECRQCRA: checksum of a rectangle */
+        if (!g_allow_readback && !getenv("HARDCORE_ALLOW_READBACK")) return;
         int top = P(t, 2, 1) - 1, left = P(t, 3, 1) - 1, bot = P(t, 4, t->rows) - 1, right = P(t, 5, t->cols) - 1, y, x;
         unsigned sum = 0;
         if (t->m_origin) { top += t->top; bot += t->top; }
@@ -1619,6 +1640,7 @@ static void csi_dispatch(Term *t, int f) {
         int off = t->m_origin ? t->top : 0;
         t->cy = P(t, 0, 1) - 1 + off;
         if (t->cy >= t->rows) t->cy = t->rows - 1;
+        if (t->m_origin && t->cy > t->bot) t->cy = t->bot;
         break;
     }
     case 'I': tab_forward(t, P(t, 0, 1)); break;
@@ -1659,7 +1681,11 @@ static void csi_dispatch(Term *t, int f) {
     case 'X': clear_span(t, t->cy, t->cx, t->cx + P(t, 0, 1)); break;
     case 'S': scroll_up(t, t->top, t->bot, P(t, 0, 1), 1); break;
     case 'T': scroll_down(t, t->top, t->bot, P(t, 0, 1)); break;
-    case 'b': for (n = P(t, 0, 1); n > 0 && t->last_ch; n--) term_put(t, t->last_ch); break;
+    case 'b':                    /* REP: at most a screenful (11 bytes could ask for a million cells) */
+        n = P(t, 0, 1);
+        if (n > t->cols * t->rows) n = t->cols * t->rows;
+        for (; n > 0 && t->last_ch; n--) term_put(t, t->last_ch);
+        break;
     case 'c': if (P(t, 0, 0) == 0) term_reply(t, "\x1b[?62;22c"); break;
     case 'm': sgr(t); break;
     case 'n':
@@ -2023,6 +2049,9 @@ static void esc_dispatch(Term *t, int b) {
         int x;
         set_alt(t, 0, 0);
         term_reset(t);
+        t->alt = 1;
+        clear_rows(t, 0, t->rows);
+        t->alt = 0;
         clear_rows(t, 0, t->rows);
         t->cx = t->cy = 0;
         memset(t->saved, 0, sizeof(t->saved));
@@ -2067,6 +2096,7 @@ static void vt_byte(Term *t, unsigned char b) {
         if (b < 0x20) { control(t, b); return; }
         if (b <= 0x2F) return;   /* more intermediates; the first one decides */
         if (t->esc_which == '(') t->g0dec = (b == '0');
+        else if (t->esc_which == ')') t->g1dec = (b == '0');
         else if (t->esc_which == '#' && b == '8') decaln(t);
         t->st = S_GROUND;
         return;
@@ -2128,7 +2158,7 @@ static void vt_feed(Term *t, const unsigned char *s, int n) {
         unsigned char b = s[i];
         /* fast path: printable ASCII in the middle of a row, nothing special going on */
         if (b >= 0x20 && b < 0x7F && t->st == S_GROUND && !t->utf8_need && !t->wrapnext &&
-            t->cx < t->cols - 1 && !t->g0dec && !t->m_insert) {
+            t->cx < t->cols - 1 && !t->g0dec && !t->shift_out && !t->m_insert) {
             Cell *c = &t->row[t->alt][t->cy][t->cx];
             if (!c->wflag) {
                 *c = t->pen;
@@ -2145,7 +2175,7 @@ static void vt_feed(Term *t, const unsigned char *s, int n) {
             uint32_t cp = b & (len == 2 ? 0x1F : len == 3 ? 0x0F : 0x07);
             if (i + len <= n) {
                 for (k = 1; k < len && (s[i + k] & 0xC0) == 0x80; k++) cp = cp << 6 | (s[i + k] & 0x3F);
-                if (k == len && cp >= (len == 2 ? 0x80u : len == 3 ? 0x800u : 0x10000u) &&
+                if (k == len && cp >= (len == 2 ? 0xA0u : len == 3 ? 0x800u : 0x10000u) &&   /* (C1: the slow path drops it) */
                     !(cp >= 0xD800 && cp <= 0xDFFF) && cp <= 0x10FFFF && (w = cp_width(cp)) > 0 &&
                     t->cx + w < t->cols) {
                     Cell *c = &t->row[t->alt][t->cy][t->cx];
@@ -2348,7 +2378,9 @@ static void term_snapshot(Term *t, SBuf *b) {
         snap_cup(b, s->cx, s->cy);
         snap_sgr(b, t, &cur, s->pen.fg, s->pen.bg, s->pen.attr, 0);
         sb_put(b, s->g0dec ? "\x1b(0" : "\x1b(B", 3);
-        sb_put(b, "\x1b[?1049h\x1b(B", 11);
+        sb_put(b, s->g1dec ? "\x1b)0" : "\x1b)B", 3);
+        sb_put(b, s->shift_out ? "\x0e" : "\x0f", 1);
+        sb_put(b, "\x1b[?1049h\x1b(B\x1b)B\x0f", 15);
         snap_sgr(b, t, &cur, 0, 0, 0, 0);
         sb_put(b, "\x1b[H", 3);
         t->alt = 1;
@@ -2370,9 +2402,11 @@ static void term_snapshot(Term *t, SBuf *b) {
             snap_cup(b, s->cx, s->cy);
             snap_sgr(b, t, &cur, s->pen.fg, s->pen.bg, s->pen.attr, 0);
             sb_put(b, s->g0dec ? "\x1b(0" : "\x1b(B", 3);
+            sb_put(b, s->g1dec ? "\x1b)0" : "\x1b)B", 3);
+            sb_put(b, s->shift_out ? "\x0e" : "\x0f", 1);
             sb_put(b, "\x1b" "7", 2);
             if (s->origin) sb_put(b, "\x1b[?6l", 5);
-            sb_put(b, "\x1b(B", 3);
+            sb_put(b, "\x1b(B\x1b)B\x0f", 7);
         }
     }
     /* tab stops, if they aren't every 8 */
@@ -2391,16 +2425,21 @@ static void term_snapshot(Term *t, SBuf *b) {
     if (!t->m_autowrap) sb_put(b, "\x1b[?7l", 5);
     if (t->m_origin) sb_put(b, "\x1b[?6h", 5);
     sb_put(b, t->g0dec ? "\x1b(0" : "\x1b(B", 3);
+    sb_put(b, t->g1dec ? "\x1b)0" : "\x1b)B", 3);
     if (t->wrapnext && t->cx == t->cols - 1 && t->m_autowrap) {
-        /* a pending wrap: print the last cell again, which leaves exactly that */
-        const Cell *c = &t->row[alt][t->cy][t->cx];
+        /* a pending wrap: print the last cell again, which leaves exactly that
+           (a wide char again from its first half: its second alone would be a space) */
+        int x = t->cx;
+        const Cell *c = &t->row[alt][t->cy][x];
         char u[8];
-        snap_cup(b, t->cx, t->m_origin ? t->cy - t->top : t->cy);
+        if (c->wflag == W_CONT && x > 0) c = &t->row[alt][t->cy][--x];
+        snap_cup(b, x, t->m_origin ? t->cy - t->top : t->cy);
         snap_sgr(b, t, &cur, c->fg, c->bg, c->attr, c->link);
         if (t->g0dec) sb_put(b, "\x1b(B", 3);
         sb_put(b, u, (size_t)utf8_encode(c->ch > ' ' ? c->ch : ' ', u));
         if (t->g0dec) sb_put(b, "\x1b(0", 3);
     } else snap_cup(b, t->cx, t->m_origin ? t->cy - t->top : t->cy);
+    if (t->shift_out) sb_put(b, "\x0e", 1);     /* after the reprint, which is in G0 */
     if (t->m_insert) sb_put(b, "\x1b[4h", 4);      /* after the reprint above: insert mode would shift it */
     if (t->m_newline) sb_put(b, "\x1b[20h", 5);
     snap_sgr(b, t, &cur, t->pen.fg, t->pen.bg, t->pen.attr, t->pen.link);
@@ -2470,10 +2509,11 @@ static int snapshot_roundtrip(Term *a, char *why, size_t cap) {
     DIFF(t.pen.fg != a->pen.fg || t.pen.bg != a->pen.bg || t.pen.attr != a->pen.attr, "pen");
     for (s = 0; s < 2; s++)
         DIFF(t.saved[s].cx != a->saved[s].cx || t.saved[s].cy != a->saved[s].cy || t.saved[s].g0dec != a->saved[s].g0dec ||
+             t.saved[s].g1dec != a->saved[s].g1dec || t.saved[s].shift_out != a->saved[s].shift_out ||
              t.saved[s].origin != a->saved[s].origin || t.saved[s].pen.fg != a->saved[s].pen.fg || t.saved[s].pen.attr != a->saved[s].pen.attr,
              "saved cursor %d: %d,%d vs %d,%d", s, t.saved[s].cx, t.saved[s].cy, a->saved[s].cx, a->saved[s].cy);
     DIFF(t.top != a->top || t.bot != a->bot, "scroll region %d-%d vs %d-%d", t.top, t.bot, a->top, a->bot);
-    DIFF(t.g0dec != a->g0dec, "charset");
+    DIFF(t.g0dec != a->g0dec || t.g1dec != a->g1dec || t.shift_out != a->shift_out, "charset");
     DIFF(t.m_autowrap != a->m_autowrap || t.m_origin != a->m_origin || t.m_insert != a->m_insert || t.m_cursor_vis != a->m_cursor_vis ||
          t.m_appcursor != a->m_appcursor || t.m_bracketed != a->m_bracketed || t.m_mouse != a->m_mouse || t.m_mouse_sgr != a->m_mouse_sgr ||
          t.m_focus != a->m_focus || t.m_newline != a->m_newline, "modes");
@@ -2485,9 +2525,9 @@ static int snapshot_roundtrip(Term *a, char *why, size_t cap) {
 }
 
 static int term_snapshot_check(FILE *f) {
-    static const char *names[3] = {"shell", "full-screen program", "odd modes"};
+    static const char *names[5] = {"shell", "full-screen program", "odd modes", "wide char in a pending wrap", "G1 line drawing"};
     int k, fails = 0;
-    for (k = 0; k < 3; k++) {
+    for (k = 0; k < 5; k++) {
         Term t;
         char why[256] = "", line[512];
         int i, n;
@@ -2508,6 +2548,11 @@ static int term_snapshot_check(FILE *f) {
         }
         if (k == 2) {
             const char *s = "\x1b[3g\x1b[1;5H\x1bH\x1b[1;13H\x1bH\x1b[3;8r\x1b[?6h\x1b[2;4H\x1b(0lqk\x1b[4h\x1b[6 q";
+            vt_feed(&t, (const unsigned char *)s, (int)strlen(s));
+        }
+        if (k == 3) { const char *s = "\x1b[12;39H\xe6\x97\xa5"; vt_feed(&t, (const unsigned char *)s, (int)strlen(s)); }
+        if (k == 4) {   /* G1 designated and shifted in, and saved with the cursor */
+            const char *s = "\x1b)0\x0eqqx\x1b[2;2H\x1b" "7\x0f\x1b[5;5Hab\x0e";
             vt_feed(&t, (const unsigned char *)s, (int)strlen(s));
         }
         if (snapshot_roundtrip(&t, why, sizeof(why))) {
@@ -3165,6 +3210,9 @@ static DWORD g_last_paint;
 #endif
 
 static Tab *active_tab(void) { return g_ntabs ? g_tabs[g_active] : NULL; }
+/* The grid pane a wheel event is over, while it scrolls without taking focus */
+static Tab *g_pointer_tab;
+static Tab *pointer_tab(void) { return g_pointer_tab ? g_pointer_tab : active_tab(); }
 #ifndef _WIN32
 static int g_cutie_focus_id;
 static int cutie_focus_valid(void);
@@ -3223,8 +3271,8 @@ static int in_sidebar(int x) { return x >= sidebar_x() && x < sidebar_x() + side
 #endif
 /* (0,0) is the native drawable surface, inside any system-owned border.
    Rounded corners may obscure cells; they never shift the grid. */
-static int term_ox(void) { Tab *tb=active_tab();return g_grid_on && tb?grid_rect(tb->id).x*CW:0; }
-static int term_oy(void) { Tab *tb=active_tab();return g_grid_on && tb?(grid_rect(tb->id).y+1)*CH:0; }
+static int term_ox(void) { Tab *tb=pointer_tab();return g_grid_on && tb?grid_rect(tb->id).x*CW:0; }
+static int term_oy(void) { Tab *tb=pointer_tab();return g_grid_on && tb?(grid_rect(tb->id).y+1)*CH:0; }
 
 static void compute_grid(int w, int h, int *cols, int *rows) {
     *cols = w / CW;
@@ -3323,37 +3371,53 @@ static void sel_norm(long long *r0, int *c0, long long *r1, int *c1) {
     }
 }
 
-static void sel_copy(void) {
-    Tab *tb = active_tab();
-    long long r0, r1, r;
-    int c0, c1;
-    char *out;
+/* The text from (r0, c0) to (r1, c1), absolute lines, as copy puts it on the
+   clipboard: wrapped rows run on; a row's trailing blanks go; a wide char's
+   second cell and the gap left where one didn't fit (W_PAD) aren't text.
+   Lines end the platform's way: \r\n on Windows, \n on macOS (where \r\n
+   pastes into vim and files as ^M). Returns a malloc'd string. */
+static char *sel_text(const Term *t, long long r0, int c0, long long r1, int c1, size_t *len) {
+    long long r;
     size_t n = 0, cap = 4096;
-    if (!tb || !g_sel_on) return;
-    sel_norm(&r0, &c0, &r1, &c1);
-    out = (char *)malloc(cap);
+    char *out = (char *)malloc(cap);
+    if (!out) { *len = 0; return NULL; }
     for (r = r0; r <= r1; r++) {
         const Cell *cells;
-        int len, wrapped, x, x0 = (r == r0) ? c0 : 0, x1 = (r == r1) ? c1 : 1 << 30;
+        int clen, wrapped, x, x0 = (r == r0) ? c0 : 0, x1 = (r == r1) ? c1 : 1 << 30;
         size_t line_start = n;
-        long long L = r - term_base(&tb->t);
-        term_line(&tb->t, (int)L, &cells, &len, &wrapped);
+        long long L = r - term_base(t);
+        term_line(t, (int)L, &cells, &clen, &wrapped);
         if (L < 0) continue;
-        for (x = x0; x <= x1 && x < len; x++) {
-            if (cells[x].wflag == W_CONT) continue;
+        for (x = x0; x <= x1 && x < clen; x++) {
+            if (cells[x].wflag == W_CONT || cells[x].wflag == W_PAD) continue;
             if (n + 8 >= cap) out = (char *)realloc(out, cap *= 2);
             n += utf8_encode((cells[x].wflag & 8) ? (cells[x].attr ? ' ' : 0xFFFC) : cells[x].ch ? cells[x].ch : ' ', out + n);
         }
-        if (!(wrapped && r < r1) || x1 < len - 1) {
+        if (!(wrapped && r < r1) || x1 < clen - 1) {
             while (n > line_start && out[n - 1] == ' ') n--;
             if (r < r1) {
                 if (n + 4 >= cap) out = (char *)realloc(out, cap *= 2);
+#ifdef _WIN32
                 out[n++] = '\r';
+#endif
                 out[n++] = '\n';
             }
         }
     }
-    set_clipboard_utf8(out, (int)n);
+    *len = n;
+    return out;
+}
+
+static void sel_copy(void) {
+    Tab *tb = active_tab();
+    long long r0, r1;
+    int c0, c1;
+    size_t n;
+    char *out;
+    if (!tb || !g_sel_on) return;
+    sel_norm(&r0, &c0, &r1, &c1);
+    out = sel_text(&tb->t, r0, c0, r1, c1, &n);
+    if (out) set_clipboard_utf8(out, (int)n);
     free(out);
 }
 
@@ -3377,20 +3441,33 @@ static void send_to_active(const char *s, int n) {
 
 /* Sends text the way a paste arrives: CRLF/LF become CR like a typed Enter,
    ESC is stripped so a paste can't end bracketed-paste mode early. */
+/* What a paste may send: text, tabs and line ends (as CR). A pasted ESC could
+   end bracketed paste early and run what follows; ^C, ^D, ^Z or a C1 control
+   acts on the shell (oss-security 2023/10/20/2). VTE and Windows Terminal drop
+   them too. out has room for strlen(in) bytes; returns the length. */
+static size_t paste_clean(const char *in, char *out) {
+    const unsigned char *p;
+    char *o = out;
+    for (p = (const unsigned char *)in; *p; p++) {
+        if (*p == '\r' && p[1] == '\n') continue;
+        if (*p == '\n' || *p == '\r') { *o++ = '\r'; continue; }
+        if ((*p < 0x20 && *p != '\t') || *p == 0x7F) continue;
+        if (*p == 0xC2 && p[1] >= 0x80 && p[1] <= 0x9F) { p++; continue; }   /* C1, UTF-8 encoded */
+        *o++ = (char)*p;
+    }
+    return (size_t)(o - out);
+}
+
 static void paste_utf8(const char *in) {
     Tab *tb = input_tab();
-    size_t n = strlen(in);
-    char *s, *o;
-    const char *p;
+    size_t n = in ? strlen(in) : 0;   /* (AppKit's UTF8String is NULL for a lone surrogate) */
+    char *s;
     if (!tb || !n) return;
-    s = o = (char *)malloc(n + 16);
-    for (p = in; *p; p++) {
-        if (*p == '\r' && p[1] == '\n') continue;
-        if (*p == 0x1B) continue;
-        *o++ = (*p == '\n') ? '\r' : *p;
-    }
+    s = (char *)malloc(n + 16);
+    if (!s) return;
+    n = paste_clean(in, s);
     if (tb->t.m_bracketed) send_to_active("\x1b[200~", 6);
-    send_to_active(s, (int)(o - s));
+    send_to_active(s, (int)n);
     if (tb->t.m_bracketed) send_to_active("\x1b[201~", 6);
     free(s);
 }
@@ -4551,6 +4628,23 @@ static void render_terminal_backgrounds(const Term *t, int ox, int oy) {
     }
 }
 
+/* Text an input method is composing (Japanese, Chinese, Korean), until it's
+   committed or cancelled: drawn at the cursor, underlined. macOS sets it. */
+static uint32_t g_preedit[64];
+static int g_preedit_n;
+static void draw_preedit(int x, int y, int room) {
+    int k, w;
+    for (k = 0; k < g_preedit_n; k++) {
+        if ((w = cp_width(g_preedit[k])) <= 0) continue;
+        if ((room -= w) < 0) break;
+        fill_rect(x, y, x + w * CW, y + CH, DEF_BG, 1);
+        r_color(DEF_FG, 1);
+        draw_glyph(g_preedit[k], x, y, w, g_scale);
+        fill_rect(x, y + CH - g_scale, x + w * CW, y + CH, AMBER, 1);
+        x += w * CW;
+    }
+}
+
 #include "hardcore_grid_draw.h"
 
 static void render(void) {
@@ -4692,6 +4786,12 @@ static void render(void) {
                 draw_glyph(c->ch, cx, cy, w, g_scale);
             }
         }
+    }
+
+    if (t->view == 0) {
+        int cursor_col, cursor_row;
+        display_cursor_position(t, &cursor_col, &cursor_row);
+        draw_preedit(ox + cursor_col * CW, oy + cursor_row * CH, t->cols - cursor_col);
     }
 
     chrome_draw_markers(t);
@@ -4922,6 +5022,14 @@ static void update_busy(int tick) {
 
 /* ── tab management ───────────────────────────────────────────────── */
 
+static int tab_hears_focus(Tab *tb) {
+#ifdef _WIN32
+    return tb->t.m_focus && tb->proc;
+#else
+    return tb->t.m_focus && tb->fd >= 0 && !mac_input_held(tb);
+#endif
+}
+
 static void activate(int i) {
 #ifndef _WIN32
     mac_tv_drag_end();mac_cutie_blur();
@@ -4929,7 +5037,16 @@ static void activate(int i) {
     if (i < 0 || i >= g_ntabs) return;
     chrome_preview_cancel();
     term_settle(&g_tabs[i]->t);  /* a tab not caught up since a resize: before it shows */
+    /* Switching tabs or grid panes moves focus: apps that asked (DECSET 1004)
+       hear it. By ID: the tab that last had focus may just have closed. */
+    static int focus_id;
+    Tab *was = tab_by_id(focus_id);
     g_active = i;
+    focus_id = g_tabs[i]->id;
+    if (was != g_tabs[i] && g_focused) {
+        if (was && tab_hears_focus(was)) tab_write(was, "\x1b[O", 3);
+        if (tab_hears_focus(g_tabs[i])) tab_write(g_tabs[i], "\x1b[I", 3);
+    }
     if(g_grid_on){grid_set_hidden(g_tabs[i]->id,0);grid_measure(g_cols,g_rows);}
     resize_all();
     tab_fit(g_tabs[i]);          /* still at an old size if the window changed while it was hidden */
@@ -4994,6 +5111,35 @@ static void new_tab_here(void) {
     g_tabs[g_ntabs ? g_active + 1 : 0] = tb;
     g_ntabs++;
     activate(g_ntabs == 1 ? 0 : g_active + 1);
+}
+
+/* The Claude flags a restored tab starts with again. They arrive in an OSC
+   that any program's output can also send, so only flags that choose a model
+   or narrow what Claude may do come back; ones that widen it (permissions,
+   prompts, tools, settings, MCP, plugins, directories) are left to the user.
+   in is the shell-quoted list rc.bash keeps ("--model opus --add-dir a\ b "). */
+static void session_args_filter(const char *in, char *out, size_t cap) {
+    static const char *keep[] = {"--model", "--fallback-model", "--effort", "--name", "-n", "--verbose", "--debug", "-d",
+                                 "--disallowedTools", "--disallowed-tools", "--max-budget-usd", "--autocompact",
+                                 "--prompt-suggestions", "--ide", "--strict-mcp-config"};
+    size_t o = 0;
+    int keeping = 0;
+    out[0] = 0;
+    while (*in) {
+        const char *a = in;
+        size_t n = 0, i, k;
+        while (a[n] && (a[n] != ' ' || (n && a[n - 1] == '\\'))) n++;   /* one word; "\ " is inside it */
+        in = a[n] ? a + n + 1 : a + n;
+        if (!n) continue;
+        if (a[0] == '-') {
+            keeping = 0;
+            for (i = 0; i < sizeof(keep) / sizeof(*keep); i++) {
+                k = strlen(keep[i]);
+                if (n >= k && !strncmp(a, keep[i], k) && (n == k || a[k] == '=')) keeping = 1;
+            }
+        }
+        if (keeping && o + n + 2 <= cap) { memcpy(out + o, a, n); o += n; out[o++] = ' '; out[o] = 0; }
+    }
 }
 
 #ifdef _WIN32
@@ -5100,7 +5246,10 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
     size_t n = 0;
     Tab *tb;
     if (g_ntabs >= MAX_TABS || !dir[0]) return;
+    char kept[400];
     if (!session_args_ok(args)) args = "";
+    session_args_filter(args, kept, sizeof(kept));
+    args = kept;
     if (!strcmp(claude, "?")) snprintf(run, sizeof(run), "claude %s--continue", args);
     else if (session_id_ok(claude)) snprintf(run, sizeof(run), "claude %s--resume %s", args, claude);
     if (text[0]) {
@@ -5519,13 +5668,18 @@ static void close_tab(int i) {
     }
     if (g_active > i || g_active >= g_ntabs) g_active--;
     if (g_active < 0) g_active = 0;
+    /* In the grid the next pane is a visible one: activating a hidden tab shows it */
+    for (int k = 0; g_grid_on && k < g_ntabs; k++) {
+        int j = (g_active + k) % g_ntabs;
+        if (!grid_hidden(g_tabs[j]->id)) { g_active = j; break; }
+    }
     activate(g_active);
 }
 
 /* ── keyboard ──────────────────────────────────────────────────────── */
 
 static void scroll_view(int lines) {
-    Tab *tb = active_tab();
+    Tab *tb = pointer_tab();
 #ifndef _WIN32
     if (tb && tb->kind == TK_BROWSER) { mac_browser_scroll(-lines); return; }
 #endif
@@ -5715,7 +5869,7 @@ static void handle_char(WPARAM wc, int alt) {
 enum { M_SHIFT = 1, M_ALT = 2, M_CTRL = 4 };   /* the modifiers a mouse report carries */
 
 static void mouse_cell(int mx, int my, int *col, int *row) {
-    Tab *tb = active_tab();
+    Tab *tb = pointer_tab();
     int c = (mx - term_ox()) / CW, r = (my - term_oy()) / CH;
     if (mx < term_ox()) c = 0;
     if (my < term_oy()) r = 0;
@@ -5856,7 +6010,7 @@ static int unit_chrome_display(FILE *f) {
 /* reports to an app that asked for the mouse (vim, htop, tmux...);
    mods: M_SHIFT | M_ALT | M_CTRL. Shift means "this one is for selecting". */
 static int mouse_report(int button, int press, int motion, int mx, int my, int mods) {
-    Tab *tb = active_tab();
+    Tab *tb = pointer_tab();
     char buf[64];
     int col, row, b = button, n;
     if (!tb || !tb->t.m_mouse || (mods & M_SHIFT)) return 0;
@@ -5866,6 +6020,12 @@ static int mouse_report(int button, int press, int motion, int mx, int my, int m
     if (motion && tb->t.m_mouse != 1003 && !(tb->t.m_mouse == 1002 && button != 3)) return 1;
     if (motion && tb->t.m_mouse == 9) return 1;
     mouse_cell(mx, my, &col, &row);
+    {   /* motion is reported once per cell, as xterm does, not once per pixel */
+        static Tab *last_tab;
+        static int last_col = -1, last_row = -1, last_b = -1;
+        if (motion && tb == last_tab && col == last_col && row == last_row && b == last_b) return 1;
+        last_tab = tb; last_col = motion ? col : -1; last_row = row; last_b = b;
+    }
     if (mods & M_CTRL) b |= 16;
     if (mods & M_ALT) b |= 8;
     if (motion) b |= 32;
@@ -5927,6 +6087,43 @@ static int link_at(int col, int row, char *out, int cap) {
     }
 }
 
+/* What a click on a link may do. Any program's output can make text point
+   anywhere (OSC 8), and opening is running for some targets: a .command or
+   .app on macOS, an .exe or a protocol handler on Windows (MS10-007, Electerm
+   CVE-2026-43941). Web and mail open; a file that would run is shown in its
+   folder instead; any other scheme asks first. */
+enum { LINK_REFUSE, LINK_OPEN, LINK_REVEAL, LINK_ASK };
+static int link_prefix(const char *s, const char *p) {
+    for (; *p; s++, p++) if (tolower((unsigned char)*s) != *p) return 0;
+    return 1;
+}
+static int link_action(const char *url) {
+    static const char *web[] = {"https://", "http://", "mailto:", "ftp://"};
+    /* what the system runs (rather than shows in an editor) when it's opened */
+#ifdef _WIN32
+    static const char *runs[] = {".exe", ".bat", ".cmd", ".com", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".msi",
+                                 ".msc", ".lnk", ".scr", ".hta", ".cpl", ".reg", ".pif", ".url", ".appref-ms", ".inf",
+                                 ".library-ms", ".search-ms", ".jar"};
+#else
+    static const char *runs[] = {".command", ".app", ".tool", ".terminal", ".workflow", ".action", ".scpt",
+                                 ".applescript", ".pkg", ".mpkg", ".prefpane", ".jar", ".webloc", ".inetloc"};
+#endif
+    size_t i, n;
+    const char *p;
+    for (i = 0; i < sizeof(web) / sizeof(*web); i++) if (link_prefix(url, web[i])) return LINK_OPEN;
+    if (link_prefix(url, "file:")) {
+        n = strcspn(url, "?#");
+        while (n && url[n - 1] == '/') n--;      /* a bundle: x.app/ */
+        for (i = 0; i < sizeof(runs) / sizeof(*runs); i++) {
+            size_t k = strlen(runs[i]);
+            if (n > k && link_prefix(url + n - k, runs[i])) return LINK_REVEAL;
+        }
+        return LINK_OPEN;
+    }
+    for (p = url; isalnum((unsigned char)*p) || *p == '+' || *p == '-' || *p == '.'; p++) {}
+    return p > url && *p == ':' && isalpha((unsigned char)*url) ? LINK_ASK : LINK_REFUSE;
+}
+
 #ifdef _WIN32
 /* file:///mnt/c/x opens C:\x; anything else goes to the default handler */
 static void open_url(const char *url) {
@@ -5943,7 +6140,21 @@ static void open_url(const char *url) {
             url = buf;
         }
     }
+    int action = link_action(url);
     MultiByteToWideChar(CP_UTF8, 0, url, -1, w, 2048);
+    if (action == LINK_REFUSE) { MessageBeep(MB_ICONWARNING); return; }
+    if (action == LINK_ASK) {
+        wchar_t q[2200];
+        _snwprintf(q, 2200, L"Open this link with the program registered for it?\n\n%ls", w);
+        if (MessageBoxW(g_hwnd, q, L"hardcore", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+    }
+    if (action == LINK_REVEAL && url == buf) {      /* a program: shown in Explorer, not run */
+        wchar_t args[2100];
+        _snwprintf(args, 2100, L"/select,\"%ls\"", w);
+        ShellExecuteW(g_hwnd, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+        return;
+    }
+    if (action == LINK_REVEAL) { MessageBeep(MB_ICONWARNING); return; }
     ShellExecuteW(g_hwnd, L"open", w, NULL, NULL, SW_SHOWNORMAL);
 }
 #else
@@ -6080,6 +6291,12 @@ static void unit_row(const Term *t, int y, char *o, size_t cap) {
     o[n] = 0;
 }
 
+static char g_unit_reply[256];
+static void unit_capture_reply(Term *t, const char *s, int n) {
+    (void)t;
+    snprintf(g_unit_reply, sizeof(g_unit_reply), "%.*s", n, s);
+}
+
 static int unit_issues(FILE *f) {
     static const struct {
         const char *name;
@@ -6119,6 +6336,23 @@ static int unit_issues(FILE *f) {
         {"ICH pushing a wide char off the edge", 8, 2, "abcdef\xe6\x97\xa5\x1b[1;1H\x1b[@", 0, 0, "", {" abcdef", NULL}, -1, -1},
         {"HTS past the right edge (wezterm#8134)", 8, 4, "\x1b[;9H\x1bH\x1b[;100H\x1bH\x1b[999;999H\x1bHX", 0, 0, "",
          {NULL}, 7, 3},
+        {"VPA in origin mode stops at the bottom margin (esctest vpa.py)", 10, 6, "\x1b[2;3r\x1b[?6h\x1b[5dX", 0, 0, "",
+         {"", "", "X", NULL}, 1, 2},
+        {"DECALN drops a pending wrap (esctest decaln.py)", 10, 3, "0123456789\x1b#8X", 0, 0, "",
+         {"XEEEEEEEEE", "EEEEEEEEEE", "EEEEEEEEEE", NULL}, 1, 0},
+        {"DECALN rows don't rejoin on a resize", 10, 3, "0123456789abc\x1b#8", 20, 3, "",
+         {"EEEEEEEEEE", "EEEEEEEEEE", "EEEEEEEEEE", NULL}, -1, -1},
+        {"SO selects G1 line drawing and SI G0 again (vttest; smacs=^N)", 10, 2, "\x1b)0\x0eqqx\x0fq", 0, 0, "",
+         {"\xe2\x94\x80\xe2\x94\x80\xe2\x94\x82q", NULL}, 4, 0},
+        {"DEC graphics _ is a blank", 10, 2, "\x1b(0a_b\x1b(Bc", 0, 0, "", {"\xe2\x96\x92 \xe2\x90\x89" "c", NULL}, 4, 0},
+        {"RIS empties the alternate screen (esctest ris.py)", 10, 3, "m\x1b[?47h\x1b[Ha\x1b" "c\x1b[?47h", 0, 0, "",
+         {"", NULL}, 0, 0},
+        {"DECIC through a wide char erases both halves", 10, 2, "ab\xe6\x97\xa5" "c\x1b[1;4H\x1b['}", 0, 0, "",
+         {"ab   c", NULL}, 3, 0},
+        {"DECDC through a wide char erases both halves", 10, 2, "ab\xe6\x97\xa5" "cd\x1b[1;4H\x1b['~", 0, 0, "",
+         {"ab cd", NULL}, 3, 0},
+        {"C1 controls sent as UTF-8 leave no glyph (xterm, VTE)", 10, 2, "a\xc2\x9b" "b\xc2\x85" "c", 0, 0, "",
+         {"abc", NULL}, 3, 0},
     };
     int i, fails = 0;
     for (i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); i++) {
@@ -6140,6 +6374,95 @@ static int unit_issues(FILE *f) {
         fprintf(f, "%s issue %s%s%s\n", ok ? "ok  " : "FAIL", cases[i].name, ok ? "" : ": ", why);
         fails += !ok;
         term_free(&t);
+    }
+    {   /* REP asks for at most a screenful: 11 bytes can't write a million cells */
+        Term t;
+        int ok = term_init(&t, 20, 3);
+        if (ok) {
+            vt_feed(&t, (const unsigned char *)"a\x1b[999999b", 12);
+            ok = t.hcount <= 2;
+            term_free(&t);
+        }
+        fprintf(f, "%s issue REP is capped at a screenful\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* DECRQCRA reads the screen back: no answer outside tests (Konsole MR 518) */
+        Term t;
+        int ok = term_init(&t, 20, 3);
+        if (ok) {
+            void (*was)(Term *, const char *, int) = g_term_reply_backend;
+            g_unit_reply[0] = 0;
+            g_term_reply_backend = unit_capture_reply;
+            vt_feed(&t, (const unsigned char *)"secret\x1b[1;1;1;1;1;1*y", 23);
+            ok = !g_unit_reply[0] || getenv("HARDCORE_ALLOW_READBACK");
+            g_allow_readback = 1;
+            vt_feed(&t, (const unsigned char *)"\x1b[1;1;1;1;1;1*y", 17);
+            ok = ok && !strcmp(g_unit_reply, "\x1bP1!~FF8D\x1b\\");
+            g_allow_readback = 0;
+            g_term_reply_backend = was;
+            term_free(&t);
+        }
+        fprintf(f, "%s issue DECRQCRA answers only in tests\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* links: web opens; a file that would run is revealed; other schemes ask (MS10-007) */
+        static const struct { const char *url; int want; } links[] = {
+            {"https://example.com", LINK_OPEN}, {"HTTP://x", LINK_OPEN}, {"mailto:a@b", LINK_OPEN},
+            {"file:///Users/u/notes.txt", LINK_OPEN}, {"file:///Users/u/src/app.js", LINK_OPEN},
+            {"vscode://file/x", LINK_ASK}, {"ms-msdt:/id", LINK_ASK}, {"javascript:alert(1)", LINK_ASK},
+            {"no scheme", LINK_REFUSE}, {"", LINK_REFUSE}, {":x", LINK_REFUSE},
+#ifdef _WIN32
+            {"file:///mnt/c/x.bat", LINK_REVEAL}, {"file:///mnt/c/Setup.EXE", LINK_REVEAL},
+#else
+            {"file:///Users/u/x.command", LINK_REVEAL}, {"file:///Applications/X.app/", LINK_REVEAL},
+            {"file:///Users/u/x.command?y#z", LINK_REVEAL},
+#endif
+        };
+        int i, ok = 1;
+        for (i = 0; i < (int)(sizeof(links) / sizeof(*links)); i++)
+            if (link_action(links[i].url) != links[i].want) { ok = 0; fprintf(f, "     link %s: %d\n", links[i].url, link_action(links[i].url)); }
+        fprintf(f, "%s issue a clicked link can't run a program unasked\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* a paste sends text, tabs and line ends only (oss-security 2023/10/20/2) */
+        const char *in = "a\x03" "b\x1b[201~c\xc2\x9b" "d\te\r\nf\ng\x7f\x04\xc3\xa9";
+        char out[64];
+        size_t n = paste_clean(in, out);
+        int ok = n == 17 && !memcmp(out, "ab[201~cd\te\rf\rg\xc3\xa9", 17);
+        fprintf(f, "%s issue a paste can't carry controls that end bracketed paste or signal the shell\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* copying a row a wide char didn't fit on: no space before it (wezterm, kitty) */
+        Term t;
+        int ok = term_init(&t, 10, 3);
+        if (ok) {
+            size_t n;
+            char *out;
+#ifdef _WIN32
+            const char *want = "abcdefghi\xe6\x97\xa5" "z\r\nnext";
+#else
+            const char *want = "abcdefghi\xe6\x97\xa5" "z\nnext";
+#endif
+            const char *in = "abcdefghi\xe6\x97\xa5" "z\r\nnext";
+            vt_feed(&t, (const unsigned char *)in, (int)strlen(in));
+            out = sel_text(&t, term_abs_line(&t, 0), 0, term_abs_line(&t, 2), 9, &n);
+            ok = out && n == strlen(want) && !memcmp(out, want, n);
+            free(out);
+            term_free(&t);
+        }
+        fprintf(f, "%s issue copy leaves out the gap before a wrapped wide char; macOS lines end in \\n\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* restored Claude tabs keep only flags that don't widen what it may do */
+        char out[400];
+        int ok;
+        session_args_filter("--model opus --dangerously-skip-permissions --add-dir a\\ b c "
+                            "--append-system-prompt run\\ this --effort=high --permission-mode bypassPermissions -d ", out, sizeof(out));
+        ok = !strcmp(out, "--model opus --effort=high -d ");
+        session_args_filter("", out, sizeof(out));
+        ok = ok && !out[0];
+        fprintf(f, "%s issue program output can't add Claude flags a restore would run%s%s\n", ok ? "ok  " : "FAIL", ok ? "" : ": ", ok ? "" : out);
+        fails += !ok;
     }
     {   /* SGR colon sub-parameters (alacritty/vte#22) */
         Term t;

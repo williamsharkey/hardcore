@@ -96,8 +96,10 @@ static void mac_grid_restore(NSDictionary *state) {
     grid_measure(g_cols,g_rows);
     NSArray *x=state[@"x"],*y=state[@"y"];
     if([x isKindOfClass:[NSArray class]] && x.count==(NSUInteger)g_grid.cols+1)
-        for(int i=0;i<=g_grid.cols;i++)g_grid.xr[i]=chrome_min(HC_GRID_RATIO,chrome_max(0,[x[i] intValue]));
+        for(int i=0;i<=g_grid.cols;i++)g_grid.xs[i]=g_grid.xr[i]=chrome_min(HC_GRID_RATIO,chrome_max(0,[x[i] intValue]));
+    if(g_grid.xs[0]==0 && x.count==(NSUInteger)g_grid.cols+1)g_grid.xs_n=g_grid.cols;
     if([y isKindOfClass:[NSArray class]] && y.count==(NSUInteger)g_grid.rows+1)
-        for(int i=0;i<=g_grid.rows;i++)g_grid.yr[i]=chrome_min(HC_GRID_RATIO,chrome_max(0,[y[i] intValue]));
+        for(int i=0;i<=g_grid.rows;i++)g_grid.ys[i]=g_grid.yr[i]=chrome_min(HC_GRID_RATIO,chrome_max(0,[y[i] intValue]));
+    if(g_grid.ys[0]==0 && y.count==(NSUInteger)g_grid.rows+1)g_grid.ys_n=g_grid.rows;
     grid_refit();
 }

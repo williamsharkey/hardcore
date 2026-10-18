@@ -372,6 +372,8 @@ reflow-test:
 chrome-test: $(APP)
 	python3 tests/test_titlebar_folder_mac.py
 	python3 tests/test_grid_mac.py
+	python3 tests/test_grid_stress_mac.py
+	python3 tests/test_input_mac.py
 	python3 tests/test_header_cursor_mac.py
 	python3 tests/test_chrome_float_mac.py
 	python3 tests/test_chrome_mac.py
