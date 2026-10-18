@@ -48,9 +48,9 @@ class HairlineWidthsTests(unittest.TestCase):
                     if cp<127:self.assertLessEqual(solid_blocks(new),solid_blocks(old))
             for c in 'Iil':
                 rows=g[ord(c)][1]
-                self.assertTrue(all(r.bit_count()==1 for r in rows[10:h-7]))
+                self.assertTrue(all(bin(r).count("1")==1 for r in rows[10:h-7]))
             # Wider means real open counters, not extra blank advance alone.
-            self.assertGreater(max(r.bit_count() for r in g[ord('H')][1]),max(r.bit_count() for r in self.source[ord('H')][1]))
+            self.assertGreater(max(bin(r).count("1") for r in g[ord('H')][1]),max(bin(r).count("1") for r in self.source[ord('H')][1]))
 
     def test_optical_anchors_accents_and_marks(self):
         for (w,h),g in self.fonts.items():
@@ -61,11 +61,11 @@ class HairlineWidthsTests(unittest.TestCase):
                 self.assertEqual(max(y for y,r in enumerate(g[ord(c)][1]) if r),base)
             for c in 'ij':
                 dot=g[ord(c)][1][4:6];self.assertEqual(len(set(dot)),1)
-                self.assertEqual(dot[0].bit_count(),1)
+                self.assertEqual(bin(dot[0]).count("1"),1)
                 stem=g[ord(c)][1][12];self.assertEqual(stem,dot[0])
             self.assertEqual([y for y,r in enumerate(g[ord('.')][1]) if r],list(range(base-2,base+1)))
             for c in '*.,:;\'"`|!©®°':
-                self.assertEqual(sum(r.bit_count() for r in g[ord(c)][1]),sum(r.bit_count() for r in (design.shorten(self.source[ord(c)][1]) if h==26 else self.source[ord(c)][1])))
+                self.assertEqual(sum(bin(r).count("1") for r in g[ord(c)][1]),sum(bin(r).count("1") for r in (design.shorten(self.source[ord(c)][1]) if h==26 else self.source[ord(c)][1])))
             for accented,plain in [('À','A'),('É','E'),('Ñ','N'),('Ü','U'),('é','e'),('ñ','n'),('ä','a'),('ï','i')]:
                 top=4 if plain.isupper() else 8
                 self.assertEqual(g[ord(accented)][1][top:base+1],g[ord(plain)][1][top:base+1])
@@ -78,7 +78,7 @@ class HairlineWidthsTests(unittest.TestCase):
             self.assertEqual(max(g[0x2500][1]),full)
             self.assertEqual(sum(bool(r) for r in g[0x2500][1]),1)
             self.assertEqual(len(set(g[0x2502][1])),1)
-            self.assertEqual(g[0x2502][1][0].bit_count(),1)
+            self.assertEqual(bin(g[0x2502][1][0]).count("1"),1)
             for y in range(h):
                 self.assertEqual(g[0x258C][1][y]|g[0x2590][1][y],full)
                 self.assertEqual(g[0x259A][1][y]|g[0x259E][1][y],full)

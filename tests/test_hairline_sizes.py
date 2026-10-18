@@ -53,8 +53,8 @@ class HairlineSizesTests(unittest.TestCase):
                     self.assertLessEqual(solid_blocks(new),solid_blocks(old))
             d=design.DESIGNS[h];top,b=d['top'],d['baseline']
             stem=g[ord('I')][1]
-            self.assertTrue(all(r.bit_count()==1 for r in stem[top+1:b]))
-            self.assertEqual(sum(r.bit_count()>1 for r in stem),2)
+            self.assertTrue(all(bin(r).count("1")==1 for r in stem[top+1:b]))
+            self.assertEqual(sum(bin(r).count("1")>1 for r in stem),2)
             self.assertEqual(next(y for y,r in enumerate(g[ord('d')][1]) if r),top)
             self.assertEqual(next(y for y,r in enumerate(g[ord('x')][1]) if r),d['x'])
             self.assertEqual(max(y for y,r in enumerate(g[ord('x')][1]) if r),b)
@@ -75,7 +75,7 @@ class HairlineSizesTests(unittest.TestCase):
     def test_boxes_join_and_blocks_tile_at_every_size(self):
         for h,g in self.fonts.items():
             v=g[0x2502][1];hor=g[0x2500][1]
-            self.assertEqual(len(set(v)),1);self.assertEqual(v[0].bit_count(),1)
+            self.assertEqual(len(set(v)),1);self.assertEqual(bin(v[0]).count("1"),1)
             self.assertEqual(sum(bool(r) for r in hor),1);self.assertEqual(max(hor),4095)
             self.assertEqual(g[0x2588][1],[4095]*h)
             self.assertEqual(g[0x2580][1],[4095]*(h//2)+[0]*(h//2))

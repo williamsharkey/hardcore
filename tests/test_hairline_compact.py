@@ -44,7 +44,7 @@ class HairlineCompactTests(unittest.TestCase):
    for c in 'ax':
     self.assertEqual(next(y for y,r in enumerate(g[ord(c)][1]) if r),8)
     self.assertEqual(max(y for y,r in enumerate(g[ord(c)][1]) if r),b)
-   for c in 'Iil':self.assertTrue(all(r.bit_count()==1 for r in g[ord(c)][1][10:b]))
+   for c in 'Iil':self.assertTrue(all(bin(r).count("1")==1 for r in g[ord(c)][1][10:b]))
    for c in 'ij':self.assertEqual(g[ord(c)][1][4],g[ord(c)][1][12])
    self.assertEqual([y for y,r in enumerate(g[46][1]) if r],list(range(b-2,b+1)))
    for accented,plain in [('À','A'),('É','E'),('Ñ','N'),('Ü','U'),('é','e'),('ñ','n'),('ä','a'),('ï','i')]:
