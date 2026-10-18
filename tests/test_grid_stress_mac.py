@@ -291,8 +291,8 @@ def run():
             wait_for(lambda: len(grid(app)['panes']) == 1, description='a new tab joins the grid')
             check_layout(app)
             app.send('cmd grid')
-            sizes = {(t['cols'], t['rows']) for t in app.state()['tabs']}
-            assert len(sizes) == 1, sizes
+            wait_for(lambda: len({(t['cols'], t['rows']) for t in app.state()['tabs']}) == 1,
+                     description='every tab at the window size again')
     print('Grid stress: resize storm, tiny window, extreme drags, focus and mouse reports, floods, close and hide passed')
 
 

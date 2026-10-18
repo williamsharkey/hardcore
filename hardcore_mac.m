@@ -83,7 +83,7 @@ static int g_gfx_ready;          /* Metal device and shaders are up */
 static int g_quitting;           /* skip the "programs are running" question: last tab closed */
 static int g_paint_pending;      /* a frame is wanted (see plat_invalidate) */
 static double uptime_ms(void);
-static NSTimer *g_timers[8];
+static NSTimer *g_timers[9];
 static int g_browser_nav_hover;
 static int g_browser_native_drag;
 static id g_mac_title_monitor;
@@ -233,6 +233,7 @@ static void timer_fired(int id) {
     plat_kill_timer(id);
     if (id == TIMER_SPARE) make_spare();
     else if (id == TIMER_SETTLE) settle_all();
+    else if (id == TIMER_RESIZE) resize_hold_expire();
     plat_invalidate();
 }
 
@@ -303,6 +304,8 @@ static double g_lat_key, g_lat_out, g_lat_down, g_lat_written;
 static void trace(const char *what);
 static int g_tracing, g_frames, g_trace_commit;
 static unsigned g_paints;   /* frames drawn, for tests: output in a pane that isn't focused must cause one */
+static FILE *g_framelog;    /* tests: each frame's active pane, as text */
+static void framelog_paint(void);
 static double g_trace_tab_t;     /* when the last Cmd+T came in */
 static double uptime_ms(void);
 static double g_t_exec;
@@ -924,7 +927,7 @@ static int tab_drain(Tab *tb) {
     int n = tb->in_n;
     tb->in = NULL;
     tb->in_n = tb->in_cap = 0;
-    if (n) {vt_feed(&tb->t, (unsigned char *)data, n);tb->output_generation++;}
+    if (n) {tab_feed(tb, (unsigned char *)data, n);tb->output_generation++;}
     free(data);
     return n;
 }
@@ -1899,8 +1902,11 @@ static void paint_view_now(void) {
     double t0;
     if (!g_layer || !g_layer.device) return;   /* the worker hasn't finished setting Metal up yet */
     t0 = g_lat ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6 : 0;
+    unsigned frames = g_presented;
     paint_now();
+    if (g_presented == frames) return;   /* put off */
     g_paints++;
+    if (g_framelog) framelog_paint();
     if (g_lat) fprintf(stderr, "paint %.3f\n", clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6 - t0);
 }
 
@@ -2947,6 +2953,21 @@ static NSString *ctl_unescape(const char *s) {
     return out;
 }
 
+/* Tests: the frame just drawn of the focused pane, its rows as the pane shows them */
+static void framelog_paint(void) {
+    Tab *tb=active_tab();if(!tb || tb->kind==TK_BROWSER)return;
+    Term *t=&tb->t;int w=t->cols,h=t->rows;
+    if(g_grid_on){HcGridRect r=grid_rect(tb->id);w=r.w;h=r.h-1;}
+    fprintf(g_framelog,"frame %u %.1f term %dx%d pane %dx%d\n",g_paints,clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1e6,t->cols,t->rows,w,h);
+    for(int y=0;y<h;y++) {
+        const Cell *cells;int n=0,wrapped;char utf[8];
+        term_line(t,t->hcount-t->view+y,&cells,&n,&wrapped);
+        for(int x=0;x<w;x++){int k=utf8_encode(x<n && cells[x].ch?cells[x].ch:' ',utf);fwrite(utf,1,k,g_framelog);}
+        fputc('\n',g_framelog);
+    }
+    fflush(g_framelog);
+}
+
 /* Native renderer inspection, available only through the opt-in local test FIFO. */
 static void ctl_chrome(const char *path) {
     Tab *tb = display_tab();
@@ -3178,6 +3199,7 @@ static void ctl_line(char *s) {
                                                    replacementRange:NSMakeRange(NSNotFound,0)];
         else if(!strncmp(c,"commit ",7))[g_view insertText:[NSString stringWithUTF8String:c+7]?:@"" replacementRange:NSMakeRange(NSNotFound,0)];
         else if(!strcmp(c,"unmark"))[g_view unmarkText];
+        else if(!strncmp(c,"framelog ",9)){if(g_framelog)fclose(g_framelog);g_framelog=c[9]?fopen(c+9,"w"):NULL;}
         else if (!strcmp(c,"grid"))grid_toggle();
         else if (!strncmp(c,"grid-hide ",10))grid_hide_tab(atoi(c+10));
         else if (!strcmp(c,"grid-expand"))grid_expand_next();

@@ -8,7 +8,31 @@ recommendation.
 
 Each fix below has a test named after its source: the `unit_issues` cases in
 `hardcore.c` (`hardcore --unit`), `tests/test_grid_layout.c`,
-`tests/test_grid_stress_mac.py` and `tests/test_input_mac.py`.
+`tests/test_grid_stress_mac.py`, `tests/test_grid_resize_mac.py` and
+`tests/test_input_mac.py`.
+
+## Round 3 — 2026-10-18: resizing under Claude Code
+
+| Bug | Source | Fix |
+|---|---|---|
+| Dragging a divider made Claude Code's text bob a line or two at each step: the old screen was rewrapped and painted before the program redrew (rewrapping also drops the blank row Ink keeps under its status line, and splits its full-width rules) | user report (kitty's `resize_debounce_time` meets the same fight by delaying resizes) | in the grid, the pty is told at once; the screen keeps its old size (cropped or padded in the pane) until the program's answer arrives, and is resized just before that answer is parsed. A program that doesn't answer within 100 ms is rewrapped without it, and at once from then on until it prints again |
+| Two sizes told before the program answered left no way to know which one its redraw was for: one frame in a fast drag came out rewrapped | — | one size in flight per tab; a drag's newer sizes wait for the answer, which also spares Claude Code a redraw per step |
+| A redraw that arrives in two reads (Claude Code's does, ~1.3 ms apart, without synchronized output) could be painted half-done | — | the cursor is hidden while it draws: a tab on screen that took its size and has the cursor hidden holds the frame for the rest (at most 50 ms between frames) |
+
+Measured with Claude Code 2.1.302 in a 2×2 grid, through a test-only frame log
+(`cmd framelog PATH`): before, its prompt went 26 → 28 → 27 on a one-row drag
+step; after, it moves one row per step on every frame. With nine panes of
+20,000-line scrollback, 60 divider steps take about 60–75 ms to work through
+either way; the cost was never speed.
+
+Still open:
+- The normal (single-tab) view still rewraps at once, so Claude Code can bob
+  there while the window is resized. Holding its screen too broke the menus
+  and panels laid out over it (`test_chrome_mac` pagination, three
+  `test_tv_mac` cases); they would need to lay out against the window's size.
+- A program slower than Claude Code that keeps redrawing through a fast drag
+  can have a half-drawn frame let through by the 50 ms bound; keeping each
+  pane's last whole frame to draw from would end that.
 
 ## Round 2 — 2026-10-18: the grid, input, and esctest/libvterm
 

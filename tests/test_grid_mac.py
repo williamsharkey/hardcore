@@ -22,8 +22,9 @@ def run():
             assert g['enabled'] and (g['cols'],g['rows'])==(3,3),g
             panes=g['panes']; state=app.state()
             assert [p['id'] for p in panes]==[t['id'] for t in state['tabs']]
-            for p,t in zip(panes,state['tabs']):
-                assert (t['cols'],t['rows'])==(p['width'],p['height']-1),(p,t)
+            # (a screen takes its size when its program answers, or 100 ms on)
+            wait_for(lambda:all((t['cols'],t['rows'])==(p['width'],p['height']-1) for p,t in zip(panes,app.state()['tabs'])),
+                     description='every pane screen at its pane size')
             for i in range(9):
                 app.send(f'cmd tab {i}')
                 app.feed([f'WINDOW {i+1}', 'abcdefghijk 0123456789', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'])
@@ -66,8 +67,7 @@ def run():
             app.send('cmd resize 1001,591')
             app.header_click('grid')
             assert not app.chrome()['grid']['enabled']
-            sizes={(t['cols'],t['rows']) for t in app.state()['tabs']}
-            assert len(sizes)==1,sizes
+            wait_for(lambda:len({(t['cols'],t['rows']) for t in app.state()['tabs']})==1,description='every tab at the window size')
             app.snap('normal-music')
             saved=app.chrome()['music']['rect']
             app.send('cmd grid');app.chrome()

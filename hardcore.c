@@ -594,6 +594,11 @@ typedef struct Tab {
     int inherit;                 /* restored text above: ConPTY starts at our cursor, not at the top */
     char start_dir[1024];
     char program[64];             /* macOS foreground app, refreshed independently of output */
+    DWORD hold_at;               /* the pty has a new size its screen waits to take (tab_fit) */
+    int hold_cols, hold_rows;
+    int want_cols, want_rows;    /* the size it should have: told once nothing is in flight */
+    DWORD redraw_at;             /* when it took that size, answering, with the cursor showing */
+    int mute;                    /* didn't answer the last one: resized without waiting */
 } Tab;
 
 enum { TK_WSL, TK_PS, TK_CMD, TK_BROWSER };
@@ -695,6 +700,7 @@ static void plat_timer(int id, int ms);          /* one-shot (or, for TIMER_THRO
 #define TIMER_SETTLE 5            /* resizing stopped: rewrap the rest of every tab's scrollback */
 #define TIMER_TV 7                /* secondary panel idle countdown/fade */
 #define TIMER_CHROME 6            /* adaptive menu search and its brief fade transition */
+#define TIMER_RESIZE 8            /* a resize waiting on its program: rewrap without the answer, or tell the next size */
 static DWORD g_chrome_input_at;   /* pause automatic menu motion while typing */
 static void plat_kill_timer(int id);
 static void plat_set_title(const wchar_t *title);
@@ -704,6 +710,7 @@ static void config_save(void);
 static Tab *tab_create(const char *dir, int spare);
 static void tab_destroy_async(Tab *tb);
 static int tab_drain(Tab *tb);
+static void tab_feed(Tab *tb, const unsigned char *d, int n);
 
 /* UTF-8 → wide, NUL-terminated and clipped to cap */
 static void utf8_to_wide(const char *s, wchar_t *out, int cap) {
@@ -2648,13 +2655,13 @@ static int tab_drain(Tab *tb) {
     if (n && g_perf) {
         LARGE_INTEGER a, b;
         QueryPerformanceCounter(&a);
-        vt_feed(&tb->t, (unsigned char *)data, n);
+        tab_feed(tb, (unsigned char *)data, n);
         QueryPerformanceCounter(&b);
         g_pf.parse += lat_ms(a, b);
         g_pf.bytes += n;
         g_pf.drains++;
         perf_tick();
-    } else if (n) vt_feed(&tb->t, (unsigned char *)data, n);
+    } else if (n) tab_feed(tb, (unsigned char *)data, n);
     free(data);
     return n;
 }
@@ -3304,14 +3311,127 @@ static int display_source(const Term *t, int col, int row) {
 
 static void tab_set_size(Tab *tb, int cols, int rows);   /* tell the pty */
 
+/* A resized program redraws itself, but only after it hears: rewrapped at
+   once, its old screen was painted for a frame first, and a TUI that keeps
+   its own layout (Claude Code, which also keeps a blank row under its status
+   line) bobbed a line or two at every step of a divider drag. So the pty is
+   told at once and the screen keeps its old size, cropped or padded in the
+   new space, until the answer arrives; the rewrap and the redraw then paint
+   as one frame. One size at a time is in flight: a drag's newer sizes wait
+   for the answer (it reads the size when it gets to it, so two told before
+   it answered left no telling which one its redraw was for). A program that
+   doesn't answer within RESIZE_HOLD is rewrapped without it, and from then
+   on at once, until it prints again. Grid panes only: the normal view lays
+   its menus and panels out over the tab's screen, which must have the
+   window's size. */
+#define RESIZE_HOLD 100
+#define REDRAW_HOLD 50
+
+static DWORD tick_mark(void) { DWORD now = GetTickCount(); return now ? now : 1; }   /* (0 = not set) */
+
+static int tab_answers_resize(Tab *tb) {
+    if (!g_grid_on || tb->kind == TK_BROWSER || tb->spare || tb->exited || tb->mute) return 0;
+#ifdef _WIN32
+    return tb->hpc && !tb->slurp_hwnd;
+#else
+    return tb->fd >= 0;
+#endif
+}
+
+/* An answer can come in more than one read (Claude Code's redraw takes two)
+   and it doesn't use synchronized output here. Like most TUIs it hides the
+   cursor for a redraw and shows it at the end: a tab that took its size with
+   the cursor showing and has it hidden now is mid-redraw. */
+static int tab_redrawing(Tab *tb) {
+    if (tb->redraw_at && (tb->t.m_cursor_vis || GetTickCount() - tb->redraw_at >= REDRAW_HOLD)) tb->redraw_at = 0;
+    return tb->redraw_at != 0;
+}
+
+/* The size in flight, before the bytes written for it are parsed */
+static void tab_take_size(Tab *tb) {
+    if (!tb->hold_at) return;
+    tb->hold_at = 0;
+    tb->redraw_at = tb->t.m_cursor_vis ? tick_mark() : 0;
+    term_resize(&tb->t, tb->hold_cols, tb->hold_rows);
+}
+
+static void resize_hold_arm(void) {
+    DWORD now = GetTickCount(), wait = 0, left;
+    for (int i = 0; i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        if (tb->hold_at) left = now - tb->hold_at >= RESIZE_HOLD ? 1 : RESIZE_HOLD - (now - tb->hold_at);
+        else if (tab_redrawing(tb) && (tb->want_cols != tb->t.cols || tb->want_rows != tb->t.rows))
+            left = now - tb->redraw_at >= REDRAW_HOLD ? 1 : REDRAW_HOLD - (now - tb->redraw_at);
+        else continue;
+        if (!wait || left < wait) wait = left;
+    }
+    if (wait) plat_timer(TIMER_RESIZE, (int)wait);
+}
+
+static void tab_tell(Tab *tb, int cols, int rows) {
+    tab_set_size(tb, cols, rows);
+    if (!tab_answers_resize(tb)) { term_resize(&tb->t, cols, rows); return; }
+    tb->hold_at = tick_mark();
+    tb->hold_cols = cols;
+    tb->hold_rows = rows;
+    resize_hold_arm();
+}
+
+/* The size the tab should have, once nothing is in flight or mid-redraw */
+static void tab_tell_next(Tab *tb) {
+    if (tb->hold_at || tab_redrawing(tb) || !tb->want_cols) return;
+    if (tb->want_cols != tb->t.cols || tb->want_rows != tb->t.rows) tab_tell(tb, tb->want_cols, tb->want_rows);
+}
+
+/* Output, at the size it was written for */
+static void tab_feed(Tab *tb, const unsigned char *d, int n) {
+    tb->mute = 0;
+    tab_take_size(tb);
+    vt_feed(&tb->t, d, n);
+    tab_tell_next(tb);
+}
+
+static void resize_hold_expire(void) {
+    DWORD now = GetTickCount();
+    for (int i = 0; i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        tab_drain(tb);
+        if (tb->hold_at && now - tb->hold_at >= RESIZE_HOLD - 2) {
+            tab_take_size(tb);
+            tb->redraw_at = 0;
+            tb->mute = 1;        /* no answer: the next size goes straight to the screen */
+        }
+        tab_tell_next(tb);
+    }
+    resize_hold_arm();
+}
+
 /* A tab (and its pty) to the window's grid, if it isn't there yet. */
 static void tab_fit(Tab *tb) {
     if(!tb)return;
     int cols=g_cols,rows=g_rows;grid_tab_size(tb,&cols,&rows);
-    if(tb->t.cols==cols && tb->t.rows==rows)return;
-    tab_drain(tb);
-    term_resize(&tb->t, cols, rows);
-    tab_set_size(tb, cols, rows);
+    tb->want_cols=cols;tb->want_rows=rows;
+    if(tb->hold_at && !tab_answers_resize(tb)){tab_drain(tb);tab_take_size(tb);tb->redraw_at=0;}   /* (left the grid) */
+    if(tb->hold_at || (tb->t.cols==cols && tb->t.rows==rows))return;   /* in flight: its answer sends this */
+    tab_drain(tb);               /* what it wrote before it hears, at the size it wrote for */
+    if(tab_redrawing(tb)){resize_hold_arm();return;}   /* the rest of that redraw first */
+    if(!tb->hold_at && (tb->t.cols!=cols || tb->t.rows!=rows))tab_tell(tb, cols, rows);
+}
+
+/* A frame waits for the rest of a redraw in progress on screen, but never
+   long, even while a drag keeps tabs answering */
+static DWORD g_present_at;
+static int resize_redrawing(void) {
+    int wait = 0;
+    for (int i = 0; i < g_ntabs; i++)
+        if (tab_redrawing(g_tabs[i]) && (g_grid_on ? grid_index(g_tabs[i]->id) >= 0 : g_tabs[i] == active_tab())) wait = 1;
+    return wait && GetTickCount() - g_present_at < REDRAW_HOLD;
+}
+
+/* The size a tab has, or is on its way to */
+static int tab_sized(const Tab *tb, int cols, int rows) {
+    return tb->t.cols == cols && tb->t.rows == rows ? !tb->hold_at || (tb->hold_cols == cols && tb->hold_rows == rows)
+                                                    : (tb->hold_at || tb->redraw_at) && tb->want_cols == cols && tb->want_rows == rows;
 }
 
 /* While the window is being resized only the tab you see follows each step.
@@ -3351,7 +3471,7 @@ static void settle_all(void) {
     for (i = 0; i <= g_ntabs; i++) {
         tb = i < g_ntabs ? g_tabs[i] : g_spare;
         int cols=g_cols,rows=g_rows;if(tb)grid_tab_size(tb,&cols,&rows);
-        if (tb && (tb->t.cols != cols || tb->t.rows != rows)) {
+        if (tb && !tab_sized(tb, cols, rows)) {
             tab_fit(tb);
             plat_timer(TIMER_SETTLE, 16);
             return;
@@ -4908,6 +5028,7 @@ static char g_snap_path[MAX_PATH];
 
 
 static void r_present(void);
+static unsigned g_presented;     /* frames that reached the screen (paint_now can put one off) */
 
 static void paint_now(void) {
     Tab *tb = active_tab();
@@ -4916,6 +5037,10 @@ static void paint_now(void) {
 #endif
     if (tb && tb->t.m_sync && GetTickCount() - tb->t.sync_since < 200) {
         plat_timer(TIMER_SYNC, 20);
+        return;
+    }
+    if (resize_redrawing()) {
+        plat_timer(TIMER_SYNC, 2);
         return;
     }
     /* a spare that just became this tab answers with its prompt within a
@@ -4945,6 +5070,8 @@ static void paint_now(void) {
     if (g_perf) QueryPerformanceCounter(&p1);
 #endif
     r_present();
+    g_presented++;
+    g_present_at = GetTickCount();
 #ifdef _WIN32
     slurp_commit_all();
     if (g_perf) {
@@ -7335,6 +7462,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
         else if (wp == TIMER_SETTLE) settle_all();
+        else if (wp == TIMER_RESIZE) resize_hold_expire();
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
     case WM_SIZE:
