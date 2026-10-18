@@ -496,6 +496,7 @@ class MacDockTests(unittest.TestCase):
                    production_function(ROOT/'hardcore.c', 'static void config_look_save(FILE *f)'),
                    widths.stdout,
                    production_function(ROOT/'hardcore.c', 'static int in_ranges(uint32_t cp, const uint32_t (*r)[2], int n)'),
+                   production_function(ROOT/'hardcore.c', 'static int cp_width_search(uint32_t cp)'),
                    production_function(ROOT/'hardcore.c', 'static int cp_width(uint32_t cp)')]
         adapter = production_function(ROOT/'hardcore_mac.m',
             'static int mac_dock_glyph(NSString *fontKey, uint32_t cp, unsigned char *pixels, int stride)')

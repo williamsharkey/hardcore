@@ -40,7 +40,7 @@ static void browser_ui_eval_value(HCBrowser *b,int node,int revision,int documen
     NSData *data=[NSJSONSerialization dataWithJSONObject:@[value] options:0 error:nil];
     NSString *array=[[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
     NSString *code=[NSString stringWithFormat:@"globalThis.hardcoreBrowser?.activate(%d,%d,%@)",node,revision,[array substringWithRange:NSMakeRange(1,array.length-2)]];
-    [b->web evaluateJavaScript:code inFrame:nil inContentWorld:browser_world() completionHandler:nil];
+    [b evaluate:code completion:nil];
 }
 static void browser_ui_commit(HCBrowser *b) {
     if(!b->editKind)return;
@@ -79,7 +79,7 @@ static void mac_browser_begin_control(Tab *tb,int node,int revision,int document
         browser_ui_begin_edit(b,[tag isEqual:@"TEXTAREA"] ? 3 : 2,browser_string(info[@"value"]));return;
     }
     NSString *code=[NSString stringWithFormat:@"globalThis.hardcoreBrowser?.activate(%d,%d)",node,revision];
-    [b->web evaluateJavaScript:code inFrame:nil inContentWorld:browser_world() completionHandler:nil];
+    [b evaluate:code completion:nil];
 }
 static void mac_browser_address_grid(void) {
     Tab *tb=active_tab();if(!tb || tb->kind!=TK_BROWSER)tb=mac_browser_new(@"hardcore:welcome",tb ? tb->id : 0,0);
@@ -95,7 +95,7 @@ static int mac_browser_insert(NSString *text) {
 static void browser_inspect_request(HCBrowser *b,int node) {
     int revision=b->generation,epoch=b->epoch,identity=b->tabID;
     NSString *js=[NSString stringWithFormat:@"globalThis.hardcoreBrowser?.inspect(%d,%d)",node,revision];
-    [b->web evaluateJavaScript:js inFrame:nil inContentWorld:browser_world() completionHandler:^(id result,NSError *error){
+    [b evaluate:js completion:^(id result,NSError *error){
         Tab *tb=tab_by_id(identity);if(error || !tb || tb->browser!=b || b->generation!=revision || b->epoch!=epoch || ![result isKindOfClass:NSDictionary.class])return;
         int oldScroll=[b->inspection[@"id"] isEqual:result[@"id"]] ? b->inspectScroll : 0;
         [b->inspection release];b->inspection=[result copy];b->inspectRevision=revision;b->inspectOpen=1;b->inspectScroll=oldScroll;b->dirty=1;
@@ -124,7 +124,7 @@ static void browser_context_target(int mx,int my,int node,int link) {
     b->menuWidth=MIN(tb->t.cols,28);b->menuX=MAX(0,MIN(tb->t.cols-b->menuWidth,col));b->menuY=MAX(0,MIN(tb->t.rows-8,row));
     b->menuItems=[@[@{@"label":@"Copy selection",@"op":@3},@{@"label":@"Inspect element",@"op":@4},@{@"label":@"Back",@"op":@5},@{@"label":@"Reload",@"op":@6}] retain];
     NSString *js=[NSString stringWithFormat:@"globalThis.hardcoreBrowser?.info(%d,%d)",link ? link : node,revision];
-    [b->web evaluateJavaScript:js inFrame:nil inContentWorld:browser_world() completionHandler:^(id info,NSError *error){
+    [b evaluate:js completion:^(id info,NSError *error){
         if(error || b->generation!=revision || b->epoch!=epoch || b->menuKind!=1 || b->menuNode!=node || ![info isKindOfClass:NSDictionary.class])return;
         NSString *url=browser_string(info[@"href"]);if(!url.length)url=browser_string(info[@"src"]);
         if(url.length){[b->menuURL release];b->menuURL=[url copy];[b->menuItems release];b->menuItems=[@[
@@ -146,7 +146,7 @@ static void browser_ui_menu_choose(HCBrowser *b,int at) {
     case 3:
         if(active_tab()->browser_native){
             int identity=b->tabID;
-            [b->web evaluateJavaScript:@"globalThis.getSelection()?.toString() || ''" inFrame:nil inContentWorld:browser_world() completionHandler:^(id value,NSError *error){
+            [b evaluate:@"globalThis.getSelection()?.toString() || ''" completion:^(id value,NSError *error){
                 if(!error && tab_by_id(identity) && [value isKindOfClass:NSString.class])set_clipboard_utf8([value UTF8String],(int)[value lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
             }];
         }else sel_copy();break;
@@ -289,8 +289,8 @@ static void mac_browser_draw_nav(void) {
     if(chrome_preview_active())return;
     Tab *tb=active_tab();HCBrowser *b=browser_for(tb);if(!b || !g_browser_nav_hover)return;
     BrowserNav n=browser_nav();
-    browser_ui_text(@"[←]",n.back,n.controlsRow,3,b->web.canGoBack ? DEF_FG : g_look.dim);
-    browser_ui_text(@"[→]",n.forward,n.controlsRow,3,b->web.canGoForward ? DEF_FG : g_look.dim);
+    browser_ui_text(@"[←]",n.back,n.controlsRow,3,[b canGoBack] ? DEF_FG : g_look.dim);
+    browser_ui_text(@"[→]",n.forward,n.controlsRow,3,[b canGoForward] ? DEF_FG : g_look.dim);
     browser_ui_text(@"[×]",n.close,n.controlsRow,3,DEF_FG);browser_ui_text(@"[+]",n.add,n.controlsRow,3,DEF_FG);
     browser_ui_text(tb->browser_native ? @"[Native]" : @"[ Mono ]",n.mode,n.controlsRow,8,AMBER);
     browser_ui_text(@"│",n.url-1,n.urlRow,1,g_look.dim);browser_ui_text(@"│",n.go-1,n.urlRow,1,g_look.dim);

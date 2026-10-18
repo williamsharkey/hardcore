@@ -67,7 +67,7 @@ static int mac_write_all(int fd, const void *bytes, size_t n) {
 static NSString *mac_runtime_dir(void) { return mac_runtime(); }
 
 #define MAC_TERM_NUMBERS(X) \
-    X(st) X(esc_which) X(np) X(priv) X(inter) X(utf8_need) X(utf8_acc) X(osc_n) \
+    X(st) X(esc_which) X(np) X(priv) X(inter) X(sub) X(csi_bad) X(utf8_need) X(utf8_acc) X(utf8_min) X(osc_n) X(osc_over) \
     X(last_ch) X(m_sync) X(sync_since) X(bell) X(spin_ch) X(spin_at) X(spin_n) \
     X(progress) X(ps_state) X(ps_pct) X(ps_tasks)
 #define MAC_TERM_STRINGS(X) X(cwd) X(claude) X(claude_args) X(cmd) X(ps_kind)
@@ -79,6 +79,7 @@ static NSDictionary *mac_pack_tab(Tab *tb) {
     NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:@{
         @"id": @(tb->id), @"kind": @(tb->kind), @"parent": @(tb->parent_id),
         @"browser_url": [NSString stringWithUTF8String:tb->browser_url] ?: @"",
+        @"browser_target": [NSString stringWithUTF8String:tb->browser_target] ?: @"",
         @"browser_site": [NSString stringWithUTF8String:tb->browser_site] ?: @"",
         @"browser_native": @(tb->browser_native),
         @"browser_recording": @(tb->browser_recording),
@@ -135,6 +136,7 @@ static Tab *mac_unpack_tab(NSDictionary *d) {
         tb->browser_native=[d[@"browser_native"] boolValue];
         int recording=[d[@"browser_recording"] intValue];tb->browser_recording=recording==1 || recording==2 ? recording : 0;
         snprintf(tb->browser_url,sizeof(tb->browser_url),"%s",[browser_string(d[@"browser_url"]) UTF8String]);
+        snprintf(tb->browser_target,sizeof(tb->browser_target),"%s",[browser_string(d[@"browser_target"]) UTF8String]);
         snprintf(tb->browser_site,sizeof(tb->browser_site),"%s",[browser_string(d[@"browser_site"]) UTF8String]);
         if (fd>=0 || [d[@"pid"] intValue]>0) { term_free(&tb->t); free(tb); return NULL; }
     }
@@ -149,7 +151,11 @@ static Tab *mac_unpack_tab(NSDictionary *d) {
     if (t->st < S_GROUND || t->st > S_STR_ESC || t->np < 0 || t->np > MAX_PARAMS || t->utf8_need < 0 || t->utf8_need > 3 || t->osc_n != (int)[osc length]) {
         term_free(t); free(tb); return NULL;
     }
-    memcpy(t->osc, [osc bytes], [osc length]);
+    if ([osc length]) {          /* the OSC buffer grows on demand: give it room for what was pending */
+        t->osc_cap = (int)[osc length] + 1024;
+        if (!(t->osc = malloc((size_t)t->osc_cap))) { term_free(t); free(tb); return NULL; }
+        memcpy(t->osc, [osc bytes], [osc length]);
+    }
     int j = 0;
     for (NSNumber *v in d[@"params"]) t->params[j++] = [v intValue];
     t->nmarks = 0;
@@ -509,11 +515,13 @@ static int mac_update_unit(FILE *f) {
     browser->fd=-1; browser->id=200; browser->parent_id=100; browser->kind=TK_BROWSER; browser->browser_native=1;
     snprintf(browser->browser_url,sizeof(browser->browser_url),"https://example.com/a?b=c");
     snprintf(browser->browser_site,sizeof(browser->browser_site),"Example");
+    snprintf(browser->browser_target,sizeof(browser->browser_target),"A1B2C3D4");
     utf8_to_wide("Page title - Example",browser->t.title,256);
     Tab *restored=mac_unpack_tab(mac_pack_tab(browser));
     int ok=restored && restored->id==200 && restored->parent_id==100 && restored->kind==TK_BROWSER &&
         restored->browser_native==1 && !restored->browser && restored->fd==-1 && restored->pid==0 &&
         !strcmp(restored->browser_url,browser->browser_url) && !strcmp(restored->browser_site,browser->browser_site) &&
+        !strcmp(restored->browser_target,browser->browser_target) &&
         !wcscmp(restored->t.title,browser->t.title);
     fprintf(f,"%s browser reload metadata, stable IDs and lazy engine restoration\n",ok ? "ok  " : "FAIL");
     fails+=!ok;

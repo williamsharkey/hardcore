@@ -4,6 +4,7 @@
 The test harness is Python; the runtime under test is a bare executable with a
 PATH containing neither Python nor Lua and no Resources directory.
 """
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -45,8 +46,45 @@ class NativeHere(unittest.TestCase):
         return subprocess.run([str(self.exe), 'here', *args], env=self.env,
             cwd=self.root, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
 
-    def stop(self):
-        self.cli('--stop', self.name)
+    def stop(self, name=None):
+        name = name or self.name
+        state = self.cli('--status', name)
+        owned = set()
+        if state.returncode == 0:
+            state = json.loads(state.stdout)
+            owned.add(state['pid'])
+            owned.update(tab['pid'] for tab in state['tabs'])
+        self.cli('--stop', name)
+        # --stop acknowledges the request before PTY shutdown and settings
+        # persistence. Wait for the owned session to finish those writes before
+        # TemporaryDirectory removes HOME; retrying rmtree would hide the race.
+        lock = Path('/tmp') / f'hardcore-here-{os.getuid()}' / (name + '.native.sock.lock')
+        try:
+            fd = os.open(lock, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        except FileNotFoundError:
+            fd = None
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                released = fd is None
+                if fd is not None:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        pass
+                    else:
+                        released = True
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                remaining = [pid for pid in owned if alive(pid)]
+                if released and not remaining:
+                    return
+                if time.monotonic() >= deadline:
+                    self.fail(f'Owned session {name} did not finish shutdown: '
+                              f'live PIDs={remaining}, lock held={not released}')
+                time.sleep(.02)
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def host(self, *args):
         t = OwnedTerminal([str(self.exe), 'here', *args], self.env, self.root)

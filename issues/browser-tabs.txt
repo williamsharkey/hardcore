@@ -1,3 +1,35 @@
+Current implementation — 2026-10-17
+
+Desktop +www and macOS native `hardcore here` WWW now use installed full Chrome
+through the embedded native CDP backend (hardcore_chrome_browser.h). The default
+attaches to the user's regular Chrome profile through Chrome 144+'s
+chrome://inspect remote-debugging opt-in (Chrome 136+ ignores debugging switches
+on the default profile, and Google refuses sign-in in a debugged private
+profile). Chrome prompts per connection; the handshake waits for Allow.
+HARDCORE_CHROME_PROFILE selects a private headless profile for tests/dev.
+No profile/cookie copying is performed. Desktop retains
+semantic grid projection and adds a screenshot/input surface for normal mode;
+terminal WWW now supports live JS, numbered DOM controls, and Chrome history.
+Local Clips documents retain WKWebView. `hardcore chrome setup` opens Chrome's
+remote-debugging opt-in page (or, with HARDCORE_CHROME_PROFILE, that profile).
+A per-login relay (hardcore_chrome_relay.h, `hardcore chrome relay`) holds the
+single consented connection, so prompts are per Chrome session and attached
+hidden targets survive reloads; unadopted targets close after 60 s, the relay
+exits after 10 idle minutes. Note: Target.getTargets omits hidden targets;
+use Target.getTargetInfo per ID.
+
+Verified with disposable Chrome profiles: DOM projection, form/native input,
+history, persisted cookies across processes, screenshots, popup opener retention,
+and a real MV3 extension content script/background worker/storage. Desktop GUI
+reload reconnects to a persistent headless target with unsaved input intact.
+Existing-profile hidden targets have connection-scoped lifetime and reload URLs
+on reconnect. Browser toolbar popups, permission/file dialogs, downloads, and
+extension-specific native messaging are not fully mirrored; Claude-extension
+compatibility and Windows remain separate work. See README for current commands.
+
+The notes below record the initial investigation; the WebKit recommendation and
+first-pass status describe the earlier implementation, superseded above.
+
 Browser tabs investigation — 2026-10-15
 Status: macOS first pass built on 2026-10-15. Live WKWebView tabs, default
 Hardcore grid/native switching, link/basic-control activation, bounded DOM

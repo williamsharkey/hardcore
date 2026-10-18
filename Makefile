@@ -36,7 +36,7 @@ MAC_LIBS   = -framework Cocoa -framework Metal -framework QuartzCore -framework 
 APP        = hardcore.app
 APPDIR    ?= $(HOME)/Applications
 BINDIR    ?= $(HOME)/.local/bin
-HERE_HEADERS = hardcore_here.h hardcore_here_transport.h hardcore_here_ui.h hardcore_here_helpers.h hardcore_here_media.h hardcore_here_media_source.h hardcore_textile.h
+HERE_HEADERS = hardcore_here.h hardcore_here_transport.h hardcore_here_ui.h hardcore_here_helpers.h hardcore_here_chrome.h hardcore_chrome_browser.h hardcore_chrome_relay.h hardcore_here_media.h hardcore_here_media_source.h hardcore_textile.h
 
 .PHONY: all clean selftest install test mac-test slurp-test
 
@@ -173,7 +173,7 @@ ifeq ($(UNAME),Linux)
 build/hardcore: hardcore.c $(HERE_HEADERS) build/font.bin build/fonts.bin build/fonts.inc build/width.inc
 	$(LINUX_CC) -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c -lutil -pthread
 else
-build/hardcore: hardcore_mac_launch.h $(HERE_HEADERS) tools/ExecutableInfo.plist
+build/hardcore: hardcore_mac_launch.h hardcore_browser_chrome_view.h $(HERE_HEADERS) tools/ExecutableInfo.plist
 
 build/hardcore: hardcore_mac_music.m hardcore_music_panel.m hardcore_recording_view_geometry.h hardcore_clips_panel.m hardcore_recording_jobs.m hardcore_camera_capture.h hardcore_camera_capture.m hardcore_camera_panel.m hardcore_recording.m hardcore_recording_library.m build/browser.inc hardcore_browser_image_geometry.h hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_INFO_FLAGS) $(MAC_LIBS)
@@ -405,6 +405,11 @@ here-test: build/hardcore
 	python3 tests/test_here_executable_info.py
 	python3 tests/test_here_media.py
 mac-here-test: here-test
+
+# Real installed Chrome; isolated temporary profiles and local fixture pages.
+.PHONY: chrome-browser-test
+chrome-browser-test: build/browser.inc
+	python3 tests/test_chrome_browser.py
 
 .PHONY: mac-browser-images-test
 mac-browser-images-test: $(APP)

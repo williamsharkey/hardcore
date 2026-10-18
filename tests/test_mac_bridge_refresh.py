@@ -26,6 +26,7 @@ HARNESS = r'''
 #include <time.h>
 #include <unistd.h>
 #include <util.h>
+#include <os/lock.h>
 #define CW 12
 #define CH 26
 typedef unsigned DWORD;
@@ -33,7 +34,8 @@ enum { TK_TERMINAL, TK_BROWSER };
 typedef struct { int cols, rows, marker, nmarks, had_activity; } Term;
 typedef struct {
     Term t; int id, kind, parent_id, fd, exited, born; pid_t pid;
-    void *rsrc, *psrc, *wq; int *wpending;
+    void *rsrc, *psrc, *wq, *pin; int *wpending;
+    char *in; int in_n, in_cap;
     unsigned long long write_seq;
     char run[600], hist[400];
 } Tab;
@@ -52,6 +54,7 @@ static int mac_input_held(Tab *tb) { (void)tb; return 0; }
 static void child_env(void) {}
 static void update_title(void) {}
 static void plat_invalidate(void) {}
+static void schedule_output(void) {}
 static void read_some(Tab *tb) {
     char buffer[4096];
     while (read(tb->fd, buffer, sizeof(buffer)) > 0) {}
@@ -188,7 +191,10 @@ class BridgeRefreshTests(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory(prefix='hc-bridge-refresh-')
         cls.addClassCleanup(cls.directory.cleanup)
         directory = Path(cls.directory.name)
+        mac = (ROOT/'hardcore_mac.m').read_text()
+        reader = mac[mac.index('enum { PIN_FULL'):mac.index('/* Stops reading; the fd closes')]   # PtyIn and its helpers
         code = HARNESS.replace('/* IO */', '\n'.join([
+            reader,
             production_function(ROOT/'hardcore_mac.m', 'static void stop_reading(Tab *tb)'),
             production_function(ROOT/'hardcore_mac.m', 'static void tab_start_io(Tab *tb)'),
             production_function(ROOT/'hardcore_mac.m', 'static void tab_write(Tab *tb, const void *s, int n)'),

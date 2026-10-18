@@ -79,14 +79,6 @@ int main(int argc, char **argv) {
             NSString *url=hhh_url([NSString stringWithUTF8String:argv[2]],argc>3?[NSString stringWithUTF8String:argv[3]]:nil);
             if(!url)return 2;puts([url UTF8String]);return 0;
         }
-        if(argc>1 && !strcmp(argv[1],"parse")) {
-            NSMutableData *input=[NSMutableData data];char buf[8192];size_t n;
-            while((n=fread(buf,1,sizeof(buf),stdin)) && [input length]<HHH_BODY_MAX)[input appendBytes:buf length:n];
-            NSString *html=[[[NSString alloc]initWithData:input encoding:NSUTF8StringEncoding]autorelease];
-            NSDictionary *page=hhh_html(html?:@"",@"https://example.com/base/",0);
-            NSData *out=[NSJSONSerialization dataWithJSONObject:page options:0 error:NULL];
-            fwrite(out.bytes,1,out.length,stdout);return 0;
-        }
         if(argc>1 && !strcmp(argv[1],"settings")) {
             HereSettings s;here_settings_load(&s);
             if(argc>2){s.theme='n';s.font_size=17;s.allow_host_font=1;snprintf(s.font_name,sizeof(s.font_name),"Monaco");if(!here_settings_save(&s))return 2;}
@@ -205,47 +197,48 @@ class NativeHelpers(unittest.TestCase):
         self.case = tempfile.TemporaryDirectory(dir=self.root)
         self.path = Path(self.case.name)
         self.env = {**os.environ, 'PATH': '/usr/bin:/bin',
-                    'XDG_CONFIG_HOME': str(self.path / 'config'), 'TERM_PROGRAM': 'test-owned'}
+                    'XDG_CONFIG_HOME': str(self.path / 'config'), 'TERM_PROGRAM': 'test-owned',
+                    'HARDCORE_CHROME_PROFILE': str(self.path / 'chrome-profile')}
+        self.env.pop('HARDCORE_CHROME_ATTACH', None)
         self.addCleanup(self.case.cleanup)
+        self.addCleanup(self.stop_chrome)
+
+    def stop_chrome(self):
+        # Only processes launched with this case's exact disposable profile.
+        marker = '--user-data-dir=' + self.env['HARDCORE_CHROME_PROFILE']
+        listing = subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True, text=True)
+        owned = []
+        for line in listing.stdout.splitlines():
+            pid, _, command = line.strip().partition(' ')
+            if marker in command and pid.isdigit():
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                    owned.append(int(pid))
+                except ProcessLookupError:
+                    pass
+
+        deadline = time.monotonic() + 4
+        while owned and time.monotonic() < deadline:
+            for pid in owned[:]:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    owned.remove(pid)
+            time.sleep(.03)
+
+    def require_chrome(self):
+        path = os.environ.get('HARDCORE_CHROME_EXECUTABLE', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+        if not Path(path).is_file():
+            self.skipTest('installed Chrome required for live WWW test')
 
     def run_helper(self, *args, input=None):
         return subprocess.run([str(self.binary), *args], input=input, capture_output=True,
                               env=self.env, timeout=5)
 
-    def parse(self, html):
-        proc = self.run_helper('parse', input=html.encode())
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        return json.loads(proc.stdout)
-
     def owned(self, *args):
         p = OwnedPTY([str(self.binary), *args], self.env)
         self.addCleanup(p.close)
         return p
-
-    def test_html_text_links_entities_and_hidden_content(self):
-        page = self.parse('<head><title>Small &amp; useful</title><script>bad()</script></head>'
-                          '<h1>Heading</h1><p>café 🚀 &lt;literal&gt; &#27;[31m</p>'
-                          '<span hidden>SECRET</span><span style="display: none">HIDDEN</span>'
-                          '<a href="../next?a=1&amp;b=2">Next</a>'
-                          '<a href="javascript:alert(1)">unsafe</a>'
-                          '<img alt="diagram"><pre>a  b\nc</pre>')
-        self.assertEqual(page['title'], 'Small & useful')
-        self.assertIn('café 🚀 <literal>', page['text'])
-        self.assertIn('Next [1]', page['text'])
-        self.assertIn('[Image: diagram]', page['text'])
-        self.assertIn('a  b\nc', page['text'])
-        self.assertNotIn('SECRET', page['text'])
-        self.assertNotIn('HIDDEN', page['text'])
-        self.assertNotIn('bad()', page['text'])
-        self.assertNotIn('\x1b', page['text'])
-        self.assertEqual(page['links'], ['https://example.com/next?a=1&b=2'])
-
-    def test_response_text_and_link_bounds(self):
-        page = self.parse('<p>' + 'a' * 190000 + '</p>')
-        self.assertLessEqual(len(page['text']), 160100)
-        self.assertIn('truncated', page['text'])
-        page = self.parse(''.join(f'<a href="/{i}">link</a>' for i in range(400)))
-        self.assertEqual(len(page['links']), 300)
 
     def test_url_validation_and_relative_resolution(self):
         self.assertEqual(self.run_helper('url', '/hello', 'https://example.com/a/').stdout.strip(),
@@ -340,10 +333,13 @@ class NativeHelpers(unittest.TestCase):
         time.sleep(.1)
         self.assertIsNone(p.process.poll())
 
-    def test_native_web_fetch_links_back_and_cancel(self):
+    def test_native_web_javascript_forms_links_back_and_cancel(self):
+        self.require_chrome()
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                payload = (b'<h1>FIRST PAGE</h1><a href="/next">Next</a>' if self.path == '/'
+                payload = (b'<h1 id="title">STATIC PAGE</h1><script>document.getElementById("title").textContent="FIRST PAGE"</script>'
+                           b'<a href="/next">Next</a><input id="name" aria-label="Name">'
+                           b'<button onclick="document.getElementById(\'result\').textContent=\'SAVED \' + document.getElementById(\'name\').value">Save</button><p id="result"></p>' if self.path == '/'
                            else b'<h1>SECOND PAGE</h1>')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -358,7 +354,13 @@ class NativeHelpers(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         p = self.owned('web', f'http://127.0.0.1:{server.server_port}/')
-        p.read_until('FIRST PAGE')
+        p.read_until('FIRST PAGE', timeout=25)
+        p.send(b'2\r')
+        p.read_until('Enter applies')
+        p.send(b'Chrome form value\r')
+        p.read_until('Name: Chrome form value')
+        p.send(b'3\r')
+        p.read_until('SAVED Chrome form value')
         p.send(b'1\r')
         p.read_until('SECOND PAGE')
         p.output.clear()
@@ -371,48 +373,42 @@ class NativeHelpers(unittest.TestCase):
                 p.output.extend(os.read(p.master, 65536))
         self.assertEqual(p.process.poll(), 0)
 
-    def test_native_web_download_redirect_bounds_and_live_cancellation(self):
+    def test_native_web_missing_chrome_is_visible_and_quit_restores_terminal(self):
+        self.env['HARDCORE_CHROME_EXECUTABLE'] = str(self.path / 'missing-chrome')
+        p = self.owned('web', 'https://example.com/')
+        p.read_until('Chrome', timeout=10)
+        p.send(b'q')
+        deadline = time.monotonic() + 3
+        while p.process.poll() is None and time.monotonic() < deadline:
+            if select.select([p.master], [], [], .02)[0]:
+                p.output.extend(os.read(p.master, 65536))
+        self.assertEqual(p.process.poll(), 0)
+
+    def test_native_web_loading_can_be_cancelled_immediately(self):
+        self.require_chrome()
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                if self.path == '/large':
+                time.sleep(2)
+                try:
                     self.send_response(200)
-                    self.send_header('Content-Type', 'text/html')
-                    self.send_header('Content-Length', str(2 * 1024 * 1024 + 1))
                     self.end_headers()
-                elif self.path == '/loop':
-                    self.send_response(302)
-                    self.send_header('Location', '/loop')
-                    self.end_headers()
-                else:
-                    time.sleep(.7)
-                    try:
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/html')
-                        self.end_headers()
-                        self.wfile.write(b'LATE RESPONSE')
-                    except (BrokenPipeError, ConnectionResetError):
-                        pass
+                    self.wfile.write(b'LATE RESPONSE')
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             def log_message(self, *args):
                 pass
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        base = f'http://127.0.0.1:{server.server_port}'
-        large = self.owned('web', base + '/large')
-        large.read_until('2 MiB limit')
-        large.send(b'q')
-        redirect = self.owned('web', base + '/loop')
-        redirect.read_until('excessive redirects')
-        redirect.send(b'q')
-        pending = self.owned('web', base + '/pending')
-        pending.read_until('Loading page')
+        p = self.owned('web', f'http://127.0.0.1:{server.server_port}/pending')
+        p.read_until('Starting Chrome', timeout=10)
         started = time.monotonic()
-        pending.send(b'q')
-        while pending.process.poll() is None and time.monotonic() - started < .5:
-            if select.select([pending.master], [], [], .02)[0]:
-                pending.output.extend(os.read(pending.master, 65536))
-        self.assertEqual(pending.process.poll(), 0, 'quit must not wait for a network response')
+        p.send(b'q')
+        while p.process.poll() is None and time.monotonic() - started < .8:
+            if select.select([p.master], [], [], .02)[0]:
+                p.output.extend(os.read(p.master, 65536))
+        self.assertEqual(p.process.poll(), 0, 'quit must not wait for browser launch or navigation')
 
 
 if __name__ == '__main__':

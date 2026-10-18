@@ -57,6 +57,7 @@ static void mac_record_upload(int,int,const unsigned char *);
 static void mac_record_event(NSEvent *,int,int);
 static void mac_record_hide_pointer(void);
 #include <util.h>
+#include <os/lock.h>
 #include <fcntl.h>
 #include <libproc.h>
 #include <pwd.h>
@@ -250,14 +251,19 @@ static void plat_kill_timer(int id) {
 }
 
 static void plat_set_title(const wchar_t *title) {
+    static wchar_t shown[300];
+    static char shown_folder[MAX_PATH];
     if (!g_win) return;
     Tab *tb=active_tab();
     if(tb && tb->kind==TK_BROWSER)tb=tab_by_id(tb->parent_id);
-    NSString *folder=nil;
-    if(tb && tb->kind!=TK_BROWSER) {
-        const char *path=tb->t.cwd[0]?tb->t.cwd:tb->start_dir;
-        if(path[0]=='/')folder=[NSString stringWithUTF8String:path];
-    }
+    const char *path=tb && tb->kind!=TK_BROWSER?(tb->t.cwd[0]?tb->t.cwd:tb->start_dir):"";
+    if(path[0]!='/')path="";
+    /* every output from the active tab asks; only a changed title or folder is news */
+    if (!wcsncmp(shown, title, 299) && wcslen(title) < 299 && !strcmp(shown_folder, path)) return;
+    wcsncpy(shown, title, 299);
+    shown[299] = 0;
+    snprintf(shown_folder, sizeof(shown_folder), "%s", path);
+    NSString *folder=path[0]?[NSString stringWithUTF8String:path]:nil;
     NSURL *url=folder.length?[NSURL fileURLWithPath:folder isDirectory:YES]:nil;
     if(![g_win.representedURL isEqual:url])[g_win setRepresentedURL:url];
     NSString *label=folder.length?[[NSFileManager defaultManager] displayNameAtPath:folder]:nil;
@@ -683,10 +689,9 @@ static void on_tab_exited(int id, int code);
 
 static int g_output_pending;
 
-static void schedule_output(void) {
-    if (g_output_pending) return;
-    g_output_pending = 1;
-    dispatch_async(dispatch_get_main_queue(), ^{ g_output_pending = 0; on_output(); });
+static void schedule_output(void) {   /* (from the reader queues too) */
+    if (__atomic_exchange_n(&g_output_pending, 1, __ATOMIC_ACQ_REL)) return;
+    dispatch_async(dispatch_get_main_queue(), ^{ __atomic_store_n(&g_output_pending, 0, __ATOMIC_RELEASE); on_output(); });
 }
 
 /* A keystroke goes straight into the pty (it's non-blocking). Whatever the
@@ -749,6 +754,108 @@ static void tab_set_size(Tab *tb, int cols, int rows) {
     ioctl(tb->fd, TIOCSWINSZ, &ws);
 }
 
+/* Output is read on a queue of the tab's own, so the 1 KB reads a macOS pty
+   hands out overlap parsing and painting on the main queue instead of taking
+   turns with them (a cat of 19 MB of CJK spent half its time in reads). The
+   reader appends to a PtyIn; the main queue takes it in tab_drain. The source
+   is suspended while any of these hold: the buffer is full (the main queue
+   is behind: don't take the whole flood into memory), the main queue is
+   reading synchronously (read_some: the rest of that turn sees no reads, as
+   when everything happened on the main queue), or the pty has ended. */
+enum { PIN_FULL = 1, PIN_HELD = 2, PIN_EOF = 4 };
+#define PIN_MAX (8 << 20)
+
+typedef struct {
+    os_unfair_lock lock;
+    char *buf;
+    int n, cap, stop, refs;      /* stop: PIN_* bits; the source is suspended while any is set */
+    int fd;
+    dispatch_source_t src;
+    dispatch_queue_t q;
+} PtyIn;
+
+static void pin_release(PtyIn *p) {
+    if (__atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL)) return;
+    free(p->buf);
+    dispatch_release(p->q);
+    free(p);
+}
+
+/* Under the lock: sets or clears a reason to stop, suspending or resuming the source on the first / last. */
+static void pin_stop(PtyIn *p, int bit, int on) {
+    int was = p->stop;
+    p->stop = on ? was | bit : was & ~bit;
+    if (!was && p->stop) dispatch_suspend(p->src);
+    else if (was && !p->stop) dispatch_resume(p->src);
+}
+
+#define PTY_CHUNK 1024
+static double g_more_at;         /* when a read last came back full (written by the reader queues) */
+
+/* On the reader queue: everything there is, up to 64 reads, into the buffer. */
+static void pin_read(PtyIn *p) {
+    char buf[65536];
+    int k, got = 0;
+    for (k = 0; k < 64; k++) {
+        ssize_t n;
+        os_unfair_lock_lock(&p->lock);
+        if (p->n >= PIN_MAX) { pin_stop(p, PIN_FULL, 1); os_unfair_lock_unlock(&p->lock); break; }
+        os_unfair_lock_unlock(&p->lock);
+        n = read(p->fd, buf, sizeof(buf));
+        if (n > 0) {
+            os_unfair_lock_lock(&p->lock);
+            if (p->n + (int)n > p->cap) {
+                int cap = p->cap ? p->cap : 65536;
+                char *more;
+                while (cap < p->n + (int)n) cap *= 2;
+                if ((more = (char *)realloc(p->buf, (size_t)cap))) { p->buf = more; p->cap = cap; }
+            }
+            if (p->n + (int)n <= p->cap) { memcpy(p->buf + p->n, buf, (size_t)n); p->n += (int)n; }
+            os_unfair_lock_unlock(&p->lock);
+            got = 1;
+            if (n >= PTY_CHUNK) { double now = uptime_ms(); __atomic_store(&g_more_at, &now, __ATOMIC_RELAXED); }
+            continue;
+        }
+        if (n == 0 || (errno != EAGAIN && errno != EINTR)) {   /* EIO: every copy of the slave side is closed */
+            os_unfair_lock_lock(&p->lock);
+            pin_stop(p, PIN_EOF, 1);
+            os_unfair_lock_unlock(&p->lock);
+            got = 1;
+        }
+        break;
+    }
+    if (got) schedule_output();
+}
+
+/* Main queue: moves what was read into tb->in. Returns 1 at the pty's end. */
+static int pin_take(Tab *tb) {
+    PtyIn *p = (PtyIn *)tb->pin;
+    int eof;
+    if (!p) return 0;
+    os_unfair_lock_lock(&p->lock);
+    if (p->n) {
+        if (!tb->in_n) {         /* the usual case: just take the buffer */
+            free(tb->in);
+            tb->in = p->buf; tb->in_n = p->n; tb->in_cap = p->cap;
+            p->buf = NULL; p->n = p->cap = 0;
+        } else {
+            if (tb->in_n + p->n > tb->in_cap) {
+                int cap = tb->in_cap;
+                while (cap < tb->in_n + p->n) cap *= 2;
+                tb->in = (char *)realloc(tb->in, (size_t)cap);
+                tb->in_cap = cap;
+            }
+            memcpy(tb->in + tb->in_n, p->buf, (size_t)p->n);
+            tb->in_n += p->n;
+            p->n = 0;
+        }
+    }
+    if (p->stop & PIN_FULL) pin_stop(p, PIN_FULL, 0);
+    eof = (p->stop & PIN_EOF) != 0;
+    os_unfair_lock_unlock(&p->lock);
+    return eof;
+}
+
 /* Stops reading; the fd closes once the writes already queued have gone out. */
 static void stop_reading(Tab *tb) {
     int fd = tb->fd, *pending = tb->wpending;
@@ -756,9 +863,20 @@ static void stop_reading(Tab *tb) {
     if (fd < 0) return;
     if (tb->rsrc) {
         dispatch_source_t r = (dispatch_source_t)tb->rsrc;
+        PtyIn *p = (PtyIn *)tb->pin;
+        if (p) pin_take(tb);     /* whatever was read before stopping still gets parsed */
         /* the close (and the counter) go last on the write queue, behind any queued writes */
-        dispatch_source_set_cancel_handler(r, ^{ dispatch_async(wq, ^{ close(fd); free(pending); }); });
-        dispatch_source_cancel(r);
+        dispatch_source_set_cancel_handler(r, ^{
+            dispatch_async(wq, ^{ close(fd); free(pending); });
+            if (p) pin_release(p);
+        });
+        dispatch_source_cancel(r);   /* (cancelled first: resuming can't let another read in) */
+        if (p) {
+            os_unfair_lock_lock(&p->lock);
+            if (p->stop) { p->stop = 0; dispatch_resume(r); }   /* a suspended source never runs its cancel handler */
+            os_unfair_lock_unlock(&p->lock);
+            tb->pin = NULL;
+        }
         dispatch_release(r);
         tb->rsrc = NULL;
     } else {
@@ -772,35 +890,35 @@ static void stop_reading(Tab *tb) {
    2.3 ms, recorded) arrives in pieces. Everything that's there is read at
    once; and a read that came back full means more of the same redraw is on
    its way, so the paint waits a moment for it (see plat_invalidate) instead
-   of showing half a menu for a frame. */
-#define PTY_CHUNK 1024
-static double g_more_at;         /* when a read last came back full */
+   of showing half a menu for a frame.
 
+   read_some is the main queue reading right now, for the moments that need
+   everything the pty has said up to here (a handoff, a reload, the first
+   prompt). The reader queue stays out of the way until this turn of the main
+   queue is over, so nothing read after it can slip past whatever this turn
+   does with the pty. */
 static void read_some(Tab *tb) {
-    char buf[65536];
-    int k;
-    for (k = 0; k < 64; k++) {   /* at most 64 reads (or 4 MB) before letting the window breathe */
-        ssize_t n = read(tb->fd, buf, sizeof(buf));
-        if (g_tracing) { static int t; if (t++ < 3) { char m[64]; snprintf(m, sizeof(m), "read %zd bytes from a shell", n); trace(m); } }
-        if (n > 0) {
-            if (tb->in_n + (int)n > tb->in_cap) {
-                int cap = tb->in_cap ? tb->in_cap : 65536;
-                while (cap < tb->in_n + (int)n) cap *= 2;
-                tb->in = (char *)realloc(tb->in, cap);
-                tb->in_cap = cap;
-            }
-            memcpy(tb->in + tb->in_n, buf, (size_t)n);
-            tb->in_n += (int)n;
-            if (n >= PTY_CHUNK) g_more_at = uptime_ms();
-            continue;
-        }
-        if (n == 0 || (errno != EAGAIN && errno != EINTR)) stop_reading(tb);   /* EIO: every copy of the slave side is closed */
-        break;
-    }
-    if (tb->in_n) schedule_output();
+    PtyIn *p = (PtyIn *)tb->pin;
+    if (tb->fd < 0) return;
+    if (!p) return;
+    __atomic_add_fetch(&p->refs, 1, __ATOMIC_ACQ_REL);
+    dispatch_sync(p->q, ^{
+        os_unfair_lock_lock(&p->lock);
+        pin_stop(p, PIN_HELD, 1);
+        os_unfair_lock_unlock(&p->lock);
+        pin_read(p);
+    });
+    dispatch_async(dispatch_get_main_queue(), ^{   /* after this turn */
+        os_unfair_lock_lock(&p->lock);
+        if (p->stop & PIN_HELD) pin_stop(p, PIN_HELD, 0);
+        os_unfair_lock_unlock(&p->lock);
+        pin_release(p);
+    });
+    if (pin_take(tb)) stop_reading(tb);
 }
 
 static int tab_drain(Tab *tb) {
+    if (pin_take(tb)) stop_reading(tb);
     char *data = tb->in;
     int n = tb->in_n;
     tb->in = NULL;
@@ -903,14 +1021,21 @@ static void tab_start_io(Tab *tb) {
     tb->wpending = (int *)calloc(1, sizeof(int));
     tb->wq = dispatch_queue_create("hardcore.tab.write",
                                    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
-    r = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, dispatch_get_main_queue());
-    dispatch_source_set_event_handler(r, ^{
-        Tab *t = tab_by_id(id);
-        if (!t && g_spare && g_spare->id == id) t = g_spare;
-        if (t && t->fd >= 0) read_some(t);
-    });
-    dispatch_resume(r);
-    tb->rsrc = r;
+    {
+        PtyIn *in = (PtyIn *)calloc(1, sizeof(PtyIn));
+        in->lock = OS_UNFAIR_LOCK_INIT;
+        in->fd = fd;
+        in->refs = 1;            /* the source's: its cancel handler lets go */
+        in->q = dispatch_queue_create("hardcore.tab.read",
+                                      dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+        r = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, in->q);
+        in->src = r;
+        dispatch_source_set_event_handler(r, ^{ pin_read(in); });
+        tb->pin = in;
+        dispatch_resume(r);
+        tb->rsrc = r;
+        (void)id;
+    }
     /* exit: catches the shell even while a background job keeps the pty open;
        holds only the pid and id, so it reaps tabs that were already closed too */
     p = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)pid, DISPATCH_PROC_EXIT, dispatch_get_main_queue());
@@ -2612,6 +2737,9 @@ static void focus_changed(int focused) {
        whenever it changes. */
     remember_dir(active_tab());  /* the next window opens where this one closed */
     config_save();
+    /* Reload keeps Chrome targets alive; an actual quit closes this window's
+       pages and waits briefly for their asynchronous close acknowledgments. */
+    hc_chrome_close_pages_main();
     for (i = 0; i < g_ntabs; i++)   /* the ptys close as we exit, which hangs them up too */
         if (g_tabs[i]->pid > 0 && !g_tabs[i]->exited) kill(g_tabs[i]->pid, SIGHUP);
     if (g_spare && g_spare->pid > 0) kill(g_spare->pid, SIGHUP);
@@ -3036,6 +3164,24 @@ static void ctl_line(char *s) {
                 if(!strcmp(action,"monitor-down") || !strcmp(action,"monitor-up") || !strcmp(action,"monitor-drag")) {
                     g_mac_test_monitor_consumed=mac_title_event(e)==nil;return;
                 }
+                /* Match AppKit hit routing when a browser surface, rather
+                   than the Metal terminal view, owns this point. */
+                if(!g_grid_on && tb && tb->kind==TK_BROWSER && tb->browser_native &&
+                   !over_chrome(x,y) && !mac_browser_nav_contains(x,y) && !mac_browser_ui_contains(x,y) &&
+                   strcmp(action,"monitor") && strcmp(action,"cursor") && strcmp(action,"flags")) {
+                    NSView *surface=[browser_for(tb) documentView];
+                    if(surface && mac_title_event(e)) {
+                        if(kind==NSEventTypeMouseMoved)[surface mouseMoved:e];
+                        else if(kind==NSEventTypeLeftMouseDown)[surface mouseDown:e];
+                        else if(kind==NSEventTypeLeftMouseUp)[surface mouseUp:e];
+                        else if(kind==NSEventTypeLeftMouseDragged)[surface mouseDragged:e];
+                        else if(kind==NSEventTypeRightMouseDown)[surface rightMouseDown:e];
+                        else if(kind==NSEventTypeRightMouseUp)[surface rightMouseUp:e];
+                        else if(kind==NSEventTypeOtherMouseDown)[surface otherMouseDown:e];
+                        else if(kind==NSEventTypeOtherMouseUp)[surface otherMouseUp:e];
+                        return;
+                    }
+                }
                 if(kind==NSEventTypeMouseMoved) {
                     if(!strcmp(action,"monitor"))mac_title_event(e);
                     else if(!strcmp(action,"cursor"))[g_view cursorUpdate:e];
@@ -3070,7 +3216,12 @@ static void ctl_line(char *s) {
         e = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:flags timestamp:0
                          windowNumber:[g_win windowNumber] context:nil characters:ctl_unescape(chars)
           charactersIgnoringModifiers:ctl_unescape(plain[0] ? plain : chars) isARepeat:NO keyCode:(unsigned short)kc];
-        if (!(flags & NSEventModifierFlagCommand) || ![[NSApp mainMenu] performKeyEquivalent:e]) [g_view keyDown:e];
+        if (!(flags & NSEventModifierFlagCommand) || ![[NSApp mainMenu] performKeyEquivalent:e]) {
+            NSResponder *responder=[g_win firstResponder];
+            if(tb && tb->kind==TK_BROWSER && tb->browser_native && responder!=(NSResponder *)g_view &&
+               [responder respondsToSelector:@selector(keyDown:)]) [responder keyDown:e];
+            else [g_view keyDown:e];
+        }
     } else if (!strncmp(s, "winid ", 6)) {
         FILE *f = fopen(s + 6, "wb");
         if (f) { fprintf(f, "%ld\n", (long)[g_win windowNumber]); fclose(f); }
@@ -3205,6 +3356,7 @@ static int unit_tests(const char *out_path) {
         fails += !ok;
     }
     fails += unit_scrollback(f);
+    fails += unit_issues(f);
     fails += unit_underlay(f);
     fails += unit_chrome_display(f);
     fails += unit_chrome(f);
@@ -3246,12 +3398,13 @@ static int replay(const char *out_path, int cols, int rows, char **files, int nf
 static void first_prompt_now(int wait_ms) {
     Tab *tb = g_ntabs ? g_tabs[0] : NULL;
     double end = uptime_ms() + wait_ms;
-    while (tb && tb->fd >= 0 && (!tb->t.nmarks || tb->t.cx == 0)) {
+    while (tb && tb->fd >= 0) {
         struct pollfd p = {tb->fd, POLLIN, 0};
         int left = (int)(end - uptime_ms());
-        if (left <= 0 || poll(&p, 1, left) <= 0) break;
-        read_some(tb);
+        read_some(tb);           /* (first: it holds the reader queue for this turn, so the poll sees everything) */
         tab_drain(tb);
+        if (tb->fd < 0 || (tb->t.nmarks && tb->t.cx != 0)) break;
+        if (left <= 0 || poll(&p, 1, left) <= 0) break;
     }
     if (tb) update_title();
 }
@@ -3287,6 +3440,7 @@ static int mac_browser_cli(int argc, char **argv);
 #include "hardcore_mac_launch.h"
 
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "chrome")) return hc_chrome_setup_main(argc, argv);
     /* The ANSI backend does not initialize Cocoa, Metal, a Dock app, or the
        GUI's dispatch queues. Its session owner forks before any of those. */
     if (argc > 1 && !strcmp(argv[1], "here")) return here_main(argc - 2, argv + 2);
