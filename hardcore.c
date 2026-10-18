@@ -6583,12 +6583,14 @@ static int unit_issues(FILE *f) {
     {   /* links: web opens; a file that would run is revealed; other schemes ask (MS10-007) */
         static const struct { const char *url; int want; } links[] = {
             {"https://example.com", LINK_OPEN}, {"HTTP://x", LINK_OPEN}, {"mailto:a@b", LINK_OPEN},
-            {"file:///Users/u/notes.txt", LINK_OPEN}, {"file:///Users/u/src/app.js", LINK_OPEN},
+            {"file:///Users/u/notes.txt", LINK_OPEN},
             {"vscode://file/x", LINK_ASK}, {"ms-msdt:/id", LINK_ASK}, {"javascript:alert(1)", LINK_ASK},
             {"no scheme", LINK_REFUSE}, {"", LINK_REFUSE}, {":x", LINK_REFUSE},
 #ifdef _WIN32
             {"file:///mnt/c/x.bat", LINK_REVEAL}, {"file:///mnt/c/Setup.EXE", LINK_REVEAL},
+            {"file:///Users/u/src/app.js", LINK_REVEAL},   /* Windows Script Host runs a .js that's opened */
 #else
+            {"file:///Users/u/src/app.js", LINK_OPEN},     /* just text on the Mac */
             {"file:///Users/u/x.command", LINK_REVEAL}, {"file:///Applications/X.app/", LINK_REVEAL},
             {"file:///Users/u/x.command?y#z", LINK_REVEAL},
 #endif
