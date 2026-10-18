@@ -693,6 +693,26 @@ static int mac_browser_page_rows(Tab *tb);
 static void mac_browser_tab_label(Tab *tb,wchar_t *out,int cap,int cols);
 static int mac_input_held(Tab *tb);
 #endif
+#ifdef _WIN32
+static void mac_browser_sync(void);
+static void mac_browser_resize(Tab *tb);
+static void mac_browser_destroy(Tab *tb);
+static void mac_browser_prepare(Tab *tb);
+static int mac_browser_cutie_project(Tab*,Cell*,int,int,int);
+static int mac_browser_cutie_generation(Tab*);
+static void mac_browser_cutie_action(Tab*,int);
+static void mac_browser_scroll(int lines);
+static void mac_browser_draw_overlay(void);
+static void mac_browser_draw_tile(Tab *tb,const Cell *cell,int x,int y);
+static int mac_browser_hover_link(void);
+static int mac_browser_page_rows(Tab *tb);
+static int mac_browser_draw_native(Tab *tb, int w, int h);
+static int mac_browser_ready(Tab *tb);
+static int mac_browser_char(uint32_t cp);
+static int mac_browser_active(void);
+static void mac_browser_open_welcome(void);
+static void mac_browser_command(int command);
+#endif
 
 /* ── platform layer: Win32 in this file, macOS in hardcore_mac.m ───── */
 
@@ -718,6 +738,7 @@ static void config_save(void);
 static Tab *tab_create(const char *dir, int spare);
 #ifdef _WIN32
 static Tab *files_tab_new(const char *dir);
+static Tab *browser_tab_restore(const char *url, int native);
 static void ui_pack(char *out, size_t cap);
 static void ui_restore(const char *v);
 static void ui_apply(void);
@@ -4403,7 +4424,12 @@ static void tab_label_fit(Tab *tb, wchar_t *out, int cap, int cols) {
         mac_browser_tab_label(tb,out,cap,cols);
 #else
         wchar_t title[256];
-        utf8_to_wide(tb->browser_url, title, 256);
+        const char *u = strstr(tb->browser_url, "://");
+        char host[256];
+        u = u ? u + 3 : tb->browser_url;
+        if (!strncmp(u, "www.", 4)) u += 4;
+        snprintf(host, sizeof(host), "%.*s", (int)strcspn(u, "/?#"), u);   /* untitled yet: where it is */
+        utf8_to_wide(!strcmp(tb->browser_url, "hardcore:welcome") ? "Browser" : host, title, 256);
         _snwprintf(out, cap, L"%ls%ls", tb->parent_id ? L"↳ " : L"", tb->t.title[0] ? tb->t.title : title);
         out[cap-1] = 0;
 #endif
@@ -4836,10 +4862,8 @@ static void render(void) {
     int y, x, ox = term_ox(), oy = term_oy(), dock_col = sidebar_x()/CW;
     int overlay = g_tab_underlay || (tb && tb->kind == TK_BROWSER);
     plat_client_size(&r.right, &r.bottom);
-#ifndef _WIN32
     if (!g_grid_on && tb && tb->kind == TK_BROWSER) mac_browser_prepare(tb);
     int browser_hover = tb && tb->kind==TK_BROWSER ? mac_browser_hover_link() : 0;
-#endif
     g_clip_w = r.right / CW * CW;
     g_clip_h = r.bottom / CH * CH;
     r_begin(r.right, r.bottom);
@@ -4856,8 +4880,14 @@ static void render(void) {
         cm_reset(&g_chrome_motion); g_chrome_motion_alpha = 1;
         plat_kill_timer(TIMER_CHROME);
     }
-#ifndef _WIN32
     if (tb && tb->kind == TK_BROWSER && tb->browser_native && !chrome_preview_active()) {
+#ifdef _WIN32
+        if (!mac_browser_draw_native(tb, r.right, r.bottom)) {   /* Chrome's pixels, or a word until they come */
+            int w = 20 * CW;
+            draw_label(mac_browser_ready(tb) ? L"Rendering Chrome…" : L"Connecting to Chrome…",
+                       (float)CW, (float)(3 * CH), (float)w, g_look.detail);
+        }
+#endif
         chrome_tv_clock();tab_layout();chrome_tv_prepare(&tb->t);mac_camera_layout(&tb->t);mac_music_layout(&tb->t);
         render_tabbar(r.right, r.bottom);
         g_draw_alpha = 1;
@@ -4866,9 +4896,11 @@ static void render(void) {
         mac_camera_draw();
         mac_music_draw();
         mac_browser_render_nav_overlay();
+#ifdef _WIN32
+        render_caption_buttons(r.right);
+#endif
         return;
     }
-#endif
 #ifdef _WIN32
     if (!tb) { render_tabbar(r.right, r.bottom); render_caption_buttons(r.right); return; }
 #else
@@ -4904,15 +4936,11 @@ static void render(void) {
             const Cell *c = &cells[x];
             uint32_t fg, bg;
             int w;
-#ifndef _WIN32
             if(tb->kind==TK_BROWSER && (c->wflag & 8)){mac_browser_draw_tile(tb,c,x,y);continue;}
-#endif
             if (c->ch <= ' ' || c->wflag == W_CONT) continue;
             cell_colors(c, &fg, &bg);
             if (fg == bg) continue;
-#ifndef _WIN32
             if(tb->kind==TK_BROWSER && c->link && c->link==browser_hover) fg=g_shown->pal[12];
-#endif
             w = (c->wflag == W_WIDE) ? 2 : 1;
             r_color(fg, 1);
             draw_glyph(c->ch, (float)(ox + x * CW), y0, w, g_scale);
@@ -4924,7 +4952,6 @@ static void render(void) {
             const Cell *c = &cells[x];
             uint32_t fg, bg;
             float x0 = (float)(ox + x * CW);
-#ifndef _WIN32
             if(tb->kind==TK_BROWSER && (c->wflag & 8))continue;
             if(tb->kind==TK_BROWSER && c->link) {
                 if(!(c->wflag & 8) && c->link!=browser_hover) {
@@ -4932,7 +4959,6 @@ static void render(void) {
                 }
                 continue;
             }
-#endif
             if (!(c->attr & (A_UNDER | A_STRIKE)) && !c->link) continue;
             cell_colors(c, &fg, &bg);
             if (fg == bg) continue;
@@ -4997,9 +5023,11 @@ static void render(void) {
     if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
         fill_rect(0, 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
     if (overlay && (chrome_hovered() || chrome_any_tv_hovered() || chrome_preview_active())) render_tabbar(r.right, r.bottom);
+    mac_browser_draw_overlay();
     render_cuties(r.right);
     mac_camera_draw();
     mac_music_draw();
+    mac_browser_render_nav_overlay();
     render_caption_buttons(r.right);
 #else
     if (overlay && (chrome_hovered() || chrome_any_tv_hovered())) render_tabbar(r.right, r.bottom);
@@ -5252,9 +5280,8 @@ static void activate(int i) {
     g_sel_on = 0;
 #ifdef _WIN32
     slurp_selection(g_tabs[i]);
-#else
-    mac_browser_sync();
 #endif
+    mac_browser_sync();
     update_title();
     plat_invalidate();
 }
@@ -5388,6 +5415,11 @@ static void session_save(void) {
         wchar_t name[32];
         FILE *v;
         if (tb->help || tb->slurp_hwnd) continue;
+        if (tb->kind == TK_BROWSER) {   /* a page: its address, and how it was shown */
+            if (tb->browser_url[0] && strncmp(tb->browser_url, "data:", 5))
+                fprintf(f, "\n[tab]\nkind=www\ndir=%s\nnative=%d\n", tb->browser_url, tb->browser_native);
+            continue;
+        }
         _snwprintf(name, 32, L"tab%d.txt", n);
         session_path(p, name);
         if ((v = _wfopen(p, L"wb"))) {
@@ -5449,6 +5481,10 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
     size_t n = 0;
     Tab *tb;
     if (g_ntabs >= MAX_TABS || !dir[0]) return;
+    if (!strcmp(kind, "www")) {     /* a page opens again, when its tab is first shown */
+        if ((tb = browser_tab_restore(dir, view))) g_tabs[g_ntabs++] = tb;
+        return;
+    }
     if (!strcmp(kind, "files")) {   /* Files starts fresh in its folder */
         if ((tb = files_tab_new(dir_exists(dir) ? dir : ""))) g_tabs[g_ntabs++] = tb;
         return;
@@ -5527,6 +5563,7 @@ static int session_restore(void) {
         else if (!strcmp(line, "claude_args")) snprintf(args, sizeof(args), "%s", v);
         else if (!strcmp(line, "cmd")) snprintf(cmd, sizeof(cmd), "%s", v);
         else if (!strcmp(line, "view")) view = atoi(v);
+        else if (!strcmp(line, "native")) view = atoi(v);   /* (a page has no scrollback: its view is its mode) */
         else if (!strcmp(line, "text")) snprintf(text, sizeof(text), "%s", v);
         else if (!strcmp(line, "ui")) ui_restore(v);
     }
@@ -5621,6 +5658,15 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         live[n++] = tb;
     }
     if (!n) { snprintf(why, cap, "no running tabs"); return 0; }
+    /* pages go over too: every carried tab's place, so the order (and the selection) stays */
+    int pos_of[MAX_TABS], carried = 0;
+    for (i = 0; i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        int page = tb->kind == TK_BROWSER && tb->browser_url[0] && strncmp(tb->browser_url, "data:", 5);
+        int term = !(tb->help || tb->exited || !tb->hpc);
+        pos_of[i] = page || term ? carried++ : -1;
+    }
+    if (pos_of[g_active] >= 0) active = pos_of[g_active];
     if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) { snprintf(why, cap, "no exe to reload into"); return 0; }
     if (!CreatePipe(&blob_r, &blob_w, &sa, 1 << 20) || !CreatePipe(&ack_r, &ack_w, &sa, 0)) { snprintf(why, cap, "pipes"); return 0; }
     SetHandleInformation(blob_w, HANDLE_FLAG_INHERIT, 0);
@@ -5657,6 +5703,16 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         char ui[1200];
         ui_pack(ui, sizeof(ui));
         blob_line(&b, "ui", ui);
+    }
+    for (i = 0; i < g_ntabs; i++) {   /* pages: the new window takes over their Chrome targets */
+        Tab *tb = g_tabs[i];
+        char page[4400];
+        int parent = -1;
+        if (tb->kind != TK_BROWSER || pos_of[i] < 0) continue;
+        for (k = 0; k < g_ntabs; k++) if (tb->parent_id && g_tabs[k]->id == tb->parent_id) parent = pos_of[k];
+        snprintf(page, sizeof(page), "%d %d %d %s %s", pos_of[i], parent, tb->browser_native,
+                 tb->browser_target[0] ? tb->browser_target : "-", tb->browser_url);
+        blob_line(&b, "www", page);
     }
     for (i = 0; i < n; i++) {
         Tab *tb = live[i];
@@ -5761,6 +5817,8 @@ static void adopt_read(void) {
 static int adopt_tabs(void) {
     char *p = g_adopt_blob, *line;
     Tab *tb = NULL;
+    static struct { Tab *tab; int at, parent; } pages[MAX_TABS];
+    int npages = 0;
     if (!p) return 0;
     while ((line = p) && *p) {
         char *nl = strchr(p, '\n'), *v;
@@ -5770,6 +5828,18 @@ static int adopt_tabs(void) {
         v = strchr(line, ' ');
         if (v) *v++ = 0; else v = line + strlen(line);
         if (!strcmp(line, "ui")) { ui_restore(v); continue; }
+        if (!strcmp(line, "www")) {   /* placed once the terminals are in */
+            int at, parent, native, used = 0;
+            char target[128];
+            if (npages < MAX_TABS && sscanf(v, "%d %d %d %127s %n", &at, &parent, &native, target, &used) == 4 && used) {
+                Tab *page = browser_tab_restore(v + used, native);
+                if (page) {
+                    if (strcmp(target, "-")) snprintf(page->browser_target, sizeof(page->browser_target), "%s", target);
+                    pages[npages].tab = page; pages[npages].at = at; pages[npages++].parent = parent;
+                }
+            }
+            continue;
+        }
         if (!strcmp(line, "tab")) {
             if (g_ntabs >= MAX_TABS) break;
             tb = (Tab *)calloc(1, sizeof(Tab));
@@ -5828,6 +5898,15 @@ static int adopt_tabs(void) {
     }
     free(g_adopt_blob);
     g_adopt_blob = NULL;
+    for (int k = 0; k < npages; k++) {   /* in order of place, each where it was */
+        int at = pages[k].at < 0 ? g_ntabs : pages[k].at > g_ntabs ? g_ntabs : pages[k].at;
+        if (g_ntabs >= MAX_TABS) break;
+        memmove(g_tabs + at + 1, g_tabs + at, (size_t)(g_ntabs - at) * sizeof(Tab *));
+        g_tabs[at] = pages[k].tab;
+        g_ntabs++;
+    }
+    for (int k = 0; k < npages; k++)
+        if (pages[k].parent >= 0 && pages[k].parent < g_ntabs) pages[k].tab->parent_id = g_tabs[pages[k].parent]->id;
     if (g_ntabs) {
         int i;
         activate(g_adopt_active >= 0 && g_adopt_active < g_ntabs ? g_adopt_active : 0);
@@ -5868,6 +5947,9 @@ static void close_tab(int i) {
     if (i < 0 || i >= g_ntabs) return;
     tb = g_tabs[i];
     if(tb->id==g_cutie_focus_id)mac_cutie_blur();
+#ifdef _WIN32
+    mac_browser_destroy(tb);
+#endif
     memmove(&g_tabs[i], &g_tabs[i + 1], sizeof(Tab *) * (g_ntabs - i - 1));
     g_ntabs--;
     if (!g_ntabs) {             /* the last tab: its folder is where the next window opens */
@@ -5896,9 +5978,7 @@ static void close_tab(int i) {
 
 static void scroll_view(int lines) {
     Tab *tb = pointer_tab();
-#ifndef _WIN32
     if (tb && tb->kind == TK_BROWSER) { mac_browser_scroll(-lines); return; }
-#endif
     if (!tb || tb->t.alt) return;
     term_settle(&tb->t);         /* scrolling back: the old lines at today's width first */
     tb->t.view += lines;
@@ -5976,6 +6056,8 @@ static int handle_keydown(WPARAM vk) {
     if (ctrl && shift && !alt) {
         switch (vk) {
         case 'T': new_tab_here(); return 1;
+        case 'B': mac_browser_open_welcome(); return 1;          /* a browser tab */
+        case 'M': mac_browser_command(0); return 1;              /* a page: Mono ↔ Native */
         case 'W': close_tab(g_active); return 1;
         case 'C': sel_copy(); g_sel_on = 0; InvalidateRect(g_hwnd, NULL, FALSE); return 1;
         case 'V': paste(); return 1;
@@ -6078,6 +6160,7 @@ static void handle_char(WPARAM wc, int alt) {
         cp = 0x10000 + (((uint32_t)g_high_surrogate - 0xD800) << 10) + (cp - 0xDC00);
         g_high_surrogate = 0;
     }
+    if (mac_browser_active() && mac_browser_char(cp)) return;   /* a browser tab has no shell */
     if (alt) buf[n++] = 0x1B;
     n += utf8_encode(cp, buf + n);
     g_sel_on = 0;
@@ -7359,6 +7442,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         for (int i = 0; i < g_ntabs; i++) if (g_tabs[i]->slurp_hwnd) slurp_detach(g_tabs[i]);
         media_quit();            /* a recording in progress is saved, not lost */
+        browser_quit();          /* our Chrome pages close; the last window closes Chrome */
         /* No per-tab teardown: when this process exits its pseudoconsoles
            close, and conhost takes the shells down with it. Closing stays instant. */
         PostQuitMessage(0);
@@ -7375,6 +7459,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (n && !buf[n - 1]) n--; /* WM_COPYDATA text senders include the terminator */
         if (cd->dwData == 0x48430001 && tb && tb->help) {   /* a help screen takes keys, not text */
             help_key(tb, buf[0] == '\n' ? '\r' : (unsigned char)buf[0]);
+        } else if (cd->dwData == 0x48430001 && mac_browser_active()) {   /* typing into a page, as keys would */
+            const char *p = buf;
+            while (*p) {
+                if (*p == '\n') { mac_browser_key(VK_RETURN, 0, 0, 0); p++; continue; }
+                mac_browser_char(wb_utf8(&p));
+            }
         } else if (cd->dwData == 0x48430001 && tb) {   /* type: \n becomes Enter */
             size_t i;
             if (g_lat && !g_lat_key.QuadPart) {        /* time it like a key, without taking focus */
@@ -7418,6 +7508,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
                 SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
                 SendMessageW(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
+            } else if (!strncmp(buf, "rpress ", 7)) {  /* a right click, the same way */
+                int x = atoi(buf + 7), y = strchr(buf + 7, ',') ? atoi(strchr(buf + 7, ',') + 1) : -1;
+                SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+                SendMessageW(hwnd, WM_RBUTTONDOWN, MK_RBUTTON, MAKELPARAM(x, y));
+                SendMessageW(hwnd, WM_RBUTTONUP, 0, MAKELPARAM(x, y));
             } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);
             else if (!strncmp(buf, "tophover ", 9)) g_top_hover = atoi(buf + 9);
             else if (!strncmp(buf, "sel ", 4) && tb) {   /* sel Y0 X0 Y1 X1: select, in screen rows */
@@ -7464,6 +7559,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (chrome_hit == HIT_BAR) return HTCAPTION;
         if ((cap = caption_hit(pt.x, pt.y))) return cap;
+        if (mac_browser_nav_contains(pt.x, pt.y)) return HTCLIENT;   /* a page's top line is its address bar */
         if (in_top_line(pt.x, pt.y)) return HTCAPTION;
         return HTCLIENT;
     }
@@ -7572,6 +7668,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             r_resize();
             QueryPerformanceCounter(&b);
             resize_all();
+            mac_browser_resize(active_tab());   /* a page's viewport follows the window */
             QueryPerformanceCounter(&c);
             /* draw now, not on the next WM_PAINT: during a live resize the
                compositor shows the swap chain's last frame until we do */
@@ -7617,6 +7714,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_APP_CAMERA:
         camera_changed();
+        return 0;
+    case WM_APP_CDP:
+        cdp_message(wp, (char *)lp);
         return 0;
     case WM_APP_SLURP:
         if (wp) InterlockedExchange(&g_slurp_running, 0);
@@ -7715,6 +7815,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_music_down) { mac_music_cancel_press(); return 0; }
             if (g_camera_drag || g_camera_pending_action) { mac_camera_cancel_press(); plat_invalidate(); return 0; }
         }
+        {
+            int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0, alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+            int ours = (ctrl && shift && !alt) || (ctrl && !shift && !alt && wp == VK_TAB) || (ctrl && alt && wp >= '1' && wp <= '9');
+            if (!ours && mac_browser_active() && mac_browser_key(wp, ctrl, shift, alt)) return 0;   /* its typing follows as WM_CHAR */
+        }
         if (handle_keydown(wp)) {
             MSG m;
             while (PeekMessageW(&m, hwnd, WM_CHAR, WM_CHAR, PM_REMOVE)) {}
@@ -7732,6 +7837,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSKEYUP:
         if (wp == VK_MENU || wp == VK_F10) return 0;
         break;
+    case WM_KEYUP:
+        if (mac_browser_key_up(wp)) return 0;
+        break;
     case WM_MOUSEMOVE: {
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), col, row;
         int was_bar = over_chrome(g_mouse_x, g_mouse_y) || chrome_any_tv_contains(g_mouse_x, g_mouse_y), on_bar;
@@ -7745,9 +7853,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_tv_drag_slot >= 0) { mac_tv_drag_move(mx, my); return 0; }
             if (g_cutie_mouse_consumed) return 0;
         }
+        if (g_browser_native_drag) { mac_browser_native_mouse(2, 0, mx, my, 0); g_mouse_x = mx; g_mouse_y = my; return 0; }
         on_bar = over_chrome(mx, my) || chrome_any_tv_contains(mx, my);
         g_mouse_x = mx;
         g_mouse_y = my;
+        mac_browser_nav_hover_at(mx, my);
         mac_music_mouse(MEV_MOVE, mx, my, 0);
         mac_camera_mouse(MEV_MOVE, mx, my, 0);
         chrome_preview_pointer(mx, my);
@@ -7766,6 +7876,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if ((wp & MK_RBUTTON) && (g_cutie_aux_buttons & 2)) return 0;
+        if (mac_browser_native_mouse(2, (wp & MK_RBUTTON) ? 2 : (wp & MK_MBUTTON) ? 1 : -1, mx, my, 0)) return 0;
         if (g_grid_on && grid_pane_at(mx, my) != g_active) return 0;   /* over another pane: not this one's motion */
         if (!on_bar && (wp & (MK_LBUTTON | MK_MBUTTON | MK_RBUTTON)))
             mouse_report((wp & MK_LBUTTON) ? 0 : (wp & MK_MBUTTON) ? 1 : 2, 1, 1, mx, my, mouse_mods(wp));
@@ -7794,6 +7905,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (mac_cutie_click(mx, my, mods)) return 0;
         mac_cutie_blur();
         if (chrome_drag_begin(mx, my)) return 0;
+        mac_browser_nav_hover_at(mx, my);
+        if (!g_grid_on && (!over_chrome(mx, my) || (browser_for(tb) && browser_for(tb)->edit_kind == 1)) && mac_browser_ui_mouse(mx, my)) return 0;
         hit = hit_tabbar(mx, my, &idx);
         if (hit != HIT_NONE) { g_cutie_mouse_consumed = 1; g_cutie_mouse_id = 0; }
         if (hit == HIT_CUTIE) {
@@ -7810,6 +7923,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (mac_header_action(hit)) return 0;
         if (chrome_setting_hit(hit)) { settings_click(mx, my); return 0; }
         if (hit == HIT_BAR || hit == HIT_CHROME_INERT) return 0;
+        if (mac_browser_native_mouse(0, 0, mx, my, msg == WM_LBUTTONDBLCLK ? 2 : 1)) { g_browser_native_drag = 1; return 0; }
+        if (tb && !g_grid_on && tb->kind == TK_BROWSER && !tb->browser_native && !(mods & M_SHIFT)) {   /* a link on a Mono page */
+            mouse_cell(mx, my, &col, &row);
+            if (col >= 0 && col < tb->t.cols && row >= 0 && row < tb->t.rows && tb->t.row[0][row][col].link) {
+                mac_browser_action(tb, tb->t.row[0][row][col].link);
+                return 0;
+            }
+        }
         if (tb && !g_grid_on && mx >= term_ox() + tb->t.cols * CW - SCROLLBAR_W && mx < term_ox() + tb->t.cols * CW && tb->t.hcount && !tb->t.alt) {
             g_sb_drag = 1;
             scrollbar_set(my);
@@ -7844,10 +7965,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_grid_drag_axis = g_grid_mouse_consumed = 0;
         g_cutie_mouse_consumed = 0;
         g_sb_drag = g_sel_drag = 0;
+        g_browser_native_drag = 0;
         return 0;
     case WM_LBUTTONUP: {
         int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), took = 1;
-        if (mac_music_mouse(MEV_UP, mx, my, 0) || mac_camera_mouse(MEV_UP, mx, my, 0)) {}
+        if (g_browser_native_drag) { mac_browser_native_mouse(1, 0, mx, my, 1); g_browser_native_drag = 0; }
+        else if (mac_music_mouse(MEV_UP, mx, my, 0) || mac_camera_mouse(MEV_UP, mx, my, 0)) {}
         else if (g_grid_mouse_consumed) { mac_grid_drag(mx, my); g_grid_drag_axis = g_grid_mouse_consumed = 0; }
         else if (g_tv_drag_slot >= 0) { mac_tv_drag_move(mx, my); mac_tv_drag_end(); mac_cutie_release(); }
         else if (g_cutie_mouse_consumed) mac_cutie_release();
@@ -7866,11 +7989,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (cutie_at(mx, my) >= 0 || over_chrome(mx, my)) { g_cutie_aux_buttons |= 1; return 0; }
         mac_cutie_blur();
         mac_grid_point(mx, my);
+        if (mac_browser_native_mouse(0, 1, mx, my, 1)) return 0;
         mouse_report(1, 1, 0, mx, my, mouse_mods(wp));
         return 0;
     }
     case WM_MBUTTONUP:
         if (g_cutie_aux_buttons & 1) { g_cutie_aux_buttons &= ~1; return 0; }
+        if (mac_browser_native_mouse(1, 1, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 1)) return 0;
         mouse_report(1, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_RBUTTONDOWN: {
@@ -7879,6 +8004,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             cutie_at(mx, my) >= 0 || over_chrome(mx, my)) { g_cutie_aux_buttons |= 2; return 0; }
         mac_cutie_blur();
         mac_grid_point(mx, my);
+        if (mac_browser_native_mouse(0, 2, mx, my, 1)) return 0;
+        if (active_tab() && active_tab()->kind == TK_BROWSER) { mac_browser_context(mx, my); return 0; }
         if (mouse_report(2, 1, 0, mx, my, mouse_mods(wp))) return 0;
         /* conhost habit: right-click copies a selection, or pastes */
         if (g_sel_on) {
@@ -7890,6 +8017,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_RBUTTONUP:
         if (g_cutie_aux_buttons & 2) { g_cutie_aux_buttons &= ~2; return 0; }
+        if (mac_browser_native_mouse(1, 2, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 1)) return 0;
         mouse_report(2, 0, 0, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), mouse_mods(wp));
         return 0;
     case WM_MOUSEWHEEL: {
@@ -7902,6 +8030,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_tv_drag_slot >= 0) return 0;
         chrome_preview_cancel();
         if (mac_music_mouse(MEV_WHEEL, pt.x, pt.y, notches) || mac_camera_mouse(MEV_WHEEL, pt.x, pt.y, notches)) return 0;
+        if (!g_grid_on && mac_browser_ui_scroll(pt.x, pt.y, -notches)) return 0;
+        if (cutie_at(pt.x, pt.y) < 0 && mac_browser_native_wheel(pt.x, pt.y, notches)) return 0;
         if (g_grid_on) {   /* the pane under the pointer scrolls, without taking the focus */
             int index = grid_pane_at(pt.x, pt.y);
             if (index >= 0 && index != g_active && !g_pointer_tab) {
@@ -8127,6 +8257,7 @@ static int unit_tests(const char *out_path) {
     fails += unit_chrome_display(f);
     fails += unit_chrome(f);
     fails += unit_tab_labels(f);
+    fails += unit_win_menu(f);
     for (i = 0; i < (int)(sizeof(urls) / sizeof(urls[0])); i++) {
         char got[256] = "";
         int hit = url_in_word(urls[i].word, urls[i].at, got, sizeof(got));

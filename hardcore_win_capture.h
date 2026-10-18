@@ -483,15 +483,54 @@ static void cam_reap(void) {
     }
 }
 
-/* ── the preview, drawn into the frame with its own pixel shader ── */
-static const char CAM_HLSL[] =
+/* ── pictures drawn into the frame (camera preview, Chrome pages): one pixel shader ── */
+static const char IMG_HLSL[] =
     "struct VO { float4 p : SV_Position; float2 uv : TEXCOORD; float4 c : COLOR; };\n"
     "Texture2D t : register(t0); SamplerState s : register(s0);\n"
     "float4 ps(VO i) : SV_Target { return float4(t.SampleLevel(s, i.uv, 0).rgb, i.c.a); }\n";
+static struct { ID3D11Device *dev; ID3D11PixelShader *ps; ID3D11SamplerState *samp; } g_imgpipe;
+static int imgpipe_ready(void) {
+    if (g_imgpipe.dev != g_dev) {
+        if (g_imgpipe.samp) ID3D11SamplerState_Release(g_imgpipe.samp);
+        if (g_imgpipe.ps) ID3D11PixelShader_Release(g_imgpipe.ps);
+        memset(&g_imgpipe, 0, sizeof(g_imgpipe));
+    }
+    if (!g_dev) return 0;
+    if (!g_imgpipe.ps) {
+        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+        PFN_D3DCompile compile = dc ? (PFN_D3DCompile)(void *)GetProcAddress(dc, "D3DCompile") : NULL;
+        ID3DBlob *b = NULL;
+        D3D11_SAMPLER_DESC sd;
+        if (!compile || FAILED(compile(IMG_HLSL, sizeof(IMG_HLSL) - 1, NULL, NULL, NULL, "ps", "ps_4_0", 0, 0, &b, NULL))) return 0;
+        ID3D11Device_CreatePixelShader(g_dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &g_imgpipe.ps);
+        ID3D10Blob_Release(b);
+        memset(&sd, 0, sizeof(sd));
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        ID3D11Device_CreateSamplerState(g_dev, &sd, &g_imgpipe.samp);
+        g_imgpipe.dev = g_dev;
+    }
+    return g_imgpipe.ps && g_imgpipe.samp;
+}
+/* A texture into (x0,y0)-(x1,y1); u runs u0..u1 and v 0..v1, in 4096ths. */
+static void img_draw(ID3D11ShaderResourceView *srv, int x0, int y0, int x1, int y1, int u0, int u1, int v1) {
+    if (!srv || !imgpipe_ready()) return;
+    r_flush();
+    g_rgba = 0xFF000000u;
+    r_quad_uv((float)x0, (float)y0, (float)x1, (float)y1, u0, 0, u1, v1);
+    ID3D11DeviceContext_PSSetShader(g_ctx, g_imgpipe.ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1, &srv);
+    ID3D11DeviceContext_PSSetSamplers(g_ctx, 0, 1, &g_imgpipe.samp);
+    r_flush();
+    ID3D11DeviceContext_PSSetShader(g_ctx, g_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1, &g_srv);
+    ID3D11DeviceContext_PSSetSamplers(g_ctx, 0, 1, &g_samp);
+}
+
+/* ── the camera's texture, refreshed from the newest frame ── */
 static struct {
     ID3D11Device *dev;
-    ID3D11PixelShader *ps;
-    ID3D11SamplerState *samp;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
     int w, h;
@@ -500,29 +539,12 @@ static struct {
 static void camtex_free(void) {
     if (g_camtex.srv) ID3D11ShaderResourceView_Release(g_camtex.srv);
     if (g_camtex.tex) ID3D11Texture2D_Release(g_camtex.tex);
-    if (g_camtex.samp) ID3D11SamplerState_Release(g_camtex.samp);
-    if (g_camtex.ps) ID3D11PixelShader_Release(g_camtex.ps);
     memset(&g_camtex, 0, sizeof(g_camtex));
 }
 static int camtex_ready(void) {
     if (g_camtex.dev != g_dev) camtex_free();
-    if (!g_dev) return 0;
-    if (!g_camtex.ps) {
-        HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
-        PFN_D3DCompile compile = dc ? (PFN_D3DCompile)(void *)GetProcAddress(dc, "D3DCompile") : NULL;
-        ID3DBlob *b = NULL;
-        D3D11_SAMPLER_DESC sd;
-        if (!compile || FAILED(compile(CAM_HLSL, sizeof(CAM_HLSL) - 1, NULL, NULL, NULL, "ps", "ps_4_0", 0, 0, &b, NULL))) return 0;
-        ID3D11Device_CreatePixelShader(g_dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &g_camtex.ps);
-        ID3D10Blob_Release(b);
-        memset(&sd, 0, sizeof(sd));
-        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.MaxLOD = D3D11_FLOAT32_MAX;
-        ID3D11Device_CreateSamplerState(g_dev, &sd, &g_camtex.samp);
-        g_camtex.dev = g_dev;
-    }
-    if (!g_camtex.ps || !g_camtex.samp) return 0;
+    if (!g_dev || !imgpipe_ready()) return 0;
+    g_camtex.dev = g_dev;
     cam_lock();
     int w = g_cam.fw, h = g_cam.fh;
     if (g_cam.frame && w > 0 && h > 0 && (w != g_camtex.w || h != g_camtex.h || !g_camtex.tex)) {
@@ -554,15 +576,6 @@ static int cam_draw_preview(int x0, int y0, int x1, int y1) {
     double scale = fmin((double)(x1 - x0) / g_camtex.w, (double)(y1 - y0) / g_camtex.h);
     int w = (int)(g_camtex.w * scale), h = (int)(g_camtex.h * scale);
     int left = x0 + (x1 - x0 - w) / 2, top = y0 + (y1 - y0 - h) / 2;
-    r_flush();
-    g_rgba = 0xFF000000u;
-    r_quad_uv((float)left, (float)top, (float)(left + w), (float)(top + h), 4096, 0, 0, 4096);
-    ID3D11DeviceContext_PSSetShader(g_ctx, g_camtex.ps, NULL, 0);
-    ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1, &g_camtex.srv);
-    ID3D11DeviceContext_PSSetSamplers(g_ctx, 0, 1, &g_camtex.samp);
-    r_flush();
-    ID3D11DeviceContext_PSSetShader(g_ctx, g_ps, NULL, 0);
-    ID3D11DeviceContext_PSSetShaderResources(g_ctx, 0, 1, &g_srv);
-    ID3D11DeviceContext_PSSetSamplers(g_ctx, 0, 1, &g_samp);
+    img_draw(g_camtex.srv, left, top, left + w, top + h, 4096, 0, 4096);
     return 1;
 }

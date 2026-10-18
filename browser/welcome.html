@@ -1,7 +1,8 @@
 <!doctype html><meta charset="utf-8"><title>Browser</title>
 <style>body{font:18px system-ui;margin:2rem;max-width:55rem}input,button{font:inherit}button{cursor:pointer}</style>
 <h1>Hardcore Browser</h1><p>Browse in the character grid or switch to the page's native view.</p>
-<p>Open an address with ⌘L. Switch grid/native with ⇧⌘M. Open another browser tab with ⇧⌘B.</p>
+<p id="keys">Open an address with ⌘L. Switch grid/native with ⇧⌘M. Open another browser tab with ⇧⌘B.</p>
+<script>if(/^Win/.test(navigator.platform))document.getElementById('keys').textContent='Open an address with Ctrl+L. Switch grid/native with Ctrl+Shift+M. Open another browser tab with Ctrl+Shift+B.'</script>
 <p><a href="https://example.com">Example.com</a> · <a href="https://en.wikipedia.org">Wikipedia</a></p>
 <h2>Try a live control</h2><p><button onclick="this.textContent='Clicked '+(++window.count)+' times'">Click me</button></p>
 <label>Name <input name="name" placeholder="Your name" oninput="document.getElementById('greeting').textContent='Hello, '+this.value"></label>

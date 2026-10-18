@@ -44,8 +44,8 @@ static int mac_input_held(Tab *tb) { (void)tb; return 0; }
 enum { MEV_MOVE, MEV_DOWN, MEV_DRAG, MEV_UP, MEV_WHEEL, MEV_OTHER };
 static void media_schedule(void);
 static void mac_cutie_blur(void);
-#include "hardcore_win_browser.h"
 #include "hardcore_win_camera.h"
+#include "hardcore_win_browser.h"
 #include "hardcore_win_music.h"
 
 /* ── files: the bundled browser, run by WSL's python3 ── */
@@ -377,6 +377,7 @@ static void win_pointer_cursor_at(int x, int y) {
     if (mac_camera_cursor(x, y)) return;
     if (g_tv_drag_slot >= 0) { win_tv_drag_cursor(); return; }
     if (g_chrome_drag) { win_cursor(IDC_SIZEALL); return; }
+    if (!g_grid_on && !over_chrome(x, y) && !chrome_any_tv_contains(x, y) && mac_browser_ui_move(x, y)) return;
     if (over_chrome(x, y) || chrome_any_tv_contains(x, y)) {
         int idx = -1, hit = hit_tabbar(x, y, &idx);
         if (g_grid_on && (hit == HIT_GRIP || hit == HIT_TV_GRIP || hit == HIT_TV_RESIZE)) { win_cursor(IDC_ARROW); return; }
@@ -453,4 +454,60 @@ static void ui_music_resume(void) {
             break;
         }
     g_ui_saved.set = 0;
+}
+
+/* --unit: the parsers that read what websites and Chrome send */
+static int unit_win_menu(FILE *f) {
+    int fails = 0, ok;
+    {
+        static const char doc[] = "{\"a\":[1,\"x\\u00e9\",true,null],\"b\":{\"c\":\"\\ud83d\\ude00\",\"d\":-2.5e1}}";
+        JDoc *d = json_parse(doc, strlen(doc));
+        int a = jget(d, 0, "a");
+        ok = d && jlen(d, a) == 4 && jint(d, jat(d, a, 0)) == 1 && !strcmp(jstr(d, jat(d, a, 1)), "x\xc3\xa9") &&
+             jtype(d, jat(d, a, 2)) == JN_TRUE && jtype(d, jat(d, a, 3)) == JN_NULL &&
+             !strcmp(jstr(d, jpath(d, 0, "b", "c", NULL)), "\xf0\x9f\x98\x80") && jnum(d, jpath(d, 0, "b", "d", NULL)) == -25;
+        json_free(d);
+        static const char *const bad[] = {"{\"a\":1,}", "[1 2]", "{\"a\"}", "\"open", "[1]x", ""};
+        for (int i = 0; i < 6; i++) { JDoc *e = json_parse(bad[i], strlen(bad[i])); ok = ok && !e; json_free(e); }
+        char deep[300];
+        memset(deep, '[', 100); memset(deep + 100, ']', 100); deep[200] = 0;
+        JDoc *e = json_parse(deep, 200);
+        ok = ok && !e;   /* nesting is bounded */
+        json_free(e);
+        fprintf(f, "%s json reads Chrome's replies and refuses malformed ones\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {
+        static const struct { const char *in, *want; } urls[] = {
+            {"example.com", "https://example.com"}, {"localhost:3000/x", "http://localhost:3000/x"},
+            {"hello world", "https://duckduckgo.com/html/?q=hello+world"}, {"javascript:alert(1)", NULL},
+            {"C:\\x y.txt", "file:///C:/x%20y.txt"}, {"chrome://settings", "chrome://settings"}, {"ftp://x", NULL},
+            {"", "hardcore:welcome"}, {"https://a.b/c d", "https://a.b/c d"}, {"http://", NULL},
+        };
+        ok = 1;
+        for (size_t i = 0; i < sizeof(urls) / sizeof(urls[0]); i++) {
+            char got[512];
+            int hit = wb_url(urls[i].in, got, sizeof(got));
+            if (urls[i].want ? !hit || strcmp(got, urls[i].want) : hit) { ok = 0; fprintf(f, "     address %s -> %s\n", urls[i].in, hit ? got : "(refused)"); }
+        }
+        fprintf(f, "%s browser addresses: hosts, searches, files; no scripts or other schemes\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {
+        char out[512];
+        static const char feed[] = "<rss><channel><item><title>Episode 7: A &amp; B</title><itunes:duration>1:02:03</itunes:duration>"
+                                   "<enclosure url=\"http://datashat.net/m_7.mp3\" length=\"1\"/></item>"
+                                   "<item><title>Bad host</title><enclosure url=\"https://evil.example/x.mp3\"/></item></channel></rss>";
+        MusicItem *items = NULL;
+        int n = music_parse(feed, &items);
+        ok = n == 1 && !strcmp(items[0].title, "Episode 7: A & B") && items[0].episode == 7 && items[0].duration == 3723 &&
+             !strcmp(items[0].audio, "https://datashat.net/m_7.mp3");
+        free(items);
+        ok = ok && !music_audio_url("https://user@datashat.net/a.mp3", out, sizeof(out)) &&
+             !music_audio_url("https://datashat.net/a.mp3?x=1", out, sizeof(out)) && !music_audio_url("https://datashat.net:8/a.mp3", out, sizeof(out)) &&
+             music_duration("61") == 61 && music_duration("1:60") == 0 && !music_parse("<!DOCTYPE x><item></item>", &items);
+        fprintf(f, "%s music feed: episodes, durations, only its own https streams\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    return fails;
 }
