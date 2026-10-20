@@ -542,6 +542,9 @@ typedef struct {
     int side;                    /* something the tab column shows changed: folder, program status */
     char claude[40];             /* Claude Code session running here (rc.bash's wrapper says), "?" = unknown */
     char claude_args[400];       /* the flags it was started with, shell-quoted, to start it with again */
+    int claude_trust;            /* claude_args came with this shell's key: rc.bash sent them, not program output */
+    char key[40];                /* the key rc.bash made as the shell started (OSC 7700;key=), "" = none */
+    int key_set;                 /* a key came (or can't come any more): later ones are ignored */
     char cmd[400];               /* the command running in the shell (rc.bash's PS0), "" at a prompt */
 } Term;
 
@@ -610,7 +613,7 @@ typedef struct Tab {
 } Tab;
 
 enum { TK_WSL, TK_PS, TK_CMD, TK_BROWSER };
-enum { HELP_NONE, HELP_NO_DISTRO, HELP_FAILED, HELP_SLURP };
+enum { HELP_NONE, HELP_NO_DISTRO, HELP_FAILED, HELP_SLURP, HELP_LOST };   /* HELP_LOST: the shell stopped under Claude */
 
 #ifdef _WIN32
 static HWND g_hwnd;
@@ -728,6 +731,8 @@ static void plat_timer(int id, int ms);          /* one-shot (or, for TIMER_THRO
 #define TIMER_SETTLE 5            /* resizing stopped: rewrap the rest of every tab's scrollback */
 #define TIMER_TV 7                /* secondary panel idle countdown/fade */
 #define TIMER_CHROME 6            /* adaptive menu search and its brief fade transition */
+#define TIMER_SESSION 10          /* Win32: save the session if something in it changed */
+static int g_session_dirty;      /* a tab's folder, command or Claude session changed since the last save */
 #define TIMER_RESIZE 8            /* a resize waiting on its program: rewrap without the answer, or tell the next size */
 static DWORD g_chrome_input_at;   /* pause automatic menu motion while typing */
 static void plat_kill_timer(int id);
@@ -1955,10 +1960,15 @@ static void osc_dispatch(Term *t) {
         else program_status(t, rest);
         break;
     case 7700:                   /* from rc.bash: mnt=<wslpath -u C:\>, when drives aren't under /mnt */
-        if (!strncmp(rest, "claude=", 7)) {      /* claude=ID as Claude Code starts, claude= as it exits */
+        if (!strncmp(rest, "key=", 4)) {         /* rc.bash, first thing: only the first one counts */
+            if (!t->key_set) snprintf(t->key, sizeof(t->key), "%s", rest + 4);
+            t->key_set = 1;
+        } else if (!strncmp(rest, "claude=", 7)) {      /* claude=ID as Claude Code starts, claude= as it exits */
             snprintf(t->claude, sizeof(t->claude), "%s", rest + 7);
+            g_session_dirty = 1;
             if (!t->claude[0]) {
                 t->claude_args[0] = 0;
+                t->claude_trust = 0;
                 /* Claude Code has exited, maybe killed: what it turned on mustn't
                    outlive it in the shell (clicks as escape codes, focus reports,
                    painting held for a sync that never ends, no cursor) */
@@ -1967,10 +1977,18 @@ static void osc_dispatch(Term *t) {
             }
         } else if (!strncmp(rest, "cmd=", 4)) {
             snprintf(t->cmd, sizeof(t->cmd), "%s", rest + 4);
+            g_session_dirty = 1;         /* each prompt and command: the folder and command may be new */
             if (t->cmd[0]) t->had_activity = 1;
             t->side = 1;
         } else if (!strncmp(rest, "claude-args=", 12)) {
-            snprintf(t->claude_args, sizeof(t->claude_args), "%s", rest + 12);
+            /* "KEY ARGS" from rc.bash's wrapper: the key says the shell sent it, so a
+               restore may start Claude with all of them (see session_args_filter) */
+            const char *a = rest + 12;
+            size_t kn = strlen(t->key);
+            t->claude_trust = kn && !strncmp(a, t->key, kn) && (a[kn] == ' ' || !a[kn]);
+            if (t->claude_trust) a += a[kn] ? kn + 1 : kn;
+            snprintf(t->claude_args, sizeof(t->claude_args), "%s", a);
+            g_session_dirty = 1;
         } else if (!strncmp(rest, "mnt=", 4) && rest[4] == '/') {
             char *e;
             snprintf(g_mnt_root, sizeof(g_mnt_root), "%s", rest + 4);
@@ -2705,12 +2723,18 @@ static int tab_drain(Tab *tb) {
    Written by hardcore on each launch; nothing in your dotfiles changes. */
 static const char RC_BASH[] =
     "# written by hardcore on every launch; edits here are overwritten\n"
+    "# first, before any program can write to the tab: a key only this shell knows (it\n"
+    "# is not exported). Claude's flags come with it, so a restore can trust them.\n"
+    "__hardcore_key=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)\n"
+    "printf '\\033]7700;key=%s\\033\\\\' \"$__hardcore_key\"\n"
     "[ -r /etc/profile ] && . /etc/profile\n"
     "if [ -r ~/.bash_profile ]; then . ~/.bash_profile\n"
     "elif [ -r ~/.bash_login ]; then . ~/.bash_login\n"
     "elif [ -r ~/.profile ]; then . ~/.profile\n"
     "elif [ -r ~/.bashrc ]; then . ~/.bashrc\n"
     "fi\n"
+    "# tests only: a folder of stand-in programs (a fake claude) ahead of the real ones\n"
+    "[ -n \"$HARDCORE_TEST_PATH\" ] && PATH=$HARDCORE_TEST_PATH:$PATH\n"
     "# drives mounted somewhere other than /mnt (wsl.conf automount root): tell hardcore where\n"
     "[ -d /mnt/c ] || printf '\\033]7700;mnt=%s\\033\\\\' \"$(wslpath -u 'C:\\' 2>/dev/null)\"\n"
     "# tell programs what this terminal can do (WSL doesn't carry WT_SESSION-style hints):\n"
@@ -2818,7 +2842,7 @@ static const char RC_BASH[] =
     "                id=$(ls -t \"$d\"/*.jsonl 2>/dev/null | head -1); id=${id##*/}; id=${id%.jsonl} ;;\n"
     "      pick) id= ;;\n"
     "    esac\n"
-    "    printf '\\033]7700;claude-args=%s\\033\\\\\\033]7700;claude=%s\\033\\\\' \"$keep\" \"${id:-?}\"\n"
+    "    printf '\\033]7700;claude-args=%s %s\\033\\\\\\033]7700;claude=%s\\033\\\\' \"$__hardcore_key\" \"$keep\" \"${id:-?}\"\n"
     "    command claude \"$@\"; rc=$?\n"
     "    printf '\\033]7700;claude=\\033\\\\'\n"
     "    return $rc\n"
@@ -5368,36 +5392,107 @@ static void session_args_filter(const char *in, char *out, size_t cap) {
 
 #ifdef _WIN32
 /* ── sessions: close hardcore, open it again, and the tabs come back ──
-   On close (and when Windows shuts down) every tab's shell, folder, text and
-   the Claude Code session running in it go to %LOCALAPPDATA%\hardcore\session.
-   The next start rebuilds them: the text replayed, the shell started under
-   it, and claude --resume ID where Claude was running. Exiting the last tab
-   yourself clears it. Test copies (--no-activate) leave it alone. */
+   Each window keeps its own session in %LOCALAPPDATA%\hardcore\session:
+   <id>.txt (the tabs: shell, folder, the Claude Code session in it and its
+   flags) and <id>-tab<N>.txt (each tab's text). It is written a moment after
+   anything it holds changes, on close, and when Windows shuts down, so a
+   crash or a power cut loses at most the last two seconds. <id>.lock, held
+   open with no sharing while the window runs, says the session is in use.
+   The next start takes the newest session that no window holds (and opens a
+   window for each other one): the text replayed, the shell started under it,
+   and claude --resume ID where Claude was running. Closing a tab removes it
+   from the session; closing the last tab yourself deletes the session. A
+   shell that stops under a running Claude (WSL stopped, out of memory) is not
+   you closing it: the tab stays, and Enter resumes Claude there. Test copies
+   (--no-activate) leave sessions alone. */
 static int g_session_off;
 static int dir_exists(const char *p);
+static wchar_t g_session_id[64];         /* this window's session: session\<id>.txt ("session" = an older build's) */
+static HANDLE g_session_lock;            /* session\<id>.lock, open while this window owns the session */
+static unsigned g_session_sig;           /* the tabs as of the last save: their ids, order and the active one */
 
 static void session_path(wchar_t *out, const wchar_t *name) {
     _snwprintf(out, MAX_PATH, L"%ls\\session\\%ls", g_cfg_dir, name);
     out[MAX_PATH - 1] = 0;
 }
 
-static void session_clear(void) {
-    wchar_t p[MAX_PATH];
-    if (g_session_off) return;
-    session_path(p, L"session.txt");
-    DeleteFileW(p);
+static void session_file(wchar_t *out, const wchar_t *id, const wchar_t *suffix) {
+    wchar_t name[96];
+    _snwprintf(name, 96, L"%ls%ls", id, suffix);
+    name[95] = 0;
+    session_path(out, name);
 }
 
-static void session_save(void) {
+/* Opens session\<id>.lock with no sharing: a live window's lock can't be
+   opened again. It goes away when closed; one left by a crash or a power cut
+   is just a file, and opens. */
+static HANDLE session_lock_take(const wchar_t *id) {
     wchar_t dir[MAX_PATH], p[MAX_PATH];
-    FILE *f;
-    int i, n = 0;
-    if (g_session_off || !g_ntabs) return;
+    HANDLE h;
     _snwprintf(dir, MAX_PATH, L"%ls\\session", g_cfg_dir);
     CreateDirectoryW(dir, NULL);
-    session_path(p, L"session.txt");
-    if (!(f = _wfopen(p, L"wb"))) return;
-    fprintf(f, "# hardcore: the tabs open when the window closed, restored on the next start\n");
+    session_file(p, id, L".lock");
+    h = CreateFileW(p, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    return h == INVALID_HANDLE_VALUE ? NULL : h;
+}
+
+/* This window's session id and its lock; a new id the first time. */
+static int session_own(void) {
+    if (g_session_lock) return 1;
+    if (!g_session_id[0])
+        _snwprintf(g_session_id, 64, L"w%08lx%08lx", (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
+    g_session_lock = session_lock_take(g_session_id);
+    return g_session_lock != NULL;
+}
+
+/* The tab text files a session's <id>.txt names, deleted with it. */
+static void session_delete_texts(const wchar_t *id) {
+    wchar_t p[MAX_PATH], suffix[24];
+    int k;
+    for (k = 0; k < MAX_TABS; k++) {
+        _snwprintf(suffix, 24, L"-tab%d.txt", k);
+        session_file(p, id, suffix);
+        DeleteFileW(p);
+        if (!wcscmp(id, L"session")) {   /* an older build's: tab<N>.txt */
+            _snwprintf(suffix, 24, L"tab%d.txt", k);
+            session_path(p, suffix);
+            DeleteFileW(p);
+        }
+    }
+}
+
+static void session_clear(void) {
+    wchar_t p[MAX_PATH];
+    if (g_session_off || !g_session_id[0]) return;
+    session_file(p, g_session_id, L".txt");
+    DeleteFileW(p);
+    session_delete_texts(g_session_id);
+}
+
+/* A tab that isn't running but still belongs in the session: its shell
+   stopped under Claude, or a restored one couldn't start (WSL down). */
+static int session_keeps(const Tab *tb) {
+    return tb->help == HELP_LOST || (tb->help == HELP_FAILED && tb->t.claude[0]);
+}
+
+static unsigned session_sig(void) {
+    unsigned h = 2166136261u ^ (unsigned)g_active;
+    int i;
+    for (i = 0; i < g_ntabs; i++) h = (h ^ (unsigned)g_tabs[i]->id ^ (unsigned)g_tabs[i]->help << 24) * 16777619u;
+    return h;
+}
+
+/* Returns 1 when the session is on disk as the tabs are now. */
+static int session_save(void) {
+    wchar_t p[MAX_PATH], tmp[MAX_PATH], suffix[24];
+    FILE *f;
+    int i, n = 0;
+    if (g_session_off || !g_ntabs) return 1;
+    if (!session_own()) return 0;        /* another window has it (a reload hands it over in a moment) */
+    session_file(p, g_session_id, L".txt");
+    session_file(tmp, g_session_id, L".txt.new");
+    if (!(f = _wfopen(tmp, L"wb"))) return 0;
+    fprintf(f, "# hardcore: the tabs open in this window, restored on the next start\n");
     fprintf(f, "active=%d\n", g_active);
     {
         char ui[1200];
@@ -5412,33 +5507,58 @@ static void session_save(void) {
     }
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
-        wchar_t name[32];
+        char text[96];
+        wchar_t tp[MAX_PATH];
         FILE *v;
-        if (tb->help || tb->slurp_hwnd) continue;
+        if (tb->slurp_hwnd || (tb->help && !session_keeps(tb))) continue;
         if (tb->kind == TK_BROWSER) {   /* a page: its address, and how it was shown */
             if (tb->browser_url[0] && strncmp(tb->browser_url, "data:", 5))
                 fprintf(f, "\n[tab]\nkind=www\ndir=%s\nnative=%d\n", tb->browser_url, tb->browser_native);
             continue;
         }
-        _snwprintf(name, 32, L"tab%d.txt", n);
-        session_path(p, name);
-        if ((v = _wfopen(p, L"wb"))) {
+        _snwprintf(suffix, 24, L"-tab%d.txt", n);
+        session_file(tp, g_session_id, suffix);
+        if ((v = _wfopen(tp, L"wb"))) {
             term_dump(&tb->t, v, 3000);
             fclose(v);
         }
+        WideCharToMultiByte(CP_UTF8, 0, g_session_id, -1, text, 64, NULL, NULL);
+        snprintf(text + strlen(text), 32, "-tab%d.txt", n);
         {
             char cmd[400];
             int k;
             snprintf(cmd, sizeof(cmd), "%s", tb->t.claude[0] ? "" : tb->t.cmd);   /* Claude comes back on its own */
             for (k = 0; cmd[k]; k++) if (cmd[k] == '\r' || cmd[k] == '\n') cmd[k] = ' ';
-            fprintf(f, "\n[tab]\nview=%d\nkind=%s\ndir=%s\nclaude=%s\nclaude_args=%s\ncmd=%s\ntext=tab%d.txt\n", tb->t.view,
+            fprintf(f, "\n[tab]\nview=%d\nkind=%s\ndir=%s\nclaude=%s\nclaude_args=%s\nclaude_trust=%d\ncmd=%s\ntext=%s\n", tb->t.view,
                     !strcmp(tb->run, "files:") ? "files" : tb->kind == TK_PS ? "powershell" : tb->kind == TK_CMD ? "cmd" : "wsl",
                     tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude,
-                    tb->t.claude[0] ? tb->t.claude_args : "", cmd, n);
+                    tb->t.claude[0] ? tb->t.claude_args : "", tb->t.claude[0] && tb->t.claude_trust, cmd, text);
         }
         n++;
     }
-    fclose(f);
+    if (fclose(f) != 0 || !MoveFileExW(tmp, p, MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(tmp); return 0; }
+    for (i = n; i < MAX_TABS; i++) {     /* tabs closed since the last save */
+        _snwprintf(suffix, 24, L"-tab%d.txt", i);
+        session_file(tmp, g_session_id, suffix);
+        DeleteFileW(tmp);
+    }
+    if (!wcscmp(g_session_id, L"session"))   /* an older build's text files, read once already */
+        for (i = 0; i < MAX_TABS; i++) {
+            _snwprintf(suffix, 24, L"tab%d.txt", i);
+            session_path(tmp, suffix);
+            DeleteFileW(tmp);
+        }
+    g_session_sig = session_sig();
+    return 1;
+}
+
+/* Every couple of seconds: save when the tabs, a folder, a command or a
+   Claude session changed. */
+static void session_tick(void) {
+    if (g_session_off || !g_ntabs) return;
+    if (!g_session_dirty && session_sig() == g_session_sig) return;
+    g_session_dirty = 0;
+    if (!session_save()) g_session_dirty = 1;
 }
 
 static char *read_file(const wchar_t *path, size_t *n) {
@@ -5474,9 +5594,34 @@ static int session_id_ok(const char *id) {
     return 1;
 }
 
-static void session_add_tab(const char *kind, const char *dir, const char *claude, const char *args, const char *cmd,
-                            const char *text, int view) {
-    wchar_t p[MAX_PATH], wname[64];
+/* The command that starts Claude again: claude FLAGS --resume ID (or
+   --continue when the id wasn't known). Flags the shell vouched for (trust)
+   all come back; others only the ones session_args_filter keeps. "" = none. */
+static void session_resume_cmd(const char *claude, const char *args, int trust, char *run, size_t cap) {
+    char kept[400];
+    size_t k;
+    run[0] = 0;
+    if (!session_args_ok(args)) args = "";
+    if (trust) {
+        snprintf(kept, sizeof(kept), "%s", args);
+        k = strlen(kept);
+        if (k && kept[k - 1] != ' ' && k + 1 < sizeof(kept)) { kept[k] = ' '; kept[k + 1] = 0; }
+    } else session_args_filter(args, kept, sizeof(kept));
+    if (!strcmp(claude, "?")) snprintf(run, cap, "claude %s--continue", kept);
+    else if (session_id_ok(claude)) snprintf(run, cap, "claude %s--resume %s", kept, claude);
+}
+
+/* A tab about to resume Claude holds the session already: if its shell
+   can't start (WSL still down), the session isn't lost on the next save. */
+static void session_preset(Tab *tb, const char *claude, const char *args, int trust) {
+    snprintf(tb->t.claude, sizeof(tb->t.claude), "%s", claude);
+    snprintf(tb->t.claude_args, sizeof(tb->t.claude_args), "%s", args);
+    tb->t.claude_trust = trust;
+}
+
+static void session_add_tab(const char *kind, const char *dir, const char *claude, const char *args, int trust,
+                            const char *cmd, const char *text, int view) {
+    wchar_t p[MAX_PATH], wname[96];
     char run[600] = "", *data = NULL;
     size_t n = 0;
     Tab *tb;
@@ -5489,14 +5634,10 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
         if ((tb = files_tab_new(dir_exists(dir) ? dir : ""))) g_tabs[g_ntabs++] = tb;
         return;
     }
-    char kept[400];
     if (!session_args_ok(args)) args = "";
-    session_args_filter(args, kept, sizeof(kept));
-    args = kept;
-    if (!strcmp(claude, "?")) snprintf(run, sizeof(run), "claude %s--continue", args);
-    else if (session_id_ok(claude)) snprintf(run, sizeof(run), "claude %s--resume %s", args, claude);
-    if (text[0]) {
-        utf8_to_wide(text, wname, 64);
+    session_resume_cmd(claude, args, trust, run, sizeof(run));
+    if (text[0] && !strchr(text, '\\') && !strchr(text, '/') && !strstr(text, "..")) {
+        utf8_to_wide(text, wname, 96);
         session_path(p, wname);
         data = read_file(p, &n);
     }
@@ -5504,8 +5645,91 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
                        run[0] ? run : NULL, !run[0] && cmd[0] && !strcmp(kind, "wsl") ? cmd : NULL, data, n);
     free(data);
     if (tb) {
+        if (run[0]) session_preset(tb, claude, args, trust);
         tb->t.view = view > 0 ? (view < tb->t.hcount ? view : tb->t.hcount) : 0;   /* scrolled back as far as it was */
         g_tabs[g_ntabs++] = tb;
+    }
+}
+
+/* The saved sessions no window holds, newest first. */
+typedef struct { wchar_t id[64]; FILETIME at; } SessionFile;
+static int session_list(SessionFile *out, int cap) {
+    wchar_t pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    int n = 0, i, j;
+    session_path(pat, L"*.txt");
+    if ((h = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) return 0;
+    do {
+        size_t len = wcslen(fd.cFileName);
+        if (len < 5 || len - 4 >= 64 || wcsstr(fd.cFileName, L"-tab") ||
+            (!wcsncmp(fd.cFileName, L"tab", 3) && iswdigit(fd.cFileName[3]))) continue;   /* tab text */
+        if (n >= cap) break;
+        wcsncpy(out[n].id, fd.cFileName, len - 4);
+        out[n].id[len - 4] = 0;
+        out[n].at = fd.ftLastWriteTime;
+        n++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    for (i = 1; i < n; i++)              /* newest first */
+        for (j = i; j > 0 && CompareFileTime(&out[j].at, &out[j - 1].at) > 0; j--) {
+            SessionFile s = out[j];
+            out[j] = out[j - 1];
+            out[j - 1] = s;
+        }
+    return n;
+}
+
+/* At start: take a saved session no window holds (want: that one only).
+   Returns 1 when this window now owns one to restore. */
+static int session_claim(const wchar_t *want) {
+    SessionFile s[16];
+    wchar_t p[MAX_PATH];
+    int n, i;
+    HANDLE h;
+    if (g_session_off) return 0;
+    if (want) {
+        session_file(p, want, L".txt");
+        if (GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES || !(h = session_lock_take(want))) return 0;
+        _snwprintf(g_session_id, 64, L"%ls", want);
+        g_session_lock = h;
+        return 1;
+    }
+    n = session_list(s, 16);
+    for (i = 0; i < n; i++)
+        if ((h = session_lock_take(s[i].id))) {
+            _snwprintf(g_session_id, 64, L"%ls", s[i].id);
+            g_session_lock = h;
+            return 1;
+        }
+    return 0;
+}
+
+/* After this window's restore: a window for each other saved session no
+   window holds (several windows were open when Windows restarted). */
+static void session_open_others(int quiet) {
+    SessionFile s[16];
+    wchar_t exe[MAX_PATH], cl[MAX_PATH + 100];
+    int n, i, opened = 0;
+    HANDLE h;
+    if (g_session_off || !GetModuleFileNameW(NULL, exe, MAX_PATH)) return;
+    n = session_list(s, 16);
+    for (i = 0; i < n && opened < 8; i++) {
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        if (!wcscmp(s[i].id, g_session_id) || !(h = session_lock_take(s[i].id))) continue;   /* ours, or in use */
+        CloseHandle(h);                  /* free again: the new window takes it */
+        _snwprintf(cl, MAX_PATH + 100, L"\"%ls\" --session %ls%ls", exe, s[i].id, quiet ? L" --no-activate" : L"");
+        cl[MAX_PATH + 99] = 0;
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        SetEnvironmentVariableW(L"HARDCORE_DETACHED", L"1");   /* started by us, not by a shell: no detaching */
+        if (CreateProcessW(exe, cl, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            opened++;
+        }
+        SetEnvironmentVariableW(L"HARDCORE_DETACHED", NULL);
     }
 }
 
@@ -5518,8 +5742,8 @@ static int session_placement(WINDOWPLACEMENT *wp) {
     unsigned show;
     long l, t, r, b;
     int ok = 0;
-    if (g_session_off) return 0;
-    session_path(p, L"session.txt");
+    if (g_session_off || !g_session_lock) return 0;
+    session_file(p, g_session_id, L".txt");
     if (!(d = read_file(p, &n))) return 0;
     if ((pl = strstr(d, "\nplacement=")) && sscanf(pl + 11, "%u %ld %ld %ld %ld", &show, &l, &t, &r, &b) == 5 && r > l && b > t) {
         memset(wp, 0, sizeof(*wp));
@@ -5537,10 +5761,10 @@ static int session_placement(WINDOWPLACEMENT *wp) {
 static int session_restore(void) {
     wchar_t p[MAX_PATH];
     size_t n;
-    char *d, *line, *next, kind[16] = "", dir[1024] = "", claude[72] = "", args[400] = "", cmd[400] = "", text[64] = "";
-    int active = 0, intab = 0, view = 0;
-    if (g_session_off) return 0;
-    session_path(p, L"session.txt");
+    char *d, *line, *next, kind[16] = "", dir[1024] = "", claude[72] = "", args[400] = "", cmd[400] = "", text[96] = "";
+    int active = 0, intab = 0, view = 0, trust = 0;
+    if (g_session_off || !g_session_lock) return 0;
+    session_file(p, g_session_id, L".txt");
     if (!(d = read_file(p, &n))) return 0;
     for (line = d; line && *line; line = next) {
         char *v, *e;
@@ -5548,10 +5772,10 @@ static int session_restore(void) {
         if (next) *next++ = 0;
         if ((e = strchr(line, '\r'))) *e = 0;
         if (!strcmp(line, "[tab]")) {
-            if (intab) session_add_tab(kind, dir, claude, args, cmd, text, view);
+            if (intab) session_add_tab(kind, dir, claude, args, trust, cmd, text, view);
             intab = 1;
             kind[0] = dir[0] = claude[0] = args[0] = cmd[0] = text[0] = 0;
-            view = 0;
+            view = trust = 0;
             continue;
         }
         if (line[0] == '#' || !(v = strchr(line, '='))) continue;
@@ -5561,17 +5785,68 @@ static int session_restore(void) {
         else if (!strcmp(line, "dir")) snprintf(dir, sizeof(dir), "%s", v);
         else if (!strcmp(line, "claude")) snprintf(claude, sizeof(claude), "%s", v);
         else if (!strcmp(line, "claude_args")) snprintf(args, sizeof(args), "%s", v);
+        else if (!strcmp(line, "claude_trust")) trust = atoi(v) == 1;
         else if (!strcmp(line, "cmd")) snprintf(cmd, sizeof(cmd), "%s", v);
         else if (!strcmp(line, "view")) view = atoi(v);
         else if (!strcmp(line, "native")) view = atoi(v);   /* (a page has no scrollback: its view is its mode) */
         else if (!strcmp(line, "text")) snprintf(text, sizeof(text), "%s", v);
         else if (!strcmp(line, "ui")) ui_restore(v);
     }
-    if (intab) session_add_tab(kind, dir, claude, args, cmd, text, view);
+    if (intab) session_add_tab(kind, dir, claude, args, trust, cmd, text, view);
     free(d);
     if (g_ntabs) activate(active >= 0 && active < g_ntabs ? active : 0);
     if (g_ntabs) ui_apply();
     return g_ntabs;
+}
+
+/* The shell under Claude stopped by itself (WSL stopped, out of memory,
+   killed): not the user closing the tab. The tab stays, says so, and keeps
+   the session; Enter starts the shell again and resumes Claude. */
+static void tab_lost(Tab *tb, DWORD code) {
+    Term *t = &tb->t;
+    char buf[300];
+    tb->help = HELP_LOST;
+    if (t->alt) set_alt(t, 0, 0);
+    t->m_mouse = t->m_mouse_sgr = t->m_focus = t->m_sync = 0;
+    t->m_cursor_vis = 0;
+    snprintf(buf, sizeof(buf), "\x1b[0m\r\n\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 the shell stopped (code %ld): WSL stopped, or it was killed "
+                               "\xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n", (long)code);
+    term_message(t, buf);
+    term_message(t, t->claude[0] ? "  \x1b[38;2;255;166;13mEnter\x1b[0m  start the shell again and resume Claude\r\n"
+                                 : "  \x1b[38;2;255;166;13mEnter\x1b[0m  start the shell again\r\n");
+    term_message(t, "  \x1b[2mClose the tab if you are done with it. Closing the window keeps it for the next start.\x1b[0m\r\n");
+    tb->attention = 1;
+    t->dirty = 1;
+    g_session_dirty = 1;
+}
+
+/* Enter on a stopped tab: a new shell under its text, resuming Claude if
+   it ran there. */
+static void tab_respawn(int at) {
+    Tab *old = g_tabs[at], *tb;
+    char run[600] = "", *data = NULL;
+    const char *dir = old->t.cwd[0] ? old->t.cwd : old->start_dir;
+    size_t n = 0;
+    wchar_t tmp[MAX_PATH], p[MAX_PATH];
+    FILE *v;
+    if (old->t.claude[0]) session_resume_cmd(old->t.claude, old->t.claude_args, old->t.claude_trust, run, sizeof(run));
+    if (GetTempPathW(MAX_PATH, tmp) && GetTempFileNameW(tmp, L"hc", 0, p)) {
+        if ((v = _wfopen(p, L"wb"))) {
+            term_dump(&old->t, v, 3000);
+            fclose(v);
+            data = read_file(p, &n);
+        }
+        DeleteFileW(p);
+    }
+    tb = tab_create_ex(dir_exists(dir) ? dir : NULL, 0, old->kind, run[0] ? run : NULL,
+                       !run[0] && old->t.cmd[0] && old->kind == TK_WSL ? old->t.cmd : NULL, data, n);
+    free(data);
+    if (!tb) return;
+    if (run[0]) session_preset(tb, old->t.claude, old->t.claude_args, old->t.claude_trust);
+    g_tabs[at] = tb;
+    tab_destroy_async(old);
+    activate(at);
+    g_session_dirty = 1;
 }
 
 /* ── reloading in place: a newer hardcore takes over without stopping anything ──
@@ -5704,6 +5979,11 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         ui_pack(ui, sizeof(ui));
         blob_line(&b, "ui", ui);
     }
+    if (g_session_id[0]) {              /* the new window saves to this window's session */
+        char sid[64];
+        WideCharToMultiByte(CP_UTF8, 0, g_session_id, -1, sid, sizeof(sid), NULL, NULL);
+        blob_line(&b, "session", sid);
+    }
     for (i = 0; i < g_ntabs; i++) {   /* pages: the new window takes over their Chrome targets */
         Tab *tb = g_tabs[i];
         char page[4400];
@@ -5737,6 +6017,8 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         blob_line(&b, "cwd", t->cwd);
         blob_line(&b, "claude", t->claude);
         blob_line(&b, "claude_args", t->claude_args);
+        blob_line(&b, "claude_trust", t->claude_trust ? "1" : "0");
+        blob_line(&b, "key", t->key);
         blob_line(&b, "cmd", t->cmd);
         blob_line(&b, "run", tb->run);
         WideCharToMultiByte(CP_UTF8, 0, t->title, -1, tmp, sizeof(tmp), NULL, NULL);
@@ -5820,6 +6102,7 @@ static int adopt_tabs(void) {
     static struct { Tab *tab; int at, parent; } pages[MAX_TABS];
     int npages = 0;
     if (!p) return 0;
+    wcscpy(g_session_id, L"session");   /* an older build's window saved to session.txt; a newer one says */
     while ((line = p) && *p) {
         char *nl = strchr(p, '\n'), *v;
         if (!nl) break;
@@ -5828,6 +6111,12 @@ static int adopt_tabs(void) {
         v = strchr(line, ' ');
         if (v) *v++ = 0; else v = line + strlen(line);
         if (!strcmp(line, "ui")) { ui_restore(v); continue; }
+        if (!strcmp(line, "session")) {        /* the old window's session: ours now (its lock goes as it exits) */
+            int ok = v[0] != 0;
+            for (char *q = v; *q; q++) if (!isalnum((unsigned char)*q)) ok = 0;
+            if (ok) utf8_to_wide(v, g_session_id, 64);
+            continue;
+        }
         if (!strcmp(line, "www")) {   /* placed once the terminals are in */
             int at, parent, native, used = 0;
             char target[128];
@@ -5853,6 +6142,7 @@ static int adopt_tabs(void) {
             int c = 80, r = 24;
             sscanf(v, "%d %d", &c, &r);
             if (!term_init(&tb->t, c, r)) { free(tb); tb = NULL; }
+            else tb->t.key_set = 1;               /* its shell made its key long ago: none may come now */
         } else if (!strcmp(line, "view")) tb->t.view = atoi(v);
         else if (!strcmp(line, "handles")) {
             unsigned long long h[6] = {0};
@@ -5867,6 +6157,8 @@ static int adopt_tabs(void) {
         else if (!strcmp(line, "cwd")) snprintf(tb->t.cwd, sizeof(tb->t.cwd), "%s", v);
         else if (!strcmp(line, "claude")) snprintf(tb->t.claude, sizeof(tb->t.claude), "%s", v);
         else if (!strcmp(line, "claude_args")) snprintf(tb->t.claude_args, sizeof(tb->t.claude_args), "%s", v);
+        else if (!strcmp(line, "claude_trust")) tb->t.claude_trust = atoi(v) == 1;
+        else if (!strcmp(line, "key")) snprintf(tb->t.key, sizeof(tb->t.key), "%s", v);
         else if (!strcmp(line, "cmd")) snprintf(tb->t.cmd, sizeof(tb->t.cmd), "%s", v);
         else if (!strcmp(line, "run")) snprintf(tb->run, sizeof(tb->run), "%s", v);
         else if (!strcmp(line, "title")) utf8_to_wide(v, tb->t.title, 256);
@@ -5972,6 +6264,9 @@ static void close_tab(int i) {
         if (!grid_hidden(g_tabs[j]->id)) { g_active = j; break; }
     }
     activate(g_active);
+#ifdef _WIN32
+    session_tick();              /* closed means done: out of the session now, not in two seconds */
+#endif
 }
 
 /* ── keyboard ──────────────────────────────────────────────────────── */
@@ -6769,6 +7064,55 @@ static int unit_issues(FILE *f) {
         fprintf(f, "%s issue program output can't add Claude flags a restore would run%s%s\n", ok ? "ok  " : "FAIL", ok ? "" : ": ", ok ? "" : out);
         fails += !ok;
     }
+    {   /* rc.bash's key: the first one counts; flags sent with it are trusted, others not */
+        Term t;
+        int ok = term_init(&t, 40, 4);
+        if (ok) {
+            const char *a = "\x1b]7700;key=k-1\x1b\\\x1b]7700;key=evil\x1b\\"
+                            "\x1b]7700;claude-args=k-1 --dangerously-skip-permissions --model opus \x1b\\\x1b]7700;claude=id-1\x1b\\";
+            vt_feed(&t, (const unsigned char *)a, (int)strlen(a));
+            ok = t.claude_trust && !strcmp(t.claude_args, "--dangerously-skip-permissions --model opus ") && !strcmp(t.claude, "id-1");
+            a = "\x1b]7700;claude-args=evil --dangerously-skip-permissions \x1b\\";
+            vt_feed(&t, (const unsigned char *)a, (int)strlen(a));
+            ok = ok && !t.claude_trust && !strcmp(t.claude_args, "evil --dangerously-skip-permissions ");
+            a = "\x1b]7700;claude-args=k-1\x1b\\";
+            vt_feed(&t, (const unsigned char *)a, (int)strlen(a));
+            ok = ok && t.claude_trust && !t.claude_args[0];
+            a = "\x1b]7700;claude=\x1b\\";
+            vt_feed(&t, (const unsigned char *)a, (int)strlen(a));
+            ok = ok && !t.claude_trust && !t.claude[0] && !t.claude_args[0];
+            term_free(&t);
+        }
+        if (ok && term_init(&t, 40, 4)) {   /* no key from the shell: nothing is trusted */
+            const char *a = "\x1b]7700;claude-args= --dangerously-skip-permissions \x1b\\";
+            vt_feed(&t, (const unsigned char *)a, (int)strlen(a));
+            ok = !t.claude_trust;
+            term_free(&t);
+        }
+        fprintf(f, "%s issue a restored Claude keeps the flags its shell started it with, and only those\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+#ifdef _WIN32
+    {   /* the command a restored or stopped tab resumes Claude with */
+        char run[600];
+        int ok;
+        session_resume_cmd("7a77ef71-0000-4000-8000-000000000001", "--dangerously-skip-permissions --model opus ", 1, run, sizeof(run));
+        ok = !strcmp(run, "claude --dangerously-skip-permissions --model opus --resume 7a77ef71-0000-4000-8000-000000000001");
+        session_resume_cmd("abc", "--dangerously-skip-permissions --model opus", 0, run, sizeof(run));
+        ok = ok && !strcmp(run, "claude --model opus --resume abc");
+        session_resume_cmd("abc", "--dangerously-skip-permissions", 1, run, sizeof(run));
+        ok = ok && !strcmp(run, "claude --dangerously-skip-permissions --resume abc");
+        session_resume_cmd("?", "", 1, run, sizeof(run));
+        ok = ok && !strcmp(run, "claude --continue");
+        session_resume_cmd("abc;rm", "", 1, run, sizeof(run));
+        ok = ok && !run[0];
+        session_resume_cmd("abc", "--x $(rm)", 1, run, sizeof(run));
+        ok = ok && !strcmp(run, "claude --resume abc");
+        fprintf(f, "%s issue the resume command: same flags when trusted, filtered when not, no shell syntax%s%s\n",
+                ok ? "ok  " : "FAIL", ok ? "" : ": ", ok ? "" : run);
+        fails += !ok;
+    }
+#endif
     {   /* SGR colon sub-parameters (alacritty/vte#22) */
         Term t;
         int ok = term_init(&t, 20, 3);
@@ -7340,7 +7684,8 @@ static int help_key(Tab *tb, uint32_t c) {
     }
     if (c == '\r') {
         g_have_distro = wsl_distros() > 0 && !_wgetenv(L"HARDCORE_PRETEND_NO_WSL");
-        replace_tab(at);
+        if (tb->help == HELP_LOST || tb->t.claude[0]) tab_respawn(at);   /* and Claude resumes */
+        else replace_tab(at);
         return 1;
     }
     return 1;                    /* nothing else means anything here */
@@ -7655,6 +8000,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_THROB) { update_busy(1); return 0; }
         if (wp == TIMER_MEDIA) { media_tick(); return 0; }
         if (wp == TIMER_DISK) { check_disk(); return 0; }
+        if (wp == TIMER_SESSION) { session_tick(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
         else if (wp == TIMER_SETTLE) settle_all();
@@ -7794,6 +8140,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
            Keep the tab and say what's wrong instead of vanishing. */
         if (code != 0 && GetTickCount() - tb->born < 3000 && !tb->help) {
             diagnose(tb, code);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        /* Claude still running as its shell ended (rc.bash says when Claude
+           exits, and you can't type exit under it), or a code no shell exits
+           with (wsl.exe's own): WSL went away. Not you closing the tab. */
+        if (!tb->help && !tb->spare && (tb->t.claude[0] || code > 255)) {
+            tab_lost(tb, code);
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
@@ -8540,6 +8894,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     MSG msg;
     char selftest_out[MAX_PATH] = "";
     int dir_given = 0;           /* a folder on the command line: open there, don't restore the last session */
+    int quiet_start = 0;         /* --no-activate: windows opened for other sessions open behind too */
+    wchar_t want_session[64] = L"";   /* --session ID: restore that saved session (opened for it by another window) */
     int slurp_window = 0;
     HWND h;
     HANDLE gfx_thread = NULL;
@@ -8643,8 +8999,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 "  hardcore slurp --list   discover eligible sessions without attaching\n"
                 "  hardcore --version      this build's version\n", HARDCORE_VERSION);
             return 0;
+        } else if (!strcmp(a, "--session") && i + 1 < argc) {
+            _snwprintf(want_session, 64, L"%ls", argv[++i]);
+            want_session[63] = 0;
         } else if (!strcmp(a, "--no-activate")) {
             show = SW_SHOWNOACTIVATE;       /* tests: open behind, never take the keyboard */
+            quiet_start = 1;
             g_session_off = !_wgetenv(L"HARDCORE_SESSIONS");   /* ...and never touch your saved tabs */
         } else if (!strcmp(a, "--inbox-conpty")) {
             g_inbox_conpty = 1;
@@ -8709,6 +9069,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     trace("conpty loaded");
     default_start_dir();
     write_rc();
+    /* the session to restore: one no window holds (the newest), or the one asked for */
+    if (!g_adopting && !slurp_window && !selftest_out[0] && (want_session[0] || !dir_given) &&
+        !session_claim(want_session[0] ? want_session : NULL) && want_session[0])
+        return 0;                                /* another window took it first */
     if (!g_shell_ps) g_have_distro = wsl_distros() > 0 && !_wgetenv(L"HARDCORE_PRETEND_NO_WSL");   /* the env: tests */
     trace("rc written");
     if (selftest_out[0]) return selftest(selftest_out);
@@ -8764,6 +9128,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     trace("window shown");
     check_disk();
     SetTimer(h, TIMER_DISK, 60 * 1000, NULL);
+    SetTimer(h, TIMER_SESSION, 2000, NULL);
     /* wsl.exe boots while the D3D device is created; the tabs from last time
        if there are any (unless a folder was asked for), else one new tab */
     if (g_adopting && adopt_tabs()) {
@@ -8772,6 +9137,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     } else if (slurp_window) { /* discovery starts after graphics initialization below */ }
     else if (dir_given || !session_restore()) new_tab_here();
     else schedule_spare();
+    if (!g_adopting && !slurp_window && !dir_given && !want_session[0]) session_open_others(quiet_start);
     trace("first tab spawned");
     if (gfx_thread) { WaitForSingleObject(gfx_thread, 5000); CloseHandle(gfx_thread); }
     trace("D3D device ready");

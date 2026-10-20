@@ -358,13 +358,14 @@ shared by every window.
 └─────────────────────────┘
 ```
 
-- **Close it, open it, and your tabs come back.** Closing the window (or
-  Windows shutting down or restarting) saves every tab: its shell (bash,
-  PowerShell or cmd), folder and text, and the Claude Code session running in it. The next start rebuilds
-  them. Each tab's text is replayed under a dim `── restored ──` line, and
-  Claude comes back with `claude --resume`, with the flags you started it with.
-  Exiting the last tab yourself means you're done: the next window starts
-  fresh. See [Sessions](#sessions).
+- **Close it, open it, and your tabs come back.** Each window saves its tabs
+  as they change: the shell (bash, PowerShell or cmd), folder and text, and
+  the Claude Code session running in it. So after a closed window, a crash, a
+  stopped WSL or a restart of Windows, the next start rebuilds them. Each
+  tab's text is replayed under a dim `── restored ──` line, and Claude comes
+  back with `claude --resume`, with the flags you started it with. A tab you
+  close is done and doesn't come back; exiting the last tab yourself means the
+  next window starts fresh. See [Sessions](#sessions).
 - **`hardcore` in any shell opens a window right there.** It works in WSL
   (Claude Code's `!` too), PowerShell and cmd. See [Update](#update).
 - **Otherwise it opens where you left off.** Launched from the Start menu,
@@ -873,18 +874,37 @@ precedence, and then sessions aren't tracked.
 The wrapper also remembers the flags you started Claude with
 (`--dangerously-skip-permissions`, `--model opus`, …), but not the session flags
 or the first prompt, so that prompt isn't sent again. A restore starts Claude
-again with only the flags that choose a model or narrow what it may do
-(`--model`, `--effort`, `--fallback-model`, `--name`, `--disallowedTools`,
-`--max-budget-usd`, `--verbose`, `--debug`, …). The flags arrive in an escape
-sequence any program's output could also send, so ones that widen what Claude
-may do (permissions, system prompts, tools, settings, MCP, plugins, added
-directories) are yours to add again.
+again with all of those flags. The flags arrive in an escape sequence that any
+program's output could also send, so `rc.bash` signs them: as the shell starts,
+before any program runs, it makes a random key, keeps it in an unexported shell
+variable and tells hardcore (`OSC 7700 ; key=…`, the first one only). Flags
+sent with that key come back as they were. Flags without it (an older
+`rc.bash`, your own wrapper, or text a program printed) come back only when
+they choose a model or narrow what Claude may do (`--model`, `--effort`,
+`--fallback-model`, `--name`, `--disallowedTools`, `--max-budget-usd`,
+`--verbose`, `--debug`, …).
 
-On close, hardcore writes `%LOCALAPPDATA%\hardcore\session\`: `session.txt`
-(each tab's shell, folder, Claude session and flags) plus each tab's last 3,000
-rows of text, and the window's position, size and maximized state, the active
-tab and each tab's scroll position. On the next start the window opens where
-it was, and each tab is rebuilt:
+Each window has its own session in `%LOCALAPPDATA%\hardcore\session\`:
+`<id>.txt` (each tab's shell, folder, Claude session and flags, the window's
+position, size and maximized state, the active tab and each tab's scroll
+position) and `<id>-tab<N>.txt` (each tab's last 3,000 rows of text). It is
+written about two seconds after a tab opens or closes, a folder or command
+changes, or Claude starts or exits, and again on close and when Windows shuts
+down. A tab you close leaves the session at once. `<id>.lock` is held open
+while the window runs. A start without a folder takes the newest session that
+no window holds, and opens one more window for each other one (several
+windows were open when Windows restarted). An older build's `session.txt` is
+taken the same way.
+
+A shell can also stop under a running Claude: WSL stops, runs out of memory,
+or kills it. That isn't you closing the tab, so the tab stays with a dim line
+that says the shell stopped. Press **Enter** to start the shell again and
+resume Claude there; close the tab if you're done with it. Closing the window
+keeps the tab for the next start. (hardcore knows Claude was still running
+because the wrapper says when Claude exits, and you can't type `exit` under
+it. An exit code above 255, which only `wsl.exe` itself gives, counts too.)
+
+On the next start the window opens where it was, and each tab is rebuilt:
 - **Its text is replayed** with colors and wraps, and rewraps to the new width.
 - **The shell starts below it.** ConPTY's inherit-cursor mode makes it start at
   the cursor, not the top. The `── restored ──` line says what comes next:
