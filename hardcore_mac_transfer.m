@@ -421,12 +421,17 @@ static int mac_tab_cmd(int argc, char **argv) {
     NSDictionary *target = nil;
     int reuse = 0;
     for (NSDictionary *w in mac_windows()) if (!target || [w[@"pid"] intValue] > [target[@"pid"] intValue]) target = w;
-    if (!target) {   /* none running: start the app that holds this executable, then use its first tab */
+    if (!target) {   /* none running: a window in this folder, as plain `hardcore` opens, then use its first tab */
+        /* Launch Services, not a child of ours: from ssh or launchd the window
+           still joins the login session's window server. */
+        char cwd[MAX_PATH];
         NSString *bundle = @(g_mac_exe_path);
         for (int up = 0; up < 3; up++) bundle = [bundle stringByDeletingLastPathComponent];   /* .app/Contents/MacOS/hardcore */
         if (![bundle hasSuffix:@".app"]) { fprintf(stderr, "hardcore: not inside an app bundle; start Hardcore first\n"); return 1; }
-        NSTask *task = [NSTask launchedTaskWithLaunchPath:@"/usr/bin/open" arguments:@[@"-a", bundle]];
+        if (!getcwd(cwd, sizeof(cwd))) snprintf(cwd, sizeof(cwd), "%s", getenv("HOME") ?: "/");
+        NSTask *task = [NSTask launchedTaskWithLaunchPath:@"/usr/bin/open" arguments:@[@"-n", @"-a", bundle, @"--args", @"--cd", @(cwd)]];
         [task waitUntilExit];
+        if (task.terminationStatus) { fprintf(stderr, "hardcore: could not launch %s\n", bundle.UTF8String); return 1; }
         for (int i = 0; i < 300 && !target; i++) {
             usleep(100000);
             for (NSDictionary *w in mac_windows()) if ([w[@"tabs"] count]) target = w;
