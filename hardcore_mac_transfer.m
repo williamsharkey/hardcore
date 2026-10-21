@@ -394,6 +394,58 @@ static NSDictionary *mac_claude_receipt(NSDictionary *req) {
 
 #include "hardcore_mac_bridge_refresh.m"
 
+/* `hardcore tab TEXT`: type TEXT and Return into a new tab of this window
+   (or, with reuse, into its active tab: a fresh window's first shell). */
+static NSDictionary *mac_run_tab(NSDictionary *req) {
+    NSString *text = req[@"text"];
+    if (![text isKindOfClass:[NSString class]] || !text.length) return @{@"error": @"run-tab needs text."};
+    if (![req[@"reuse"] boolValue]) {
+        if (g_ntabs >= MAX_TABS) return @{@"error": @"This window has no room for another tab."};
+        new_tab_mac();
+    }
+    Tab *tb = active_tab();
+    if (!tb || tb->fd < 0) return @{@"error": @"No shell tab to run the command in."};
+    if (mac_input_held(tb)) return @{@"error": @"The active tab is holding input."};
+    NSString *line = [text stringByAppendingString:@"\r"];
+    tab_write(tb, line.UTF8String, (int)strlen(line.UTF8String));
+    [g_win makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+    return @{@"ok": @YES, @"pid": @(tb->pid), @"window": @(getpid())};
+}
+
+static int mac_tab_cmd(int argc, char **argv) {
+    NSMutableArray *words = [NSMutableArray array];
+    for (int i = 0; i < argc; i++) if (i || strcmp(argv[i], "--")) [words addObject:@(argv[i])];
+    if (!words.count) { fprintf(stderr, "usage: hardcore tab [--] COMMAND...\n"); return 2; }
+    NSString *text = [words componentsJoinedByString:@" "];
+    NSDictionary *target = nil;
+    int reuse = 0;
+    for (NSDictionary *w in mac_windows()) if (!target || [w[@"pid"] intValue] > [target[@"pid"] intValue]) target = w;
+    if (!target) {   /* none running: start the app that holds this executable, then use its first tab */
+        NSString *bundle = @(g_mac_exe_path);
+        for (int up = 0; up < 3; up++) bundle = [bundle stringByDeletingLastPathComponent];   /* .app/Contents/MacOS/hardcore */
+        if (![bundle hasSuffix:@".app"]) { fprintf(stderr, "hardcore: not inside an app bundle; start Hardcore first\n"); return 1; }
+        NSTask *task = [NSTask launchedTaskWithLaunchPath:@"/usr/bin/open" arguments:@[@"-a", bundle]];
+        [task waitUntilExit];
+        for (int i = 0; i < 300 && !target; i++) {
+            usleep(100000);
+            for (NSDictionary *w in mac_windows()) if ([w[@"tabs"] count]) target = w;
+        }
+        if (!target) { fprintf(stderr, "hardcore: Hardcore did not start within 30 s\n"); return 1; }
+        reuse = 1;
+        usleep(300000);   /* let the first shell reach its prompt */
+    }
+    int fd = mac_connect(target[@"socket"]);
+    NSDictionary *reply = fd >= 0 && mac_send(fd, @{@"op": @"run-tab", @"text": text, @"reuse": @(reuse)}) ? mac_recv(fd) : nil;
+    if (fd >= 0) close(fd);
+    if (![reply[@"ok"] boolValue]) {
+        fprintf(stderr, "hardcore: %s\n", reply[@"error"] ? [reply[@"error"] UTF8String] : "the window did not accept run-tab (an older build? update it)");
+        return 1;
+    }
+    printf("hardcore: tab opened in pid %d\n", [target[@"pid"] intValue]);
+    return 0;
+}
+
 static void mac_server(void) {
     NSString *dir = mac_runtime();
     if (!dir) { fprintf(stderr, "hardcore: live updates unavailable: unsafe runtime directory\n"); return; }
@@ -463,6 +515,7 @@ static void mac_server(void) {
                         else if ([op isEqual:@"camera-status"]) mac_send(peer, mac_camera_status());
                         else if ([op isEqual:@"music-status"]) mac_send(peer, mac_music_panel_status());
                         else if ([op isEqual:@"claude-receipt"] || [op isEqual:@"claude-cursor"] || [op isEqual:@"claude-release"] || [op isEqual:@"claude-guard"]) mac_send(peer, mac_claude_receipt(req));
+                        else if ([op isEqual:@"run-tab"]) mac_send(peer, mac_run_tab(req));
                         else if ([op isEqual:@"take"]) { if (mac_export(peer)) { close(peer); mac_retire(); } }
                         else if ([op isEqual:@"reload"]) {
                             NSString *exe = req[@"exe"];
@@ -955,6 +1008,7 @@ static int mac_cli(int argc, char **argv) {
              "hardcore browser open [URL]     new live browser tab (Hardcore grid by default)\n"
              "hardcore browser --help         browser commands and tab targeting\n"
              "hardcore host [--] [COMMAND...] start a portable tmux-backed session in this terminal\n"
+             "hardcore tab [--] COMMAND...    run COMMAND in a new tab of the running window (starts one if none)\n"
              "hardcore update                use a newly installed build, or check GitHub for an update, then reload live windows\n"
              "hardcore update --local         reload the installed build without downloading\n"
              "hardcore update --from PATH     install a local app bundle or bare executable, then reload\n"
@@ -981,6 +1035,7 @@ static int mac_cli(int argc, char **argv) {
              "Arbitrary iTerm PTYs are not supported yet; tmux-backed sessions can attach.\n"
              "Pre-handoff Hardcore builds require one manual restart."); return 0;
     }
+    if (!strcmp(argv[1], "tab")) return mac_tab_cmd(argc - 2, argv + 2);
     if (!strcmp(argv[1], "--reload")) {
         if (argc != 2) return 2;
         return mac_reload_windows();
