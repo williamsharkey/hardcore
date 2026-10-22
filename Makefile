@@ -135,6 +135,7 @@ win-test: hardcore.exe reflow-test
 	python3 tests/test_small_fonts.py
 	python3 tests/test_default_theme.py
 	python3 tests/test_session_resume_windows.py
+	python3 tests/test_ensure_tab_windows.py
 	$(MAKE) --no-print-directory selftest
 	$(MAKE) --no-print-directory slurp-test
 
