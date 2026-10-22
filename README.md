@@ -1425,7 +1425,8 @@ process with private settings and shell history.
 | Ctrl+Alt+1…9 | Jump to tab (9 = last). AltGr+digit still types `{ [ ] }` on layouts that need it |
 | Ctrl+Shift+J | Jump to the next tab that needs you: Claude blocked, failed, or finished |
 | Ctrl+Shift+↑ / ↓ | Previous / next prompt or Claude turn in the scrollback |
-| Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste. A clipboard image pastes as the path of a saved PNG; copied files paste as their paths |
+| Ctrl+C / Ctrl+X / Ctrl+V | As in Windows Terminal: Ctrl+C copies the selection and clears it; with no selection it sends ^C as always. Ctrl+X copies too (a terminal can't cut); with no selection it sends ^X. Ctrl+V pastes. `ctrl_copy=0` in `config.ini` gives all three back to the program |
+| Ctrl+Shift+C / Ctrl+Shift+X / Ctrl+Shift+V | Copy / copy / paste, always. A clipboard image pastes as the path of a saved PNG; copied files paste as their paths |
 | Right-click | Copy the selection if there is one, otherwise paste (conhost habit) |
 | Shift+Insert / Ctrl+Insert | Paste / copy |
 | Drag / double-click | Select / select word (hold Shift to select inside mouse-aware apps) |
