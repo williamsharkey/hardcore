@@ -680,10 +680,11 @@ From any shell:
 ```
 hardcore               # a new hardcore window in this folder
 hardcore DIR           # ...or in DIR
-hardcore update        # install the latest release, like `claude update`
+hardcore update        # install the latest release, if it's newer than this build
+hardcore upgrade       # build the newest main in WSL and swap it in, hot
 hardcore slurp         # gather live WSL and classic Windows console sessions
 hardcore slurp --list  # preview eligible sessions without attaching
-hardcore --version     # which release and commit this is
+hardcore --version     # which release, build, commit and commit date this is
 ```
 
 `hardcore` works in any WSL shell, Claude Code's `!` included, and in PowerShell
@@ -701,9 +702,24 @@ Started from the Start menu, the desktop or the taskbar, it restores your last
 session.
 
 `hardcore update` asks GitHub for the latest release and compares it with this
-build's version. If it's newer, it downloads `hardcore.exe`, checks it against
-the SHA-256 GitHub publishes for it, and swaps it in. A running exe can be
-renamed, so nothing has to close for that.
+build by commit: GitHub's compare of the release's tag with the commit this
+build was made from (the Makefile stamps every build with `git describe`, the
+commit and its date). Only a release that is newer than this build is
+installed: it downloads `hardcore.exe`, checks it against the SHA-256 GitHub
+publishes for it, and swaps it in. A running exe can be renamed, so nothing has
+to close for that. A release older than this build, or one missing some of its
+commits, is never installed, not even with `--force`.
+
+`hardcore upgrade` gets the newest code from `main` instead of a release. It
+fetches main into a clone of its own in WSL (`~/.cache/hardcore/src`), compares
+it with this build's commit and, when this build is behind, builds
+`hardcore.exe` there with `make` (git, make, python3, gcc and mingw-w64 in WSL)
+and swaps it in the same way. When this build is main's newest commit, it says
+so and shows both. A build main doesn't have (a branch, or your own commits) is
+left alone unless you add `--force`. For a build of your own checkout,
+`make win-upgrade` builds it and runs `hardcore.exe upgrade --self`, which swaps
+that exe in. That is also the way in the first time, while the installed
+hardcore is older than `upgrade`.
 
 **Then every open window reloads in place.** The programs in your tabs keep
 running through it: Claude, builds and servers don't notice. Each window hands
@@ -728,7 +744,7 @@ The first update from a release without this (0.4.x or older) can't reload in
 place, because that window doesn't know how. Close and reopen it once: your
 tabs come back through [sessions](#sessions). Copies left behind by earlier
 updates are deleted on the next update. `--force` reinstalls the latest
-release even if this one isn't older.
+release when it is this same build; it never installs an older one.
 
 ### Slurp: attach running sessions
 
@@ -862,9 +878,12 @@ starts, the function tells hardcore which session it is
 (`OSC 7700 ; claude=ID`), and again when it exits:
 - **A new session:** the wrapper picks the id and passes it as `--session-id`.
 - **`--resume ID`:** that id.
-- **`--continue`:** the newest transcript in that folder.
-- **The picker (`-r` with no id):** unknown until you pick (see below); with
-  no id at all the tab comes back with `claude --continue`.
+- **`--continue` and the picker (`-r` with no id):** unknown until Claude opens
+  a session; then the watcher (below) reports its id. The wrapper never guesses
+  from the newest transcript in the folder: in a folder where several Claude
+  sessions run, that is often another tab's. A tab whose id was never known
+  comes back with Claude's picker (`claude --resume` with no id), not
+  `--continue`.
 
 The id can change while Claude runs: `/resume` and `/clear` move it to another
 session. Claude Code writes the session it shows now to
@@ -875,6 +894,18 @@ and sends `OSC 7700 ; claude=ID` again each time the id changes. So the session
 that comes back is the one that was on screen, not the one Claude was started
 with. hardcore never uses the tab title (Claude Code's topic summary) as a
 session name.
+
+hardcore also follows each tab's Claude itself, so a shell without the watcher
+is covered too: a shell started by an older build keeps that build's `rc.bash`
+when a window reloads in place, and a `claude` started before an update never
+got a watcher. Every 10 seconds, while a WSL tab runs Claude, hardcore runs
+`bash rc.bash --claude-ids` (no window). It prints, for each running Claude
+Code, the session id on its command line (`--resume ID` or `--session-id ID`)
+and the id its `sessions/<pid>.json` names now. A tab whose saved id is no
+Claude's on-screen id takes the on-screen id of the one Claude that was started
+with that id. Two such Claudes, none, or a session another tab holds: the tab
+keeps its id. It only runs while a tab's shell runs, so it never starts a
+stopped WSL.
 
 Subcommands (`claude mcp …`, `claude doctor`), `-p` and `--version` pass
 straight through. So does a one-word prompt like `claude hello`, which looks
@@ -1405,9 +1436,10 @@ From x86-64 WSL, with `mingw-w64`, a native Linux C compiler with static libc
 development files, and `python3` installed:
 
 ```bash
-make            # → hardcore.exe
-make test       # unit tests, xterm.js fixtures, ConPTY and live-attachment tests
-make install    # copy to %LOCALAPPDATA%\hardcore + Start menu and desktop shortcuts
+make hardcore.exe # → hardcore.exe (plain make in WSL builds the native Linux one)
+make win-test     # unit tests, xterm.js fixtures, ConPTY and live-attachment tests
+make win-install  # copy to %LOCALAPPDATA%\hardcore + Start menu and desktop shortcuts
+make win-upgrade  # this build over the installed exe, hot: windows reload, tabs and Claude kept
 ```
 
 The Windows build also compiles the WSL attachment code from source using

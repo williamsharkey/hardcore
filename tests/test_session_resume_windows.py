@@ -110,6 +110,8 @@ for a in "$@"; do
   case $prev in --session-id|--resume) id=$a ;; esac
   prev=$a
 done
+# --continue or the picker: Claude opens some session; the test says which (opens-next)
+[ -z "$id" ] && [ -f "$here/opens-next" ] && id=$(cat "$here/opens-next") && rm -f "$here/opens-next"
 cfg=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 proj=$cfg/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
 mkdir -p "$proj" && touch "$proj/$id.jsonl"
@@ -119,7 +121,8 @@ printf '{"pid":%s,"sessionId":"%s","cwd":"%s","procStart":"%s"}' $$ "$id" "$PWD"
 echo "$$" > "$here/pid-$id"
 echo "$PPID" > "$here/shell-$id"
 echo "fake claude $id"
-exec sleep 600
+# not exec: like Claude Code, its command line keeps the flags (rc.bash --claude-ids reads them)
+sleep 600 & wait
 '''
 
 
@@ -318,6 +321,66 @@ def run(exe):
         assert calls(fake)[before:] == [f"{w1}|{flags} --resume {picked}"], calls(fake)[before:]
         app.end("K")
         print("ok   a session picked with /resume inside Claude is the one that comes back")
+
+        # 8. a shell with no watcher (an older rc.bash a reload kept): hardcore follows the
+        #    Claude started with the saved id to the session on its screen, by id
+        for p in (config / "session").glob("*"):
+            p.unlink(missing_ok=True)
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        app.send(f"T __hardcore_claude_watch() {{ :; }}; cd {w2} && claude {flags}")
+        wait_for(lambda: len(calls(fake)) > before, "a claude in an unwatched shell")
+        id5 = re.search(r"--session-id (\S+)", calls(fake)[before]).group(1)
+        wait_for(lambda: [t.get("claude") for t in saved_tabs(config)] == [id5], "its first session saved")
+        moved = "6c1d2e3f-4a5b-4c6d-8e7f-a0b1c2d3e4f5"
+        pid = (fake / f"pid-{id5}").read_text().strip()
+        state = home / "sessions" / f"{pid}.json"
+        proj2 = home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(w2))
+        (proj2 / f"{moved}.jsonl").touch()
+        state.write_text(state.read_text().replace(id5, moved))
+        wait_for(lambda: [t.get("claude") for t in saved_tabs(config)] == [moved], "the on-screen session saved by resync", 40)
+        app.end("K")
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        wait_for(lambda: len(calls(fake)) > before, "the on-screen session resumed")
+        assert calls(fake)[before:] == [f"{w2}|{flags} --resume {moved}"], calls(fake)[before:]
+        app.end("K")
+        print("ok   a Claude in a shell with no watcher is still followed by id (rc.bash --claude-ids)")
+
+        # 9. claude --continue: the id Claude opens, not the newest transcript in the folder
+        for p in (config / "session").glob("*"):
+            p.unlink(missing_ok=True)
+        decoy = "dec0dec0-0000-4000-8000-00000000dec0"         # another tab's session, written last
+        opened = "0be4ed00-0000-4000-8000-0000000be4ed"
+        (proj2 / f"{opened}.jsonl").touch()
+        time.sleep(1.1)
+        (proj2 / f"{decoy}.jsonl").touch()
+        (fake / "opens-next").write_text(opened)
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        app.send(f"T cd {w2} && claude --continue")
+        wait_for(lambda: len(calls(fake)) > before, "claude --continue")
+        wait_for(lambda: [t.get("claude") for t in saved_tabs(config)] == [opened], "the session --continue opened, saved", 15)
+        app.end("K")
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        wait_for(lambda: len(calls(fake)) > before, "the --continue session resumed")
+        assert calls(fake)[before:] == [f"{w2}|--resume {opened}"], calls(fake)[before:]
+        app.end("K")
+        print("ok   claude --continue saves the session Claude opened, never the folder's newest file")
+
+        # 10. an id never known ("?"): the restore opens Claude's picker, not --continue
+        for p in (config / "session").glob("*"):
+            p.unlink(missing_ok=True)
+        (config / "session/w00000002bbbbbbbb.txt").write_text(
+            f"active=0\n\n[tab]\nview=0\nkind=wsl\ndir={w1}\nclaude=?\n"
+            f"claude_args={flags} \nclaude_trust=1\ncmd=\ntext=\n")
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        wait_for(lambda: len(calls(fake)) > before, "claude restored with no id")
+        assert calls(fake)[before:] == [f"{w1}|{flags} --resume"], calls(fake)[before:]
+        app.end("K")
+        print("ok   a tab whose session id was never known opens the picker, never a guessed session")
     finally:
         shutil.rmtree(lin, ignore_errors=True)
 
