@@ -863,8 +863,18 @@ starts, the function tells hardcore which session it is
 - **A new session:** the wrapper picks the id and passes it as `--session-id`.
 - **`--resume ID`:** that id.
 - **`--continue`:** the newest transcript in that folder.
-- **The picker (`-r` with no id):** unknown, so the tab comes back with
-  `claude --continue`.
+- **The picker (`-r` with no id):** unknown until you pick (see below); with
+  no id at all the tab comes back with `claude --continue`.
+
+The id can change while Claude runs: `/resume` and `/clear` move it to another
+session. Claude Code writes the session it shows now to
+`~/.claude/sessions/<pid>.json` (under `$CLAUDE_CONFIG_DIR` when that is set).
+While Claude runs, the wrapper starts a small watcher that finds that file for
+the `claude` it started (its parent is this shell and its start time matches)
+and sends `OSC 7700 ; claude=ID` again each time the id changes. So the session
+that comes back is the one that was on screen, not the one Claude was started
+with. hardcore never uses the tab title (Claude Code's topic summary) as a
+session name.
 
 Subcommands (`claude mcp …`, `claude doctor`), `-p` and `--version` pass
 straight through. So does a one-word prompt like `claude hello`, which looks
