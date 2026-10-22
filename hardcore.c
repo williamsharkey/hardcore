@@ -601,6 +601,8 @@ typedef struct Tab {
     int traced;
     char run[600];               /* a command for the shell to run first (a restored claude --resume) */
     char hist[400];              /* ...or one only to offer: put in its history, not run */
+    char tag[32];                /* hardcore --ensure-tab NAME: the tab's name, kept in the session */
+    char tag_cmd[400];           /* ...and the command it runs, run again when the session comes back */
     int adopt_marks;             /* reload: prompt marks to set once the snapshot is in */
     long long mark_off[512];
     int inherit;                 /* restored text above: ConPTY starts at our cursor, not at the top */
@@ -5746,6 +5748,7 @@ static int session_save(void) {
                     !strcmp(tb->run, "files:") ? "files" : tb->kind == TK_PS ? "powershell" : tb->kind == TK_CMD ? "cmd" : "wsl",
                     tb->t.cwd[0] ? tb->t.cwd : tb->start_dir, tb->t.claude,
                     tb->t.claude[0] ? tb->t.claude_args : "", tb->t.claude[0] && tb->t.claude_trust, cmd, text);
+            if (tb->tag[0]) fprintf(f, "tag=%s\ntag_cmd=%s\n", tb->tag, tb->tag_cmd);
         }
         n++;
     }
@@ -5833,7 +5836,7 @@ static void session_preset(Tab *tb, const char *claude, const char *args, int tr
 }
 
 static void session_add_tab(const char *kind, const char *dir, const char *claude, const char *args, int trust,
-                            const char *cmd, const char *text, int view) {
+                            const char *cmd, const char *text, int view, const char *tag, const char *tag_cmd) {
     wchar_t p[MAX_PATH], wname[96];
     char run[600] = "", *data = NULL;
     size_t n = 0;
@@ -5849,6 +5852,7 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
     }
     if (!session_args_ok(args)) args = "";
     session_resume_cmd(claude, args, trust, run, sizeof(run));
+    if (!run[0] && tag[0] && tag_cmd[0]) snprintf(run, sizeof(run), "%s", tag_cmd);   /* a named tab runs its command again */
     if (text[0] && !strchr(text, '\\') && !strchr(text, '/') && !strstr(text, "..")) {
         utf8_to_wide(text, wname, 96);
         session_path(p, wname);
@@ -5858,7 +5862,9 @@ static void session_add_tab(const char *kind, const char *dir, const char *claud
                        run[0] ? run : NULL, !run[0] && cmd[0] && !strcmp(kind, "wsl") ? cmd : NULL, data, n);
     free(data);
     if (tb) {
-        if (run[0]) session_preset(tb, claude, args, trust);
+        if (run[0] && claude[0]) session_preset(tb, claude, args, trust);
+        snprintf(tb->tag, sizeof(tb->tag), "%s", tag);
+        snprintf(tb->tag_cmd, sizeof(tb->tag_cmd), "%s", tag[0] ? tag_cmd : "");
         tb->t.view = view > 0 ? (view < tb->t.hcount ? view : tb->t.hcount) : 0;   /* scrolled back as far as it was */
         g_tabs[g_ntabs++] = tb;
     }
@@ -5975,6 +5981,7 @@ static int session_restore(void) {
     wchar_t p[MAX_PATH];
     size_t n;
     char *d, *line, *next, kind[16] = "", dir[1024] = "", claude[72] = "", args[400] = "", cmd[400] = "", text[96] = "";
+    char tag[32] = "", tag_cmd[400] = "";
     int active = 0, intab = 0, view = 0, trust = 0;
     if (g_session_off || !g_session_lock) return 0;
     session_file(p, g_session_id, L".txt");
@@ -5985,9 +5992,9 @@ static int session_restore(void) {
         if (next) *next++ = 0;
         if ((e = strchr(line, '\r'))) *e = 0;
         if (!strcmp(line, "[tab]")) {
-            if (intab) session_add_tab(kind, dir, claude, args, trust, cmd, text, view);
+            if (intab) session_add_tab(kind, dir, claude, args, trust, cmd, text, view, tag, tag_cmd);
             intab = 1;
-            kind[0] = dir[0] = claude[0] = args[0] = cmd[0] = text[0] = 0;
+            kind[0] = dir[0] = claude[0] = args[0] = cmd[0] = text[0] = tag[0] = tag_cmd[0] = 0;
             view = trust = 0;
             continue;
         }
@@ -6003,13 +6010,85 @@ static int session_restore(void) {
         else if (!strcmp(line, "view")) view = atoi(v);
         else if (!strcmp(line, "native")) view = atoi(v);   /* (a page has no scrollback: its view is its mode) */
         else if (!strcmp(line, "text")) snprintf(text, sizeof(text), "%s", v);
+        else if (!strcmp(line, "tag")) snprintf(tag, sizeof(tag), "%s", v);
+        else if (!strcmp(line, "tag_cmd")) snprintf(tag_cmd, sizeof(tag_cmd), "%s", v);
         else if (!strcmp(line, "ui")) ui_restore(v);
     }
-    if (intab) session_add_tab(kind, dir, claude, args, trust, cmd, text, view);
+    if (intab) session_add_tab(kind, dir, claude, args, trust, cmd, text, view, tag, tag_cmd);
     free(d);
     if (g_ntabs) activate(active >= 0 && active < g_ntabs ? active : 0);
     if (g_ntabs) ui_apply();
     return g_ntabs;
+}
+
+/* ── hardcore --ensure-tab NAME -- COMMAND ──────────────────────────
+   One tab named NAME that runs COMMAND, never two. The name is kept in the
+   session (tag=, tag_cmd=), so a restored NAME tab runs COMMAND again and
+   counts. At a cold start the session comes back first, then the check;
+   with a window running, the request goes to it over the pipe. Nothing waits
+   on a timer: the answer is what the tabs and saved sessions say now. */
+static char g_ensure_name[32], g_ensure_cmd[400];
+
+static int tag_name_ok(const char *n) {
+    size_t k = strlen(n), i;
+    if (!k || k >= sizeof(g_ensure_name)) return 0;
+    for (i = 0; i < k; i++) if (!isalnum((unsigned char)n[i]) && !strchr("_.-", n[i])) return 0;
+    return 1;
+}
+
+/* a tab named NAME in another window's saved session; held_only: a window that runs now */
+static int tag_in_other_sessions(const char *name, int held_only) {
+    wchar_t pat[MAX_PATH], p[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+    int found = 0;
+    session_path(pat, L"*.txt");
+    if ((f = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) return 0;
+    do {
+        wchar_t id[64];
+        size_t n = wcslen(fd.cFileName);
+        char *d, *line, *next;
+        size_t len;
+        if (wcsstr(fd.cFileName, L"-tab") || n < 5 || n - 4 >= 64) continue;
+        wcsncpy(id, fd.cFileName, n - 4);
+        id[n - 4] = 0;
+        if (!wcscmp(id, g_session_id)) continue;
+        if (held_only) {
+            HANDLE h = session_lock_take(id);
+            if (h) { CloseHandle(h); continue; }      /* no window has it: it comes back at the next start */
+        }
+        session_path(p, fd.cFileName);
+        if (!(d = read_file(p, &len))) continue;
+        for (line = d; line && *line && !found; line = next) {
+            char *e;
+            next = strchr(line, '\n');
+            if (next) *next++ = 0;
+            if ((e = strchr(line, '\r'))) *e = 0;
+            if (!strncmp(line, "tag=", 4) && !strcmp(line + 4, name)) found = 1;
+        }
+        free(d);
+    } while (!found && FindNextFileW(f, &fd));
+    FindClose(f);
+    return found;
+}
+
+/* 1: a NAME tab is there (in this window, or another window's session), or now opened */
+static int ensure_tab(const char *name, const char *cmd, int held_only) {
+    Tab *tb;
+    int i;
+    if (!tag_name_ok(name) || !cmd[0] || strlen(cmd) >= sizeof(tb->tag_cmd)) return 0;
+    for (i = 0; i < g_ntabs; i++) if (g_tabs[i] && !strcmp(g_tabs[i]->tag, name)) return 1;
+    if (tag_in_other_sessions(name, held_only)) return 1;
+    if (g_ntabs >= MAX_TABS) return 0;
+    tb = tab_create_ex(g_start_dir[0] && dir_exists(g_start_dir) ? g_start_dir : NULL, 0, -1, cmd, NULL, NULL, 0);
+    if (!tb) return 0;
+    snprintf(tb->tag, sizeof(tb->tag), "%s", name);
+    snprintf(tb->tag_cmd, sizeof(tb->tag_cmd), "%s", cmd);
+    g_tabs[g_ntabs++] = tb;
+    if (g_ntabs == 1) activate(0);
+    g_session_dirty = 1;
+    if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+    return 1;
 }
 
 /* The shell under Claude stopped by itself (WSL stopped, out of memory,
@@ -6043,6 +6122,7 @@ static void tab_respawn(int at) {
     wchar_t tmp[MAX_PATH], p[MAX_PATH];
     FILE *v;
     if (old->t.claude[0]) session_resume_cmd(old->t.claude, old->t.claude_args, old->t.claude_trust, run, sizeof(run));
+    else if (old->tag[0] && old->tag_cmd[0]) snprintf(run, sizeof(run), "%s", old->tag_cmd);
     if (GetTempPathW(MAX_PATH, tmp) && GetTempFileNameW(tmp, L"hc", 0, p)) {
         if ((v = _wfopen(p, L"wb"))) {
             term_dump(&old->t, v, 3000);
@@ -6055,7 +6135,9 @@ static void tab_respawn(int at) {
                        !run[0] && old->t.cmd[0] && old->kind == TK_WSL ? old->t.cmd : NULL, data, n);
     free(data);
     if (!tb) return;
-    if (run[0]) session_preset(tb, old->t.claude, old->t.claude_args, old->t.claude_trust);
+    if (run[0] && old->t.claude[0]) session_preset(tb, old->t.claude, old->t.claude_args, old->t.claude_trust);
+    snprintf(tb->tag, sizeof(tb->tag), "%s", old->tag);
+    snprintf(tb->tag_cmd, sizeof(tb->tag_cmd), "%s", old->tag_cmd);
     g_tabs[at] = tb;
     tab_destroy_async(old);
     activate(at);
@@ -6234,6 +6316,8 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         blob_line(&b, "key", t->key);
         blob_line(&b, "cmd", t->cmd);
         blob_line(&b, "run", tb->run);
+        blob_line(&b, "tag", tb->tag);
+        blob_line(&b, "tag_cmd", tb->tag_cmd);
         WideCharToMultiByte(CP_UTF8, 0, t->title, -1, tmp, sizeof(tmp), NULL, NULL);
         blob_line(&b, "title", tmp);
         sb_printf(&b, "ps %d %d %d %d\n", t->ps_state, t->ps_pct, t->ps_tasks, t->progress);
@@ -6374,6 +6458,8 @@ static int adopt_tabs(void) {
         else if (!strcmp(line, "key")) snprintf(tb->t.key, sizeof(tb->t.key), "%s", v);
         else if (!strcmp(line, "cmd")) snprintf(tb->t.cmd, sizeof(tb->t.cmd), "%s", v);
         else if (!strcmp(line, "run")) snprintf(tb->run, sizeof(tb->run), "%s", v);
+        else if (!strcmp(line, "tag")) snprintf(tb->tag, sizeof(tb->tag), "%s", v);
+        else if (!strcmp(line, "tag_cmd")) snprintf(tb->tag_cmd, sizeof(tb->tag_cmd), "%s", v);
         else if (!strcmp(line, "title")) utf8_to_wide(v, tb->t.title, 256);
         else if (!strcmp(line, "ps")) sscanf(v, "%d %d %d %d", &tb->t.ps_state, &tb->t.ps_pct, &tb->t.ps_tasks, &tb->t.progress);
         else if (!strcmp(line, "ps_kind")) snprintf(tb->t.ps_kind, sizeof(tb->t.ps_kind), "%s", v);
@@ -8108,6 +8194,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
             }
+            else if (!strncmp(buf, "ensure ", 7)) {    /* hardcore --ensure-tab NAME -- COMMAND, with this window running */
+                char name[32] = "";
+                const char *sp = strchr(buf + 7, ' ');
+                if (!sp || (size_t)(sp - (buf + 7)) >= sizeof(name)) return FALSE;
+                memcpy(name, buf + 7, (size_t)(sp - (buf + 7)));
+                name[sp - (buf + 7)] = 0;
+                if (!ensure_tab(name, sp + 1, 1)) return FALSE;
+            }
             else if (!strcmp(buf, "nexttab")) activate((g_active + 1) % g_ntabs);
             else if (!strcmp(buf, "closetab")) close_tab(g_active);
             else if (!strcmp(buf, "close")) PostMessageW(hwnd, WM_CLOSE, 0, 0);   /* as the × does */
@@ -9247,8 +9341,13 @@ static const char *my_sid(void) {
 }
 
 static int pipe_name(wchar_t *out, size_t cap) {
+    const wchar_t *test = _wgetenv(L"HARDCORE_TEST_CONFIG");
     if (!my_sid()[0]) return 0;
-    _snwprintf(out, cap, L"\\\\.\\pipe\\hardcore-%hs", my_sid());
+    if (test) {                  /* a test copy (its own config) has its own pipe: never your window's */
+        unsigned h = 2166136261u;
+        for (; *test; test++) h = (h ^ (unsigned)towlower(*test)) * 16777619u;
+        _snwprintf(out, cap, L"\\\\.\\pipe\\hardcore-%hs-t%08x", my_sid(), h);
+    } else _snwprintf(out, cap, L"\\\\.\\pipe\\hardcore-%hs", my_sid());
     out[cap - 1] = 0;
     return 1;
 }
@@ -9574,6 +9673,22 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             return slurp_cmd(argc - i - 1, argv + i + 1);
         } else if (!strcmp(a, "tab")) {
             return tab_cmd(argc - i - 1, argv + i + 1);
+        } else if (!strcmp(a, "--ensure-tab") && i + 1 < argc) {
+            /* --ensure-tab NAME [--] COMMAND...: the rest of the line is the command */
+            size_t k = 0;
+            WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, g_ensure_name, sizeof(g_ensure_name), NULL, NULL);
+            if (i + 1 < argc && !wcscmp(argv[i + 1], L"--")) i++;
+            g_ensure_cmd[0] = 0;
+            for (i++; i < argc; i++) {
+                if (k && k + 1 < sizeof(g_ensure_cmd)) g_ensure_cmd[k++] = ' ';
+                k += (size_t)WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, g_ensure_cmd + k, (int)(sizeof(g_ensure_cmd) - k), NULL, NULL);
+                if (k) k--;
+                g_ensure_cmd[k] = 0;
+            }
+            if (!tag_name_ok(g_ensure_name) || !g_ensure_cmd[0]) {
+                cli("hardcore: --ensure-tab NAME -- COMMAND (NAME: letters, digits, _ . -)\n");
+                return 2;
+            }
         } else if (!strcmp(a, "--detached")) {
             detached_arg = 1;      /* started by a hardcore (a relaunch, the pipe) or a login task: no detach, a session as Explorer's */
         } else if (!strcmp(a, "--slurp-selftest") && i + 1 < argc) {
@@ -9604,6 +9719,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 "  hardcore exit/detach    here session commands in the native Linux build\n"
                 "  hardcore update         install the latest release (--force: even if current)\n"
                 "  hardcore tab [-- CMD]   a new tab in the running window, CMD typed into it\n"
+                "  hardcore --ensure-tab NAME -- CMD\n"
+                "                          one tab named NAME running CMD: the running window's, the\n"
+                "                          restored session's, or a new one (a cold start restores first)\n"
                 "  hardcore slurp          attach running WSL and classic Windows consoles\n"
                 "  hardcore slurp --list   discover eligible sessions without attaching\n"
                 "  hardcore --version      this build's version\n", HARDCORE_VERSION);
@@ -9643,6 +9761,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             dir_given = 1;
         }
     }
+    /* --ensure-tab with a window running: that window decides */
+    if (g_ensure_name[0] && !g_adopting && !selftest_out[0]) {
+        char req[600];
+        DWORD res = 0;
+        snprintf(req, sizeof(req), "ensure %s %s", g_ensure_name, g_ensure_cmd);
+        if (pipe_send(0x48430002, req, strlen(req), &res)) {
+            cli(res ? "hardcore: the %s tab is open\n" : "hardcore: the running window did not open the %s tab\n", g_ensure_name);
+            LocalFree(argv);
+            return res ? 0 : 1;
+        }
+    }
     /* `hardcore` or `hardcore DIR` typed in a shell: a window there (the shell's
        folder if none was named), started on its own so the shell gets its
        prompt back (WSL waits for the Windows programs it starts) */
@@ -9662,8 +9791,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         }
         MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, 1100);
         GetModuleFileNameW(NULL, self, MAX_PATH);
-        _snwprintf(cl, 4096, L"\"%ls\" --cd \"%ls\"", self, wdir);
+        if (g_ensure_name[0] && !dir_given) _snwprintf(cl, 4096, L"\"%ls\"", self);   /* the session comes back */
+        else _snwprintf(cl, 4096, L"\"%ls\" --cd \"%ls\"", self, wdir);
         cl[4095] = 0;
+        if (g_ensure_name[0]) {
+            wchar_t wn[32], wc2[400];
+            MultiByteToWideChar(CP_UTF8, 0, g_ensure_name, -1, wn, 32);
+            MultiByteToWideChar(CP_UTF8, 0, g_ensure_cmd, -1, wc2, 400);
+            quote_arg(cl, 4096, L"--ensure-tab");
+            quote_arg(cl, 4096, wn);
+            quote_arg(cl, 4096, L"--");
+            quote_arg(cl, 4096, wc2);
+        }
         memset(&si, 0, sizeof(si));
         si.cb = sizeof(si);
         SetEnvironmentVariableW(L"HARDCORE_DETACHED", L"1");
@@ -9756,6 +9895,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     else if (dir_given || !session_restore()) new_tab_here();
     else schedule_spare();
     if (!g_adopting && !slurp_window && !dir_given && !want_session[0]) session_open_others(quiet_start);
+    if (g_ensure_name[0] && !g_adopting && !slurp_window) ensure_tab(g_ensure_name, g_ensure_cmd, 0);   /* after the session */
     trace("first tab spawned");
     if (gfx_thread) { WaitForSingleObject(gfx_thread, 5000); CloseHandle(gfx_thread); }
     trace("D3D device ready");

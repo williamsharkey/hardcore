@@ -1629,6 +1629,15 @@ again.
   with highest privileges, normal priority). `-Execute`/`-Arguments` choose what
   it starts; `-Remove` deletes it. `--detached` starts hardcore as the Start menu
   does: the last session comes back.
+- `hardcore --ensure-tab NAME -- COMMAND...` keeps one tab named NAME that runs
+  COMMAND. With a window running, the request goes over the pipe and that
+  window decides. Otherwise hardcore starts, restores the session first, and
+  then decides. A NAME tab in this window, or in another window's saved session,
+  counts; a restored NAME tab runs COMMAND again. If none counts, a new tab
+  runs COMMAND. The name is saved in the session (`tag=`, `tag_cmd=`), never
+  taken from a title. Nothing waits on a timer. The log-on task on the ThinkPad
+  runs `hardcore.exe --detached --ensure-tab homedash -- ~/.local/bin/homedash`,
+  and `hostdash open` on Windows runs the same command.
 
 Known side effects:
 
