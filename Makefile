@@ -48,7 +48,13 @@ install: $(APP)
 else ifeq ($(UNAME),Linux)
 all: build/hardcore
 test: here-test
+# Never over a link: in WSL ~/.local/bin/hardcore links to the Windows hardcore.exe
+# (rc.bash makes it), and replacing it would take `hardcore upgrade` and friends away.
 install: build/hardcore
+	@if [ -L "$(BINDIR)/hardcore" ]; then \
+	  echo "make install: $(BINDIR)/hardcore is a link to $$(readlink "$(BINDIR)/hardcore"); not replacing it."; \
+	  echo "  For the Windows hardcore: make win-install or make win-upgrade. For this Linux build elsewhere: make install BINDIR=DIR"; \
+	  exit 1; fi
 	install -d "$(BINDIR)"
 	install -m 755 build/hardcore "$(BINDIR)/hardcore"
 else
@@ -117,12 +123,25 @@ build/slurp-linux: $(SLURP_SRC) $(SLURP_HEADERS) build/slurp-license.h
 
 build/slurp-version.h: build/slurp-linux
 	python3 -c 'import hashlib,pathlib; p=pathlib.Path("build/slurp-linux"); print("#define SLURP_VERSION L\""+hashlib.sha256(p.read_bytes()).hexdigest()[:16]+"\"")' > $@
-# which commit a build is (hardcore --version); the release number is HARDCORE_VERSION in hardcore.c
-BUILD := $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
+# which commit a build is (hardcore --version, hardcore update and hardcore upgrade compare
+# by it); the release number is HARDCORE_VERSION in hardcore.c. A Linux git, else
+# Windows' git.exe (WSL without git, or a worktree git.exe made, whose .git points at
+# C:/...). make BUILD=... COMMIT=... COMMIT_DATE=... overrides them.
+GITQ = { git $(1) 2>/dev/null || git.exe $(1) 2>/dev/null; } | tr -d '\r'
+BUILD := $(or $(shell $(call GITQ,describe --tags --always --dirty)),unknown)
+COMMIT := $(shell $(call GITQ,rev-parse HEAD))
+COMMIT_DATE := $(shell $(call GITQ,log -1 --format=%cI))
+STAMP_FLAGS = -DHARDCORE_BUILD='"$(BUILD)"' -DHARDCORE_COMMIT='"$(COMMIT)"' -DHARDCORE_COMMIT_DATE='"$(COMMIT_DATE)"'
 
-hardcore.exe: build/browser.inc hardcore_json.h hardcore_win_cdp.h hardcore_browser_grid.h hardcore_browser_pixels.h hardcore_browser_image_geometry.h hardcore.c hardcore_win_menu.h hardcore_win_music.h hardcore_win_camera.h hardcore_win_capture.h hardcore_win_browser.h tools/files.py hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
+# rewritten only when the commit (or -dirty) changes, so a new commit rebuilds with its stamp
+.PHONY: FORCE
+build/stamp.txt: FORCE
+	@mkdir -p build
+	@echo '$(BUILD) $(COMMIT) $(COMMIT_DATE)' | cmp -s - $@ || echo '$(BUILD) $(COMMIT) $(COMMIT_DATE)' > $@
+
+hardcore.exe: build/stamp.txt build/browser.inc hardcore_json.h hardcore_win_cdp.h hardcore_browser_grid.h hardcore_browser_pixels.h hardcore_browser_image_geometry.h hardcore.c hardcore_win_menu.h hardcore_win_music.h hardcore_win_camera.h hardcore_win_capture.h hardcore_win_browser.h tools/files.py hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
-		-DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c build/res.o $(LIBS)
+		$(STAMP_FLAGS) -o $@ hardcore.c build/res.o $(LIBS)
 
 win-test: hardcore.exe reflow-test
 	./hardcore.exe --unit "$$(wslpath -w build/unit.txt)"; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]
@@ -135,6 +154,7 @@ win-test: hardcore.exe reflow-test
 	python3 tests/test_small_fonts.py
 	python3 tests/test_default_theme.py
 	python3 tests/test_session_resume_windows.py
+	python3 tests/test_upgrade.py
 	python3 tests/test_ensure_tab_windows.py
 	$(MAKE) --no-print-directory selftest
 	$(MAKE) --no-print-directory slurp-test
@@ -152,6 +172,14 @@ selftest: hardcore.exe
 
 win-install: hardcore.exe
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/install.ps1 -Exe "$$(wslpath -w hardcore.exe 2>/dev/null || echo hardcore.exe)"
+
+# Build this checkout and swap it in for the installed hardcore, hot: every open window
+# reloads into it and keeps its tabs, programs and Claude sessions (hardcore upgrade --self).
+# hardcore upgrade does the same from the newest main; this is for a branch, or the first
+# time, when the installed build is older than hardcore upgrade.
+.PHONY: win-upgrade
+win-upgrade: hardcore.exe
+	./hardcore.exe upgrade --self | cat
 
 # ── macOS ──────────────────────────────────────────────────────────────
 
@@ -172,13 +200,13 @@ build/browser.inc: tools/embed_browser.py browser/project.js browser/welcome.htm
 	python3 tools/embed_browser.py
 
 ifeq ($(UNAME),Linux)
-build/hardcore: hardcore.c $(HERE_HEADERS) build/font.bin build/fonts.bin build/fonts.inc build/width.inc
-	$(LINUX_CC) -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c -lutil -pthread
+build/hardcore: build/stamp.txt hardcore.c $(HERE_HEADERS) build/font.bin build/fonts.bin build/fonts.inc build/width.inc
+	$(LINUX_CC) -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' $(STAMP_FLAGS) -o $@ hardcore.c -lutil -pthread -lm
 else
-build/hardcore: hardcore_mac_launch.h hardcore_browser_chrome_view.h $(HERE_HEADERS) tools/ExecutableInfo.plist
+build/hardcore: build/stamp.txt hardcore_mac_launch.h hardcore_browser_chrome_view.h $(HERE_HEADERS) tools/ExecutableInfo.plist
 
 build/hardcore: hardcore_mac_music.m hardcore_music_panel.m hardcore_recording_view_geometry.h hardcore_clips_panel.m hardcore_recording_jobs.m hardcore_camera_capture.h hardcore_camera_capture.m hardcore_camera_panel.m hardcore_recording.m hardcore_recording_library.m build/browser.inc hardcore_browser_image_geometry.h hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
-	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DHARDCORE_BUILD='"$(BUILD)"' -o $@ hardcore.c $(MAC_INFO_FLAGS) $(MAC_LIBS)
+	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' $(STAMP_FLAGS) -o $@ hardcore.c $(MAC_INFO_FLAGS) $(MAC_LIBS)
 
 endif
 

@@ -238,6 +238,17 @@ static PFN_ClosePC  pClosePC;
 /* the release: `hardcore update` compares it with the latest tag, and the Mac
    build reads it into Info.plist (keep this line exactly as it is) */
 #define HARDCORE_VERSION "0.5"
+/* which commit this build is, from the Makefile (git describe, the full hash and its
+   date): `hardcore --version` shows them, update and upgrade compare by them */
+#ifndef HARDCORE_BUILD
+#define HARDCORE_BUILD "unknown"
+#endif
+#ifndef HARDCORE_COMMIT
+#define HARDCORE_COMMIT ""
+#endif
+#ifndef HARDCORE_COMMIT_DATE
+#define HARDCORE_COMMIT_DATE ""
+#endif
 
 /* ── color schemes: the settings panel's lower grid ────────────────────
    One is in effect for every window. Lowercase letters are dark schemes,
@@ -543,6 +554,8 @@ typedef struct {
     int dirty;
     int side;                    /* something the tab column shows changed: folder, program status */
     char claude[40];             /* Claude Code session running here (rc.bash's wrapper says), "?" = unknown */
+    char claude_origin[40];      /* the id it was started with (its command line's): claude_resync follows it */
+    unsigned claude_gen;         /* bumped by each claude= report: a resync taken before one is stale */
     char claude_args[400];       /* the flags it was started with, shell-quoted, to start it with again */
     int claude_trust;            /* claude_args came with this shell's key: rc.bash sent them, not program output */
     char key[40];                /* the key rc.bash made as the shell started (OSC 7700;key=), "" = none */
@@ -1968,9 +1981,14 @@ static void osc_dispatch(Term *t) {
             if (!t->key_set) snprintf(t->key, sizeof(t->key), "%s", rest + 4);
             t->key_set = 1;
         } else if (!strncmp(rest, "claude=", 7)) {      /* claude=ID as Claude Code starts, claude= as it exits */
+            /* the first id after none is the one on its command line; the watcher's
+               later ones (/resume, /clear) change the session, not where it started */
+            if (!t->claude[0]) snprintf(t->claude_origin, sizeof(t->claude_origin), "%s", strcmp(rest + 7, "?") ? rest + 7 : "");
             snprintf(t->claude, sizeof(t->claude), "%s", rest + 7);
+            t->claude_gen++;
             g_session_dirty = 1;
             if (!t->claude[0]) {
+                t->claude_origin[0] = 0;
                 t->claude_args[0] = 0;
                 t->claude_trust = 0;
                 /* Claude Code has exited, maybe killed: what it turned on mustn't
@@ -2727,6 +2745,30 @@ static int tab_drain(Tab *tb) {
    Written by hardcore on each launch; nothing in your dotfiles changes. */
 static const char RC_BASH[] =
     "# written by hardcore on every launch; edits here are overwritten\n"
+    "# bash rc.bash --claude-ids (hardcore runs it now and then, not as a shell): one line for\n"
+    "# each running Claude Code, \"STARTED-WITH ON-SCREEN\": the session id on its command line\n"
+    "# (--resume ID or --session-id ID, - for none) and the one sessions/PID.json names now.\n"
+    "# hardcore matches the first to the id a tab saved, so a Claude whose shell can't say\n"
+    "# that it changed (an older rc.bash, a watcher that stopped) is still followed by id.\n"
+    "if [ \"$1\" = --claude-ids ]; then\n"
+    "  for f in \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"/sessions/[0-9]*.json; do\n"
+    "    p=${f##*/}; p=${p%.json}\n"
+    "    read -r -a a 2>/dev/null < \"/proc/$p/stat\" || continue\n"
+    "    j=; read -r -d '' j 2>/dev/null < \"$f\"\n"
+    "    case $j in *'\"procStart\":'*) case $j in *\"\\\"procStart\\\":\\\"${a[21]}\\\"\"*) ;; *) continue ;; esac ;; esac\n"
+    "    id=${j#*\\\"sessionId\\\":\\\"}; [ \"$id\" = \"$j\" ] && continue; id=${id%%\\\"*}\n"
+    "    case $id in ''|*[!0-9A-Za-z-]*) continue ;; esac\n"
+    "    s= prev=\n"
+    "    while IFS= read -r -d '' x; do\n"
+    "      case $prev in -r|--resume|--session-id) s=$x ;; esac\n"
+    "      case $x in --resume=*|--session-id=*) s=${x#*=} ;; esac\n"
+    "      prev=$x\n"
+    "    done 2>/dev/null < \"/proc/$p/cmdline\"\n"
+    "    case $s in ''|*[!0-9A-Za-z-]*) s=- ;; esac\n"
+    "    printf '%s %s\\n' \"$s\" \"$id\"\n"
+    "  done\n"
+    "  exit 0\n"
+    "fi\n"
     "# first, before any program can write to the tab: a key only this shell knows (it\n"
     "# is not exported). Claude's flags come with it, so a restore can trust them.\n"
     "__hardcore_key=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)\n"
@@ -2778,7 +2820,8 @@ static const char RC_BASH[] =
     "case $PS0 in *__hardcore_preexec*) ;; *) PS0=\"${PS0}\\$(__hardcore_preexec)\" ;; esac\n"
     "[ -n \"$HARDCORE_HIST\" ] && { __hardcore_once=$HARDCORE_HIST; unset HARDCORE_HIST; }\n"
     "# hardcore itself: `hardcore` opens a new window here (or in DIR), `hardcore update`\n"
-    "# installs the latest release, `hardcore --version` says which one this is\n"
+    "# installs the latest release, `hardcore upgrade` builds main and swaps it in, `hardcore\n"
+    "# --version` says which build this is\n"
     "# and as a command in every WSL shell (Claude Code's ! too): one symlink to the\n"
     "# installed exe in ~/.local/bin, unless something called hardcore is already there\n"
     "case $HARDCORE_EXE in */hardcore/hardcore.exe)\n"
@@ -2788,7 +2831,7 @@ static const char RC_BASH[] =
     "  hardcore() {\n"
     "    case $1 in\n"
     "      here) echo 'Native terminal mode: run a Linux build of hardcore here in WSL.' >&2; return 2 ;;\n"
-    "      update|--update|version|--version|-v|help|--help|-h) \"$HARDCORE_EXE\" \"$@\" | cat ;;\n"
+    "      update|--update|upgrade|version|--version|-v|help|--help|-h) \"$HARDCORE_EXE\" \"$@\" | cat ;;\n"
     "      *) local d; d=$(cd -- \"${1:-.}\" 2>/dev/null && pwd) || { echo \"hardcore: no folder $1\" >&2; return 1; }\n"
     "         ( \"$HARDCORE_EXE\" --cd \"$d\" </dev/null >/dev/null 2>&1 & ) ;;\n"
     "    esac\n"
@@ -2796,8 +2839,9 @@ static const char RC_BASH[] =
     "fi\n"
     "# Claude Code: tell hardcore which session runs in this tab (OSC 7700;claude=ID), so\n"
     "# closing hardcore and opening it again resumes it. New sessions get their id up\n"
-    "# front (--session-id); --resume ID is known; --continue is looked up; subcommands,\n"
-    "# -p and the like pass straight through.\n"
+    "# front (--session-id); --resume ID is known; for --continue and the picker the\n"
+    "# watcher below reports the id Claude opens (never a guess from the newest file);\n"
+    "# subcommands, -p and the like pass straight through.\n"
     "__hardcore_claude_mode() {\n"
     "  local a prev= id= mode=new\n"
     "  case $1 in [a-z]*) case $1 in *[!a-z-]*) ;; *) mode=sub ;; esac ;; esac\n"
@@ -2839,10 +2883,10 @@ static const char RC_BASH[] =
     "# sends that id each time it changes, so a restore resumes the session on screen\n"
     "# (not the one Claude was started with).\n"
     "__hardcore_claude_watch() {\n"
-    "  local sh=$1 last=$2 dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions pid= f p j id n=0 a\n"
+    "  local sh=$1 last=$2 dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions pid= f p j id a\n"
     "  while sleep 2; do\n"
     "    if [ -z \"$pid\" ]; then\n"
-    "      n=$((n + 1)); [ $n -gt 150 ] && return\n"
+    "      kill -0 \"$sh\" 2>/dev/null || return      # the shell is gone: so is its claude\n"
     "      for f in \"$dir\"/[0-9]*.json; do\n"
     "        p=${f##*/}; p=${p%.json}\n"
     "        read -r -a a 2>/dev/null < \"/proc/$p/stat\" || continue\n"
@@ -2869,9 +2913,7 @@ static const char RC_BASH[] =
     "    case $m in\n"
     "      sub) command claude \"$@\"; return ;;\n"
     "      new) id=$(cat /proc/sys/kernel/random/uuid); set -- --session-id \"$id\" \"$@\" ;;\n"
-    "      continue) d=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(printf '%s' \"$PWD\" | sed 's/[^A-Za-z0-9]/-/g')\n"
-    "                id=$(ls -t \"$d\"/*.jsonl 2>/dev/null | head -1); id=${id##*/}; id=${id%.jsonl} ;;\n"
-    "      pick) id= ;;\n"
+    "      continue|pick) id= ;;   # not known yet: the watcher reports the one Claude opens\n"
     "    esac\n"
     "    printf '\\033]7700;claude-args=%s %s\\033\\\\\\033]7700;claude=%s\\033\\\\' \"$__hardcore_key\" \"$keep\" \"${id:-?}\"\n"
     "    w=$(__hardcore_claude_watch \"$me\" \"${id:-?}\" 2>/dev/null </dev/null >/dev/tty & echo $!)\n"
@@ -5810,9 +5852,11 @@ static int session_id_ok(const char *id) {
     return 1;
 }
 
-/* The command that starts Claude again: claude FLAGS --resume ID (or
-   --continue when the id wasn't known). Flags the shell vouched for (trust)
-   all come back; others only the ones session_args_filter keeps. "" = none. */
+/* The command that starts Claude again: claude FLAGS --resume ID, always by
+   id. When the id wasn't known ("?"), claude FLAGS --resume with no id: Claude's
+   own picker, never --continue (that takes the newest session in the folder,
+   which can be another tab's). Flags the shell vouched for (trust) all come
+   back; others only the ones session_args_filter keeps. "" = none. */
 static void session_resume_cmd(const char *claude, const char *args, int trust, char *run, size_t cap) {
     char kept[400];
     size_t k;
@@ -5823,14 +5867,149 @@ static void session_resume_cmd(const char *claude, const char *args, int trust, 
         k = strlen(kept);
         if (k && kept[k - 1] != ' ' && k + 1 < sizeof(kept)) { kept[k] = ' '; kept[k + 1] = 0; }
     } else session_args_filter(args, kept, sizeof(kept));
-    if (!strcmp(claude, "?")) snprintf(run, cap, "claude %s--continue", kept);
+    if (!strcmp(claude, "?")) snprintf(run, cap, "claude %s--resume", kept);
     else if (session_id_ok(claude)) snprintf(run, cap, "claude %s--resume %s", kept, claude);
+}
+
+/* Follows each tab's Claude by id, whatever its shell knows. ids is what
+   rc.bash --claude-ids printed: "STARTED ONSCREEN" for each running Claude
+   Code (the id on its command line, - for none; the session it shows now).
+   A tab whose saved id is no Claude's on-screen id takes the on-screen id of
+   the one Claude started with that id (or with the tab's claude_origin), when
+   exactly one did and no other tab holds that session. Anything else (none,
+   two, a "?" tab) stays as it is: no guess. Returns how many tabs changed. */
+static int claude_resync(Term **tt, int n, const char *ids) {
+    int i, j, changed = 0;
+    for (i = 0; i < n; i++) {
+        Term *t = tt[i];
+        const char *line, *hit = NULL;
+        char start[72], now[72], found[72] = "", from[72] = "";
+        int matches = 0, held = 0;
+        if (!t || !session_id_ok(t->claude)) continue;
+        for (line = ids; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+            if (sscanf(line, "%71s %71s", start, now) != 2 || !session_id_ok(now)) continue;
+            if (!strcmp(now, t->claude)) { hit = line; break; }          /* on screen already: in step */
+            if (!strcmp(start, t->claude) || (t->claude_origin[0] && !strcmp(start, t->claude_origin))) {
+                matches++;
+                snprintf(found, sizeof(found), "%s", now);
+                snprintf(from, sizeof(from), "%s", start);
+            }
+        }
+        if (hit || matches != 1) continue;
+        for (j = 0; j < n; j++) if (j != i && tt[j] && !strcmp(tt[j]->claude, found)) held = 1;
+        if (held) continue;
+        if (!t->claude_origin[0] && strlen(from) < sizeof(t->claude_origin)) snprintf(t->claude_origin, sizeof(t->claude_origin), "%s", from);
+        snprintf(t->claude, sizeof(t->claude), "%s", found);
+        changed++;
+    }
+    return changed;
+}
+
+static int release_vs_build(const char *tag, const char *build, const char *status);   /* hardcore update */
+
+/* Every few seconds, while a WSL tab runs Claude: rc.bash --claude-ids in the
+   background (no window), and claude_resync on what it prints. The shell's
+   own watcher usually says first; this catches a Claude it can't follow (a
+   shell started by an older build, which a reload keeps). Only while a tab's
+   shell runs, so it never starts a stopped WSL. */
+#define WM_APP_CLAUDE_IDS (WM_APP + 5)   /* lp: rc.bash --claude-ids output (malloc'd), wp: claude_gen sum when it began */
+#define TIMER_CLAUDE 11                  /* Win32: claude_resync_start, every 10 s */
+static volatile LONG g_resync_busy;
+
+static unsigned claude_gen_sum(void) {
+    unsigned g = 0;
+    int i;
+    for (i = 0; i < g_ntabs; i++) g += g_tabs[i]->t.claude_gen + (unsigned)g_tabs[i]->id * 7919u;
+    return g;
+}
+
+static DWORD WINAPI claude_resync_thread(void *arg) {
+    wchar_t *cmd = (wchar_t *)arg;
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    HANDLE rd = NULL, wr = NULL;
+    char *out = NULL;
+    size_t n = 0, cap = 0;
+    DWORD got, avail, t0 = GetTickCount();
+    unsigned gen = (unsigned)(UINT_PTR)0;
+    memcpy(&gen, cmd + wcslen(cmd) + 1, sizeof(gen));     /* stashed after the command's NUL */
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    if (CreatePipe(&rd, &wr, &sa, 1 << 16)) {
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = wr;
+        si.hStdInput = si.hStdError = INVALID_HANDLE_VALUE;
+        if (CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            CloseHandle(wr); wr = NULL;
+            for (;;) {                   /* everything it prints, for up to 15 s */
+                if (!PeekNamedPipe(rd, NULL, 0, NULL, &avail, NULL)) break;      /* it exited: the pipe is closed */
+                if (!avail) {
+                    if (GetTickCount() - t0 > 15000) { TerminateProcess(pi.hProcess, 1); free(out); out = NULL; break; }
+                    Sleep(30);
+                    continue;
+                }
+                if (n + avail + 1 > cap) {
+                    char *b = (char *)realloc(out, cap = (n + avail + 1) * 2);
+                    if (!b) { free(out); out = NULL; break; }
+                    out = b;
+                }
+                if (!ReadFile(rd, out + n, avail, &got, NULL)) break;
+                n += got;
+                out[n] = 0;
+                if (n > (1 << 20)) break;
+            }
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
+    if (wr) CloseHandle(wr);
+    if (rd) CloseHandle(rd);
+    free(cmd);
+    if (out && !PostMessageW(g_hwnd, WM_APP_CLAUDE_IDS, (WPARAM)gen, (LPARAM)out)) free(out);
+    if (!out) InterlockedExchange(&g_resync_busy, 0);
+    return 0;
+}
+
+static void claude_resync_start(void) {
+    wchar_t *cmd;
+    unsigned gen;
+    int i, any = 0;
+    HANDLE th;
+    if (g_no_bash || g_resync_busy) return;
+    for (i = 0; i < g_ntabs && !any; i++) {
+        Tab *tb = g_tabs[i];
+        any = tb->kind == TK_WSL && tb->proc && WaitForSingleObject(tb->proc, 0) == WAIT_TIMEOUT && session_id_ok(tb->t.claude);
+    }
+    if (!any || !(cmd = (wchar_t *)malloc(600 * sizeof(wchar_t)))) return;
+    _snwprintf(cmd, 580, L"wsl.exe%ls%hs%ls -e bash -c \"exec bash \\\"$HARDCORE_RC\\\" --claude-ids\"",
+               g_distro[0] ? L" -d \"" : L"", g_distro, g_distro[0] ? L"\"" : L"");
+    cmd[580] = 0;
+    gen = claude_gen_sum();
+    memcpy(cmd + wcslen(cmd) + 1, &gen, sizeof(gen));
+    InterlockedExchange(&g_resync_busy, 1);
+    if ((th = CreateThread(NULL, 0, claude_resync_thread, cmd, 0, NULL))) CloseHandle(th);
+    else { free(cmd); InterlockedExchange(&g_resync_busy, 0); }
+}
+
+/* the answer, on the UI thread: applied unless a claude= report came meanwhile */
+static void claude_resync_done(unsigned gen, char *ids) {
+    Term *tt[MAX_TABS];
+    int i;
+    InterlockedExchange(&g_resync_busy, 0);
+    if (gen == claude_gen_sum()) {
+        for (i = 0; i < g_ntabs && i < MAX_TABS; i++) tt[i] = g_tabs[i]->kind == TK_WSL ? &g_tabs[i]->t : NULL;
+        if (claude_resync(tt, i, ids)) g_session_dirty = 1;
+    }
+    free(ids);
 }
 
 /* A tab about to resume Claude holds the session already: if its shell
    can't start (WSL still down), the session isn't lost on the next save. */
 static void session_preset(Tab *tb, const char *claude, const char *args, int trust) {
     snprintf(tb->t.claude, sizeof(tb->t.claude), "%s", claude);
+    snprintf(tb->t.claude_origin, sizeof(tb->t.claude_origin), "%s", strcmp(claude, "?") ? claude : "");
     snprintf(tb->t.claude_args, sizeof(tb->t.claude_args), "%s", args);
     tb->t.claude_trust = trust;
 }
@@ -6313,6 +6492,7 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         blob_line(&b, "claude", t->claude);
         blob_line(&b, "claude_args", t->claude_args);
         blob_line(&b, "claude_trust", t->claude_trust ? "1" : "0");
+        blob_line(&b, "claude_origin", t->claude_origin);
         blob_line(&b, "key", t->key);
         blob_line(&b, "cmd", t->cmd);
         blob_line(&b, "run", tb->run);
@@ -6455,6 +6635,7 @@ static int adopt_tabs(void) {
         else if (!strcmp(line, "claude")) snprintf(tb->t.claude, sizeof(tb->t.claude), "%s", v);
         else if (!strcmp(line, "claude_args")) snprintf(tb->t.claude_args, sizeof(tb->t.claude_args), "%s", v);
         else if (!strcmp(line, "claude_trust")) tb->t.claude_trust = atoi(v) == 1;
+        else if (!strcmp(line, "claude_origin")) snprintf(tb->t.claude_origin, sizeof(tb->t.claude_origin), "%s", v);
         else if (!strcmp(line, "key")) snprintf(tb->t.key, sizeof(tb->t.key), "%s", v);
         else if (!strcmp(line, "cmd")) snprintf(tb->t.cmd, sizeof(tb->t.cmd), "%s", v);
         else if (!strcmp(line, "run")) snprintf(tb->run, sizeof(tb->run), "%s", v);
@@ -7455,13 +7636,81 @@ static int unit_issues(FILE *f) {
         session_resume_cmd("abc", "--dangerously-skip-permissions", 1, run, sizeof(run));
         ok = ok && !strcmp(run, "claude --dangerously-skip-permissions --resume abc");
         session_resume_cmd("?", "", 1, run, sizeof(run));
-        ok = ok && !strcmp(run, "claude --continue");
+        ok = ok && !strcmp(run, "claude --resume");                 /* unknown id: the picker, never --continue */
+        session_resume_cmd("?", "--model opus ", 1, run, sizeof(run));
+        ok = ok && !strcmp(run, "claude --model opus --resume");
         session_resume_cmd("abc;rm", "", 1, run, sizeof(run));
         ok = ok && !run[0];
         session_resume_cmd("abc", "--x $(rm)", 1, run, sizeof(run));
         ok = ok && !strcmp(run, "claude --resume abc");
         fprintf(f, "%s issue the resume command: same flags when trusted, filtered when not, no shell syntax%s%s\n",
                 ok ? "ok  " : "FAIL", ok ? "" : ": ", ok ? "" : run);
+        fails += !ok;
+    }
+    {   /* claude_resync: a tab follows its Claude by id, never by folder or age */
+        static Term a, b, c;
+        Term *tt[3] = {&a, &b, &c};
+        int ok, k;
+        memset(&a, 0, sizeof(a)); memset(&b, 0, sizeof(b)); memset(&c, 0, sizeof(c));
+        /* the owner's case: started as 7a77..., /resume'd to c246... in a shell with no watcher */
+        strcpy(a.claude, "7a77ef71-bcbb-4c56-b88d-bff86eb465ad");
+        strcpy(b.claude, "11111111-0000-4000-8000-000000000001");
+        k = claude_resync(tt, 3, "7a77ef71-bcbb-4c56-b88d-bff86eb465ad c24693cc-a8a8-4bf9-8019-5388ea87fed1\n"
+                                 "11111111-0000-4000-8000-000000000001 11111111-0000-4000-8000-000000000001\n"
+                                 "- 99999999-0000-4000-8000-000000000009\n");
+        ok = k == 1 && !strcmp(a.claude, "c24693cc-a8a8-4bf9-8019-5388ea87fed1")
+             && !strcmp(a.claude_origin, "7a77ef71-bcbb-4c56-b88d-bff86eb465ad")
+             && !strcmp(b.claude, "11111111-0000-4000-8000-000000000001") && !c.claude[0];
+        /* in step: nothing changes; a second switch follows the origin */
+        k = claude_resync(tt, 3, "7a77ef71-bcbb-4c56-b88d-bff86eb465ad c24693cc-a8a8-4bf9-8019-5388ea87fed1\n");
+        ok = ok && k == 0 && !strcmp(a.claude, "c24693cc-a8a8-4bf9-8019-5388ea87fed1");
+        k = claude_resync(tt, 3, "7a77ef71-bcbb-4c56-b88d-bff86eb465ad d0000000-0000-4000-8000-00000000000d\n");
+        ok = ok && k == 1 && !strcmp(a.claude, "d0000000-0000-4000-8000-00000000000d");
+        /* two Claudes started with the same id: ambiguous, no guess */
+        strcpy(c.claude, "22222222-0000-4000-8000-000000000002");
+        k = claude_resync(tt, 3, "22222222-0000-4000-8000-000000000002 33333333-0000-4000-8000-000000000003\n"
+                                 "22222222-0000-4000-8000-000000000002 44444444-0000-4000-8000-000000000004\n");
+        ok = ok && k == 0 && !strcmp(c.claude, "22222222-0000-4000-8000-000000000002");
+        /* a session another tab holds is never taken; no Claude for a tab (exited, WSL down): kept */
+        k = claude_resync(tt, 3, "22222222-0000-4000-8000-000000000002 11111111-0000-4000-8000-000000000001\n");
+        ok = ok && k == 0 && !strcmp(c.claude, "22222222-0000-4000-8000-000000000002");
+        k = claude_resync(tt, 3, "");
+        ok = ok && k == 0 && !strcmp(b.claude, "11111111-0000-4000-8000-000000000001");
+        /* "?" (the picker, not reported yet) and junk lines: left alone */
+        strcpy(c.claude, "?");
+        k = claude_resync(tt, 3, "? 55555555-0000-4000-8000-000000000005\n- x;rm\ngarbage\n");
+        ok = ok && k == 0 && !strcmp(c.claude, "?");
+        /* the OSC: the first id after none is the origin; the watcher's later ids are not */
+        {
+            Term t;
+            const char *in = "\x1b]7700;claude=aaaa-1\x1b\\\x1b]7700;claude=bbbb-2\x1b\\";
+            if (!term_init(&t, 40, 4)) ok = 0;
+            else {
+            vt_feed(&t, (const unsigned char *)in, (int)strlen(in));
+            ok = ok && !strcmp(t.claude, "bbbb-2") && !strcmp(t.claude_origin, "aaaa-1") && t.claude_gen == 2;
+            in = "\x1b]7700;claude=\x1b\\\x1b]7700;claude=?\x1b\\";
+            vt_feed(&t, (const unsigned char *)in, (int)strlen(in));
+            ok = ok && !strcmp(t.claude, "?") && !t.claude_origin[0];
+            term_free(&t);
+            }
+        }
+        fprintf(f, "%s follow each tab's Claude by id: a /resume in an unwatched shell, never ambiguous, never another tab's\n",
+                ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* hardcore update: by commits, never a downgrade (1 newer release, 0 same, -1 older, -2 diverged, -3 unknown) */
+        int ok = release_vs_build("v0.5", "v0.5-82-g1beff69", "") == -1           /* 82 commits past the release */
+              && release_vs_build("v0.5", "v0.5", "") == 0
+              && release_vs_build("v0.5", "v0.5-dirty", "") == 0
+              && release_vs_build("v0.6", "v0.5-82-g1beff69", "") == 1
+              && release_vs_build("v0.4.2", "v0.5", "") == -1
+              && release_vs_build("v0.5", "unknown", "") == -3
+              && release_vs_build("v0.5", "1beff69", "") == -3
+              && release_vs_build("v0.6", "v0.5-82-g1beff69", "ahead") == -1     /* GitHub's compare wins over numbers */
+              && release_vs_build("v0.5", "v0.5-82-g1beff69", "behind") == 1
+              && release_vs_build("v0.5", "v0.5-82-g1beff69", "identical") == 0
+              && release_vs_build("v0.5", "v0.5-82-g1beff69", "diverged") == -2;
+        fprintf(f, "%s hardcore update compares the release with this build's commit: never older over newer\n", ok ? "ok  " : "FAIL");
         fails += !ok;
     }
 #endif
@@ -8378,6 +8627,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_MEDIA) { media_tick(); return 0; }
         if (wp == TIMER_DISK) { check_disk(); return 0; }
         if (wp == TIMER_SESSION) { session_tick(); return 0; }
+        if (wp == TIMER_CLAUDE) { claude_resync_start(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
         else if (wp == TIMER_SETTLE) settle_all();
@@ -8493,6 +8743,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_SETTINGS:
         config_load();
         settings_apply();
+        return 0;
+    case WM_APP_CLAUDE_IDS:
+        claude_resync_done((unsigned)wp, (char *)lp);
         return 0;
     case WM_APP_HANDED_OVER:
         /* the new process has every pseudoconsole; ending here closes only our
@@ -9064,9 +9317,6 @@ static double bench_now_ms(void) {
    swaps it in. A running hardcore.exe can't be overwritten but can be
    renamed, so windows that are open keep running the old copy and the next
    one starts the new. Run from a tab as `hardcore update` (rc.bash). */
-#ifndef HARDCORE_BUILD
-#define HARDCORE_BUILD "unknown"  /* git describe, from the Makefile: which commit this is */
-#endif
 #define UPDATE_REPO L"/repos/williamsharkey/hardcore/releases/latest"
 
 static HANDLE g_cli_out;
@@ -9169,18 +9419,146 @@ static int sha256_hex(const char *data, size_t n, char out[65]) {
 
 static int pipe_send(DWORD kind, const void *data, size_t n, DWORD *res);
 
+/* How the latest release stands to this build. status is GitHub's compare of
+   the release with this build's commit ("ahead": this build has commits the
+   release lacks; "behind"; "identical"; "diverged"), or "" when GitHub
+   couldn't say (no network, a commit it doesn't have). Then git describe:
+   vX.Y-N-gSHA is N commits past the tag vX.Y. */
+enum { REL_NEWER = 1, REL_SAME = 0, REL_OLDER = -1, REL_DIVERGED = -2, REL_UNKNOWN = -3 };
+static int release_vs_build(const char *tag, const char *build, const char *status) {
+    long vr, vb;
+    int k = 0;
+    if (!strcmp(status, "behind")) return REL_NEWER;
+    if (!strcmp(status, "identical")) return REL_SAME;
+    if (!strcmp(status, "ahead")) return REL_OLDER;
+    if (!strcmp(status, "diverged")) return REL_DIVERGED;
+    if (build[0] != 'v' || !isdigit((unsigned char)build[1])) return REL_UNKNOWN;   /* "unknown", or a bare hash: no tag to go by */
+    vr = ver_num(tag, NULL);
+    vb = ver_num(build, &k);
+    if (vr != vb) return vr > vb ? REL_NEWER : REL_OLDER;
+    return k > 0 ? REL_OLDER : REL_SAME;
+}
+
+/* the exe an update or upgrade replaces: HARDCORE_INSTALL_EXE (tests), the
+   installed one (--self: a build elsewhere installs itself), or this one */
+static void install_target(int self, wchar_t *out) {
+    const wchar_t *e = _wgetenv(L"HARDCORE_INSTALL_EXE"), *la = _wgetenv(L"LOCALAPPDATA");
+    if (e && *e) _snwprintf(out, MAX_PATH, L"%ls", e);
+    else if (self) _snwprintf(out, MAX_PATH, L"%ls\\hardcore\\hardcore.exe", la ? la : L".");
+    else GetModuleFileNameW(NULL, out, MAX_PATH);
+    out[MAX_PATH - 1] = 0;
+}
+
+/* Puts bin in place of exe. A running exe can't be overwritten, but it can be
+   renamed: it moves aside as hardcore.old-<time>.exe and keeps running from
+   there. Copies left by earlier swaps go, once nothing runs them. */
+static int install_exe(const wchar_t *exe, const char *bin, size_t bn) {
+    wchar_t tmp[MAX_PATH], old[MAX_PATH], dir[MAX_PATH], pat[MAX_PATH], *sl;
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    SYSTEMTIME st;
+    FILE *f;
+    _snwprintf(dir, MAX_PATH, L"%ls", exe);
+    dir[MAX_PATH - 1] = 0;
+    if ((sl = wcsrchr(dir, L'\\'))) *sl = 0;
+    CreateDirectoryW(dir, NULL);
+    _snwprintf(pat, MAX_PATH, L"%ls\\hardcore.old-*.exe", dir);
+    if ((h = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
+        do {
+            _snwprintf(old, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+            DeleteFileW(old);     /* fails, harmlessly, for one still running */
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    _snwprintf(tmp, MAX_PATH, L"%ls.new", exe);
+    tmp[MAX_PATH - 1] = 0;
+    if (!(f = _wfopen(tmp, L"wb")) || fwrite(bin, 1, bn, f) != bn) {
+        if (f) fclose(f);
+        cli("hardcore: can't write next to %ls\n", exe);
+        return 0;
+    }
+    fclose(f);
+    GetLocalTime(&st);
+    _snwprintf(old, MAX_PATH, L"%ls\\hardcore.old-%04d%02d%02d%02d%02d%02d.exe", dir,
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    old[MAX_PATH - 1] = 0;
+    if (GetFileAttributesW(exe) != INVALID_FILE_ATTRIBUTES && !MoveFileExW(exe, old, MOVEFILE_REPLACE_EXISTING)) {
+        cli("hardcore: couldn't move %ls aside (error %lu)\n", exe, GetLastError());
+        DeleteFileW(tmp);
+        return 0;
+    }
+    if (!MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING)) {
+        cli("hardcore: couldn't swap in the new exe (error %lu)\n", GetLastError());
+        MoveFileExW(old, exe, 0);
+        return 0;
+    }
+    return 1;
+}
+
+/* the folder of the exe a window's process runs, lowercased: "" if it can't be read */
+static void window_exe_dir(HWND w, wchar_t *out, DWORD cap) {
+    DWORD pid = 0, n = cap;
+    HANDLE p;
+    wchar_t *sl;
+    out[0] = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (!(p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))) return;
+    if (!QueryFullProcessImageNameW(p, 0, out, &n)) out[0] = 0;
+    CloseHandle(p);
+    if ((sl = wcsrchr(out, L'\\'))) *sl = 0;
+    _wcslwr(out);
+}
+
+/* Every open window of the hardcore at exe takes up the new exe in place:
+   tabs, programs and Claude sessions keep going (reload_into). Windows of a
+   hardcore elsewhere (a test copy, another install) are left alone. */
+static void reload_windows(const wchar_t *exe) {
+    HWND w = NULL, all[64];
+    wchar_t want[MAX_PATH], dir[MAX_PATH], *sl;
+    int ok = 0, bad = 0, nw = 0, i;
+    _snwprintf(want, MAX_PATH, L"%ls", exe);
+    want[MAX_PATH - 1] = 0;
+    if ((sl = wcsrchr(want, L'\\'))) *sl = 0;
+    _wcslwr(want);
+    while (nw < 64 && (w = FindWindowExW(NULL, w, L"hardcore", NULL)) != NULL) all[nw++] = w;   /* first, before any of them changes */
+    for (i = 0; i < nw; i++) {
+        COPYDATASTRUCT cd;
+        DWORD_PTR res = 0;
+        window_exe_dir(all[i], dir, MAX_PATH);
+        if (wcscmp(dir, want)) continue;
+        cd.dwData = 0x48430002;
+        cd.cbData = 6;
+        cd.lpData = (void *)"reload";
+        if (SendMessageTimeoutW(all[i], WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 20000, &res) && res) ok++;
+        else bad++;
+    }
+    if (bad) {                  /* an elevated window ignores a normal process's messages: its pipe */
+        DWORD res = 0;
+        if (pipe_send(0x48430002, "reload", 6, &res) && res) { ok++; bad--; }
+    }
+    if (ok) cli("hardcore: %d window%s reloaded in place: tabs, programs and Claude sessions kept\n", ok, ok == 1 ? "" : "s");
+    else if (!bad) cli("hardcore: no window open; the next one starts the new build\n");
+    if (bad) cli("hardcore: %d window%s couldn't reload in place: close and reopen %s to finish (tabs and Claude sessions come back)\n",
+                 bad, bad == 1 ? "" : "s", bad == 1 ? "it" : "them");
+}
+
+static void build_line(void) {
+    cli("hardcore %s (build %s%s%.12s%s%.10s)\n", HARDCORE_VERSION, HARDCORE_BUILD,
+        HARDCORE_COMMIT[0] ? ", commit " : "", HARDCORE_COMMIT,
+        HARDCORE_COMMIT_DATE[0] ? ", " : "", HARDCORE_COMMIT_DATE);
+}
+
 static int update_cmd(int force) {
-    char *json, *bin, tag[64], url[1024], digest[96] = "", hex[65];
+    char *json, *bin, tag[64], url[1024], digest[96] = "", hex[65], published[32] = "", status[32] = "";
     const char *asset;
     size_t jn, bn;
-    wchar_t wurl[1024], exe[MAX_PATH], tmp[MAX_PATH], old[MAX_PATH];
-    long mine, latest;
-    int ahead;
-    FILE *f;
-    SYSTEMTIME st;
-    cli("hardcore %s: checking github.com/williamsharkey/hardcore for the latest release...\n", HARDCORE_VERSION);
+    wchar_t wurl[1024], exe[MAX_PATH];
+    int rel;
+    build_line();
+    cli("hardcore: checking github.com/williamsharkey/hardcore for the latest release...\n");
     if (!(json = https_get(L"https://api.github.com" UPDATE_REPO, &jn, 1))) { cli("hardcore: couldn't reach GitHub\n"); return 1; }
     if (!json_str(json, "tag_name", tag, sizeof(tag))) { cli("hardcore: no release found\n"); free(json); return 1; }
+    json_str(json, "published_at", published, sizeof(published));
     /* the asset named hardcore.exe: its download URL and digest come after its name */
     if (!(asset = strstr(json, "\"name\":\"hardcore.exe\"")) && !(asset = strstr(json, "\"name\": \"hardcore.exe\""))) {
         cli("hardcore: release %s has no hardcore.exe\n", tag); free(json); return 1;
@@ -9188,11 +9566,33 @@ static int update_cmd(int force) {
     if (!json_str(asset, "browser_download_url", url, sizeof(url))) { cli("hardcore: release %s: no download link\n", tag); free(json); return 1; }
     json_str(asset, "digest", digest, sizeof(digest));
     free(json);
-    mine = ver_num(HARDCORE_VERSION, &ahead);
-    latest = ver_num(tag, NULL);
-    (void)ahead;
-    if (!force && latest <= mine) {
-        cli("hardcore: up to date (%s; latest release %s)\n", HARDCORE_VERSION, tag);
+    if (strlen(HARDCORE_COMMIT) == 40) {     /* GitHub says which is newer, by commits, not by number */
+        wchar_t q[300];
+        char *cmp;
+        size_t cn;
+        _snwprintf(q, 300, L"https://api.github.com/repos/williamsharkey/hardcore/compare/%hs...%hs?per_page=1", tag, HARDCORE_COMMIT);
+        q[299] = 0;
+        if ((cmp = https_get(q, &cn, 1))) {
+            json_str(cmp, "status", status, sizeof(status));
+            free(cmp);
+        }
+    }
+    rel = release_vs_build(tag, HARDCORE_BUILD, status);
+    if (rel == REL_UNKNOWN && ver_num(tag, NULL) > ver_num(HARDCORE_VERSION, NULL)) rel = REL_NEWER;   /* a higher release number */
+    if (rel == REL_OLDER || rel == REL_DIVERGED) {
+        /* never a downgrade, not even with --force: the release would take commits away */
+        cli("hardcore: the latest release, %s (%.10s), is %s this build: not installing it%s.\n"
+            "hardcore: for the newest code, `hardcore upgrade` builds main and swaps it in.\n",
+            tag, published, rel == REL_OLDER ? "older than" : "missing commits of", force ? ", not even with --force" : "");
+        return 0;
+    }
+    if (rel == REL_UNKNOWN && force) {
+        cli("hardcore: can't tell whether release %s is older than this build (its commit isn't known): not installing it.\n"
+            "hardcore: `hardcore upgrade` builds main and swaps it in.\n", tag);
+        return 1;
+    }
+    if (rel != REL_NEWER && !(rel == REL_SAME && force)) {
+        cli("hardcore: up to date (latest release %s, %.10s). `hardcore upgrade` builds main, which may be newer.\n", tag, published);
         return 0;
     }
     cli("hardcore: downloading %s...\n", tag);
@@ -9206,59 +9606,176 @@ static int update_cmd(int force) {
         }
         cli("hardcore: SHA-256 checks out\n");
     }
-    GetModuleFileNameW(NULL, exe, MAX_PATH);
-    {   /* copies left by earlier updates, once nothing runs them any more */
-        WIN32_FIND_DATAW fd;
-        wchar_t pat[MAX_PATH], dir[MAX_PATH], *sl;
-        HANDLE h;
-        _snwprintf(dir, MAX_PATH, L"%ls", exe);
-        if ((sl = wcsrchr(dir, L'\\'))) *sl = 0;
-        _snwprintf(pat, MAX_PATH, L"%ls\\hardcore.old-*.exe", dir);
-        if ((h = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
-            do {
-                _snwprintf(old, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
-                DeleteFileW(old);     /* fails, harmlessly, for one still running */
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
-        }
-    }
-    _snwprintf(tmp, MAX_PATH, L"%ls.new", exe);
-    tmp[MAX_PATH - 1] = 0;
-    if (!(f = _wfopen(tmp, L"wb")) || fwrite(bin, 1, bn, f) != bn) {
-        if (f) fclose(f);
-        cli("hardcore: can't write next to %ls\n", exe); free(bin); return 1;
-    }
-    fclose(f);
+    install_target(0, exe);
+    if (!install_exe(exe, bin, bn)) { free(bin); return 1; }
     free(bin);
-    GetLocalTime(&st);              /* this exe may be running (it is now): move it aside, don't overwrite */
-    _snwprintf(old, MAX_PATH, L"%.*ls.old-%04d%02d%02d%02d%02d%02d.exe", (int)(wcslen(exe) - 4), exe,
-               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    old[MAX_PATH - 1] = 0;
-    if (!MoveFileExW(exe, old, MOVEFILE_REPLACE_EXISTING) || !MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING)) {
-        cli("hardcore: couldn't swap in the new exe (error %lu)\n", GetLastError()); return 1;
+    cli("hardcore: updated %s -> %s\n", HARDCORE_BUILD, tag);
+    reload_windows(exe);
+    return 0;
+}
+
+/* ── hardcore upgrade: the newest main, built in WSL, swapped in hot ──────
+   Fetches main into a clone of its own (~/.cache/hardcore/src), compares it
+   with this build's commit, builds hardcore.exe there with make when this one
+   is behind, and swaps it in like an update: every open window reloads in
+   place and keeps its tabs, programs and Claude sessions. Lines that start
+   with @@ are for hardcore.exe; the rest are for you. */
+static const char UPGRADE_SH[] =
+    "set -u\n"
+    "src=${HARDCORE_UPGRADE_SRC:-$HOME/.cache/hardcore/src}\n"
+    "url=${HARDCORE_UPGRADE_URL:-https://github.com/williamsharkey/hardcore.git}\n"
+    "have=${HARDCORE_UPGRADE_HAVE:-}\n"
+    "force=${HARDCORE_UPGRADE_FORCE:-0}\n"
+    "export GIT_TERMINAL_PROMPT=0\n"
+    "need=\n"
+    "for c in git make python3 gcc x86_64-w64-mingw32-gcc x86_64-w64-mingw32-windres; do\n"
+    "  command -v \"$c\" >/dev/null 2>&1 || need=\"$need $c\"\n"
+    "done\n"
+    "if [ -n \"$need\" ]; then\n"
+    "  echo \"WSL is missing:$need (Debian/Ubuntu: sudo apt install git make python3 gcc mingw-w64)\"; exit 3\n"
+    "fi\n"
+    "if [ ! -d \"$src/.git\" ]; then\n"
+    "  echo \"first upgrade: cloning $url into $src\"\n"
+    "  mkdir -p \"${src%/*}\" && git clone -q \"$url\" \"$src\" || exit 4\n"
+    "fi\n"
+    "git -C \"$src\" fetch -q --tags origin main 2>&1 || { echo \"couldn't fetch main from $url\"; exit 4; }\n"
+    "new=$(git -C \"$src\" rev-parse FETCH_HEAD) || exit 4\n"
+    "echo \"@@main $new $(git -C \"$src\" log -1 --format='%cs %s' \"$new\")\"\n"
+    "if [ \"$force\" != 1 ]; then\n"
+    "  [ \"$have\" = \"$new\" ] && { echo @@current; exit 0; }\n"
+    "  if [ -n \"$have\" ]; then\n"
+    "    git -C \"$src\" cat-file -e \"$have^{commit}\" 2>/dev/null || { echo @@notmain; exit 0; }   # a commit main never had\n"
+    "    git -C \"$src\" merge-base --is-ancestor \"$new\" \"$have\" && { echo @@newer; exit 0; }       # this build has main, and more\n"
+    "    git -C \"$src\" merge-base --is-ancestor \"$have\" \"$new\" || { echo @@notmain; exit 0; }     # a branch main doesn't have\n"
+    "  fi\n"
+    "fi\n"
+    "git -C \"$src\" checkout -q --force --detach \"$new\" || exit 4\n"
+    "echo \"building $(git -C \"$src\" describe --tags --always) in $src (a minute or two)...\"\n"
+    "if ! nice make -C \"$src\" -j4 hardcore.exe > \"$src/upgrade.log\" 2>&1; then\n"
+    "  tail -15 \"$src/upgrade.log\"; echo \"the build failed; its log: $src/upgrade.log\"; exit 5\n"
+    "fi\n"
+    "echo \"@@built $(wslpath -w \"$src/hardcore.exe\")\"\n";
+
+/* runs cmd (no window), each line it prints to on_line; its exit code (-1: it didn't run) */
+static long run_lines(wchar_t *cmd, void (*on_line)(char *line, void *ctx), void *ctx) {
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    HANDLE rd, wr;
+    char buf[4096], line[2048];
+    size_t ln = 0;
+    DWORD got, code = (DWORD)-1, i;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = si.hStdError = wr;
+    si.hStdInput = INVALID_HANDLE_VALUE;
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(rd); CloseHandle(wr);
+        return -1;
     }
-    cli("hardcore: updated %s -> %s\n", HARDCORE_VERSION, tag);
-    {   /* and every open window takes it up in place: tabs, programs and all keep going */
-        HWND w = NULL, all[64];
-        int ok = 0, bad = 0, nw = 0, i;
-        while (nw < 64 && (w = FindWindowExW(NULL, w, L"hardcore", NULL)) != NULL) all[nw++] = w;   /* first, before any of them changes */
-        for (i = 0; i < nw; i++) {
-            COPYDATASTRUCT cd;
-            DWORD_PTR res = 0;
-            w = all[i];
-            cd.dwData = 0x48430002;
-            cd.cbData = 6;
-            cd.lpData = (void *)"reload";
-            if (SendMessageTimeoutW(w, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 20000, &res) && res) ok++;
-            else bad++;
+    CloseHandle(wr);
+    while (ReadFile(rd, buf, sizeof(buf), &got, NULL) && got)
+        for (i = 0; i < got; i++) {
+            if (buf[i] == '\r') continue;
+            if (buf[i] == '\n' || ln + 1 >= sizeof(line)) { line[ln] = 0; on_line(line, ctx); ln = 0; }
+            if (buf[i] != '\n') line[ln++] = buf[i];
         }
-        if (bad) {                  /* an elevated window ignores a normal process's messages: its pipe */
-            DWORD res = 0;
-            if (pipe_send(0x48430002, "reload", 6, &res) && res) { ok++; bad--; }
-        }
-        if (ok) cli("hardcore: %d window%s reloaded in place\n", ok, ok == 1 ? "" : "s");
-        if (bad) cli("hardcore: %d window%s couldn't reload in place: close and reopen %s to finish\n", bad, bad == 1 ? "" : "s", bad == 1 ? "it" : "them");
+    if (ln) { line[ln] = 0; on_line(line, ctx); }
+    CloseHandle(rd);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (long)code;
+}
+
+typedef struct { char main[300]; char built[MAX_PATH * 3]; int current, newer, notmain; } Upgrade;
+
+static void upgrade_line(char *line, void *ctx) {
+    Upgrade *u = (Upgrade *)ctx;
+    if (!strncmp(line, "@@main ", 7)) {
+        char sha[48] = "", rest[256] = "";
+        snprintf(u->main, sizeof(u->main), "%s", line + 7);
+        sscanf(line + 7, "%47s %255[^\n]", sha, rest);
+        cli("hardcore: main is %.12s (%s)\n", sha, rest);
     }
+    else if (!strcmp(line, "@@current")) u->current = 1;
+    else if (!strcmp(line, "@@newer")) u->newer = 1;
+    else if (!strcmp(line, "@@notmain")) u->notmain = 1;
+    else if (!strncmp(line, "@@built ", 8)) snprintf(u->built, sizeof(u->built), "%s", line + 8);
+    else cli("  %s\n", line);
+}
+
+static int upgrade_cmd(int force, int self) {
+    wchar_t exe[MAX_PATH], me[MAX_PATH], src[MAX_PATH], sh[MAX_PATH], cmd[700], old[2048] = L"", wslenv[2400];
+    char *bin = NULL;
+    size_t bn = 0;
+    Upgrade u;
+    FILE *f;
+    long rc;
+    DWORD n;
+    memset(&u, 0, sizeof(u));
+    build_line();
+    install_target(self, exe);
+    GetModuleFileNameW(NULL, me, MAX_PATH);
+    if (self) {                  /* this exe (a build of a checkout) in place of the installed one */
+        if (!_wcsicmp(me, exe)) { cli("hardcore: this is the installed hardcore already (%ls)\n", exe); return 0; }
+        _snwprintf(src, MAX_PATH, L"%ls", me);
+    } else {
+        cli("hardcore: fetching main from github.com/williamsharkey/hardcore...\n");
+        _snwprintf(sh, MAX_PATH, L"%ls\\hardcore-upgrade-%lu.sh", _wgetenv(L"TEMP") ? _wgetenv(L"TEMP") : L".", GetCurrentProcessId());
+        sh[MAX_PATH - 1] = 0;
+        if (!(f = _wfopen(sh, L"wb"))) { cli("hardcore: can't write %ls\n", sh); return 1; }
+        fwrite(UPGRADE_SH, 1, sizeof(UPGRADE_SH) - 1, f);
+        fclose(f);
+        SetEnvironmentVariableW(L"HARDCORE_UPGRADE_SH", sh);
+        SetEnvironmentVariableA("HARDCORE_UPGRADE_HAVE", HARDCORE_COMMIT);
+        SetEnvironmentVariableW(L"HARDCORE_UPGRADE_FORCE", force ? L"1" : L"0");
+        n = GetEnvironmentVariableW(L"WSLENV", old, 2048);
+        _snwprintf(wslenv, 2400, L"%ls%lsHARDCORE_UPGRADE_SH/p:HARDCORE_UPGRADE_HAVE:HARDCORE_UPGRADE_FORCE:HARDCORE_UPGRADE_SRC:HARDCORE_UPGRADE_URL",
+                   n && n < 2048 ? old : L"", n && n < 2048 ? L":" : L"");
+        wslenv[2399] = 0;
+        SetEnvironmentVariableW(L"WSLENV", wslenv);
+        _snwprintf(cmd, 700, L"wsl.exe%ls%hs%ls -e bash -c \"exec bash \\\"$HARDCORE_UPGRADE_SH\\\"\"",
+                   g_distro[0] ? L" -d \"" : L"", g_distro, g_distro[0] ? L"\"" : L"");
+        cmd[699] = 0;
+        rc = run_lines(cmd, upgrade_line, &u);
+        DeleteFileW(sh);
+        if (u.current) {
+            cli("hardcore: up to date: this build, %s (%.12s), is main's newest commit\n", HARDCORE_BUILD, HARDCORE_COMMIT);
+            return 0;
+        }
+        if (u.newer) {
+            cli("hardcore: this build, %s (%.12s), is newer than main (it has main's commits, and more): nothing to do\n",
+                HARDCORE_BUILD, HARDCORE_COMMIT);
+            return 0;
+        }
+        if (u.notmain) {
+            cli("hardcore: this build, %s (%.12s), has commits main doesn't (a branch or local build).\n"
+                "hardcore: `hardcore upgrade --force` builds main and installs it anyway.\n", HARDCORE_BUILD, HARDCORE_COMMIT);
+            return 0;
+        }
+        if (rc != 0 || !u.built[0]) {
+            cli("hardcore: upgrade failed%s; nothing changed\n", rc == -1 ? " (couldn't run wsl.exe)" : "");
+            return 1;
+        }
+        MultiByteToWideChar(CP_UTF8, 0, u.built, -1, src, MAX_PATH);
+    }
+    {
+        FILE *in = _wfopen(src, L"rb");
+        long len = -1;
+        if (in && !fseek(in, 0, SEEK_END) && (len = ftell(in)) > 100000 && !fseek(in, 0, SEEK_SET) &&
+            (bin = (char *)malloc((size_t)len)) && fread(bin, 1, (size_t)len, in) == (size_t)len) bn = (size_t)len;
+        if (in) fclose(in);
+        if (!bn || bin[0] != 'M' || bin[1] != 'Z') { cli("hardcore: can't read the new build at %ls\n", src); free(bin); return 1; }
+    }
+    if (!install_exe(exe, bin, bn)) { free(bin); return 1; }
+    free(bin);
+    cli("hardcore: installed %ls (the old one moved aside)\n", exe);
+    reload_windows(exe);
     return 0;
 }
 
@@ -9709,22 +10226,35 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             return 1;
         } else if (!strcmp(a, "update") || !strcmp(a, "--update")) {
             return update_cmd(i + 1 < argc && !wcscmp(argv[i + 1], L"--force"));
+        } else if (!strcmp(a, "upgrade") || !strcmp(a, "--upgrade")) {
+            int force = 0, self = 0, k;
+            for (k = i + 1; k < argc; k++) {
+                if (!wcscmp(argv[k], L"--force")) force = 1;
+                else if (!wcscmp(argv[k], L"--self")) self = 1;
+                else { cli("hardcore upgrade [--force] [--self]\n"); return 2; }
+            }
+            return upgrade_cmd(force, self);
         } else if (!strcmp(a, "version") || !strcmp(a, "--version") || !strcmp(a, "-v")) {
-            cli("hardcore %s (build %s)\n", HARDCORE_VERSION, HARDCORE_BUILD);
+            build_line();
             return 0;
         } else if (!strcmp(a, "help") || !strcmp(a, "--help") || !strcmp(a, "-h")) {
             cli("hardcore %s: a terminal for WSL\n"
                 "  hardcore [DIR]          a new window in DIR (from a tab: this folder)\n"
                 "  hardcore here           use the native Linux build inside WSL\n"
                 "  hardcore exit/detach    here session commands in the native Linux build\n"
-                "  hardcore update         install the latest release (--force: even if current)\n"
+                "  hardcore update         install the latest release, if it's newer than this build\n"
+                "                          (--force: reinstall the same one; never an older one)\n"
+                "  hardcore upgrade        build the newest main in WSL and swap it in; open windows\n"
+                "                          reload in place and keep their tabs and Claude sessions\n"
+                "                          (--force: build main even if this build is newer or a branch's;\n"
+                "                          --self: install this exe, a build of your own checkout)\n"
                 "  hardcore tab [-- CMD]   a new tab in the running window, CMD typed into it\n"
                 "  hardcore --ensure-tab NAME -- CMD\n"
                 "                          one tab named NAME running CMD: the running window's, the\n"
                 "                          restored session's, or a new one (a cold start restores first)\n"
                 "  hardcore slurp          attach running WSL and classic Windows consoles\n"
                 "  hardcore slurp --list   discover eligible sessions without attaching\n"
-                "  hardcore --version      this build's version\n", HARDCORE_VERSION);
+                "  hardcore --version      this build's version, commit and date\n", HARDCORE_VERSION);
             return 0;
         } else if (!strcmp(a, "--session") && i + 1 < argc) {
             _snwprintf(want_session, 64, L"%ls", argv[++i]);
@@ -9886,6 +10416,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     check_disk();
     SetTimer(h, TIMER_DISK, 60 * 1000, NULL);
     SetTimer(h, TIMER_SESSION, 2000, NULL);
+    SetTimer(h, TIMER_CLAUDE, 10000, NULL);
     /* wsl.exe boots while the D3D device is created; the tabs from last time
        if there are any (unless a folder was asked for), else one new tab */
     if (g_adopting && adopt_tabs()) {
@@ -9941,7 +10472,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--here-web")) return hc_here_web_main(argc - 1, argv + 1);
     if (argc > 1 && !strcmp(argv[1], "--here-media")) return hc_here_media_main(argc - 1, argv + 1);
     if (argc > 1 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "version"))) {
-        printf("hardcore %s (native terminal backend)\n", HARDCORE_VERSION); return 0;
+        printf("hardcore %s (native terminal backend, build %s%s%.12s)\n", HARDCORE_VERSION, HARDCORE_BUILD, HARDCORE_COMMIT[0] ? ", commit " : "", HARDCORE_COMMIT); return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "here")) return here_main(argc - 2, argv + 2);
     return here_main(argc - 1, argv + 1);
