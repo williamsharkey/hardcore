@@ -687,6 +687,11 @@ hardcore slurp --list  # preview eligible sessions without attaching
 hardcore --version     # which release, build, commit and commit date this is
 ```
 
+In a hardcore tab, `hardcore` with a folder (or nothing) opens a window there;
+any other first word goes to hardcore.exe as a command, so commands a newer
+build adds work too. A tab started before an update keeps the older shell
+function until a new shell starts in it.
+
 `hardcore` works in any WSL shell, Claude Code's `!` included, and in PowerShell
 and cmd:
 - **WSL:** hardcore's first tab adds a symlink, `~/.local/bin/hardcore`,
@@ -720,6 +725,8 @@ left alone unless you add `--force`. For a build of your own checkout,
 `make win-upgrade` builds it and runs `hardcore.exe upgrade --self`, which swaps
 that exe in. That is also the way in the first time, while the installed
 hardcore is older than `upgrade`.
+Run in a tab, `hardcore upgrade` says everything before the window reloads,
+then nothing more, so its output is whole and ends before the next prompt.
 
 **Then every open window reloads in place.** The programs in your tabs keep
 running through it: Claude, builds and servers don't notice. Each window hands

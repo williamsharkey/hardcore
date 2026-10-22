@@ -2831,9 +2831,13 @@ static const char RC_BASH[] =
     "  hardcore() {\n"
     "    case $1 in\n"
     "      here) echo 'Native terminal mode: run a Linux build of hardcore here in WSL.' >&2; return 2 ;;\n"
-    "      update|--update|upgrade|version|--version|-v|help|--help|-h) \"$HARDCORE_EXE\" \"$@\" | cat ;;\n"
-    "      *) local d; d=$(cd -- \"${1:-.}\" 2>/dev/null && pwd) || { echo \"hardcore: no folder $1\" >&2; return 1; }\n"
-    "         ( \"$HARDCORE_EXE\" --cd \"$d\" </dev/null >/dev/null 2>&1 & ) ;;\n"
+    "      update|--update|upgrade|version|--version|-v|help|--help|-h|tab|slurp) \"$HARDCORE_EXE\" \"$@\" | cat ;;\n"
+    "      *) local d\n"
+    "         # a folder (or nothing: this one) opens a window there; any other word is a\n"
+    "         # command for hardcore.exe (update, upgrade, tab, slurp and ones to come)\n"
+    "         if [ $# -le 1 ] && d=$(cd -- \"${1:-.}\" 2>/dev/null && pwd); then\n"
+    "           ( \"$HARDCORE_EXE\" --cd \"$d\" </dev/null >/dev/null 2>&1 & )\n"
+    "         else \"$HARDCORE_EXE\" \"$@\" | cat; fi ;;\n"
     "    esac\n"
     "  }\n"
     "fi\n"
@@ -9515,17 +9519,27 @@ static void window_exe_dir(HWND w, wchar_t *out, DWORD cap) {
 static void reload_windows(const wchar_t *exe) {
     HWND w = NULL, all[64];
     wchar_t want[MAX_PATH], dir[MAX_PATH], *sl;
-    int ok = 0, bad = 0, nw = 0, i;
+    int ok = 0, bad = 0, nw = 0, i, mine;
     _snwprintf(want, MAX_PATH, L"%ls", exe);
     want[MAX_PATH - 1] = 0;
     if ((sl = wcsrchr(want, L'\\'))) *sl = 0;
     _wcslwr(want);
     while (nw < 64 && (w = FindWindowExW(NULL, w, L"hardcore", NULL)) != NULL) all[nw++] = w;   /* first, before any of them changes */
-    for (i = 0; i < nw; i++) {
+    for (i = 0, mine = 0; i < nw; i++) {
+        window_exe_dir(all[i], dir, MAX_PATH);
+        if (!wcscmp(dir, want)) all[mine++] = all[i];
+    }
+    if (!mine) { cli("hardcore: no window open; the next one starts the new build\n"); return; }
+    /* Everything is said before a window reloads, then nothing more on success:
+       this command's output may be going to a tab of that window, and text
+       arriving while it hands its tabs over showed up after the next prompt */
+    cli("hardcore: done. %d window%s now reload%s in place: tabs, programs and Claude sessions keep running\n",
+        mine, mine == 1 ? "" : "s", mine == 1 ? "s" : "");
+    if (g_cli_out && g_cli_out != INVALID_HANDLE_VALUE) FlushFileBuffers(g_cli_out);
+    Sleep(700);                  /* for the terminal to draw it */
+    for (i = 0; i < mine; i++) {
         COPYDATASTRUCT cd;
         DWORD_PTR res = 0;
-        window_exe_dir(all[i], dir, MAX_PATH);
-        if (wcscmp(dir, want)) continue;
         cd.dwData = 0x48430002;
         cd.cbData = 6;
         cd.lpData = (void *)"reload";
@@ -9536,8 +9550,7 @@ static void reload_windows(const wchar_t *exe) {
         DWORD res = 0;
         if (pipe_send(0x48430002, "reload", 6, &res) && res) { ok++; bad--; }
     }
-    if (ok) cli("hardcore: %d window%s reloaded in place: tabs, programs and Claude sessions kept\n", ok, ok == 1 ? "" : "s");
-    else if (!bad) cli("hardcore: no window open; the next one starts the new build\n");
+    (void)ok;
     if (bad) cli("hardcore: %d window%s couldn't reload in place: close and reopen %s to finish (tabs and Claude sessions come back)\n",
                  bad, bad == 1 ? "" : "s", bad == 1 ? "it" : "them");
 }
@@ -10287,6 +10300,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         } else if (!strcmp(a, "--selftest") && i + 1 < argc) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, selftest_out, sizeof(selftest_out), NULL, NULL);
         } else if (a[0] != '-') {
+            /* a folder; a bare word that is none (no slash, no drive) is a command this build doesn't know */
+            if (!strpbrk(a, "/\\:.~") && !dir_exists(a)) {
+                cli("hardcore: no command or folder \"%s\" (hardcore help lists the commands)\n", a);
+                return 2;
+            }
             snprintf(g_start_dir, sizeof(g_start_dir), "%s", a);
             dir_given = 1;
         }

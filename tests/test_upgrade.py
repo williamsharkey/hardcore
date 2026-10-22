@@ -113,6 +113,39 @@ def script_tests():
         shutil.rmtree(base, ignore_errors=True)
 
 
+def shell_function_tests():
+    """rc.bash's `hardcore` in a tab: a folder (or none) opens a window there; any other
+    first word goes to hardcore.exe, so commands added later work in old tabs' places too."""
+    rc = c_string("RC_BASH")
+    start = rc.index('if [ -n "$HARDCORE_EXE" ] && ! declare -F hardcore')
+    func = rc[start:rc.index("\nfi\n", start) + 4]
+    base = Path(tempfile.mkdtemp(prefix="hcfn-"))
+    try:
+        exe = base / "hardcore.exe"
+        exe.write_text('#!/bin/sh\necho "$*" >> "$(dirname "$0")/args"\necho out-"$1"\n')
+        exe.chmod(0o755)
+        (base / "dir with space").mkdir()
+
+        def run(line):
+            (base / "args").unlink(missing_ok=True)
+            p = subprocess.run(["bash", "-c", func + "\n" + line + "\nwait; sleep 0.3"], cwd=base,
+                               env=dict(os.environ, HARDCORE_EXE=str(exe)), capture_output=True, text=True, timeout=30)
+            return p.stdout, (base / "args").read_text().splitlines() if (base / "args").exists() else []
+        out, args = run("hardcore upgrade --force")
+        assert args == ["upgrade --force"] and "out-upgrade" in out, (out, args)
+        out, args = run("hardcore tab -- ls")
+        assert args == ["tab -- ls"], args
+        out, args = run("hardcore some-future-command")
+        assert args == ["some-future-command"] and "out-some-future-command" in out, (out, args)
+        out, args = run("hardcore 'dir with space'")
+        assert args == [f"--cd {base}/dir with space"], args
+        out, args = run("hardcore")
+        assert args == [f"--cd {base}"], args
+        print("ok   hardcore in a tab: a folder opens a window, any other word is a command for hardcore.exe")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def winpath(path):
     return subprocess.check_output(["wslpath", "-w", str(path)], text=True).strip()
 
@@ -147,6 +180,7 @@ def windows_test(exe):
         app.send(f"T cd {w1} && claude --model opus")
         srw.wait_for(lambda: len(srw.calls(fake)) == 1, "claude")
         sid = re.search(r"--session-id (\S+)", srw.calls(fake)[0]).group(1)
+        srw.wait_for(lambda: (fake / f"pid-{sid}").exists(), "claude's pid")
         pid = (fake / f"pid-{sid}").read_text().strip()
         srw.wait_for(lambda: [t.get("claude") for t in srw.saved_tabs(config)] == [sid], "the session saved")
 
@@ -169,7 +203,7 @@ def windows_test(exe):
         print("ok   hardcore upgrade leaves a build main doesn't have alone, and says --force")
 
         rc, out = upgrade("--force")
-        assert rc == 0 and "installed" in out and "1 window reloaded in place" in out, out
+        assert rc == 0 and "installed" in out and "1 window now reloads in place" in out, out
         assert len(list(install.glob("hardcore.old-*.exe"))) == 1, "the old exe moved aside"
         os.kill(int(pid), 0)                                    # Claude kept running through it
         assert len(srw.calls(fake)) == 1, "Claude was not started again"
@@ -184,20 +218,45 @@ def windows_test(exe):
         print("ok   after the upgrade a crash still resumes Claude by its id")
 
         # make win-upgrade: a build of a checkout installs itself (--self), hot, the same way
+        srw.wait_for(lambda: (fake / f"pid-{sid}").read_text().strip() != pid, "the resumed claude's pid")
         pid2 = (fake / f"pid-{sid}").read_text().strip()
         p = subprocess.run([str(exe), "upgrade", "--self"], env=env, capture_output=True, text=True, timeout=120)
-        assert p.returncode == 0 and "installed" in p.stdout and "1 window reloaded in place" in p.stdout, p.stdout
+        assert p.returncode == 0 and "installed" in p.stdout and "1 window now reloads in place" in p.stdout, p.stdout
         os.kill(int(pid2), 0)
         assert len(srw.calls(fake)) == 2, "Claude was not started again"
         p = subprocess.run([str(installed), "upgrade", "--self"], env=env, capture_output=True, text=True, timeout=60)
         assert "the installed hardcore already" in p.stdout, p.stdout
         app.end("K")
         print("ok   upgrade --self (make win-upgrade) installs a checkout's build hot; Claude runs on")
+
+        # run in a tab of the window it reloads, as you would: every line whole, in order,
+        # and all of it before the next prompt
+        for f in (config / "session").glob("*"):
+            f.unlink()
+        app = srw.App(helper, installed, config, fake)
+        exports = " ".join(f"{k}='{env[k]}'" for k in ("HARDCORE_INSTALL_EXE", "HARDCORE_TEST_CONFIG")) + \
+            " WSLENV=HARDCORE_INSTALL_EXE:HARDCORE_TEST_CONFIG"
+        app.send(f"T clear; export {exports}; '{exe}' upgrade --self | cat; echo END-$((6*7))")
+
+        def tab_text():
+            texts = sorted((config / "session").glob("*-tab*.txt"))
+            return texts[0].read_text(errors="replace") if texts else ""
+        srw.wait_for(lambda: "END-42" in tab_text(), "the command's end in the tab", 60)
+        time.sleep(3)
+        text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", tab_text())
+        rows = [r.rstrip() for r in text.replace("\r", "").split("\n")]
+        at = {key: next((i for i, r in enumerate(rows) if r.startswith(key)), -1)
+              for key in ("hardcore 0", "hardcore: installed", "hardcore: done.", "END-42")}
+        assert -1 not in at.values() and at["hardcore 0"] < at["hardcore: installed"] < at["hardcore: done."] < at["END-42"], (at, rows)
+        assert not any("hardcore:" in r for r in rows[at["END-42"]:]), rows
+        app.end("K")
+        print("ok   in a tab of the window it reloads: whole lines, in order, all before the prompt")
     finally:
         shutil.rmtree(lin, ignore_errors=True)
 
 
 if __name__ == "__main__":
+    shell_function_tests()
     script_tests()
     if len(sys.argv) < 2 or sys.argv[1] != "--script-only":
         windows_test(ROOT / "hardcore.exe")
