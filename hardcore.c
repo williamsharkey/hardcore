@@ -3213,6 +3213,8 @@ static void tab_destroy_async(Tab *tb) {
 
 static int g_cfg_elevated;      /* config.ini elevated=1: windows run as administrator (README: Run as administrator) */
 
+static int g_clean_copy;        /* config.ini clean_copy (see sel_text_clean) */
+
 static void config_path(wchar_t *out) { _snwprintf(out, MAX_PATH, L"%ls\\config.ini", g_cfg_dir); out[MAX_PATH - 1] = 0; }
 
 static void config_load(void) {
@@ -3240,6 +3242,7 @@ static void config_load(void) {
         else if (!strcmp(line, "shell")) g_shell_ps = !_stricmp(v, "powershell");
         else if (!strcmp(line, "width")) g_win_w = atoi(v);
         else if (!strcmp(line, "height")) g_win_h = atoi(v);
+        else if (!strcmp(line, "clean_copy")) g_clean_copy = !(v[0] == '0' || !_stricmp(v, "no") || !_stricmp(v, "false"));
         else if (!strcmp(line, "elevated")) g_cfg_elevated = v[0] == '1' || !_stricmp(v, "yes") || !_stricmp(v, "true");
         else config_look(line, v);
     }
@@ -3260,6 +3263,9 @@ static void config_save(void) {
     fprintf(f, "# shell=powershell runs PowerShell in tabs instead of WSL; empty = WSL\n");
     fprintf(f, "shell=%s\n", g_shell_ps ? "powershell" : "");
     fprintf(f, "width=%d\nheight=%d\n", g_win_w, g_win_h);
+    fprintf(f, "# clean_copy=1: a copy leaves out Claude Code's marks (\xe2\x97\x8f \xe2\x8e\xbf \xe2\x9d\xaf \xe2\x96\x8e) and the indent the lines share,\n"
+               "# and joins the lines Claude broke at the right edge; 0 = copy the screen as it is\n");
+    fprintf(f, "clean_copy=%d\n", g_clean_copy);
     fprintf(f, "# elevated=1 starts windows as administrator (one UAC prompt); empty = a normal window\n");
     fprintf(f, "elevated=%s\n", g_cfg_elevated ? "1" : "");
     fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
@@ -3632,7 +3638,8 @@ static char *sel_text(const Term *t, long long r0, int c0, long long r1, int c1,
         for (x = x0; x <= x1 && x < clen; x++) {
             if (cells[x].wflag == W_CONT || cells[x].wflag == W_PAD) continue;
             if (n + 8 >= cap) out = (char *)realloc(out, cap *= 2);
-            n += utf8_encode((cells[x].wflag & 8) ? (cells[x].attr ? ' ' : 0xFFFC) : cells[x].ch ? cells[x].ch : ' ', out + n);
+            n += utf8_encode((cells[x].wflag & 8) ? (cells[x].attr ? ' ' : 0xFFFC) :
+                             cells[x].ch && cells[x].ch != 0xA0 ? cells[x].ch : ' ', out + n);   /* NBSP (Claude's prompt) is a space */
         }
         if (!(wrapped && r < r1) || x1 < clen - 1) {
             while (n > line_start && out[n - 1] == ' ') n--;
@@ -3649,6 +3656,157 @@ static char *sel_text(const Term *t, long long r0, int c0, long long r1, int c1,
     return out;
 }
 
+/* ── clean copy: Claude Code's screen as the text it stands for ──────
+   Claude Code breaks its own lines (a newline and an indent, not a soft
+   wrap) and puts marks in front of blocks (● ⎿ ❯ ▎). With clean_copy on, a
+   copy (1) leaves out a mark at the start of a line, (2) takes away the
+   indent all the copied lines share, and (3) joins a line to the one before
+   it when the line before stops at the right edge: its next word would not
+   have fit there, and the line carries on at the same indent (not a list item,
+   a mark or a table; not after a sentence that ends well short of the edge).
+   The terminal can't know Claude's text for sure: a line that really ended
+   near the edge is joined too. Soft wraps (the terminal's own) always join. */
+static int g_clean_copy =
+#ifdef _WIN32
+    1;
+#else
+    0;
+#endif
+
+typedef struct { uint32_t *cp; int *col, n, cap, tail_end, head; } CopyLine;
+
+static int copy_gutter(uint32_t c) {
+    return c == 0x25CF || c == 0x23FA || c == 0x23BF || c == 0x276F || c == 0x258E || c == 0x258D ||
+           c == 0x258C || c == 0x2502 || c == 0x2503 || c == 0x2575;
+}
+static int copy_box(uint32_t c) { return c >= 0x2500 && c <= 0x257F; }
+
+static void copy_line_push(CopyLine *l, uint32_t c, int col) {
+    if (l->n == l->cap) {
+        int cap = l->cap ? l->cap * 2 : 128;
+        uint32_t *a = (uint32_t *)realloc(l->cp, (size_t)cap * sizeof(uint32_t));
+        int *b = a ? (int *)realloc(l->col, (size_t)cap * sizeof(int)) : NULL;
+        if (a) l->cp = a;
+        if (!a || !b) return;
+        l->col = b; l->cap = cap;
+    }
+    l->cp[l->n] = c; l->col[l->n++] = col;
+}
+
+/* Where a line's text starts (after a mark and its spaces), its body (after a
+   list marker), whether it had a mark, and whether it holds box drawing. */
+static void copy_line_shape(const CopyLine *l, int *start, int *body, int *gutter, int *box) {
+    int i = 0, k, others = 0;
+    *gutter = *box = 0;
+    while (i < l->n && l->cp[i] == ' ') i++;
+    for (k = 0; k < l->n; k++) if (copy_box(l->cp[k]) && k != i) others = 1;
+    if (i < l->n && copy_gutter(l->cp[i]) && (i + 1 >= l->n || l->cp[i + 1] == ' ') &&
+        !((l->cp[i] == 0x2502 || l->cp[i] == 0x2503 || l->cp[i] == 0x2575) && others)) {
+        *gutter = 1;
+        for (i++; i < l->n && l->cp[i] == ' '; i++) {}
+    }
+    for (k = i; k < l->n && !*box; k++) if (copy_box(l->cp[k])) *box = 1;
+    *start = i;
+    *body = i;
+    if (i < l->n) {
+        k = i;
+        if ((l->cp[k] == '-' || l->cp[k] == '*' || l->cp[k] == 0x2022) && k + 1 < l->n && l->cp[k + 1] == ' ') k += 2;
+        else {
+            while (k < l->n && l->cp[k] >= '0' && l->cp[k] <= '9') k++;
+            k = (k > i && k + 1 < l->n && (l->cp[k] == '.' || l->cp[k] == ')') && l->cp[k + 1] == ' ') ? k + 2 : i;
+        }
+        while (k < l->n && l->cp[k] == ' ') k++;
+        *body = k;
+    }
+}
+
+static int copy_list_item(const CopyLine *l, int start, int body) { return body != start && start < l->n; }
+
+/* The clean text of rows r0..r1 (see above): malloc'd, *len bytes. */
+static char *sel_text_clean(const Term *t, long long r0, int c0, long long r1, int c1, int cols, size_t *len) {
+    CopyLine *lines = NULL;
+    int nl = 0, capl = 0, i, common = INT_MAX, open = 0;
+    long long r;
+    size_t n = 0, cap = 4096;
+    char *out;
+    for (r = r0; r <= r1; r++) {
+        const Cell *cells;
+        int clen, wrapped, x, x0 = (r == r0) ? c0 : 0, x1 = (r == r1) ? c1 : 1 << 30, last = -1;
+        long long L = r - term_base(t);
+        CopyLine *l;
+        term_line(t, (int)L, &cells, &clen, &wrapped);
+        if (L < 0) continue;
+        if (!open) {
+            if (nl == capl) {
+                CopyLine *more = (CopyLine *)realloc(lines, (size_t)(capl = capl ? capl * 2 : 64) * sizeof(CopyLine));
+                if (!more) break;
+                lines = more;
+            }
+            memset(&lines[nl++], 0, sizeof(CopyLine));
+        }
+        l = &lines[nl - 1];
+        for (x = x0; x <= x1 && x < clen; x++) {
+            uint32_t c;
+            if (cells[x].wflag == W_CONT || cells[x].wflag == W_PAD) continue;
+            c = (cells[x].wflag & 8) ? ' ' : cells[x].ch && cells[x].ch != 0xA0 ? cells[x].ch : ' ';
+            copy_line_push(l, c, x);
+            if (c != ' ') last = x + (cells[x].wflag == W_WIDE ? 2 : 1);
+        }
+        l->tail_end = last;
+        open = wrapped && r < r1 && x1 >= clen - 1;    /* a soft wrap: the next row runs on */
+    }
+    for (i = 0; i < nl; i++) {
+        int st, bd, g, b;
+        while (lines[i].n && lines[i].cp[lines[i].n - 1] == ' ') lines[i].n--;
+        copy_line_shape(&lines[i], &st, &bd, &g, &b);
+        if (st < lines[i].n && lines[i].col[st] < common) common = lines[i].col[st];
+    }
+    if (common == INT_MAX) common = 0;
+    out = (char *)malloc(cap);
+    for (i = 0; out && i < nl; i++) {
+        int st, bd, g, b, k;
+        CopyLine *l = &lines[i];
+        copy_line_shape(l, &st, &bd, &g, &b);
+        if (i > 0 && lines[i - 1].head >= 0 && st < l->n && !g && !b && !copy_list_item(l, st, bd)) {
+            /* a continuation of the paragraph above? */
+            const CopyLine *p = &lines[i - 1], *h = &lines[p->head];
+            int hs, hb, hg, hbox, w = 0;
+            copy_line_shape(h, &hs, &hb, &hg, &hbox);
+            for (k = st; k < l->n && l->cp[k] != ' '; k++) w += cp_width(l->cp[k]) > 1 ? 2 : 1;
+            uint32_t end = p->n ? p->cp[p->n - 1] : 0;
+            int sentence = end == '.' || end == '!' || end == '?' || end == ':';
+            /* a sentence that ends short of the edge, then a long word (a URL): a new line, most likely */
+            if (!hbox && hb < h->n && l->col[st] == h->col[hb] && p->tail_end >= 0 && p->tail_end + 1 + w > cols - 3 &&
+                (!sentence || p->tail_end > cols - 15)) {
+                if (p->tail_end < cols) out[n++] = ' ';    /* a line full to the edge broke inside a word */
+                l->head = p->head;
+                goto text;
+            }
+        }
+        if (i > 0) {
+#ifdef _WIN32
+            out[n++] = '\r';
+#endif
+            out[n++] = '\n';
+        }
+        l->head = (st < l->n && !b) ? i : -1;
+        if (st < l->n) for (k = common; k < l->col[st]; k++) {
+            if (n + 8 >= cap) { char *m = (char *)realloc(out, cap *= 2); if (!m) { free(out); out = NULL; break; } out = m; }
+            out[n++] = ' ';
+        }
+    text:
+        for (k = st; out && k < l->n; k++) {
+            if (n + 16 >= cap) { char *m = (char *)realloc(out, cap *= 2); if (!m) { free(out); out = NULL; break; } out = m; }
+            n += utf8_encode(l->cp[k], out + n);
+        }
+        if (out && n + 8 >= cap) { char *m = (char *)realloc(out, cap *= 2); if (!m) { free(out); out = NULL; } else out = m; }
+    }
+    for (i = 0; i < nl; i++) { free(lines[i].cp); free(lines[i].col); }
+    free(lines);
+    *len = out ? n : 0;
+    return out;
+}
+
 static void sel_copy(void) {
     Tab *tb = active_tab();
     long long r0, r1;
@@ -3657,7 +3815,7 @@ static void sel_copy(void) {
     char *out;
     if (!tb || !g_sel_on) return;
     sel_norm(&r0, &c0, &r1, &c1);
-    out = sel_text(&tb->t, r0, c0, r1, c1, &n);
+    out = g_clean_copy ? sel_text_clean(&tb->t, r0, c0, r1, c1, tb->t.cols, &n) : sel_text(&tb->t, r0, c0, r1, c1, &n);
     if (out) set_clipboard_utf8(out, (int)n);
     free(out);
 }
@@ -7039,6 +7197,44 @@ static int unit_issues(FILE *f) {
         fprintf(f, "%s issue a paste can't carry controls that end bracketed paste or signal the shell\n", ok ? "ok  " : "FAIL");
         fails += !ok;
     }
+    {   /* Claude Code's output (a title, OSC 8 links, words placed with CSI G, NBSP after the
+           prompt mark): fed whole or a byte at a time, no escape bytes reach the cells or a
+           copy; clean copy drops the marks and shared indent and joins Claude's own line breaks */
+        static const char claude_out[] = "\x1b""]0;\xe2""\x9c""\xb3"" Email draft\x07""\xe2""\x9d""\xaf""\xc2""\xa0""write an email\x0d""\x0a""\x0d""\x0a""\x1b""[38;2;255;255;255m\xe2""\x97""\x8f""\x1b""[39m Hi Meg,\x0d""\x0a""\x1b""[3GFollowing\x1b""[13Gup\x1b""[16Gon\x1b""[19Gyesterday's\x1b""[31Gcall,\x1b""[37Gthe\x1b""[41Gstaging\x0d""\x0a""\x1b""[3Genvironment\x1b""[15Gwill\x1b""[20Gbe\x1b""[23Gready\x1b""[29Gfor\x1b""[33Gthe\x1b""[37Gfinal\x1b""[43Ground\x1b""[49Gof\x1b""[52Gtesting\x0d""\x0a""\x1b""[3Gbefore\x1b""[10GFriday\x1b""[17Gafternoon.\x0d""\x0a""  Thanks, \x1b""]8;id=a1;https://example.com/sam\x1b""\x5c""Sam\x1b""]8;;\x1b""\x5c""\x0d""\x0a""\x0d""\x0a""  \xe2""\x8e""\xbf""  Read 3 files\x0d""\x0a""  \xe2""\x94""\x82"" a \xe2""\x94""\x82"" b \xe2""\x94""\x82""\x0d""\x0a""  - item one\x0d""\x0a""    more\x0d""\x0a""";
+        Term a, b;
+        int ok, i;
+        memset(&a, 0, sizeof(a)); memset(&b, 0, sizeof(b));
+        ok = term_init(&a, 60, 16) && term_init(&b, 60, 16);
+        if (ok) {
+            size_t na, nb, nc;
+            char *ta, *tb2, *tc;
+#ifdef _WIN32
+#define NL "\r\n"
+#else
+#define NL "\n"
+#endif
+            const char *want_plain = "\xe2\x9d\xaf write an email" NL NL "\xe2\x97\x8f Hi Meg," NL "  Following";
+            const char *want_clean = "write an email" NL NL "Hi Meg," NL
+                "Following up on yesterday's call, the staging environment will be ready for the final round of testing before Friday afternoon." NL
+                "Thanks, Sam" NL NL "   Read 3 files" NL "\xe2\x94\x82 a \xe2\x94\x82 b \xe2\x94\x82" NL "- item one" NL "  more";
+            vt_feed(&a, (const unsigned char *)claude_out, (int)sizeof(claude_out) - 1);
+            for (i = 0; i < (int)sizeof(claude_out) - 1; i++) vt_feed(&b, (const unsigned char *)claude_out + i, 1);
+            ta = sel_text(&a, term_abs_line(&a, 0), 0, term_abs_line(&a, 11), 59, &na);
+            tb2 = sel_text(&b, term_abs_line(&b, 0), 0, term_abs_line(&b, 11), 59, &nb);
+            tc = sel_text_clean(&a, term_abs_line(&a, 0), 0, term_abs_line(&a, 11), 59, 60, &nc);
+            ok = ta && tb2 && tc && na == nb && !memcmp(ta, tb2, na) && !memchr(ta, 0x1b, na) &&
+                 na > strlen(want_plain) && !memcmp(ta, want_plain, strlen(want_plain)) &&
+                 nc == strlen(want_clean) && !memcmp(tc, want_clean, nc);
+            for (i = 0; ok && i + 2 < (int)na; i++) if (ta[i] == ']' && (ta[i + 1] == '0' || ta[i + 1] == '8') && ta[i + 2] == ';') ok = 0;
+            if (!ok && tc) fprintf(f, "     clean copy: [%.*s]\n", (int)nc, tc);
+            free(ta); free(tb2); free(tc);
+#undef NL
+        }
+        if (a.cols) term_free(&a);
+        if (b.cols) term_free(&b);
+        fprintf(f, "%s Claude Code's output copies with no escape bytes; clean copy drops its marks and joins its line breaks\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
     {   /* copying a row a wide char didn't fit on: no space before it (wezterm, kitty) */
         Term t;
         int ok = term_init(&t, 10, 3);
@@ -8670,6 +8866,34 @@ static int replay(const char *out_path, int cols, int rows, wchar_t **files, int
     return 0;
 }
 
+/* --copy OUT COLS ROWS FILE: what copying all of FILE's screen and scrollback
+   puts on the clipboard, plain and clean (see sel_text_clean) */
+static int copy_dump(const char *out_path, int cols, int rows, const wchar_t *file) {
+    FILE *in = _wfopen(file, L"rb"), *out;
+    Term t;
+    unsigned char buf[65536];
+    size_t n;
+    char *a, *b;
+    size_t na = 0, nb = 0;
+    long long first, last;
+    if (!in) return 3;
+    memset(&t, 0, sizeof(t));
+    if (!term_init(&t, cols, rows)) { fclose(in); return 4; }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) vt_feed(&t, buf, (int)n);
+    fclose(in);
+    first = term_base(&t);
+    last = term_abs_line(&t, rows - 1);
+    a = sel_text(&t, first, 0, last, cols - 1, &na);
+    b = sel_text_clean(&t, first, 0, last, cols - 1, cols, &nb);
+    if ((out = fopen(out_path, "wb"))) {
+        fprintf(out, "--- plain\n%.*s\n--- clean\n%.*s\n", (int)na, a ? a : "", (int)nb, b ? b : "");
+        fclose(out);
+    }
+    free(a); free(b);
+    term_free(&t);
+    return out ? 0 : 3;
+}
+
 static double bench_now_ms(void) {
     LARGE_INTEGER t, f;
     QueryPerformanceCounter(&t);
@@ -9345,6 +9569,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             char out[MAX_PATH * 3];
             WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
             return replay(out, _wtoi(argv[i + 2]), _wtoi(argv[i + 3]), argv + i + 4, argc - i - 4);
+        } else if (!strcmp(a, "--copy") && i + 4 < argc) {
+            char out[MAX_PATH * 3];
+            WideCharToMultiByte(CP_UTF8, 0, argv[i + 1], -1, out, sizeof(out), NULL, NULL);
+            return copy_dump(out, _wtoi(argv[i + 2]), _wtoi(argv[i + 3]), argv[i + 4]);
         } else if (!strcmp(a, "--selftest") && i + 1 < argc) {
             WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, selftest_out, sizeof(selftest_out), NULL, NULL);
         } else if (a[0] != '-') {
