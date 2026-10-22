@@ -3241,6 +3241,7 @@ static void tab_destroy_async(Tab *tb) {
 /* ── config ────────────────────────────────────────────────────────── */
 
 static int g_cfg_elevated;      /* config.ini elevated=1: windows run as administrator (README: Run as administrator) */
+static int g_ctrl_copy = 1;     /* config.ini ctrl_copy: Ctrl+C copies a selection, Ctrl+V pastes (Windows Terminal's way) */
 
 static void config_path(wchar_t *out) { _snwprintf(out, MAX_PATH, L"%ls\\config.ini", g_cfg_dir); out[MAX_PATH - 1] = 0; }
 
@@ -3270,6 +3271,7 @@ static void config_load(void) {
         else if (!strcmp(line, "width")) g_win_w = atoi(v);
         else if (!strcmp(line, "height")) g_win_h = atoi(v);
         else if (!strcmp(line, "elevated")) g_cfg_elevated = v[0] == '1' || !_stricmp(v, "yes") || !_stricmp(v, "true");
+        else if (!strcmp(line, "ctrl_copy")) g_ctrl_copy = !(v[0] == '0' || !_stricmp(v, "no") || !_stricmp(v, "false"));
         else config_look(line, v);
     }
     fclose(f);
@@ -3291,6 +3293,9 @@ static void config_save(void) {
     fprintf(f, "width=%d\nheight=%d\n", g_win_w, g_win_h);
     fprintf(f, "# elevated=1 starts windows as administrator (one UAC prompt); empty = a normal window\n");
     fprintf(f, "elevated=%s\n", g_cfg_elevated ? "1" : "");
+    fprintf(f, "# ctrl_copy=1: Ctrl+C copies the selection (no selection: ^C as always), Ctrl+X copies it too,\n"
+               "# Ctrl+V pastes; 0 = only Ctrl+Shift+C / Ctrl+Shift+V (Ctrl+C, Ctrl+V, Ctrl+X go to the program)\n");
+    fprintf(f, "ctrl_copy=%d\n", g_ctrl_copy);
     fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
     fprintf(f, "last=%s\n", g_last_dir);
     config_look_save(f);
@@ -3689,6 +3694,20 @@ static void sel_copy(void) {
     out = sel_text(&tb->t, r0, c0, r1, c1, &n);
     if (out) set_clipboard_utf8(out, (int)n);
     free(out);
+}
+
+/* What a key with Ctrl does to the clipboard on Windows: 1 copy (and clear
+   the selection), 2 paste, 0 nothing (the key goes to the program).
+   Ctrl+Shift+C/X copy and Ctrl+Shift+V pastes always. With ctrl_copy on, as
+   in Windows Terminal: Ctrl+C and Ctrl+X copy only when there is a selection
+   (a terminal can't cut; no selection = ^C / ^X), Ctrl+V pastes. key is the
+   letter, upper case. */
+static int copy_key(int key, int ctrl, int shift, int alt, int sel_on, int ctrl_copy) {
+    if (!ctrl || alt) return 0;
+    if (shift) return key == 'C' || key == 'X' ? 1 : key == 'V' ? 2 : 0;
+    if (!ctrl_copy) return 0;
+    if ((key == 'C' || key == 'X') && sel_on) return 1;
+    return key == 'V' ? 2 : 0;
 }
 
 static void send_to_active(const char *s, int n) {
@@ -6390,8 +6409,6 @@ static int handle_keydown(WPARAM vk) {
         case 'B': mac_browser_open_welcome(); return 1;          /* a browser tab */
         case 'M': mac_browser_command(0); return 1;              /* a page: Mono ↔ Native */
         case 'W': close_tab(g_active); return 1;
-        case 'C': sel_copy(); g_sel_on = 0; InvalidateRect(g_hwnd, NULL, FALSE); return 1;
-        case 'V': paste(); return 1;
         case VK_TAB: activate((g_active + g_ntabs - 1) % g_ntabs); return 1;
         case 'J': jump_to_attention(); return 1;
         case VK_UP: jump_mark(-1); return 1;
@@ -6399,6 +6416,12 @@ static int handle_keydown(WPARAM vk) {
         }
     }
     if (ctrl && !shift && !alt && vk == VK_TAB) { activate((g_active + 1) % g_ntabs); return 1; }
+    /* copy and paste: Ctrl+Shift+C/X/V, and Ctrl+C/X/V with ctrl_copy (paste is
+       bracketed when the program asked for it) */
+    switch (copy_key((int)vk, ctrl, shift, alt, g_sel_on, g_ctrl_copy)) {
+    case 1: sel_copy(); g_sel_on = 0; InvalidateRect(g_hwnd, NULL, FALSE); return 1;
+    case 2: paste(); return 1;
+    }
     /* AltGr arrives as Ctrl+Alt with the right Alt down; on many layouts
        AltGr+7/8/9/0 is how you type { [ ] }, so it's never a tab jump */
     if (ctrl && alt && !(GetKeyState(VK_RMENU) & 0x8000) && vk >= '1' && vk <= '9') { activate(vk == '9' ? g_ntabs - 1 : (int)(vk - '1')); return 1; }
@@ -7058,6 +7081,17 @@ static int unit_issues(FILE *f) {
         for (i = 0; i < (int)(sizeof(links) / sizeof(*links)); i++)
             if (link_action(links[i].url) != links[i].want) { ok = 0; fprintf(f, "     link %s: %d\n", links[i].url, link_action(links[i].url)); }
         fprintf(f, "%s issue a clicked link can't run a program unasked\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
+    {   /* Ctrl+C/X copy a selection (else ^C/^X), Ctrl+V pastes; Ctrl+Shift always; ctrl_copy=0 = Shift only */
+        int ok = copy_key('C', 1, 0, 0, 1, 1) == 1 && copy_key('C', 1, 0, 0, 0, 1) == 0 &&
+                 copy_key('X', 1, 0, 0, 1, 1) == 1 && copy_key('X', 1, 0, 0, 0, 1) == 0 &&
+                 copy_key('V', 1, 0, 0, 0, 1) == 2 && copy_key('V', 1, 0, 0, 1, 1) == 2 &&
+                 copy_key('C', 1, 0, 0, 1, 0) == 0 && copy_key('V', 1, 0, 0, 0, 0) == 0 &&
+                 copy_key('C', 1, 1, 0, 0, 0) == 1 && copy_key('X', 1, 1, 0, 1, 0) == 1 && copy_key('V', 1, 1, 0, 0, 0) == 2 &&
+                 copy_key('C', 1, 0, 1, 1, 1) == 0 && copy_key('V', 1, 0, 1, 0, 1) == 0 &&   /* AltGr / Ctrl+Alt */
+                 copy_key('C', 0, 0, 0, 1, 1) == 0 && copy_key('A', 1, 0, 0, 1, 1) == 0;
+        fprintf(f, "%s Ctrl+C copies a selection or sends ^C; Ctrl+V pastes; ctrl_copy=0 leaves them to the program\n", ok ? "ok  " : "FAIL");
         fails += !ok;
     }
     {   /* a paste sends text, tabs and line ends only (oss-security 2023/10/20/2) */
