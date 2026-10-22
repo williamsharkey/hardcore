@@ -45,6 +45,8 @@
 #include <winhttp.h>
 #include <tlhelp32.h>
 #include <bcrypt.h>
+#include <sddl.h>
+#include <aclapi.h>
 #define COBJMACROS
 #include <d3d11.h>
 #include <dxgi1_5.h>
@@ -3209,6 +3211,8 @@ static void tab_destroy_async(Tab *tb) {
 
 /* ── config ────────────────────────────────────────────────────────── */
 
+static int g_cfg_elevated;      /* config.ini elevated=1: windows run as administrator (README: Run as administrator) */
+
 static void config_path(wchar_t *out) { _snwprintf(out, MAX_PATH, L"%ls\\config.ini", g_cfg_dir); out[MAX_PATH - 1] = 0; }
 
 static void config_load(void) {
@@ -3236,6 +3240,7 @@ static void config_load(void) {
         else if (!strcmp(line, "shell")) g_shell_ps = !_stricmp(v, "powershell");
         else if (!strcmp(line, "width")) g_win_w = atoi(v);
         else if (!strcmp(line, "height")) g_win_h = atoi(v);
+        else if (!strcmp(line, "elevated")) g_cfg_elevated = v[0] == '1' || !_stricmp(v, "yes") || !_stricmp(v, "true");
         else config_look(line, v);
     }
     fclose(f);
@@ -3255,6 +3260,8 @@ static void config_save(void) {
     fprintf(f, "# shell=powershell runs PowerShell in tabs instead of WSL; empty = WSL\n");
     fprintf(f, "shell=%s\n", g_shell_ps ? "powershell" : "");
     fprintf(f, "width=%d\nheight=%d\n", g_win_w, g_win_h);
+    fprintf(f, "# elevated=1 starts windows as administrator (one UAC prompt); empty = a normal window\n");
+    fprintf(f, "elevated=%s\n", g_cfg_elevated ? "1" : "");
     fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
     fprintf(f, "last=%s\n", g_last_dir);
     config_look_save(f);
@@ -7825,6 +7832,23 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 new_tab_here();
                 if (g_lat) g_nt_id = active_tab() ? active_tab()->id : 0;
             }
+            else if (!strncmp(buf, "run ", 4) || !strncmp(buf, "runhere ", 8)) {
+                /* hardcore tab [COMMAND]: a new tab (runhere: the active one, a cold
+                   start's first tab) with COMMAND typed into it, and the window in front */
+                const char *text = buf + (buf[3] == 'h' ? 8 : 4);
+                Tab *rt;
+                if (buf[3] != 'h') {
+                    if (g_ntabs >= MAX_TABS) return FALSE;
+                    new_tab_here();
+                }
+                if (!(rt = active_tab())) return FALSE;
+                if (*text) {
+                    tab_write(rt, text, (int)strlen(text));
+                    tab_write(rt, "\r", 1);
+                }
+                if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
             else if (!strcmp(buf, "nexttab")) activate((g_active + 1) % g_ntabs);
             else if (!strcmp(buf, "closetab")) close_tab(g_active);
             else if (!strcmp(buf, "close")) PostMessageW(hwnd, WM_CLOSE, 0, 0);   /* as the × does */
@@ -8762,6 +8786,8 @@ static int sha256_hex(const char *data, size_t n, char out[65]) {
     return ok;
 }
 
+static int pipe_send(DWORD kind, const void *data, size_t n, DWORD *res);
+
 static int update_cmd(int force) {
     char *json, *bin, tag[64], url[1024], digest[96] = "", hex[65];
     const char *asset;
@@ -8845,6 +8871,10 @@ static int update_cmd(int force) {
             if (SendMessageTimeoutW(w, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 20000, &res) && res) ok++;
             else bad++;
         }
+        if (bad) {                  /* an elevated window ignores a normal process's messages: its pipe */
+            DWORD res = 0;
+            if (pipe_send(0x48430002, "reload", 6, &res) && res) { ok++; bad--; }
+        }
         if (ok) cli("hardcore: %d window%s reloaded in place\n", ok, ok == 1 ? "" : "s");
         if (bad) cli("hardcore: %d window%s couldn't reload in place: close and reopen %s to finish\n", bad, bad == 1 ? "" : "s", bad == 1 ? "it" : "them");
     }
@@ -8886,6 +8916,292 @@ static void folder_for_tab(const wchar_t *w, char *out, size_t cap) {
     else WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL);
 }
 
+/* ── run as administrator, and the command pipe ─────────────────────────
+   With elevated=1 in config.ini a window runs elevated. Windows (UIPI) drops
+   WM_COPYDATA from a normal process to an elevated window, so every window
+   also serves \\.\pipe\hardcore-<your SID>: `hardcore tab`, hostdash open and
+   `hardcore update` try it first. Only processes running as you are served. */
+
+#define HC_PIPE_SPAWN 0x48430010u   /* "E" or "-", NUL, folder, NUL, arguments: a new window */
+
+static int is_elevated(void) {
+    HANDLE t;
+    TOKEN_ELEVATION e;
+    DWORD n;
+    int r = 0;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) {
+        if (GetTokenInformation(t, TokenElevation, &e, sizeof(e), &n)) r = e.TokenIsElevated != 0;
+        CloseHandle(t);
+    }
+    return r;
+}
+
+/* the user SID of a process, as S-1-5-21-... */
+static int process_sid(HANDLE proc, char *out, size_t cap) {
+    HANDLE t;
+    BYTE buf[256];
+    DWORD n;
+    LPSTR s;
+    int ok = 0;
+    if (!OpenProcessToken(proc, TOKEN_QUERY, &t)) return 0;
+    if (GetTokenInformation(t, TokenUser, buf, sizeof(buf), &n) && ConvertSidToStringSidA(((TOKEN_USER *)buf)->User.Sid, &s)) {
+        snprintf(out, cap, "%s", s);
+        LocalFree(s);
+        ok = 1;
+    }
+    CloseHandle(t);
+    return ok;
+}
+
+static const char *my_sid(void) {
+    static char sid[184];
+    if (!sid[0]) process_sid(GetCurrentProcess(), sid, sizeof(sid));
+    return sid;
+}
+
+static int pipe_name(wchar_t *out, size_t cap) {
+    if (!my_sid()[0]) return 0;
+    _snwprintf(out, cap, L"\\\\.\\pipe\\hardcore-%hs", my_sid());
+    out[cap - 1] = 0;
+    return 1;
+}
+
+/* a client of the pipe: a process that runs as you */
+static int pid_is_mine(DWORD pid) {
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    char sid[184];
+    int ok;
+    if (!p) return 0;
+    ok = process_sid(p, sid, sizeof(sid)) && !strcmp(sid, my_sid());
+    CloseHandle(p);
+    return ok;
+}
+
+/* a server of the pipe: its owner is you, or Administrators (an elevated window's default owner) */
+static int pipe_owner_ok(HANDLE h) {
+    PSID owner = NULL, admins = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+    LPSTR s = NULL;
+    int ok = 0;
+    if (GetSecurityInfo(h, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL, NULL, NULL, &sd) != ERROR_SUCCESS) return 0;
+    if (ConvertSidToStringSidA(owner, &s)) { ok = !strcmp(s, my_sid()); LocalFree(s); }
+    if (!ok && AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins)) {
+        ok = EqualSid(owner, admins);
+        FreeSid(admins);
+    }
+    LocalFree(sd);
+    return ok;
+}
+
+/* one request to a running window: 1 when one answered (its answer in *res) */
+static int pipe_send(DWORD kind, const void *data, size_t n, DWORD *res) {
+    wchar_t name[256];
+    HANDLE h = INVALID_HANDLE_VALUE;
+    char *msg;
+    DWORD w, got = 0, ans = 0;
+    ULONG spid = 0;
+    int i, ok = 0;
+    if (!pipe_name(name, 256) || n > 60000) return 0;
+    for (i = 0; i < 20; i++) {
+        h = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, NULL);
+        if (h != INVALID_HANDLE_VALUE || GetLastError() != ERROR_PIPE_BUSY) break;
+        WaitNamedPipeW(name, 500);
+    }
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!pipe_owner_ok(h)) { CloseHandle(h); return 0; }
+    if (GetNamedPipeServerProcessId(h, &spid)) AllowSetForegroundWindow(spid);   /* its window may come to the front */
+    if ((msg = (char *)malloc(n + 4))) {
+        memcpy(msg, &kind, 4);
+        memcpy(msg + 4, data, n);
+        if (WriteFile(h, msg, (DWORD)(n + 4), &w, NULL) && ReadFile(h, &ans, 4, &got, NULL) && got == 4) ok = 1;
+        free(msg);
+    }
+    CloseHandle(h);
+    if (ok && res) *res = ans;
+    return ok;
+}
+
+static void quote_arg(wchar_t *cl, size_t cap, const wchar_t *a) {
+    size_t k = wcslen(cl);
+    if (k + wcslen(a) + 4 >= cap) return;
+    _snwprintf(cl + k, cap - k, wcspbrk(a, L" \t") || !*a ? L" \"%ls\"" : L" %ls", a);
+    cl[cap - 1] = 0;
+}
+
+/* a pipe request for a new window: this (elevated) process starts it, so no prompt */
+static DWORD pipe_spawn(const char *msg, size_t n) {
+    const char *dir = msg + 2, *args;
+    wchar_t wdir[1100], wargs[4096], cl[4600];
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    if (n < 4 || msg[1] || !memchr(dir, 0, n - 2)) return 0;
+    args = dir + strlen(dir) + 1;
+    if ((size_t)(args - msg) >= n || !memchr(args, 0, n - (size_t)(args - msg))) return 0;
+    if (msg[0] == 'E' && !is_elevated()) return 0;          /* asked for an elevated window: not here */
+    MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, 1100);
+    MultiByteToWideChar(CP_UTF8, 0, args, -1, wargs, 4096);
+    _snwprintf(cl, 4600, L"\"%ls\" --detached%ls", g_exe_path, wargs);
+    cl[4599] = 0;
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    if (!CreateProcessW(g_exe_path, cl, NULL, NULL, FALSE, 0, NULL, wdir[0] ? wdir : NULL, &si, &pi)) return 0;
+    AllowSetForegroundWindow(pi.dwProcessId);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return 1;
+}
+
+static DWORD WINAPI pipe_thread(LPVOID unused) {
+    wchar_t name[256], sddl[400];
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    static char msg[65536];
+    (void)unused;
+    if (!pipe_name(name, 256)) return 0;
+    /* you only, labeled Medium so a normal (not elevated) process of yours may connect */
+    _snwprintf(sddl, 400, L"D:P(A;;GA;;;%hs)S:(ML;;NW;;;ME)", my_sid());
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, NULL)) return 0;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    for (;;) {
+        HANDLE p = CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                                    PIPE_UNLIMITED_INSTANCES, 4096, sizeof(msg), 0, &sa);
+        DWORD n = 0, res = 0, w;
+        ULONG pid = 0;
+        if (p == INVALID_HANDLE_VALUE) { Sleep(5000); continue; }
+        if ((ConnectNamedPipe(p, NULL) || GetLastError() == ERROR_PIPE_CONNECTED) &&
+            GetNamedPipeClientProcessId(p, &pid) && pid_is_mine(pid) &&
+            ReadFile(p, msg, sizeof(msg) - 1, &n, NULL) && n >= 4) {
+            DWORD kind;
+            memcpy(&kind, msg, 4);
+            msg[n] = 0;
+            if (kind == HC_PIPE_SPAWN) res = pipe_spawn(msg + 4, n - 4);
+            else if (g_hwnd) {   /* the window's own WM_COPYDATA commands, sent from inside this process */
+                COPYDATASTRUCT cd;
+                DWORD_PTR r = 0;
+                cd.dwData = kind;
+                cd.cbData = n - 4;
+                cd.lpData = msg + 4;
+                if (SendMessageTimeoutW(g_hwnd, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 20000, &r)) res = (DWORD)r;
+            }
+            WriteFile(p, &res, 4, &w, NULL);
+            FlushFileBuffers(p);
+        }
+        DisconnectNamedPipe(p);
+        CloseHandle(p);
+    }
+    return 0;
+}
+
+/* elevated=1 and this copy isn't: an elevated window takes over, then this one exits.
+   1 = handed over. A running elevated window starts it without a prompt; else one UAC prompt. */
+static int relaunch_elevated(int argc, wchar_t **argv) {
+    wchar_t args[4096] = L"", here[MAX_PATH * 2];
+    char msg[4096 * 3 + MAX_PATH * 6];
+    int i, n;
+    DWORD res = 0;
+    SHELLEXECUTEINFOW sei;
+    for (i = 1; i < argc; i++)
+        if (wcscmp(argv[i], L"--detached")) quote_arg(args, 4096, argv[i]);
+    GetCurrentDirectoryW(MAX_PATH * 2, here);
+    msg[0] = 'E';
+    msg[1] = 0;
+    n = 2 + WideCharToMultiByte(CP_UTF8, 0, here, -1, msg + 2, MAX_PATH * 6, NULL, NULL);
+    n += WideCharToMultiByte(CP_UTF8, 0, args, -1, msg + n, (int)sizeof(msg) - n, NULL, NULL);
+    if (pipe_send(HC_PIPE_SPAWN, msg, (size_t)n, &res) && res) return 1;
+    {
+        wchar_t params[4200];
+        _snwprintf(params, 4200, L"--detached%ls", args);
+        params[4199] = 0;
+        memset(&sei, 0, sizeof(sei));
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+        sei.lpVerb = L"runas";
+        sei.lpFile = g_exe_path;
+        sei.lpParameters = params;
+        sei.lpDirectory = here;
+        sei.nShow = SW_SHOWNORMAL;
+        return ShellExecuteExW(&sei) != 0;   /* No on the prompt: this copy opens a normal window instead */
+    }
+}
+
+/* hardcore tab [--] [COMMAND...]: COMMAND typed into a new tab of the running
+   window (none: a new window in this folder, and COMMAND in its first tab) */
+static int tab_cmd(int argc, wchar_t **argv) {
+    char text[4000] = "", req[4100], dir[1100];
+    wchar_t here[MAX_PATH * 2], self[MAX_PATH], cl[4096], wdir[1100];
+    size_t k = 0;
+    int i, t;
+    DWORD res = 0;
+    HWND w;
+    for (i = 0; i < argc; i++) {
+        if (!i && !wcscmp(argv[i], L"--")) continue;
+        if (k && k + 1 < sizeof(text)) text[k++] = ' ';
+        k += (size_t)WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, text + k, (int)(sizeof(text) - k), NULL, NULL);
+        if (k) k--;           /* the terminator */
+        text[k] = 0;
+    }
+    snprintf(req, sizeof(req), "run %s", text);
+    if (pipe_send(0x48430002, req, strlen(req), &res)) {
+        if (!res) { cli("hardcore: the window did not open the tab\n"); return 1; }
+        cli("hardcore: tab opened\n");
+        return 0;
+    }
+    if ((w = FindWindowExW(NULL, NULL, L"hardcore", NULL)) != NULL) {   /* a build without the pipe */
+        COPYDATASTRUCT cd;
+        DWORD_PTR r = 0;
+        cd.dwData = 0x48430002;
+        cd.cbData = (DWORD)strlen(req) + 1;
+        cd.lpData = req;
+        if (SendMessageTimeoutW(w, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 10000, &r) && r) { cli("hardcore: tab opened\n"); return 0; }
+        if (GetLastError() == ERROR_ACCESS_DENIED) { cli("hardcore: the running window is elevated and has no command pipe (an older build): restart it\n"); return 1; }
+        cd.cbData = 7;
+        cd.lpData = (void *)"newtab";
+        if (SendMessageTimeoutW(w, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 10000, &r) && r) {
+            if (text[0]) {
+                Sleep(1500);
+                snprintf(req, sizeof(req), "%s\n", text);
+                cd.dwData = 0x48430001;
+                cd.cbData = (DWORD)strlen(req) + 1;
+                cd.lpData = req;
+                SendMessageTimeoutW(w, WM_COPYDATA, 0, (LPARAM)&cd, SMTO_ABORTIFHUNG, 10000, &r);
+            }
+            cli("hardcore: tab opened\n");
+            return 0;
+        }
+        cli("hardcore: the running window did not answer\n");
+        return 1;
+    }
+    /* none runs: a window in this folder (elevated=1: after its prompt), then its first tab */
+    GetCurrentDirectoryW(MAX_PATH * 2, here);
+    folder_for_tab(here, dir, sizeof(dir));
+    MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, 1100);
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    _snwprintf(cl, 4096, L"\"%ls\" --detached --cd \"%ls\"", self, wdir);
+    cl[4095] = 0;
+    {
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof(si));
+        si.cb = sizeof(si);
+        if (!CreateProcessW(self, cl, NULL, NULL, FALSE, DETACHED_PROCESS, NULL, NULL, &si, &pi)) { cli("hardcore: could not start a window\n"); return 1; }
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    snprintf(req, sizeof(req), "runhere %s", text);
+    for (t = 0; t < 1200; t++) {          /* up to 2 minutes: a UAC prompt may wait for you */
+        Sleep(100);
+        if (pipe_send(0x48430002, req, strlen(req), &res)) {
+            cli(res ? "hardcore: window started\n" : "hardcore: the new window did not take the command\n");
+            return res ? 0 : 1;
+        }
+    }
+    cli("hardcore: no window answered in 2 minutes\n");
+    return 1;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     int argc, i, cols, rows;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -8896,6 +9212,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     int dir_given = 0;           /* a folder on the command line: open there, don't restore the last session */
     int quiet_start = 0;         /* --no-activate: windows opened for other sessions open behind too */
     wchar_t want_session[64] = L"";   /* --session ID: restore that saved session (opened for it by another window) */
+    int detached_arg = 0;
     int slurp_window = 0;
     HWND h;
     HANDLE gfx_thread = NULL;
@@ -8968,6 +9285,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             return bench_resize(out);
         } else if (!strcmp(a, "slurp")) {
             return slurp_cmd(argc - i - 1, argv + i + 1);
+        } else if (!strcmp(a, "tab")) {
+            return tab_cmd(argc - i - 1, argv + i + 1);
+        } else if (!strcmp(a, "--detached")) {
+            detached_arg = 1;      /* started by a hardcore (a relaunch, the pipe) or a login task: no detach, a session as Explorer's */
         } else if (!strcmp(a, "--slurp-selftest") && i + 1 < argc) {
             return slurp_selftest(argv[i + 1]);
         } else if (!strcmp(a, "--slurp-wsl-selftest") && i + 1 < argc) {
@@ -8995,6 +9316,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 "  hardcore here           use the native Linux build inside WSL\n"
                 "  hardcore exit/detach    here session commands in the native Linux build\n"
                 "  hardcore update         install the latest release (--force: even if current)\n"
+                "  hardcore tab [-- CMD]   a new tab in the running window, CMD typed into it\n"
                 "  hardcore slurp          attach running WSL and classic Windows consoles\n"
                 "  hardcore slurp --list   discover eligible sessions without attaching\n"
                 "  hardcore --version      this build's version\n", HARDCORE_VERSION);
@@ -9033,7 +9355,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     /* `hardcore` or `hardcore DIR` typed in a shell: a window there (the shell's
        folder if none was named), started on its own so the shell gets its
        prompt back (WSL waits for the Windows programs it starts) */
-    if (!slurp_window && !selftest_out[0] && show != SW_SHOWNOACTIVATE && !g_adopting && !_wgetenv(L"HARDCORE_DETACHED") && from_command_line()) {
+    if (!slurp_window && !selftest_out[0] && show != SW_SHOWNOACTIVATE && !g_adopting && !detached_arg && !_wgetenv(L"HARDCORE_DETACHED") && from_command_line()) {
         wchar_t self[MAX_PATH], here[MAX_PATH * 2], full[MAX_PATH * 2], cl[4096], wdir[1100];
         char dir[1100];
         STARTUPINFOW si;
@@ -9064,6 +9386,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         dir_given = 1;
     }
     SetEnvironmentVariableW(L"HARDCORE_DETACHED", NULL);   /* not for the tabs' children */
+    if (g_cfg_elevated && !slurp_window && !selftest_out[0] && show != SW_SHOWNOACTIVATE && !g_adopting && !is_elevated() &&
+        relaunch_elevated(argc, argv)) {
+        LocalFree(argv);
+        return 0;
+    }
     trace("config");
     load_conpty(g_inbox_conpty);
     trace("conpty loaded");
@@ -9152,6 +9479,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
         paint_now();
         SetForegroundWindow(h);
         adopt_done();
+    }
+
+    if (show != SW_SHOWNOACTIVATE || _wgetenv(L"HARDCORE_PIPE")) {   /* tests' windows don't take your hardcore tab */
+        HANDLE pt = CreateThread(NULL, 0, pipe_thread, NULL, 0, NULL);
+        if (pt) CloseHandle(pt);
     }
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {

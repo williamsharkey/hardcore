@@ -1547,11 +1547,46 @@ font=U           # a font's letter
 theme=g          # a color scheme's letter; default is Gruvbox Dark
 tab_underlay=1   # 1=right underlay, 2=left underlay; legacy 0 becomes left
 dock_row=0       # desired underlay top row (clamped to fit)
+elevated=        # 1 = Windows: windows run as administrator (below)
 ```
 
 The command line overrides it: `hardcore.exe [--cd DIR] [--distro NAME] [DIR]`.
 `--inbox-conpty` uses Windows' built-in ConPTY instead of the bundled one, for
 comparison.
+
+### Run as administrator (Windows)
+
+`elevated=1` in `%LOCALAPPDATA%\hardcore\config.ini` is a setting for one
+computer. It is off by default. Set it by hand, then close hardcore and start it
+again.
+
+- A hardcore that starts without elevation asks Windows once (one UAC prompt)
+  for an elevated copy, hands it the command line, and exits. When an elevated
+  window already runs, that window starts the new one, with no prompt. **No** on
+  the prompt opens a normal window.
+- Every window serves the pipe `\\.\pipe\hardcore-<your SID>`. Its access list
+  allows only your user, and a window answers only processes that run as you.
+  `hardcore tab [-- COMMAND...]` (a new tab, COMMAND typed into it; no window:
+  one in this folder), `hardcore update` and homedash's `hostdash open` use the
+  pipe first and WM_COPYDATA second. Windows blocks WM_COPYDATA from a normal
+  process to an elevated window.
+- No prompt at log on: `tools\win-elevated-login.ps1`, run once as
+  administrator, adds the task `hardcore-elevated` (At log on, your user, Run
+  with highest privileges, normal priority). `-Execute`/`-Arguments` choose what
+  it starts; `-Remove` deletes it. `--detached` starts hardcore as the Start menu
+  does: the last session comes back.
+
+Known side effects:
+
+- Every program that you start from hardcore runs as administrator: shells,
+  WSL's Windows programs (`powershell.exe`, `cmd.exe`), editors, installers.
+- Windows blocks drag and drop from a normal Explorer window into an elevated
+  window. Paste the path instead, or use an Explorer that runs elevated.
+- Any program that runs as you (not elevated) can open an administrator tab
+  through `hardcore tab` or the pipe. That is the purpose of the pipe; turn
+  `elevated` off if this is not acceptable on the computer.
+- A normal program can't send window messages to an elevated window (UIPI);
+  tools that still use WM_COPYDATA only reach normal windows.
 
 ## Testing
 
