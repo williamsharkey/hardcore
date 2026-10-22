@@ -1442,6 +1442,11 @@ make win-install  # copy to %LOCALAPPDATA%\hardcore + Start menu and desktop sho
 make win-upgrade  # this build over the installed exe, hot: windows reload, tabs and Claude kept
 ```
 
+Plain `make install` in WSL installs the native Linux build as
+`~/.local/bin/hardcore`. It refuses when that is a link (the one to the Windows
+hardcore.exe that hardcore's first tab makes), so it never takes `hardcore`
+away from your WSL shells; give it another `BINDIR=` for the Linux build.
+
 The Windows build also compiles the WSL attachment code from source using
 `LINUX_CC` (default `gcc`). Cross-builds need an x86-64 Linux compiler for that
 step. No prebuilt reptyr executable is checked in or downloaded. `make slurp-test`

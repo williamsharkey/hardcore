@@ -48,7 +48,13 @@ install: $(APP)
 else ifeq ($(UNAME),Linux)
 all: build/hardcore
 test: here-test
+# Never over a link: in WSL ~/.local/bin/hardcore links to the Windows hardcore.exe
+# (rc.bash makes it), and replacing it would take `hardcore upgrade` and friends away.
 install: build/hardcore
+	@if [ -L "$(BINDIR)/hardcore" ]; then \
+	  echo "make install: $(BINDIR)/hardcore is a link to $$(readlink "$(BINDIR)/hardcore"); not replacing it."; \
+	  echo "  For the Windows hardcore: make win-install or make win-upgrade. For this Linux build elsewhere: make install BINDIR=DIR"; \
+	  exit 1; fi
 	install -d "$(BINDIR)"
 	install -m 755 build/hardcore "$(BINDIR)/hardcore"
 else
@@ -195,7 +201,7 @@ build/browser.inc: tools/embed_browser.py browser/project.js browser/welcome.htm
 
 ifeq ($(UNAME),Linux)
 build/hardcore: build/stamp.txt hardcore.c $(HERE_HEADERS) build/font.bin build/fonts.bin build/fonts.inc build/width.inc
-	$(LINUX_CC) -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' $(STAMP_FLAGS) -o $@ hardcore.c -lutil -pthread
+	$(LINUX_CC) -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' $(STAMP_FLAGS) -o $@ hardcore.c -lutil -pthread -lm
 else
 build/hardcore: build/stamp.txt hardcore_mac_launch.h hardcore_browser_chrome_view.h $(HERE_HEADERS) tools/ExecutableInfo.plist
 
