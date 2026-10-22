@@ -1448,6 +1448,49 @@ process with private settings and shell history.
 
 F-keys, Ctrl+letters and Alt+letters go to the shell untouched.
 
+### Copying Claude Code's text
+
+A copy never carries escape codes: the parser keeps every escape sequence
+(titles, OSC 8 links, progress, kitty graphics queries) out of the cells, and
+a no-break space (Claude Code puts one after `❯`) copies as a plain space.
+Rows the terminal wrapped at the right edge join with no line break, and the
+spaces at the end of each line go.
+
+Claude Code breaks its own lines, though: each break is a real newline plus
+an indent, so the terminal never sees the text it came from. With
+`clean_copy=1` (the default on Windows; `0` copies the screen as it is), a
+copy also:
+- leaves out a mark at the start of a line (`●` `⏺` `⎿` `❯` `▎` `▌`, or `│`
+  when it is not part of a table) and the spaces after it,
+- takes away the indent that all the copied lines share,
+- joins a line to the one above when the line above stops near the right
+  edge (its next word would not have fit), the line carries on at the same
+  indent, and neither line is a list item, a mark line or a table row. After a
+  sentence that ends well short of the edge, a long word (a URL) starts a new
+  line instead.
+
+Before (the screen, copied as it is):
+
+```
+● Hi team,
+  Following up on yesterday's discussion about the release schedule, I wanted to confirm that the
+  staging environment will be ready for the final round of acceptance testing before Friday
+  afternoon so we can keep the launch on track.
+  Thanks, Sam
+```
+
+After (`clean_copy=1`):
+
+```
+Hi team,
+Following up on yesterday's discussion about the release schedule, I wanted to confirm that the staging environment will be ready for the final round of acceptance testing before Friday afternoon so we can keep the launch on track.
+Thanks, Sam
+```
+
+A line that really ended near the edge is joined too: the terminal can only
+guess. `hardcore.exe --copy OUT COLS ROWS FILE` writes both copies of a
+recorded byte stream, to check a case.
+
 ## How "same folder" works
 
 Each tab runs:
