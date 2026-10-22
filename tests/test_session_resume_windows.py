@@ -110,8 +110,13 @@ for a in "$@"; do
   case $prev in --session-id|--resume) id=$a ;; esac
   prev=$a
 done
-proj=~/.claude/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
+cfg=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+proj=$cfg/projects/$(printf '%s' "$PWD" | sed 's/[^A-Za-z0-9]/-/g')
 mkdir -p "$proj" && touch "$proj/$id.jsonl"
+# like Claude Code: sessions/PID.json names the session on screen (/resume changes it)
+mkdir -p "$cfg/sessions"
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","procStart":"%s"}' $$ "$id" "$PWD" "$(cut -d' ' -f22 /proc/$$/stat)" > "$cfg/sessions/$$.json"
+echo "$$" > "$here/pid-$id"
 echo "$PPID" > "$here/shell-$id"
 echo "fake claude $id"
 exec sleep 600
@@ -135,8 +140,10 @@ def wait_for(check, description, timeout=30):
 class App:
     def __init__(self, helper, exe, config, fake):
         self.log = open(OUT / "driver.log", "a")
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(fake.parent / "claude-home"))
+        env["WSLENV"] = (env.get("WSLENV", "") + ":CLAUDE_CONFIG_DIR").lstrip(":")
         self.proc = subprocess.Popen([str(helper), winpath(exe), winpath(config), str(fake)],
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log)
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, env=env)
         self.read(40)
 
     def read(self, timeout=30):
@@ -206,7 +213,7 @@ def run(exe):
     w1, w2 = lin / "w1", lin / "w2"
     w1.mkdir()
     w2.mkdir()
-    projects = [Path.home() / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(w)) for w in (w1, w2)]
+    home = lin / "claude-home"                                      # CLAUDE_CONFIG_DIR: never the real ~/.claude
     flags = "--dangerously-skip-permissions --model opus"
     try:
         # 1. two Claude tabs, one closed by the user, then a crash
@@ -287,10 +294,32 @@ def run(exe):
         wait_for(lambda: not (config / "session/tab0.txt").exists(), "the old build's text file replaced", 8)
         app.end("K")
         print("ok   an older build's session and every other saved window come back (untrusted flags filtered)")
+
+        # 7. /resume inside Claude picks another session: the restore resumes that one
+        for p in (config / "session").glob("*"):
+            p.unlink(missing_ok=True)
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        app.send(f"T cd {w1} && claude {flags}")
+        wait_for(lambda: len(calls(fake)) > before, "a new claude")
+        id4 = re.search(r"--session-id (\S+)", calls(fake)[before]).group(1)
+        wait_for(lambda: [t.get("claude") for t in saved_tabs(config)] == [id4], "the new session saved")
+        picked = "0b5e7c2a-1d34-4e8f-9a6b-5c4d3e2f1a0b"            # what /resume switches to
+        pid = (fake / f"pid-{id4}").read_text().strip()
+        state = home / "sessions" / f"{pid}.json"
+        proj = home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(w1))
+        (proj / f"{picked}.jsonl").touch()
+        state.write_text(state.read_text().replace(id4, picked))
+        wait_for(lambda: [t.get("claude") for t in saved_tabs(config)] == [picked], "the picked session saved", 15)
+        app.end("K")
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        wait_for(lambda: len(calls(fake)) > before, "the picked session resumed")
+        assert calls(fake)[before:] == [f"{w1}|{flags} --resume {picked}"], calls(fake)[before:]
+        app.end("K")
+        print("ok   a session picked with /resume inside Claude is the one that comes back")
     finally:
         shutil.rmtree(lin, ignore_errors=True)
-        for p in projects:
-            shutil.rmtree(p, ignore_errors=True)
 
 
 if __name__ == "__main__":
