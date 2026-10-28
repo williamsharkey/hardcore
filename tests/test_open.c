@@ -43,6 +43,9 @@ int main(void) {
     snprintf(d, sizeof(d), "%s/sub", root); mkdir(d, 0755);
     touch("src/a.c", "int a;\n"); touch("README.md", "# hi\n"); touch("Makefile", "all:\n");
     touch("img.PNG", "\x89PNG"); touch("notes.pdf", "%PDF");
+    touch("my file.md", "# spaces\n"); touch("file.md", "short\n");
+    touch("file[1].c", "int b;\n"); touch("file (1).txt", "copy\n");
+    touch("src/name[v2].h", "int c;\n");
 
     /* compiler, grep and linter output */
     path_case("src/a.c:42: error: expected ';'", "a.c", "", "src/a.c", 42, 0, "src/a.c:42:");
@@ -69,6 +72,65 @@ int main(void) {
     path_case("src/a.c", " ", "", "", 0, 0, NULL);
     { HcPathHit h; char cwd[2048]; snprintf(cwd, sizeof(cwd), "%s", root);
       check(hc_path_at("ls sub", 6, cwd, root, &h) == 0, "offset past the end is no hit"); }
+
+    /* spaces: quotes, backslash, or the longest existing run. Brackets stay in the name. */
+    path_case("open \"my file.md\" now", "file.md", "", "my file.md", 0, 0, "my file.md");
+    path_case("open 'my file.md' now", "file.md", "", "my file.md", 0, 0, "my file.md");
+    path_case("open \"my file.md\"", "\"", "", "my file.md", 0, 0, "my file.md");
+    path_case("see my\\ file.md:4 please", "file.md", "", "my file.md", 4, 0, NULL);
+    path_case("see my file.md now", "my file", "", "my file.md", 0, 0, "my file.md");
+    path_case("see my file.md now", "file.md", "", "my file.md", 0, 0, "my file.md");   /* longer than file.md */
+    path_case("open ~/my file.md please", "file.md", "", "my file.md", 0, 0, NULL);
+    path_case("build file[1].c:9:2: error", "file[1]", "", "file[1].c", 9, 2, "file[1].c:9:2:");
+    path_case("note src/name[v2].h:8", "name[v2]", "", "src/name[v2].h", 8, 0, NULL);
+    path_case("wrote file (1).txt today", "(1).txt", "", "file (1).txt", 0, 0, "file (1).txt");
+    {   /* the space between the two words of the longest run */
+        const char *line = "see my file.md now";
+        HcPathHit h; char cwd[2048];
+        const char *sp = strstr(line, "y f");
+        snprintf(cwd, sizeof(cwd), "%s", root);
+        int got = hc_path_at(line, sp ? (int)(sp + 1 - line) : -1, cwd, root, &h);
+        char want[2048]; snprintf(want, sizeof(want), "%s/my file.md", root);
+        check(got && !strcmp(h.path, want) && h.end - h.start == (int)strlen("my file.md"),
+              "space inside 'my file.md' is part of the path");
+    }
+    {   /* a soft wrap is the two rows joined, with no character inserted */
+        char full[2048];
+        snprintf(full, sizeof(full), "note %s/my file.md end", root);
+        const char *mp = strstr(full, "my file.md");
+        int path_at = mp ? (int)(mp - full) : 0;
+        int width = path_at + 4;   /* "my f" | "ile.md" */
+        HcPathHit h;
+        int ln[2], c0[2], c1[2], np, w2[2] = {width, 0}, one[2] = {80, 0};
+        check(width < (int)strlen(full) && hc_path_at(full, path_at + 1, root, root, &h), "joined wrap text hits");
+        w2[1] = h.end > width ? h.end - width : 0;
+        np = hc_path_wrap_parts_n(w2, 2, h.start, h.end, ln, c0, c1, 2);
+        check(np == 2 && ln[0] == 0 && ln[1] == 1 && c1[0] == width && c0[1] == 0 && c1[1] == h.end - width,
+              "wrap splits into %d parts (%d:%d and %d:%d)", np, c0[0], c1[0], np > 1 ? c0[1] : -1, np > 1 ? c1[1] : -1);
+        check(hc_path_at(full, width + 1, root, root, &h) && strstr(h.path, "my file.md"), "hit from the second wrapped row");
+        check(hc_path_wrap_parts_n(one, 2, 2, 10, ln, c0, c1, 2) == 1 && ln[0] == 0 && c0[0] == 2 && c1[0] == 10, "a hit on one row stays one part");
+    }
+    {   /* default-app line jump: xed, vscode/cursor URL schemes, BBEdit */
+        char u[1024];
+        check(hc_open_line_kind("com.apple.dt.Xcode", "Xcode") == HC_LINE_XCODE, "kind Xcode");
+        check(hc_open_line_kind("com.microsoft.VSCode", NULL) == HC_LINE_VSCODE, "kind VS Code");
+        check(hc_open_line_kind("com.microsoft.VSCodeInsiders", NULL) == HC_LINE_VSCODE_INSIDERS, "kind VS Code Insiders");
+        check(hc_open_line_kind(NULL, "Cursor") == HC_LINE_CURSOR, "kind Cursor by name");
+        check(hc_open_line_kind("com.todesktop.230313mzl4w4u92", NULL) == HC_LINE_CURSOR, "kind Cursor by bundle id");
+        check(hc_open_line_kind("com.barebones.bbedit", "BBEdit") == HC_LINE_BBEDIT, "kind BBEdit");
+        check(hc_open_line_kind("com.apple.Preview", "Preview") == HC_LINE_NONE, "Preview has no line jump");
+        check(hc_open_line_target(HC_LINE_XCODE, "/tmp/a.c", 42, 7, u, (int)sizeof(u)) && !strcmp(u, "xed -l 42 /tmp/a.c"), "xed target: %s", u);
+        check(hc_open_line_target(HC_LINE_VSCODE, "/tmp/my file.c", 42, 7, u, (int)sizeof(u))
+              && !strcmp(u, "vscode://file/tmp/my%20file.c:42:7"), "vscode target: %s", u);
+        check(hc_open_line_target(HC_LINE_VSCODE_INSIDERS, "/tmp/a.c", 9, 0, u, (int)sizeof(u))
+              && !strcmp(u, "vscode-insiders://file/tmp/a.c:9:1"), "vscode-insiders target: %s", u);
+        check(hc_open_line_target(HC_LINE_CURSOR, "/tmp/a.c", 3, 0, u, (int)sizeof(u))
+              && !strcmp(u, "cursor://file/tmp/a.c:3:1"), "cursor target: %s", u);
+        check(hc_open_line_target(HC_LINE_BBEDIT, "/tmp/my file.c", 5, 2, u, (int)sizeof(u))
+              && !strcmp(u, "x-bbedit://open?url=file:///tmp/my%20file.c&line=5&column=2"), "bbedit target: %s", u);
+        check(!hc_open_line_target(HC_LINE_NONE, "/tmp/a.c", 4, 1, u, (int)sizeof(u)), "no target for Preview");
+        check(!hc_open_line_target(HC_LINE_VSCODE, "/tmp/a.c", 0, 1, u, (int)sizeof(u)), "no target without a line");
+    }
 
     /* registry: built-in defaults */
     HcOpenConf c; hc_open_defaults(&c);
