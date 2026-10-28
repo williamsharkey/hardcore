@@ -12,9 +12,14 @@ typedef struct {
     /* The last dragged layout of each axis, back when its count returns
        (a window narrowed for a moment, a tab hidden and shown again) */
     int xs[HC_GRID_AXES+1],ys[HC_GRID_AXES+1],xs_n,ys_n;
+    /* Split view in a tall window: up to three panes one above the other */
+    int stack;
     HcGridRect rect[HC_GRID_MAX];
 } HcGrid;
 static inline int hc_grid_min(int a,int b){return a<b?a:b;}
+/* Split view stacks its panes only in a clearly portrait area (pixels):
+   side by side is the default, as a vertical split. */
+static inline int hc_grid_portrait(int width_px,int height_px){return 4LL*width_px<3LL*height_px;}
 static inline int hc_grid_max(int a,int b){return a>b?a:b;}
 static inline void hc_grid_axis(int *out,int *ratios,int count,int length,int minimum) {
     out[0]=0;out[count]=length;
@@ -33,7 +38,7 @@ static inline void hc_grid_build(HcGrid *g,int count,int width,int height) {
     count=hc_grid_min(HC_GRID_MAX,hc_grid_max(0,count));
     width=hc_grid_max(1,width);height=hc_grid_max(1,height);
     int cols=1,rows=1;
-    if(count<=3)cols=hc_grid_max(1,count);
+    if(count<=3)cols=g->stack?1:hc_grid_max(1,count);
     else {while(cols*cols<count)cols++;}
     /* Prefer readable panes when a tall, narrow window cannot fit the square. */
     cols=hc_grid_min(cols,hc_grid_max(1,width/10));

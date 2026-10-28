@@ -3,6 +3,10 @@
 static int g_grid_on,g_grid_expand_id,g_grid_hidden[MAX_TABS],g_grid_nhidden;
 static int g_grid_ids[MAX_TABS],g_grid_count,g_grid_left,g_grid_top=1,g_grid_rail=48;
 static HcGrid g_grid;
+/* Split view: the tab you were in plus one opened beside it; every other tab
+   is hidden (still running). The tab ids, 0 = not split. */
+static int g_split_main,g_split_other;
+static int grid_split_tall(int cols,int rows);
 static int grid_utility_columns(void);
 static int g_grid_drag_axis,g_grid_drag_boundary;
 static int grid_hidden(int id) {
@@ -36,6 +40,8 @@ static void grid_measure(int cols,int rows) {
     g_grid_rail=grid_utility_columns();
     if(g_grid_rail>cols-10)g_grid_rail=hc_grid_max(1,cols/3);
     g_grid_left=g_tab_underlay==2?g_grid_rail:0;
+    /* a split in a window taller than wide stacks its panes */
+    g_grid.stack=g_split_main && count<=3 && grid_split_tall(cols-g_grid_rail,rows-g_grid_top);
     hc_grid_build(&g_grid,count,cols-g_grid_rail,hc_grid_max(1,rows-g_grid_top));
     g_grid_count=count;
     int expanded=-1;

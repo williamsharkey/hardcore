@@ -1,0 +1,53 @@
+[0;1;4;95mhcmd fixture[0m
+[0;95m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+
+A paragraph with [0;1mbold[0m, [0;3mitalic[0m, [0;3malso italic[0m, [0;93;48;5;236minline code[0m,
+[0;9mstruck[0m and a ]8;;file://@DIR@/docs/other.md\[0;4;94mrelative link]8;;\[0m plus ]8;;https://example.com/auto\[0;4;94mhttps://example.com/auto]8;;\[0m and
+a bare ]8;;https://example.org/path\[0;4;94mhttps://example.org/path]8;;\[0m. Snake_case_words stay as
+they are. A long line that has to wrap because it keeps
+going well past the width of the dump.
+
+[0;1;96mSetext heading[0m
+[0;90m────────────────────────────────────────────────────────────[0m
+
+[0;1;96mLists[0m
+[0;90m────────────────────────────────────────────────────────────[0m
+
+[0;96m• [0mfirst item
+[0;96m• [0msecond item with [0;93;48;5;236mcode[0m
+  [0;96m◦ [0mnested item
+  [0;96m◦ ☑ [0mdone task
+  [0;96m◦ ☐ [0mopen task
+[0;96m• [0mthird
+
+[0;1;90m1. [0mone
+[0;1;90m2. [0mtwo continued text
+
+[0;90m│ [0mA quote with [0;1mbold[0m inside that continues.
+[0;90m│[0m
+[0;90m│ │ [0mnested quote
+
+[0;48;5;236m                                                          [0;90;48;5;236mc[0;48;5;236m [0m
+[0;48;5;236m int main(void) {                                           [0m
+[0;48;5;236m     return 0;   /* a tab above */                          [0m
+[0;48;5;236m }                                                          [0m
+[0;48;5;236m                                                            [0m
+
+[0;48;5;236m                                                            [0m
+[0;48;5;236m indented code                                              [0m
+[0;48;5;236m                                                            [0m
+
+[0;90m┌────────┬───────┬─────────────────────────────────────────┐[0m
+[0;90m│[0m [0;1mName[0m   [0;90m│[0m [0;1mCount[0m [0;90m│[0m                  [0;1mNote[0m                   [0;90m│[0m
+[0;90m├────────┼───────┼─────────────────────────────────────────┤[0m
+[0;90m│[0m apples [0;90m│[0m     3 [0;90m│[0m crisp and sweet, from the orchard down  [0;90m│[0m
+[0;90m│[0m        [0;90m│[0m       [0;90m│[0m                the road                 [0;90m│[0m
+[0;90m│[0m pears  [0;90m│[0m    12 [0;90m│[0m                  [0;93;48;5;236msoft[0m                   [0;90m│[0m
+[0;90m└────────┴───────┴─────────────────────────────────────────┘[0m
+
+[0;90m────────────────────────────────────────────────────────────[0m
+
+]8;;file://@DIR@/img/diagram.png\[0;94m▣ [0;4;94mdiagram]8;;\[0m and ]8;;https://example.net/ref\[0;4;94mref link]8;;\[0m.
+
+Line with hard break
+next line & an entity — done.

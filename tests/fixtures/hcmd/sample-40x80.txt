@@ -1,0 +1,59 @@
+hcmd fixture
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A paragraph with bold, italic, also
+italic, inline code, struck and a
+relative link plus
+https://example.com/auto and a bare
+https://example.org/path.
+Snake_case_words stay as they are. A
+long line that has to wrap because it
+keeps going well past the width of the
+dump.
+
+Setext heading
+────────────────────────────────────────
+
+Lists
+────────────────────────────────────────
+
+• first item
+• second item with code
+  ◦ nested item
+  ◦ ☑ done task
+  ◦ ☐ open task
+• third
+
+1. one
+2. two continued text
+
+│ A quote with bold inside that
+│ continues.
+│
+│ │ nested quote
+
+                                      c
+ int main(void) {
+     return 0;   /* a tab above */
+ }
+
+
+
+ indented code
+
+
+┌────────┬───────┬─────────────────────┐
+│ Name   │ Count │        Note         │
+├────────┼───────┼─────────────────────┤
+│ apples │     3 │  crisp and sweet,   │
+│        │       │  from the orchard   │
+│        │       │    down the road    │
+│ pears  │    12 │        soft         │
+└────────┴───────┴─────────────────────┘
+
+────────────────────────────────────────
+
+▣ diagram and ref link.
+
+Line with hard break
+next line & an entity — done.

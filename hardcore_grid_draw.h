@@ -13,7 +13,10 @@ static void grid_refit(void) {
     g_display_term=NULL;g_sel_on=g_sel_drag=g_sb_drag=0;
     tab_layout();mac_grid_browser_sync();plat_invalidate();
 }
+static void grid_split_restore(void);
 static void grid_toggle(void) {
+    /* Grid in a split: every tab in the grid, as it was before the split */
+    if(g_grid_on && g_split_main){grid_split_restore();grid_refit();return;}
     chrome_preview_cancel();mac_cutie_blur();mac_tv_drag_end();
     mac_grid_transition(!g_grid_on);
     g_grid_on=!g_grid_on;g_grid_drag_axis=0;
@@ -21,6 +24,48 @@ static void grid_toggle(void) {
     if(g_grid_on && !g_grid_expand_id && g_ntabs)g_grid_expand_id=g_tabs[0]->id;
     for(int i=0;i<HC_TV_COUNT;i++){g_tvs[i].state.placed=0;hc_tv_motion_reset(&g_tvs[i].motion);}
     grid_refit();
+}
+/* Split view reuses the grid: entering it saves the grid's hidden set and
+   hides every tab but the two; leaving puts the set back. */
+static int grid_split_tall(int cols,int rows){return hc_grid_portrait(cols*CW,rows*CH);}
+static int g_split_saved[MAX_TABS],g_split_nsaved,g_split_saved_expand,g_split_last_other;
+static void grid_split_restore(void) {
+    if(!g_split_main)return;
+    g_grid_nhidden=0;
+    for(int i=0;i<g_split_nsaved;i++)if(tab_by_id(g_split_saved[i]))grid_set_hidden(g_split_saved[i],1);
+    g_grid_expand_id=g_split_saved_expand;
+    g_split_last_other=g_split_other;g_split_main=g_split_other=0;
+}
+static void grid_split_enter(int main_id,int other_id) {
+    if(g_grid_on && !g_split_main){grid_set_hidden(other_id,0);grid_refit();return;}   /* full grid: one more pane */
+    if(!g_split_main) {
+        memcpy(g_split_saved,g_grid_hidden,sizeof(int)*g_grid_nhidden);g_split_nsaved=g_grid_nhidden;
+        g_split_saved_expand=g_grid_expand_id;
+    }
+    g_split_main=main_id;g_split_other=other_id;g_grid_nhidden=0;
+    for(int i=0;i<g_ntabs;i++)if(g_tabs[i]->id!=main_id && g_tabs[i]->id!=other_id)grid_set_hidden(g_tabs[i]->id,1);
+    g_grid_expand_id=main_id;
+    if(!g_grid_on)grid_toggle();else grid_refit();
+}
+/* Back to the single tab keep_id, the grid as it was before */
+static void grid_split_leave(int keep_id) {
+    if(!g_split_main)return;
+    grid_split_restore();
+    if(g_grid_on)grid_toggle();
+    for(int i=0;i<g_ntabs;i++)if(g_tabs[i]->id==keep_id){activate(i);break;}
+}
+/* Which tab a closing one leaves on its own (0: not half of a split) */
+static int grid_split_closing(int id) {
+    if(!g_split_main)return 0;
+    return id==g_split_other?g_split_main:id==g_split_main?g_split_other:0;
+}
+/* Cmd+\: split → the main tab alone → the same split again */
+static int grid_split_toggle(void) {
+    if(g_split_main){grid_split_leave(g_split_main);return 1;}
+    Tab *cur=active_tab(),*other=tab_by_id(g_split_last_other);
+    if(!cur || !other || other==cur)return 0;
+    grid_split_enter(cur->id,other->id);
+    return 1;
 }
 static void grid_hide_tab(int index) {
     if(index<0 || index>=g_ntabs)return;
@@ -165,5 +210,9 @@ static void render_grid(int win_w,int win_h) {
     fill_rect(rail,g_grid_top*CH,rail+1,win_h,g_look.dim,.5f);
     if(!g_grid_count)draw_label(L"All tabs hidden. Use show in the menu.",g_grid_left*CW+CW,(g_grid_top+2)*CH,g_grid.width*CW-CW,g_look.detail);
     render_tabbar(win_w,win_h);mac_grid_utility_draw();mac_camera_draw();mac_music_draw();
-    mac_browser_render_nav_overlay();UI_DONE;
+    mac_browser_render_nav_overlay();
+#ifndef _WIN32
+    mac_open_hover_draw();
+#endif
+    UI_DONE;
 }

@@ -38,7 +38,7 @@ APPDIR    ?= $(HOME)/Applications
 BINDIR    ?= $(HOME)/.local/bin
 HERE_HEADERS = hardcore_here.h hardcore_here_transport.h hardcore_here_ui.h hardcore_here_helpers.h hardcore_here_chrome.h hardcore_chrome_browser.h hardcore_chrome_relay.h hardcore_here_media.h hardcore_here_media_source.h hardcore_textile.h
 
-.PHONY: all clean selftest install test mac-test slurp-test
+.PHONY: all clean selftest install test mac-test slurp-test open-test
 
 ifeq ($(UNAME),Darwin)
 all: $(APP)
@@ -205,6 +205,8 @@ build/hardcore: build/stamp.txt hardcore.c $(HERE_HEADERS) build/font.bin build/
 else
 build/hardcore: build/stamp.txt hardcore_mac_launch.h hardcore_browser_chrome_view.h $(HERE_HEADERS) tools/ExecutableInfo.plist
 
+build/hardcore: hardcore_open.h hardcore_mac_open.m
+
 build/hardcore: hardcore_mac_music.m hardcore_music_panel.m hardcore_recording_view_geometry.h hardcore_clips_panel.m hardcore_recording_jobs.m hardcore_camera_capture.h hardcore_camera_capture.m hardcore_camera_panel.m hardcore_recording.m hardcore_recording_library.m build/browser.inc hardcore_browser_image_geometry.h hardcore_browser_mac.m hardcore_browser_label.h hardcore_browser_ui.h hardcore_browser_images.h hardcore_browser_pixels.h hardcore_browser_cli.h hardcore_browser_grid.h hardcore.c hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_mac.m hardcore_mac_update.h hardcore.metal build/font.bin build/fonts.bin build/fonts.inc build/width.inc $(METALLIB) hardcore_font_menu.h hardcore_mac_dock.m hardcore_mac_caf.m hardcore_mac_transfer.m hardcore_mac_terminal.m hardcore_mac_bridge_refresh.m hardcore_mac_tmux_metadata.m
 	$(MAC_CC) $(MAC_FLAGS) -x objective-c -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' $(STAMP_FLAGS) -o $@ hardcore.c $(MAC_INFO_FLAGS) $(MAC_LIBS)
 
@@ -221,10 +223,26 @@ build/recording-export: tools/recording_export.m
 	@mkdir -p build
 	clang -O2 -fobjc-arc -mmacosx-version-min=11.0 -arch arm64 -arch x86_64 -framework Foundation -framework AppKit -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework CoreGraphics -framework ImageIO $< -o $@
 
-$(APP): build/recording-export $(wildcard recording/*.html recording/*.js recording/*.css) tools/files.py build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
+# hcmd: the Markdown / text reader Cmd+click opens files in (tools/hcmd/hcmd.c, libc only)
+build/hcmd: tools/hcmd/hcmd.c
+	@mkdir -p build
+	$(MAC_CC) -O2 -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=11.0 -arch arm64 -arch x86_64 -o $@ $<
+
+# Cmd+click file opening and hcmd, headless: path detection, handlers, split
+# geometry, hcmd's rendering against fixtures and its live terminal behaviour
+build/test_open: tests/test_open.c hardcore_open.h hardcore_grid.h
+	@mkdir -p build
+	$(MAC_CC) -O2 -Wall -Wextra -o $@ tests/test_open.c
+open-test: build/test_open build/hcmd
+	build/test_open
+	python3 tests/test_hcmd.py build/hcmd
+
+$(APP): build/hcmd build/recording-export $(wildcard recording/*.html recording/*.js recording/*.css) tools/files.py build/hardcore build/hardcore.icns tools/Info.plist tools/update_mac.py tools/claude_slurp.py tools/claude_handoff.py tools/slurp_mac.py $(CLAUDE_PLUGINS)
 	rm -rf $@
 	mkdir -p $@/Contents/MacOS $@/Contents/Resources
 	cp build/hardcore $@/Contents/MacOS/hardcore
+	cp build/hcmd $@/Contents/MacOS/hcmd
+	codesign --force --sign - $@/Contents/MacOS/hcmd
 	cp build/hardcore.icns $@/Contents/Resources/hardcore.icns
 	cp build/recording-export $@/Contents/Resources/
 	codesign --force --sign - $@/Contents/Resources/recording-export
@@ -237,7 +255,7 @@ $(APP): build/recording-export $(wildcard recording/*.html recording/*.js record
 	sed 's/@VERSION@/$(shell sed -n 's/^#define HARDCORE_VERSION "\(.*\)"/\1/p' hardcore.c)/' tools/Info.plist > $@/Contents/Info.plist
 	codesign --force --sign - $@
 
-mac-test: build/hardcore reflow-test browser-test
+mac-test: build/hardcore reflow-test browser-test open-test
 	python3 tests/test_cutie_browser.py
 	python3 tests/test_browser_cli.py
 	build/hardcore --unit build/unit.txt; rc=$$?; tail -1 build/unit.txt; [ $$rc = 0 ]

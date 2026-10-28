@@ -599,6 +599,8 @@ typedef struct Tab {
     int exited;
     int claude_guard, claude_released, claude_cursor_sent;
     DWORD claude_guard_at;       /* bounded input hold while the adapter restores its draft */
+    char open_file[1024];        /* run "open:SCRIPT": the file Cmd+click opened, its line */
+    int open_line;
 #endif
     char *in;
     int in_n, in_cap;
@@ -5138,6 +5140,9 @@ static void draw_preedit(int x, int y, int room) {
     }
 }
 
+#ifndef _WIN32
+static void mac_open_hover_draw(void);
+#endif
 #include "hardcore_grid_draw.h"
 
 static void render(void) {
@@ -5321,6 +5326,7 @@ static void render(void) {
     mac_camera_draw();
     mac_music_draw();
     mac_browser_render_nav_overlay();
+    mac_open_hover_draw();
 #endif
 }
 
@@ -6723,6 +6729,7 @@ static void close_tab(int i) {
     if (i < 0 || i >= g_ntabs) return;
     tb = g_tabs[i];
     if(tb->id==g_cutie_focus_id)mac_cutie_blur();
+    int split_keep = grid_split_closing(tb->id);   /* closing half of a split: back to the other half */
 #ifdef _WIN32
     mac_browser_destroy(tb);
 #endif
@@ -6748,6 +6755,7 @@ static void close_tab(int i) {
         if (!grid_hidden(g_tabs[j]->id)) { g_active = j; break; }
     }
     activate(g_active);
+    if (split_keep) grid_split_leave(split_keep);
 #ifdef _WIN32
     session_tick();              /* closed means done: out of the session now, not in two seconds */
 #endif

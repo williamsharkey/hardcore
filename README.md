@@ -1421,6 +1421,10 @@ experimental takeover suite are documented in
   | Cmd+↑ / ↓ | Previous / next prompt or Claude turn |
   | Cmd+C, Cmd+V | Copy, paste (an image pastes as a saved PNG's path; Claude Code's own Ctrl+V image paste still works) |
   | Cmd+click | Open a link. Web and mail links open; a file that would run when opened (`.command`, `.app`, …) is shown in Finder instead; any other scheme (`vscode:`, …) asks first |
+  | Cmd+click a file path | Open it: a registered type in a new tab in split view, anything else in its default app (see [Opening files](#opening-files-on-macos)) |
+  | Cmd+Option+click a file path | The other choice: the default app for a registered type; hardcore's text view for an unregistered text file |
+  | Cmd+\\ | Split view ↔ the single main tab |
+  | Cmd+Shift+\\ | Split view → the full grid |
   | Left Option | Meta: Option+B/F/D/Backspace, Option+←/→ by word, Option+Enter for a newline in Claude Code |
   | Right Option | Types é, ü, @, { and the rest, as usual |
   | Cmd+←/→, Cmd+Backspace | Start / end of line, delete to start of line |
@@ -1436,6 +1440,66 @@ experimental takeover suite are documented in
 `HARDCORE_CTL=/path/fifo` turns on a test channel. It's the Mac side of
 `termbench`: `type`, `key`, `cmd`, `snap` and `winid` lines drive a window
 that doesn't have focus (see the comment in `hardcore_mac.m`).
+
+### Opening files on macOS
+
+Hold **Cmd** over a file path in any tab's text and hardcore underlines it and
+shows a hint by the pointer: the resolved path, what **Cmd+click** does and
+what **Cmd+Option+click** does instead, e.g. `⌘-click: open in hardcore split`
+/ `⌥⌘-click: open in Xcode`. The default app's name comes from macOS
+(`URLForApplicationToOpenURL`). Only paths that exist get a hint, so ordinary
+words never light up. OSC 8 links and URLs keep their own Cmd+click.
+
+Recognized: absolute paths, `~/…`, `file://…`, paths relative to the tab's
+folder (the foreground program's folder, then the shell's OSC 7 report, then
+the shell's own folder), `path:line` and `path:line:col` (compilers, grep),
+Python's `File "x.py", line 42`, git's `a/` `b/` prefixes and `--opt=PATH`.
+A path containing spaces or brackets, or wrapped across two rows, is not
+recognized (quote-free tokens only).
+
+What opens a file (built-in, overridable in `~/.config/hardcore/open.conf`,
+reread when it changes; later lines win):
+
+| Type | Opens with |
+|---|---|
+| `md markdown mdown mkd mdx …` | `hcmd %f`, the Markdown reader |
+| source and text (`c h py js ts json yaml toml sh rs go …`), and extensionless text files (`Makefile`, `LICENSE`) | `hcmd -p +%l %f`: plain, numbered, opened at the clicked line |
+| `png jpg gif webp heic …` | `hardcore --here-media --image %f`, the character image view |
+| folders | Files, hardcore's file browser |
+| anything else | the default macOS app (a file that would run, such as `.command` or an executable, is shown in Finder instead) |
+
+```
+# ~/.config/hardcore/open.conf: KEYS = COMMAND | default | files
+# %f file, %l line (1 if none), %d folder; keys: extensions, text, / (folders), * (rest)
+md = default            # Markdown in its default app instead
+pdf epub = hcmd -p %f
+log = less -R +%lg %f
+```
+
+A file opened in hardcore gets a new tab in **split view**: from a single tab,
+the grid shows that tab and the new one side by side (stacked when the window
+is clearly taller than wide), with every other tab hidden but still running.
+**Cmd+\\** goes back to the single main tab and into the same split again;
+**Cmd+Shift+\\** (or the Grid control) turns the split into the full grid with
+your tabs as they were. Closing the opened tab, or quitting its viewer,
+returns to the single main tab. Opening another file from a split replaces the
+side pane (the earlier one stays open, hidden); from the full grid it adds a
+pane. Both are in the Window menu.
+
+### hcmd: Markdown in the terminal
+
+`hcmd FILE.md` (in the app bundle next to `hardcore`, so on the PATH of
+hardcore's tabs; `tools/hcmd/hcmd.c`, C with libc only) renders headings,
+emphasis, lists and task lists, block quotes, fenced and indented code on a
+background, tables with box drawing and alignment, rules, entities, and links
+as OSC 8 hyperlinks (relative targets resolve against the file's folder, so
+Cmd+click opens them too). It reflows on resize and reloads when the file
+changes. `hcmd -p [+LINE] FILE` is the plain numbered view; `hcmd -` reads
+stdin. Keys: j/k/arrows, space/b, d/u, g/G, `/` search with n/N, r reload,
+q quit; the mouse wheel scrolls (Shift-drag selects). It works in any
+terminal; piped, it prints plain text. Images show as `▣ alt` links, not
+inline pixels: hardcore has no inline image protocol yet, and the link opens
+the character image view.
 
 ## Build
 
@@ -1748,6 +1812,12 @@ Known side effects:
   - DECRQCRA unanswered outside tests, links that would run a program,
     Claude flags a restore may start, pasted control characters;
   - copying around a wrapped wide character.
+- `make open-test` checks Cmd+click file opening without a window: path
+  detection over sample lines with a cwd, the handler registry and
+  `open.conf` overrides, split geometry, and hcmd's rendering against golden
+  files plus its live viewer in a pty. `tests/test_open_mac.py` drives an
+  isolated app: the hover hint, Option, a click into split view, Cmd+\\,
+  and quitting back to one tab (snapshots in `build/open-native`).
 - `tests/test_grid_layout.c` checks grid geometry for every pane count and
   size; `tests/test_grid_stress_mac.py` puts a 12-pane grid with real programs
   through a resize storm, tiny windows, extreme divider drags, focus and mouse

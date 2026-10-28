@@ -1076,6 +1076,7 @@ static void tab_start_io(Tab *tb) {
     tb->psrc = p;
     dispatch_resume(p);
 }
+static void mac_open_exec(Tab *tb);
 static int tab_spawn(Tab *tb) {
     struct winsize ws;
     pid_t pid;
@@ -1101,6 +1102,13 @@ static int tab_spawn(Tab *tb) {
         if (!strncmp(tb->run, "terminal:", 9)) {
             child_env();
             execl(g_mac_exe_path, "hardcore", "--terminal-bridge", tb->run + 9, tb->hist, (char *)NULL);
+            _exit(127);
+        }
+        if (!strncmp(tb->run, "open:", 5)) {   /* Cmd+click opened a file: its handler (hardcore_mac_open.m) */
+            child_env();
+            signal(SIGPIPE, SIG_DFL);
+            if (chdir(tb->start_dir) != 0) {}
+            mac_open_exec(tb);
             _exit(127);
         }
         if (!strcmp(tb->run,"files:")) {
@@ -1651,6 +1659,7 @@ static void mac_record_file_viewer(NSString *path) {
         path=path.stringByDeletingLastPathComponent;
     if(path.length)mac_files_at(path.fileSystemRepresentation);
 }
+#include "hardcore_mac_open.m"
 static int g_grid_mouse_consumed,g_grid_drag_grab;
 static int mac_grid_down(int mx,int my) {
     if(!g_grid_on)return 0;
@@ -1934,7 +1943,9 @@ static void view_px(NSEvent *e, int *x, int *y) {
    mouseMoved's arrow. All cursor-update, motion and modifier paths now agree
    on the same geometry. Native WebKit retains ownership of its page body. */
 static void mac_pointer_cursor_at(int x,int y,NSEventModifierFlags flags) {
+    int path_hover=mac_open_hover_update(x,y,flags);
     if(mac_grid_cursor(x,y))return;
+    if(path_hover){[[NSCursor pointingHandCursor] set];return;}
     if(mac_music_cursor(x,y))return;
     if(mac_camera_cursor(x,y))return;
     if(g_tv_drag_slot>=0){[(g_tv_drag_mode?mac_tv_resize_cursor():[NSCursor closedHandCursor]) set];return;}
@@ -2510,6 +2521,7 @@ static unichar mac_ansi_key(unsigned short kc) {
     if ([e modifierFlags] & NSEventModifierFlagCommand) {   /* Cmd+click opens a link, even inside mouse-aware apps */
         char url[2048];
         if (link_at(col, row, url, sizeof(url))) { open_url(url); return; }
+        if (mac_open_click(mx, my, [e modifierFlags])) return;   /* a file path in the text */
     }
     if (mouse_report(0, 1, 0, mx, my, mods)) return;
     if ([e clickCount] == 2) {
@@ -2634,6 +2646,7 @@ static unichar mac_ansi_key(unsigned short kc) {
 - (void)mouseEntered:(NSEvent *)e { [self mouseMoved:e]; }
 
 - (void)mouseExited:(NSEvent *)e {
+    mac_open_hover_clear();
     mac_record_hide_pointer();
     mac_cutie_blur();
     chrome_preview_cancel();
@@ -2745,6 +2758,8 @@ static unichar mac_ansi_key(unsigned short kc) {
 - (void)jumpAttention:(id)sender { (void)sender; jump_to_attention(); }
 - (void)prevMark:(id)sender { (void)sender; jump_mark(-1); }
 - (void)nextMark:(id)sender { (void)sender; jump_mark(1); }
+- (void)toggleSplit:(id)sender { (void)sender; if (!grid_split_toggle()) NSBeep(); }
+- (void)splitToGrid:(id)sender { (void)sender; if (g_split_main) grid_toggle(); else NSBeep(); }
 - (void)toggleDockSummary:(id)sender {
     (void)sender;
     g_mac_dock_summary = !g_mac_dock_summary;
@@ -2918,6 +2933,9 @@ static void build_menus(void) {
     menu_item(win, @"Enter Full Screen", @selector(toggleFullScreen:), @"f", C | NSEventModifierFlagControl);
     [win addItem:[NSMenuItem separatorItem]];
     menu_item(win, @"Show Active Tab in Dock Icon", @selector(toggleDockSummary:), @"", 0);
+    [win addItem:[NSMenuItem separatorItem]];
+    menu_item(win, @"Split View / Single Tab", @selector(toggleSplit:), @"\\", C);
+    menu_item(win, @"Split View to Full Grid", @selector(splitToGrid:), @"\\", CS);
     [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:browser];
     menu_item(browser,@"New Browser Tab",@selector(newBrowser:),@"b",CS);
     menu_item(browser,@"Open Address…",@selector(browserAddress:),@"l",C);
@@ -3145,6 +3163,14 @@ static void ctl_chrome(const char *path) {
     }
     state[@"grid"]=@{@"enabled":@(g_grid_on),@"cols":@(g_grid.cols),@"rows":@(g_grid.rows),@"extra":@(g_grid.extra),
         @"window":@[@(g_cols),@(g_rows)],@"left":@(g_grid_left),@"top":@(g_grid_top),@"width":@(g_grid.width),@"height":@(g_grid.height),@"panes":panes};
+    {   /* Cmd+hover on a file path: what the hint says and which cells are underlined */
+        NSMutableArray *hint=[NSMutableArray array];
+        for(int i=0;g_open_hover.on && i<3;i++)[hint addObject:[[[NSString alloc] initWithBytes:g_open_hover.text[i]
+            length:wcslen(g_open_hover.text[i])*4 encoding:NSUTF32LittleEndianStringEncoding] autorelease] ?: @""];
+        state[@"open_hover"]=@{@"on":@(g_open_hover.on),@"tab":@(g_open_hover.tab_id),@"line":@(g_open_hover.L),
+            @"c0":@(g_open_hover.c0),@"c1":@(g_open_hover.c1),@"path":@(g_open_hover.hit.path),@"hint":hint};
+        state[@"split"]=@{@"main":@(g_split_main),@"other":@(g_split_other),@"stacked":@(g_grid.stack)};
+    }
     Tab *selected=active_tab(),*shown=display_tab();
     state[@"preview"]=@{@"active_id":@(selected?selected->id:0),@"display_id":@(shown?shown->id:0),
         @"preview_id":@(g_tab_preview.target_id)};
@@ -3219,6 +3245,8 @@ static void ctl_line(char *s) {
         else if(!strcmp(c,"unmark"))[g_view unmarkText];
         else if(!strncmp(c,"framelog ",9)){if(g_framelog)fclose(g_framelog);g_framelog=c[9]?fopen(c+9,"w"):NULL;}
         else if (!strcmp(c,"grid"))grid_toggle();
+        else if (!strcmp(c,"split"))grid_split_toggle();   /* Cmd+\ */
+        else if (!strcmp(c,"split-grid")){if(g_split_main)grid_toggle();}   /* Cmd+Shift+\ */
         else if (!strncmp(c,"grid-hide ",10))grid_hide_tab(atoi(c+10));
         else if (!strcmp(c,"grid-expand"))grid_expand_next();
         else if (!strcmp(c, "newtab")) { g_trace_tab_t = uptime_ms(); trace("ctl newtab"); new_tab_mac(); }
@@ -3284,8 +3312,8 @@ static void ctl_line(char *s) {
                 [g_view scrollAtX:x y:y delta:delta precise:NO mods:0];
             return;
         } else if (!strncmp(c, "pointer ", 8)) {
-            char action[16]; int x, y;
-            if (sscanf(c+8, "%15s %d,%d", action, &x, &y) == 3) {
+            char action[16]; int x, y; unsigned flags = 0;   /* optional hex modifier flags: Cmd hover/click tests */
+            if (sscanf(c+8, "%15s %d,%d %x", action, &x, &y, &flags) >= 3) {
                 NSEventType kind = !strcmp(action,"right-down")?NSEventTypeRightMouseDown:
                                    !strcmp(action,"right-up")?NSEventTypeRightMouseUp:
                                    !strcmp(action,"middle-down")?NSEventTypeOtherMouseDown:
@@ -3295,7 +3323,7 @@ static void ctl_line(char *s) {
                                    (!strcmp(action,"move") || !strcmp(action,"monitor") || !strcmp(action,"cursor") || !strcmp(action,"flags")) ? NSEventTypeMouseMoved : NSEventTypeLeftMouseUp;
                 CGFloat scale = [g_win backingScaleFactor];
                 NSPoint p = [(NSView *)g_view convertPoint:NSMakePoint(x/scale, y/scale) toView:nil];
-                NSEvent *e = [NSEvent mouseEventWithType:kind location:p modifierFlags:0 timestamp:0
+                NSEvent *e = [NSEvent mouseEventWithType:kind location:p modifierFlags:flags timestamp:0
                     windowNumber:[g_win windowNumber] context:nil eventNumber:0 clickCount:1 pressure:1];
                 if(!strcmp(action,"monitor-down") || !strcmp(action,"monitor-up") || !strcmp(action,"monitor-drag")) {
                     g_mac_test_monitor_consumed=mac_title_event(e)==nil;return;
