@@ -82,14 +82,28 @@ static void mac_grid_utilities(void) {
 }
 static NSDictionary *mac_grid_pack(void) {
     NSMutableArray *hidden=[NSMutableArray array],*x=[NSMutableArray array],*y=[NSMutableArray array];
+    NSMutableArray *split_saved=[NSMutableArray array];
     for(int i=0;i<g_grid_nhidden;i++)[hidden addObject:@(g_grid_hidden[i])];
     for(int i=0;i<=g_grid.cols;i++)[x addObject:@(g_grid.xr[i])];
     for(int i=0;i<=g_grid.rows;i++)[y addObject:@(g_grid.yr[i])];
-    return @{@"enabled":@(g_grid_on),@"expanded":@(g_grid_expand_id),@"hidden":hidden,@"x":x,@"y":y};
+    for(int i=0;i<g_split_nsaved;i++)[split_saved addObject:@(g_split_saved[i])];
+    return @{@"enabled":@(g_grid_on),@"expanded":@(g_grid_expand_id),@"hidden":hidden,@"x":x,@"y":y,
+        @"split_main":@(g_split_main),@"split_other":@(g_split_other),@"split_last":@(g_split_last_other),
+        @"split_expand":@(g_split_saved_expand),@"split_saved":split_saved};
 }
 static void mac_grid_restore(NSDictionary *state) {
     if(![state isKindOfClass:[NSDictionary class]])return;
     g_grid_on=[state[@"enabled"] boolValue];g_grid_expand_id=[state[@"expanded"] intValue];
+    /* Missing keys (an older handoff) read as 0, which is "not split". */
+    g_split_main=[state[@"split_main"] intValue];g_split_other=[state[@"split_other"] intValue];
+    g_split_last_other=[state[@"split_last"] intValue];g_split_saved_expand=[state[@"split_expand"] intValue];
+    g_split_nsaved=0;
+    if([state[@"split_saved"] isKindOfClass:[NSArray class]])
+        for(NSNumber *num in state[@"split_saved"])
+            if([num isKindOfClass:[NSNumber class]] && g_split_nsaved<MAX_TABS)g_split_saved[g_split_nsaved++]=num.intValue;
+    if(g_split_main && (!tab_by_id(g_split_main) || (g_split_other && !tab_by_id(g_split_other))))
+        g_split_main=g_split_other=0;
+    if(g_split_last_other && !tab_by_id(g_split_last_other))g_split_last_other=0;
     g_grid_nhidden=0;
     if([state[@"hidden"] isKindOfClass:[NSArray class]])for(NSNumber *id in state[@"hidden"])
         if([id isKindOfClass:[NSNumber class]] && tab_by_id(id.intValue))grid_set_hidden(id.intValue,1);

@@ -6,6 +6,7 @@ tab with the other tabs hidden, Cmd+\\ toggles split and single tab, and
 quitting hcmd returns to the single tab. Snapshots go to build/open-native.
 Never clicks something that would open another app."""
 from pathlib import Path
+import subprocess
 import tempfile
 from test_chrome_mac import NativeApp, ROOT, wait_for
 
@@ -33,6 +34,11 @@ def run():
         (root / "src").mkdir()
         (root / "src/a.c").write_text("".join(f"int line{i};\n" for i in range(1, 60)))
         (root / "report.pdf").write_bytes(b"%PDF-1.4\n")
+        (root / "my file.md").write_text("# spaces\n")
+        (root / "file.md").write_text("short\n")
+        (root / "file[1].c").write_text("int b;\n")
+        (root / "file (1).txt").write_text("copy\n")
+        (root / "wrapme file.md").write_text("# wrap\n")
         with NativeApp(root, 2, artifacts) as app:
             app.quiet_tabs(3)
             app.send("cmd tab 0")
@@ -69,7 +75,65 @@ def run():
             app.send("cmd pointer flags {},{} 0".format(*point(c, col + 2, row)))
             print("PASS no hint for a missing path, or without Cmd")
 
+            c = app.feed(["", "", "", "",
+                          "see my file.md now",
+                          "wrote file (1).txt today",
+                          "build file[1].c:9:2: error",
+                          "note my\\ file.md:4"])
+            col, row = locate(c, "my file.md")
+            app.send("cmd pointer flags {},{} {:x}".format(*point(c, col + 2, row), CMD))
+            h = app.chrome()["open_hover"]
+            assert h["on"] and h["path"].endswith("/my file.md"), h
+            assert h["c1"] - h["c0"] == len("my file.md"), h
+            assert len(h["parts"]) == 1 and h["parts"][0]["c1"] - h["parts"][0]["c0"] == len("my file.md"), h
+            print("PASS space inside the longest run:", h["path"])
+            col, row = locate(c, "file (1).txt")
+            app.send("cmd pointer flags {},{} {:x}".format(*point(c, col + 2, row), CMD))
+            h = app.chrome()["open_hover"]
+            assert h["path"].endswith("/file (1).txt") and h["c1"] - h["c0"] == len("file (1).txt"), h
+            print("PASS brackets in the name:", h["path"])
+            col, row = locate(c, "file[1].c:9:2:")
+            app.send("cmd pointer flags {},{} {:x}".format(*point(c, col + 2, row), CMD))
+            h = app.chrome()["open_hover"]
+            assert h["path"].endswith("/file[1].c") and h["c1"] - h["c0"] == len("file[1].c:9:2:"), h
+            assert ":9" in h["hint"][0], h["hint"]
+            print("PASS file[1].c line:", h["hint"][0])
+            col, row = locate(c, "my\\ file.md:4")
+            app.send("cmd pointer flags {},{} {:x}".format(*point(c, col + 4, row), CMD))
+            h = app.chrome()["open_hover"]
+            assert h["path"].endswith("/my file.md") and ":4" in h["hint"][0], h
+            print("PASS backslash-escaped space:", h["hint"][0])
+
+            meta = app.chrome()
+            name = "wrapme file.md"
+            cut = 4  # "wrap" stays on the first row; "me file.md" starts the next
+            cols = meta["cols"]
+            assert cols > cut + 2, cols
+            wrapped = ("x" * (cols - cut - 1)) + " " + name + " END"
+            lines = [""] * meta["rows"]
+            lines[4] = wrapped
+            c = app.feed(lines)
+            tail = name[cut:cut + 8]
+            try:
+                col, row = locate(c, tail)
+            except AssertionError:
+                print("WRAP DISPLAY cols", cols, "tail", tail)
+                print("\n".join(c["display"][3:8]))
+                raise
+            app.send("cmd pointer flags {},{} {:x}".format(*point(c, col, row), CMD))
+            h = app.chrome()["open_hover"]
+            assert h["on"] and h["path"].endswith("/" + name), h
+            assert len({p["line"] for p in h["parts"]}) >= 2, h["parts"]
+            assert sum(p["c1"] - p["c0"] for p in h["parts"]) == len(name), (h["parts"], name)
+            print("PASS soft wrap joins", len(h["parts"]), "rows:", h["parts"])
+            col, row = locate(c, "wrap")
+            app.send("cmd pointer flags {},{} {:x}".format(*point(c, col + 1, row), CMD))
+            h = app.chrome()["open_hover"]
+            assert h["path"].endswith("/" + name) and len(h["parts"]) >= 2, h
+            print("PASS soft wrap from the first row")
+
             # Cmd+click: hcmd in a split beside tab 0, tabs 1 and 2 hidden but alive
+            c = app.feed(["", "", "", "", "build: see docs/guide.md and src/a.c:42: error"])
             col, row = locate(c, "docs/guide.md")
             x, y = point(c, col + 3, row)
             app.send(f"cmd pointer down {x},{y} {CMD:x}")
@@ -88,6 +152,18 @@ def run():
                      app.state()["tabs"][-1]["program"] == "hcmd", description="hcmd running in the new pane")
             print("PASS Cmd+click opened hcmd in a split; other tabs hidden:", c["grid"]["panes"])
             app.snap("split")
+
+            # The isolated app's own --reload. It matches g_mac_exe, so the owner's app is left alone.
+            pid = app.proc.pid
+            result = subprocess.run([str(app.root / "hardcore.app/Contents/MacOS/hardcore"), "--reload"],
+                                    capture_output=True, text=True, timeout=40)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert app.state()["pid"] == pid, "reload changed app PID"
+            c = wait_for(lambda: (s := app.chrome())["grid"]["enabled"] and s["split"]["main"] == ids[0]
+                         and s["split"]["other"] == opened[0]["id"]
+                         and [p["id"] for p in s["grid"]["panes"]] == panes and s,
+                         timeout=40, description="split survived reload")
+            print("PASS split survived reload, pid", pid, c["split"])
 
             app.send("cmd split")
             c = app.chrome()

@@ -3167,8 +3167,11 @@ static void ctl_chrome(const char *path) {
         NSMutableArray *hint=[NSMutableArray array];
         for(int i=0;g_open_hover.on && i<3;i++)[hint addObject:[[[NSString alloc] initWithBytes:g_open_hover.text[i]
             length:wcslen(g_open_hover.text[i])*4 encoding:NSUTF32LittleEndianStringEncoding] autorelease] ?: @""];
+        NSMutableArray *parts=[NSMutableArray array];
+        for(int i=0;i<g_open_hover.nparts;i++)
+            [parts addObject:@{@"line":@(g_open_hover.part_L[i]),@"c0":@(g_open_hover.part_c0[i]),@"c1":@(g_open_hover.part_c1[i])}];
         state[@"open_hover"]=@{@"on":@(g_open_hover.on),@"tab":@(g_open_hover.tab_id),@"line":@(g_open_hover.L),
-            @"c0":@(g_open_hover.c0),@"c1":@(g_open_hover.c1),@"path":@(g_open_hover.hit.path),@"hint":hint};
+            @"c0":@(g_open_hover.c0),@"c1":@(g_open_hover.c1),@"path":@(g_open_hover.hit.path),@"hint":hint,@"parts":parts};
         state[@"split"]=@{@"main":@(g_split_main),@"other":@(g_split_other),@"stacked":@(g_grid.stack)};
     }
     Tab *selected=active_tab(),*shown=display_tab();
@@ -3781,8 +3784,9 @@ int main(int argc, char **argv) {
         close(g_mac_ready_fd); g_mac_ready_fd = -1;
     }
     if (!getenv("HARDCORE_NO_ACTIVATE") && (!g_mac_adopt || [g_mac_adopt[@"focused"] boolValue])) [NSApp activateIgnoringOtherApps:YES];   /* tests: open behind */
-    mac_adopt_ready();
+    /* Restore the grid before the reload ack, so the caller sees the split. */
     if(g_mac_adopt){mac_music_view_restore(g_mac_adopt[@"music"]);mac_grid_restore(g_mac_adopt[@"grid"]);}
+    mac_adopt_ready();
     mac_refresh_programs();
     update_title();
     g_mac_dock_ready = 1;
