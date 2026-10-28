@@ -1454,8 +1454,18 @@ Recognized: absolute paths, `~/…`, `file://…`, paths relative to the tab's
 folder (the foreground program's folder, then the shell's OSC 7 report, then
 the shell's own folder), `path:line` and `path:line:col` (compilers, grep),
 Python's `File "x.py", line 42`, git's `a/` `b/` prefixes and `--opt=PATH`.
-A path containing spaces or brackets, or wrapped across two rows, is not
-recognized (quote-free tokens only).
+
+A path may contain spaces. hardcore takes a quoted path (`"my file.md"`,
+`'my file.md'`), a backslash-escaped path (`my\ file.md`), or the longest
+run of words that is an existing file (`my file.md`). Brackets are part of
+the name (`file[1].c`, `file (1).txt`). A path that the terminal soft-wraps
+across rows is one path. The underline covers each row. The join covers at
+most three rows.
+
+When the default app is Xcode, Visual Studio Code, Cursor or BBEdit and the
+path names a line, the open goes to that line. Xcode uses `xed -l`. Visual
+Studio Code and Cursor use their `file` URL (`vscode://file`, `cursor://file`).
+BBEdit uses `x-bbedit://open`. Other apps open the file with no line.
 
 What opens a file (built-in, overridable in `~/.config/hardcore/open.conf`,
 reread when it changes; later lines win):
@@ -1484,7 +1494,8 @@ is clearly taller than wide), with every other tab hidden but still running.
 your tabs as they were. Closing the opened tab, or quitting its viewer,
 returns to the single main tab. Opening another file from a split replaces the
 side pane (the earlier one stays open, hidden); from the full grid it adds a
-pane. Both are in the Window menu.
+pane. Both are in the Window menu. Split view survives `hardcore reload`:
+the same two tabs come back side by side.
 
 ### hcmd: Markdown in the terminal
 
@@ -1813,11 +1824,13 @@ Known side effects:
     Claude flags a restore may start, pasted control characters;
   - copying around a wrapped wide character.
 - `make open-test` checks Cmd+click file opening without a window: path
-  detection over sample lines with a cwd, the handler registry and
+  detection over sample lines with a cwd (spaces, brackets, a two-row wrap,
+  and the line a default app would open), the handler registry and
   `open.conf` overrides, split geometry, and hcmd's rendering against golden
   files plus its live viewer in a pty. `tests/test_open_mac.py` drives an
-  isolated app: the hover hint, Option, a click into split view, Cmd+\\,
-  and quitting back to one tab (snapshots in `build/open-native`).
+  isolated app: the hover hint, Option, spaces and brackets, a soft-wrapped
+  path, a click into split view, that split after the app's own `--reload`,
+  Cmd+\\, and quitting back to one tab (snapshots in `build/open-native`).
 - `tests/test_grid_layout.c` checks grid geometry for every pane count and
   size; `tests/test_grid_stress_mac.py` puts a 12-pane grid with real programs
   through a resize storm, tiny windows, extreme divider drags, focus and mouse
