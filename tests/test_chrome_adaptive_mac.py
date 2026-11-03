@@ -143,6 +143,54 @@ def test_opposite_side(app):
     print("PASS: a clear opposite-side position wins when every same-side position is obstructed")
 
 
+def test_fullscreen_tui(app):
+    c = app.quiet_tabs(7)
+    app.hover(-1, -1)
+    alternate = "\x1b[?1049h\x1b[?25l"
+    app.feed([""] * c["rows"], prefix=alternate)
+    c = wait_for(lambda: (s if (s := app.chrome())["mode"] == 1 and s["dock"]["y"] == 0 and
+                          s["motion"]["phase"] == 0 else None), description="upper-right TUI menu")
+    clean = app.snap("tui-empty")
+    dense = app.feed(["X" * c["cols"]] * c["rows"], prefix=alternate)
+    covered = app.snap("tui-full-grid-fallback")
+    assert dense["source"] == dense["display"], "TUI cells were reflowed"
+    dock, cell = c["dock"], c["cell"]
+    # Native Metal pixels, without hovering: even a completely full terminal
+    # must leave all primary controls visible and their hit maps intact.
+    box = (dock["x"] * cell["width"] + 4, 4,
+           dock["width"] * cell["width"] - 8, dock["height"] * cell["height"] - 8)
+    assert clean.crop(*box) == covered.crop(*box), "terminal erased the fallback menu"
+    c = app.chrome()
+    assert not c["hovered"]
+    assert all(row["map"] == list(range(dock["width"])) for row in c["menu_rows"])
+    height, gap = dock["height"], dock["height"] + 2
+    assert gap + height < c["rows"]
+    lines = ["X" * c["cols"] for _ in range(c["rows"])]
+    for row in range(gap, gap + height):
+        lines[row] = "X" * dock["x"] + " " * (dock["width"] - 1) + "│"
+    initial = app.feed(lines, prefix=alternate)
+    # Simulate a dashboard redrawing faster than the settling interval. The
+    # geometry remains useful even though its values never stop changing.
+    for index in range(12):
+        lines[0] = ("A" if index % 2 else "B") * c["cols"]
+        app.feed(lines, prefix=alternate)
+        time.sleep(.1)
+    final = wait_for(lambda: (s if (s := app.chrome())["dock"]["y"] == gap and
+                              s["mode"] == 1 and s["motion"]["phase"] == 0 else None),
+                     timeout=6, description="quiet bordered TUI pocket")
+    assert final["motion"]["commits"] == initial["motion"]["commits"] + 1
+    assert final["source"] == final["display"] and not final["reflow_changed"]
+    app.snap("tui-bordered-pocket")
+    assert app.header_click("settings")["settings_open"], "TUI menu control did not respond"
+    # Returning to the main screen restores ordinary text-priority behavior.
+    app.hover(-1, -1)
+    c = app.feed(["X" * c["cols"]] * c["rows"])
+    app.snap("tui-exit-underlay")
+    c = app.chrome()
+    assert all(row["map"] == [-1] * dock["width"] for row in c["menu_rows"])
+    print("PASS: full-screen TUI menu stays visible, finds bordered pockets during redraws, and remains clickable")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, default=Path("build/chrome-adaptive"))
@@ -156,6 +204,8 @@ def main():
             test_motion(app)
         with NativeApp(root / "opposite", 1, artifacts, adaptive=True) as app:
             test_opposite_side(app)
+        with NativeApp(root / "tui", 1, artifacts, adaptive=True) as app:
+            test_fullscreen_tui(app)
     print(f"PASS: native adaptive menu; screenshots: {artifacts}")
 
 

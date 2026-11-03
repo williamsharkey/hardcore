@@ -230,12 +230,13 @@ class NativeApp:
     def map(self, col, row):
         return json.loads(self.output(f"cmd map {col},{row}").read_text())
 
-    def feed(self, lines, suffix=""):
+    def feed(self, lines, suffix="", prefix=""):
         self.sequence += 1
         path = self.root / f"fixture-{self.sequence}.txt"
         # Explicit cursor positioning preserves intentional hard row boundaries.
         # Put the hidden cursor far below the paragraph being tested.
         stream = "\x1bc\x1b[2J\x1b[3J\x1b[?25l"
+        stream += prefix
         for row, text in enumerate(lines):
             if text:
                 stream += f"\x1b[{row + 1};1H{text}"

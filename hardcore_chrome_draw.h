@@ -448,7 +448,7 @@ static void render_tabbar(int win_w, int win_h) {
         fill_rect(0, row_y(g_chrome.bottom) - 1, (float)chrome_draw_width(), row_y(g_chrome.bottom), g_look.dim, 1);
     }
     chrome_round_edges();
-    chrome_capture_end(g_grid_on || chrome_hovered() || !g_tab_underlay);
+    chrome_capture_end(g_grid_on || chrome_hovered() || chrome_tui_raised() || !g_tab_underlay);
     render_tvs();
     g_clip_w=clip;
     g_draw_alpha = saved_alpha;

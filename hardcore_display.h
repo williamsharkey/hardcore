@@ -23,7 +23,7 @@ static uint64_t chrome_motion_hash(uint64_t hash, const void *data, size_t lengt
 static uint64_t chrome_motion_context(Term *t) {
     const uintptr_t identity[] = { (uintptr_t)t, (uintptr_t)g_font, (uintptr_t)g_scheme,
         (uintptr_t)(active_tab() ? active_tab()->id : 0), (uintptr_t)t->cols, (uintptr_t)t->rows,
-        (uintptr_t)g_ntabs, (uintptr_t)g_active, (uintptr_t)g_settings_open, (uintptr_t)g_settings_tab,
+        (uintptr_t)t->alt, (uintptr_t)g_ntabs, (uintptr_t)g_active, (uintptr_t)g_settings_open, (uintptr_t)g_settings_tab,
         (uintptr_t)g_tab_offset, (uintptr_t)g_setting_offset[g_settings_tab],
         (uintptr_t)g_chrome.tab_capacity, (uintptr_t)g_chrome.list_capacity,
         (uintptr_t)g_chrome.tab_count, (uintptr_t)g_chrome.list_count };
@@ -221,12 +221,65 @@ static int chrome_motion_search(Term *t, const Cell *input, const unsigned char 
     }
     return cm_score_worth_move(winner, &baseline);
 }
+/* Score actual ink, not the span between a TUI's panel borders. Covering a
+ * border is cheaper than covering text; the live cursor is most expensive.
+ * Sliding sums inspect every full-height position on both edges, including
+ * large terminals that exceed the prose reflow search budget. */
+static int chrome_tui_row_cost(Term *t, const Cell *input, int side, int row) {
+    int left = side == 1 ? t->cols - SB_COLS : 0, cost = 0;
+    for (int x = left; x < left + SB_COLS; x++) {
+        const Cell *c = input + row * t->cols + x;
+        if (cell_covers_chrome(c)) cost += c->ch >= 0x2500 && c->ch <= 0x257f ? 1 : 8;
+        if (t->m_cursor_vis && row == t->cy &&
+            (x == t->cx || (x == t->cx + 1 && t->cx >= 0 && t->cx < t->cols &&
+                           input[row*t->cols+t->cx].wflag == W_WIDE))) cost += 64;
+    }
+    return cost;
+}
+static int chrome_tui_score_better(const ChromePlacementScore *a, const ChromePlacementScore *b) {
+    if (a->collision_cells != b->collision_cells) return a->collision_cells < b->collision_cells;
+    if (a->side != b->side) return a->side == 1;
+    return a->row < b->row;
+}
+static int chrome_tui_search(Term *t, const Cell *input, ChromePlacementScore *winner) {
+    int height = g_chrome.bottom - g_chrome.top;
+    ChromePlacementScore baseline = {0};
+    baseline.side = g_tab_underlay; baseline.row = g_chrome.top;
+    *winner = baseline;
+    if (height <= 0 || t->cols < SB_COLS || height > t->rows) return 0;
+    for (int y = baseline.row; y < baseline.row + height; y++)
+        baseline.collision_cells += chrome_tui_row_cost(t, input, baseline.side, y);
+    *winner = baseline;
+    for (int side = 1; side <= 2; side++) {
+        ChromePlacementScore score = {0}; score.side = side;
+        for (int y = 0; y < height; y++) score.collision_cells += chrome_tui_row_cost(t, input, side, y);
+        for (int row = 0; row + height <= t->rows; row++) {
+            ChromeLayout measure = chrome_primary_measure(t->rows, first_row(), g_ntabs, g_settings_open,
+                                                          side, row, chrome_item_total());
+            score.row = row;
+            if (measure.top == row && measure.tab_capacity == g_chrome.tab_capacity &&
+                measure.list_capacity == g_chrome.list_capacity && chrome_tui_score_better(&score, winner))
+                *winner = score;
+            if (row + height < t->rows) {
+                score.collision_cells -= chrome_tui_row_cost(t, input, side, row);
+                score.collision_cells += chrome_tui_row_cost(t, input, side, row + height);
+            }
+        }
+    }
+    if (winner->side == baseline.side && winner->row == baseline.row) return 0;
+    /* A deterministic upper-right tie break converges even on a full grid.
+     * Otherwise ignore tiny fluctuations in a dashboard's changing values. */
+    return winner->collision_cells == baseline.collision_cells || !winner->collision_cells ||
+           (int64_t)winner->collision_cells * 10 <= (int64_t)baseline.collision_cells * 9;
+}
 static void chrome_autoplace_prepare(Term *t, const Cell *input, const unsigned char *protected_rows) {
     uint32_t now = GetTickCount();
     uint64_t hash = chrome_motion_hash(UINT64_C(1469598103934665603), input,
                                        (size_t)t->cols * t->rows * sizeof(Cell));
     int cursor[] = {t->cx, t->cy, t->m_cursor_vis, t->view, t->hcount};
     int blocked, held, action;
+    ChromePlacementScore tui_winner;
+    int tui = chrome_tui_active(t), tui_move = 0;
     const char *test = getenv("HARDCORE_TEST_CHROME_MOTION");
     if (getenv("HARDCORE_CTL") && test && !strcmp(test, "0")) {
         cm_reset(&g_chrome_motion); g_chrome_motion_alpha = 1;
@@ -234,6 +287,14 @@ static void chrome_autoplace_prepare(Term *t, const Cell *input, const unsigned 
     }
     hash = chrome_motion_hash(hash, cursor, sizeof(cursor));
     hash = chrome_motion_hash(hash, protected_rows, (size_t)t->rows);
+    if (tui) {
+        tui_move = chrome_tui_search(t, input, &tui_winner);
+        /* Clocks, meters and redraws must not perpetually reset settling or
+         * cancel a fade when the best destination has not changed. */
+        int destination[] = {tui_move ? tui_winner.side : g_tab_underlay,
+                             tui_move ? tui_winner.row : g_chrome.top};
+        hash = chrome_motion_hash(UINT64_C(1469598103934665603), destination, sizeof(destination));
+    }
     held = (!g_focused && !(getenv("HARDCORE_CTL") && test && !strcmp(test, "1"))) ||
            g_chrome_drag || chrome_hovered() || chrome_preview_active() || g_sel_on || g_sel_drag || g_sb_drag;
     held=held || chrome_any_tv_hovered() || g_cutie_focus_id>0 || g_tv_drag_slot>=0;
@@ -242,7 +303,9 @@ static void chrome_autoplace_prepare(Term *t, const Cell *input, const unsigned 
                          g_tab_underlay, g_chrome.top, blocked);
     if (action == CM_SEARCH) {
         ChromePlacementScore winner;
-        if (chrome_motion_search(t, input, protected_rows, &winner))
+        if (tui) {
+            if (tui_move) cm_start(&g_chrome_motion, now, &tui_winner);
+        } else if (chrome_motion_search(t, input, protected_rows, &winner))
             cm_start(&g_chrome_motion, now, &winner);
     } else if (action == CM_COMMIT) {
         /* The only geometry mutation in a transition, on its zero-opacity
@@ -268,7 +331,7 @@ static void chrome_prepare_display_internal(Term *t, int dock_x, int dock_y, int
     int x, y;
     chrome_reflow_free(&g_display);
     g_display_term = NULL;
-    if (!g_tab_underlay || !g_chrome_reflow || t->cols <= SB_COLS + 4 ||
+    if (!g_tab_underlay || (!g_chrome_reflow && !chrome_tui_active(t)) || t->cols <= SB_COLS + 4 ||
         (display_tab() && &display_tab()->t == t && display_tab()->kind == TK_BROWSER)) {
         if (automatic) {
             cm_reset(&g_chrome_motion); g_chrome_motion_alpha = 1;
@@ -286,6 +349,11 @@ static void chrome_prepare_display_internal(Term *t, int dock_x, int dock_y, int
         if (n > t->cols) n = t->cols;
         for (x = 0; x < t->cols; x++) input[y*t->cols+x].ch = ' ';
         if (n > 0) memcpy(input + y*t->cols, cells, (size_t)n * sizeof(Cell));
+    }
+    if (chrome_tui_active(t)) {
+        if (automatic) chrome_autoplace_prepare(t, input, protected_rows);
+        /* Keep application coordinates, selection and mouse reporting intact. */
+        free(input); free(protected_rows); return;
     }
     /* VT autowrap can split a word across physical rows. The prose engine
        treats row breaks as word boundaries, so protect both halves instead

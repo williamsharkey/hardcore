@@ -195,6 +195,50 @@ static void unchanged(void) {
     assert(!checked_search(&t, grid, protected_rows, &winner));
     free(grid);
 }
+static void tui(void) {
+    Term t = {100, 40, 0, 0, 0, 0};
+    Cell *grid = blank_grid(t.cols, t.rows);
+    g_chrome = chrome_primary_measure(t.rows, 0, g_ntabs, 0, 1, 0, 0);
+    int height = g_chrome.bottom - g_chrome.top, gap = 15;
+    for (int y = 0; y < t.rows; y++) {
+        for (int x = 0; x < t.cols; x++) grid[y*t.cols+x].ch = 'X';
+        if (y >= gap && y < gap+height)
+            for (int x = t.cols-SB_COLS; x < t.cols-1; x++) grid[y*t.cols+x].ch = ' ';
+        grid[y*t.cols+t.cols-1].ch = 0x2502;
+    }
+    ChromePlacementScore winner = {0};
+    assert(chrome_tui_search(&t, grid, &winner));
+    assert(winner.side == 1 && winner.row == gap && winner.collision_cells == height);
+    /* Both edges have a quiet pocket: prefer right, then its highest row. */
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < SB_COLS; x++) grid[y*t.cols+x].ch = x ? ' ' : 0x2502;
+    assert(chrome_tui_search(&t, grid, &winner) && winner.side == 1 && winner.row == gap);
+    t.m_cursor_vis = 1; t.cx = 85; t.cy = gap;
+    assert(chrome_tui_search(&t, grid, &winner) && winner.side == 2 && winner.row == 0);
+    /* No empty rectangle exists: a full grid still has one stable fallback. */
+    t.m_cursor_vis = 0;
+    for (int i = 0; i < t.cols*t.rows; i++) grid[i].ch = 'X';
+    g_tab_underlay = 2;
+    g_chrome = chrome_primary_measure(t.rows, 0, g_ntabs, 0, 2, 8, 0);
+    assert(chrome_tui_search(&t, grid, &winner) && winner.side == 1 && winner.row == 0);
+    g_tab_underlay = 1;
+    g_chrome = chrome_primary_measure(t.rows, 0, g_ntabs, 0, 1, 0, 0);
+    assert(!chrome_tui_search(&t, grid, &winner));
+    free(grid);
+    /* Large grids must not inherit the bounded prose search's early exit. */
+    t.cols = 400; t.rows = 200;
+    grid = blank_grid(t.cols, t.rows);
+    g_chrome = chrome_primary_measure(t.rows, 0, g_ntabs, 0, 1, 80, 0);
+    assert(chrome_tui_search(&t, grid, &winner) && winner.side == 1 && winner.row == 0);
+    /* Preserve all tabs when a lower placement would reduce capacity. */
+    g_ntabs = 195;
+    g_chrome = chrome_primary_measure(t.rows, 0, g_ntabs, 0, 1, 0, 0);
+    for (int x = 0; x < t.cols; x++) grid[x].ch = 'X';
+    assert(chrome_tui_search(&t, grid, &winner) && winner.row == 1);
+    ChromeLayout destination = chrome_primary_measure(t.rows, 0, g_ntabs, 0, winner.side, winner.row, 0);
+    assert(destination.tab_capacity == g_chrome.tab_capacity);
+    free(grid);
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     if (!strcmp(argv[1], "right")) regional(1, 0);
@@ -203,6 +247,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[1], "cursor")) cursor();
     else if (!strcmp(argv[1], "capacity")) capacity();
     else if (!strcmp(argv[1], "unchanged")) unchanged();
+    else if (!strcmp(argv[1], "tui")) tui();
     else return 2;
     puts("PASS production chrome search");
     return 0;
@@ -251,6 +296,9 @@ class ChromeSearchTests(unittest.TestCase):
 
     def test_clear_or_unimprovable_content_does_not_move(self):
         self.check_case("unchanged")
+
+    def test_tui_pockets_cursor_dense_fallback_and_large_grid(self):
+        self.check_case("tui")
 
 
 if __name__ == "__main__":

@@ -5312,7 +5312,7 @@ static void render(void) {
 #ifdef _WIN32
     if (g_top_hover)                   /* the top line shows it's a title bar only while you point at it */
         fill_rect(0, 0, (float)(r.right - 3 * caption_btn_w()), (float)caption_h(), BAR_BG, 0.55f);
-    if (overlay && (chrome_hovered() || chrome_any_tv_hovered() || chrome_preview_active())) render_tabbar(r.right, r.bottom);
+    if (overlay && (chrome_hovered() || chrome_any_tv_hovered() || chrome_preview_active() || chrome_tui_raised())) render_tabbar(r.right, r.bottom);
     mac_browser_draw_overlay();
     render_cuties(r.right);
     mac_camera_draw();
@@ -5320,7 +5320,7 @@ static void render(void) {
     mac_browser_render_nav_overlay();
     render_caption_buttons(r.right);
 #else
-    if (overlay && (chrome_hovered() || chrome_any_tv_hovered())) render_tabbar(r.right, r.bottom);
+    if (overlay && (chrome_hovered() || chrome_any_tv_hovered() || chrome_tui_raised())) render_tabbar(r.right, r.bottom);
     mac_browser_draw_overlay();
     render_cuties(r.right);
     mac_camera_draw();

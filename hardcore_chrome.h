@@ -82,6 +82,13 @@ static int chrome_header_hit(int row, int col) {
     return HIT_CHROME_INERT;
 }
 static ChromeLayout g_chrome;
+/* Alternate-screen applications own a fixed grid. Their frame and status
+ * lines must not turn the primary menu into an invisible underlay. */
+static int chrome_tui_active(const Term *t) { return t->alt && !t->view; }
+static int chrome_tui_raised(void) {
+    Tab *tb = display_tab();
+    return g_tab_underlay && tb && tb->kind != TK_BROWSER && chrome_tui_active(&tb->t);
+}
 static float g_chrome_motion_alpha = 1;
 #include "hardcore_chrome_pack.h"
 static ChromePackRow *g_chrome_menu_rows;
