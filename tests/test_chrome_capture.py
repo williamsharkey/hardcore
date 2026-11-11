@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shlex
+import shutil
 import tempfile
 import unittest
 
@@ -116,7 +117,7 @@ class CaptureTests(unittest.TestCase):
         harness = path / "capture.c"
         harness.write_text(source)
         cls.exe = path / "capture"
-        command = shlex.split(os.environ.get("CC", "clang"))
+        command = shlex.split(os.environ.get("CC", "clang" if shutil.which("clang") else "cc"))   # plain C: cc where there is no clang
         command += ["-std=c99", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT)]
         command += shlex.split(os.environ.get("HC_TEST_CFLAGS", ""))
         result = bounded_run(command + [str(harness), "-o", str(cls.exe)], 30)

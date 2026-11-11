@@ -755,6 +755,9 @@ itself to the new exe:
   active and each tab scrolled where it was. It draws, and only then does the
   old process end, without closing the pseudoconsoles. So the switch is one
   frame.
+- **A tab whose shell stopped under Claude** (see [Sessions](#sessions)) goes
+  over as it is, with its text and its Claude session. **Enter** resumes
+  Claude there, as before the update.
 - **If anything goes wrong** before that, the old window carries on unchanged
   and `hardcore update` says to close and reopen it.
 
@@ -959,7 +962,19 @@ A shell can also stop under a running Claude: WSL stops, runs out of memory,
 or kills it. That isn't you closing the tab, so the tab stays with a dim line
 that says the shell stopped. Press **Enter** to start the shell again and
 resume Claude there; close the tab if you're done with it. Closing the window
-keeps the tab for the next start. (hardcore knows Claude was still running
+keeps the tab for the next start.
+
+When WSL itself stopped, you don't have to press Enter. Each shell tells
+hardcore which boot of Linux it runs in (`OSC 7700 ; boot=`, from
+`/proc/sys/kernel/random/boot_id`). While a stopped Claude tab waits, hardcore
+asks every 5 seconds whether the distro runs (`wsl -l --running`, which never
+starts it) and, only if it does, which boot runs now. A new boot means WSL
+stopped and started again, so the tab resumes Claude by itself, the same way
+Enter does. So does a distro that was seen not running (twice) and runs again.
+A shell that was killed while Linux ran on (the same boot) still waits for
+Enter. A tab whose shell failed right away is resumed this way once at most. Two tabs that come back with the same session start one
+Claude on it: the first shell to claim it (`/tmp/hardcore-resume-ID`) starts
+it, and the other waits up to 10 seconds to see it, then leaves it. (hardcore knows Claude was still running
 because the wrapper says when Claude exits, and you can't type `exit` under
 it. An exit code above 255, which only `wsl.exe` itself gives, counts too.)
 
@@ -971,6 +986,11 @@ On the next start the window opens where it was, and each tab is rebuilt:
 - **A Claude tab runs `claude <flags> --resume <id>`**, which is also put in the
   shell's history. A session closed before its first message has no transcript
   yet, so it gets a fresh `claude` with the same flags instead.
+- **A session that a running Claude has open is not resumed again.** This can
+  happen when another tab or window resumed it while this tab's shell was
+  stopped. Two Claudes on one session would both write its transcript. The tab
+  waits up to 5 seconds for a Claude that is still ending, then starts a plain
+  shell, says which Claude has the session, and puts the command behind ↑.
 
 On restore, an id must be letters, digits and dashes, and flags may contain
 only characters plain flags use, because the command goes through `eval`.

@@ -156,7 +156,8 @@ static inline HcTvRect hc_tv_requested_rect(HcTvRect requested,int cols,int rows
     int w=requested.w?requested.w:28,h=requested.h?requested.h:HC_TV_CUTIE_ROWS;
     w=w<HC_TV_MIN_WIDTH?HC_TV_MIN_WIDTH:w>HC_TV_MAX_WIDTH?HC_TV_MAX_WIDTH:w;
     h=h<HC_TV_MIN_HEIGHT?HC_TV_MIN_HEIGHT:h>HC_TV_MAX_HEIGHT?HC_TV_MAX_HEIGHT:h;
-    if(w>cols)w=cols;if(h>rows)h=rows;
+    if(w>cols)w=cols;
+    if(h>rows)h=rows;
     return (HcTvRect){hc_tv_clamp(requested.x,cols-w),hc_tv_clamp(requested.y,rows-h),w,h};
 }
 /* Jump past rectangles, never scan screen rows. Each pass advances beyond at
@@ -187,7 +188,8 @@ static inline int hc_tv_stack_band(const HcTvPlacement *p,HcTvRect primary) {
     return 2;
 }
 static inline int hc_tv_stack_better(const HcTvPlacement *a,const HcTvPlacement *b,HcTvRect primary) {
-    if(!b->valid)return a->valid;if(!a->valid)return 0;
+    if(!b->valid)return a->valid;
+    if(!a->valid)return 0;
     int aa=hc_tv_stack_band(a,primary),bb=hc_tv_stack_band(b,primary);
     if(aa!=bb)return aa<bb;
     if(!aa && a->rank!=b->rank)return a->rank<b->rank;

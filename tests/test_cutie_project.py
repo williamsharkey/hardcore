@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shlex
+import shutil
 import tempfile
 import unittest
 
@@ -198,7 +199,7 @@ class CutieProjectionTests(unittest.TestCase):
         source = path / "project.c"
         source.write_text(HARNESS)
         cls.exe = path / "project"
-        command = shlex.split(os.environ.get("CC", "clang"))
+        command = shlex.split(os.environ.get("CC", "clang" if shutil.which("clang") else "cc"))   # plain C: cc where there is no clang
         command += ["-std=c99", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT)]
         command += shlex.split(os.environ.get("HARDCORE_TEST_CFLAGS", ""))
         result = bounded_run(command + [str(source), "-o", str(cls.exe)], 30)

@@ -138,7 +138,8 @@ static void cutie_hit(void){
 static void packed_title(void){
     int idx=-1;init();ChromeTv *tv=g_tvs+HC_TV_CUTIE_FIRST;*tv=g_tvs[0];g_tvs[0].state.open=0;tv->tab_id=100;
     unsigned char ink[SB_COLS]={0};
-    for(int x=1;x<13;x++)ink[x]=1;ink[22]=ink[24]=ink[26]=1;
+    for(int x=1;x<13;x++)ink[x]=1;
+    ink[22]=ink[24]=ink[26]=1;
     for(int left=0;left<SB_COLS;left++)for(int right=left+1;right<=SB_COLS;right++) {
         chrome_pack_row(rows,ink,SB_COLS,left,right);
         for(int x=0;x<SB_COLS;x++) {
@@ -155,7 +156,8 @@ static void packed_title(void){
 }
 int main(int argc,char **argv){int n=argc>1?atoi(argv[1]):0;
     if(!n)packed();else if(n==1)stale();else if(n==2)caf();else if(n==3)lifecycle();
-    else if(n==4)persistent();else if(n==5)cutie_hit();else packed_title();puts("ok");return 0;}
+    else if(n==4)persistent();else if(n==5)cutie_hit();else packed_title();
+    puts("ok");return 0;}
 '''
 class Hit(unittest.TestCase):
     @classmethod
