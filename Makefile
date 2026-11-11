@@ -139,7 +139,7 @@ build/stamp.txt: FORCE
 	@mkdir -p build
 	@echo '$(BUILD) $(COMMIT) $(COMMIT_DATE)' | cmp -s - $@ || echo '$(BUILD) $(COMMIT) $(COMMIT_DATE)' > $@
 
-hardcore.exe: build/stamp.txt build/browser.inc hardcore_json.h hardcore_win_cdp.h hardcore_browser_grid.h hardcore_browser_pixels.h hardcore_browser_image_geometry.h hardcore.c hardcore_win_menu.h hardcore_win_music.h hardcore_win_camera.h hardcore_win_capture.h hardcore_win_browser.h tools/files.py hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
+hardcore.exe: build/stamp.txt build/browser.inc hardcore_json.h hardcore_win_disk.h hardcore_disk_policy.h hardcore_win_cdp.h hardcore_browser_grid.h hardcore_browser_pixels.h hardcore_browser_image_geometry.h hardcore.c hardcore_win_menu.h hardcore_win_music.h hardcore_win_camera.h hardcore_win_capture.h hardcore_win_browser.h tools/files.py hardcore_grid.h hardcore_grid_state.h hardcore_grid_draw.h hardcore_grid_mac.m hardcore_chrome.h hardcore_chrome_draw.h hardcore_chrome_pack.h hardcore_chrome_motion.h hardcore_tv.h hardcore_tv_ui.h hardcore_tv_layout.h hardcore_tv_draw.h hardcore_tv_reflow.h hardcore_cutie.h hardcore_cutie_project.h hardcore_tab_preview.h hardcore_display.h hardcore_reflow.h hardcore_structured_reflow.h hardcore_panel_reflow.h hardcore_badge_reflow.h hardcore_slurp.h slurp/reptyr/COPYING build/slurp-version.h build/font.bin build/fonts.bin build/fonts.inc build/width.inc build/res.o vendor/conpty/conpty.dll vendor/conpty/OpenConsole.exe hardcore_font_menu.h
 	$(CC) $(CFLAGS) -DFONT_BIN='"build/font.bin"' -DFONTS_BIN='"build/fonts.bin"' -DCONPTY_VER='L"$(CONPTY_VER)"' -DCONPTY_VER_A='"$(CONPTY_VER)"' \
 		$(STAMP_FLAGS) -o $@ hardcore.c build/res.o $(LIBS)
 
@@ -156,6 +156,7 @@ win-test: hardcore.exe reflow-test
 	python3 tests/test_session_resume_windows.py
 	python3 tests/test_upgrade.py
 	python3 tests/test_ensure_tab_windows.py
+	python3 tests/test_disk_reclaim_windows.py
 	$(MAKE) --no-print-directory selftest
 	$(MAKE) --no-print-directory slurp-test
 
@@ -390,9 +391,18 @@ font-settings-test: hardcore.exe
 	python3 tests/test_font_settings_windows.py
 
 # Pure display-only paragraph reflow: also runnable without a desktop.
-.PHONY: reflow-test chrome-test
+.PHONY: reflow-test chrome-test disk-test
+# WSL disk reclaim: the rules, then hardcore disk on small test VHDX files and the card (fake sizes)
+disk-test: hardcore.exe
+	@mkdir -p build
+	cc -std=c99 -O2 -Wall -Wextra -Werror tests/test_disk_policy.c -o build/test-disk-policy
+	build/test-disk-policy
+	python3 tests/test_disk_reclaim_windows.py
+
 reflow-test:
 	@mkdir -p build
+	cc -std=c99 -O2 -Wall -Wextra -Werror tests/test_disk_policy.c -o build/test-disk-policy
+	build/test-disk-policy
 	cc -std=c99 -O2 -Wall -Wextra tests/test_grid_layout.c -o build/test-grid-layout
 	build/test-grid-layout
 	cc -std=c99 -O2 -Wall -Wextra tests/test_reflow.c -o build/test-reflow

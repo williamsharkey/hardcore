@@ -93,6 +93,14 @@ The tab column now warns when the drive that holds WSL's disk runs low on
 space. It shows amber under 20 GB free and red under 5 GB, checked every
 minute. That's the most likely cause above, caught before it takes WSL down.
 
+## Done in hardcore (feat/wsl-disk-reclaim)
+
+The low-disk warning grew into a card that offers to give free Linux space
+back to the drive: fstrim, stop Linux, compact the `.vhdx` with
+`CompactVirtualDisk` (no admin; open flag 0x400 for a sparse file), start the
+tabs again. It measures the drive of each distro's own disk file, not
+`%LOCALAPPDATA%`. See `design/WSL-DISK-RECLAIM.md` and `hardcore disk`.
+
 ## Possible hardcore changes (not done; they need a Windows box to test)
 
 - Default the start folder to the Linux home when the distro has one,

@@ -389,6 +389,17 @@ shared by every window.
   then the whole WSL VM goes down, taking every tab with it. Under 20 GB free,
   the bottom of the tab column shows how much is left (amber), and under 5 GB
   it turns red.
+- **Gives free Linux space back to Windows.** When Linux deletes files, its
+  `.vhdx` does not get smaller by itself. When the drive is low, or Linux
+  holds 10 GB or more that it does not use, the tab column offers to give it
+  back. Press **R**: hardcore says what will stop, and a second **R** stops
+  Linux, compacts the disk file (no admin), and starts your tabs again.
+  **C** caps the Linux disk so it cannot fill the drive. **D** deletes WSL
+  crash dumps. hardcore never stops Linux without your key. From a shell:
+  `hardcore disk` shows the sizes; `hardcore disk help` lists the rest.
+  `reclaim=` in `config.ini` (`ask`, `idle`, `warn`, `off`) or
+  `HARDCORE_RECLAIM=off` changes this. WSL lets go of the disk file only
+  when its Linux VM stops, so every other distro must be stopped too.
 - **+** (or Ctrl+Shift+T) opens a new WSL tab **in the same folder as the
   tab you're in**.
 - **A tab's label is `folder:program`**, for example `hardcore:codex`.

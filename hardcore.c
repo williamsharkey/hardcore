@@ -581,6 +581,7 @@ typedef struct Tab {
     HPCON_ hpc;
     HANDLE pin_w, pout_r, proc, reader, wait;
     HWND slurp_hwnd;             /* live native console; closing this tab detaches */
+    int disk_lost;               /* its shell stopped for a disk step: it starts again when the step ends */
     int slurp_ready, slurp_committed, slurp_wsl;
     int slurp_sel_on, slurp_sel_top, slurp_sel_bottom, slurp_sel_left, slurp_sel_right;
     wchar_t slurp_command[4096]; /* source-built Linux attachment, bypass shell startup */
@@ -2989,31 +2990,13 @@ static void write_rc(void) {
     SetEnvironmentVariableW(L"FORCE_HYPERLINK", L"1");
 }
 
+#include "hardcore_win_disk.h"
+
 /* Distros registered for this user, and the default one's name. No process,
    no WSL service start: just the registry, so it costs microseconds. */
 static int wsl_distros(void) {
-    HKEY k, d;
-    wchar_t name[128], def[64] = L"";
-    DWORD i, n = 0, sz;
-    g_default_distro[0] = 0;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss", 0, KEY_READ, &k)) return 0;
-    sz = sizeof(def);
-    RegGetValueW(k, NULL, L"DefaultDistribution", RRF_RT_REG_SZ, NULL, def, &sz);
-    for (i = 0;; i++) {
-        wchar_t sub[64], dn[128];
-        DWORD subn = 64;
-        if (RegEnumKeyExW(k, i, sub, &subn, NULL, NULL, NULL, NULL)) break;
-        sz = sizeof(dn);
-        if (RegOpenKeyExW(k, sub, 0, KEY_READ, &d)) continue;
-        if (!RegGetValueW(d, NULL, L"DistributionName", RRF_RT_REG_SZ, NULL, dn, &sz)) {
-            n++;
-            if (!_wcsicmp(sub, def) || !g_default_distro[0]) _snwprintf(g_default_distro, 128, L"%ls", dn);
-        }
-        RegCloseKey(d);
-    }
-    RegCloseKey(k);
-    (void)name;
-    return (int)n;
+    WslDistro all[WSL_MAX_DISTROS];
+    return wsl_distro_list(all, WSL_MAX_DISTROS, g_default_distro, 128);
 }
 
 /* A folder for a PowerShell tab: Windows paths as-is, <mount root>/c/x → C:\x,
@@ -3324,6 +3307,7 @@ static void config_load(void) {
         else if (!strcmp(line, "height")) g_win_h = atoi(v);
         else if (!strcmp(line, "clean_copy")) g_clean_copy = !(v[0] == '0' || !_stricmp(v, "no") || !_stricmp(v, "false"));
         else if (!strcmp(line, "elevated")) g_cfg_elevated = v[0] == '1' || !_stricmp(v, "yes") || !_stricmp(v, "true");
+        else if (!strcmp(line, "reclaim")) snprintf(g_reclaim_cfg, sizeof(g_reclaim_cfg), "%s", v);
         else if (!strcmp(line, "ctrl_copy")) g_ctrl_copy = !(v[0] == '0' || !_stricmp(v, "no") || !_stricmp(v, "false"));
         else config_look(line, v);
     }
@@ -3352,6 +3336,9 @@ static void config_save(void) {
     fprintf(f, "# ctrl_copy=1: Ctrl+C copies the selection (no selection: ^C as always), Ctrl+X copies it too,\n"
                "# Ctrl+V pastes; 0 = only Ctrl+Shift+C / Ctrl+Shift+V (Ctrl+C, Ctrl+V, Ctrl+X go to the program)\n");
     fprintf(f, "ctrl_copy=%d\n", g_ctrl_copy);
+    fprintf(f, "# reclaim=ask: offer to give WSL disk space back to Windows; idle = also do it\n"
+               "# when the PC is idle and nothing runs; warn = only show it; off = never\n");
+    fprintf(f, "reclaim=%s\n", g_reclaim_cfg);
     fprintf(f, "# the folder the last window closed in; new windows open there (empty: use dir=)\n");
     fprintf(f, "last=%s\n", g_last_dir);
     config_look_save(f);
@@ -4865,43 +4852,561 @@ static int g_top_hover;          /* the mouse is on the top line: it drags the w
 /* the top line, left of the buttons: a title bar that only shows itself on hover */
 static int in_top_line(int mx, int my) { return mx >= 0 && !in_sidebar(mx) && my >= 0 && my < caption_h(); }
 
-/* ── low disk ─────────────────────────────────────────────────────────
+/* ── low disk, and giving WSL disk space back ─────────────────────────
    WSL's disk is a .vhdx on a Windows drive that grows as Linux writes. When
    that drive fills, the guest still thinks it has room; its writes fail
    underneath it, programs die with SIGBUS ("Bus error") and then the whole
-   VM goes, taking every tab with it. So the tab column warns early. */
-#define DISK_WARN_GB 20.0
-#define DISK_BAD_GB 5.0
+   VM goes, taking every tab with it. So the tab column warns early, and
+   offers to give the free Linux space back (design/WSL-DISK-RECLAIM.md):
+   one key stops Linux, compacts the disk file, and starts the tabs again.
+   hardcore never stops Linux without that key (reclaim=ask, the default). */
 static double g_disk_free_gb = -1;
 static wchar_t g_disk_name[4] = L"C:";
 
+#define WM_APP_DISK (WM_APP + 20)        /* wp: DISK_MSG_*, lp: a malloc'd result or NULL */
+#define WM_APP_DISK_HOLD (WM_APP + 21)   /* another window stops Linux: keep tabs that stop, make no spare */
+#define WM_APP_DISK_DONE (WM_APP + 22)   /* ...and it ended: start those tabs again */
+#define TIMER_DISK_TICK 20               /* once a second, while a countdown or a run shows */
+enum { DISK_MSG_PROBE = 1, DISK_MSG_PROGRESS, DISK_MSG_DONE };
+enum { DP_NONE, DP_CHECKING, DP_CONFIRM, DP_BLOCKED, DP_COUNTDOWN, DP_RUNNING, DP_DONE, DP_FAILED, DP_EARLY };
+enum { DJ_COMPACT, DJ_CAP };
+enum { DQ_PERIODIC, DQ_KEY, DQ_AUTO };   /* why a probe runs */
+
+static WslDistro g_dk_w;
+static int g_dk_have, g_dk_state = DS_UNKNOWN, g_dk_phase, g_dk_job_kind, g_dk_want_idle, g_dk_probing, g_dk_hold_remote;
+static DiskSizes g_dk;
+static DiskAction g_dk_act;
+static double g_dk_dumps, g_dk_cap, g_dk_freed;
+static DWORD g_dk_phase_at, g_dk_probe_at;
+static char g_dk_busy[500], g_dk_blocked[400];
+static DiskJob *g_dk_job;
+static HANDLE g_dk_lock;
+static DiskFake g_dk_fake;
+static struct { float y0, y1; int key; } g_dk_rows[12];
+static int g_dk_nrows;
+static float g_dk_top = -1;
+
+typedef struct {
+    wchar_t distro[128];
+    int why, trim;
+    LinuxInfo li;
+    WslClients wc;
+    char others[300], trim_msg[200];
+    int running;
+    long trim_rc;
+} DiskProbe;
+
+typedef struct {
+    DiskJob j;
+    wchar_t distro[128];
+    int kind;
+    double cap;
+    long vm_idle_ms;
+    char note[300];
+} DiskGuiJob;
+
+static void tab_respawn(int at);
+static void activate(int i);
+static void disk_set_phase(int ph);
+static int session_save(void);
+static void tab_lost(Tab *tb, DWORD code);
+
+static wchar_t *disk_window_distro(void) {
+    static wchar_t n[128];
+    if (g_distro[0]) MultiByteToWideChar(CP_UTF8, 0, g_distro, -1, n, 128);
+    else _snwprintf(n, 128, L"%ls", g_default_distro);
+    return n;
+}
+
+/* Linux is being stopped for a disk step, by this window or another one */
+static int disk_holding(void) {
+    return g_dk_phase == DP_RUNNING || g_dk_hold_remote || disk_lock_holder() != 0;
+}
+
+static int disk_tab_of_distro(const Tab *tb) { return tb->kind == TK_WSL && !tb->help; }
+
+/* what a stop ends, from this window's tabs: "2 tabs run programs: make, claude" */
+static int disk_own_busy(char *out, size_t cap) {
+    int i, n = 0;
+    out[0] = 0;
+    for (i = 0; i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        const char *what = tb->t.claude[0] ? "claude" : tb->t.cmd[0] ? tb->t.cmd : tb->busy ? "a program" : NULL;
+        char word[48];
+        size_t k;
+        if (!disk_tab_of_distro(tb) || !what) continue;
+        for (k = 0; what[k] && what[k] != ' ' && k + 1 < sizeof(word); k++) word[k] = what[k];
+        word[k] = 0;
+        n++;
+        if (!strstr(out, word) && strlen(out) + k + 3 < cap) {
+            if (out[0]) strcat(out, ", ");
+            strcat(out, word);
+        }
+    }
+    return n;
+}
+
+static DWORD WINAPI disk_probe_thread(void *arg) {
+    DiskProbe *p = (DiskProbe *)arg;
+    p->running = wsl_running(p->distro, p->others, sizeof(p->others));
+    if (p->running) {
+        if (p->trim) p->trim_rc = wsl_trim(p->distro, p->trim_msg, sizeof(p->trim_msg));
+        linux_info(p->distro, &p->li);
+    }
+    wsl_clients(p->distro, &p->wc);
+    if (!PostMessageW(g_hwnd, WM_APP_DISK, DISK_MSG_PROBE, (LPARAM)p)) free(p);
+    return 0;
+}
+
+static void disk_probe_start(int why) {
+    DiskProbe *p;
+    HANDLE th;
+    double trim_at;
+    if (g_dk_fake.on) {          /* tests: fake sizes never ask the real Linux */
+        if (why == DQ_KEY) disk_set_phase(DP_CONFIRM);
+        return;
+    }
+    if (g_dk_probing || !g_dk_have || (why == DQ_PERIODIC && disk_holding())) return;
+    if (!(p = (DiskProbe *)calloc(1, sizeof(*p)))) return;
+    _snwprintf(p->distro, 128, L"%ls", g_dk_w.name);
+    p->why = why;
+    disk_state_load();
+    trim_at = disk_state_num(disk_key(g_dk_w.name, "trim_at"));
+    p->trim = why == DQ_PERIODIC && reclaim_mode() != RM_OFF && time(NULL) - trim_at > RECLAIM_TRIM_HOURS * 3600.0;
+    g_dk_probing = 1;
+    g_dk_probe_at = GetTickCount();
+    if ((th = CreateThread(NULL, 0, disk_probe_thread, p, 0, NULL))) CloseHandle(th);
+    else { free(p); g_dk_probing = 0; }
+}
+
+static void disk_set_phase(int ph) {
+    g_dk_phase = ph;
+    g_dk_phase_at = GetTickCount();
+    if (ph == DP_COUNTDOWN || ph == DP_RUNNING) SetTimer(g_hwnd, TIMER_DISK_TICK, 1000, NULL);
+    else KillTimer(g_hwnd, TIMER_DISK_TICK);
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+/* other hardcore windows: hold their tabs, then start them again */
+static BOOL CALLBACK disk_tell_window(HWND h, LPARAM msg) {
+    wchar_t cls[32];
+    if (h != g_hwnd && GetClassNameW(h, cls, 32) && !wcscmp(cls, L"hardcore")) PostMessageW(h, (UINT)msg, 0, 0);
+    return TRUE;
+}
+
+static void disk_job_progress(DiskJob *j) { PostMessageW(g_hwnd, WM_APP_DISK, DISK_MSG_PROGRESS, 0); (void)j; }
+
+static DWORD WINAPI disk_job_thread(void *arg) {
+    DiskGuiJob *g = (DiskGuiJob *)arg;
+    char msg[300] = "";
+    long rc;
+    rc = wsl_trim(g->distro, msg, sizeof(msg));
+    disk_log(g->distro, "trim rc=%ld %s", rc, msg);
+    rc = wsl_terminate(g->distro);
+    disk_log(g->distro, "terminate rc=%ld", rc);
+    if (g->kind == DJ_COMPACT) disk_compact_run(&g->j);
+    else {
+        /* the cap: wait for WSL to let go of the file, then let WSL resize it */
+        HANDLE h = NULL;
+        DWORD t0 = GetTickCount(), r;
+        wchar_t cmd[300];
+        char *o = NULL;
+        while ((r = vd_open(g->j.vhd, g->j.sparse, VIRTUAL_DISK_ACCESS_GET_INFO, &h)) == ERROR_SHARING_VIOLATION &&
+               GetTickCount() - t0 < g->j.wait_ms && !g->j.cancel)
+            Sleep(1000);
+        if (h) CloseHandle(h);
+        if (r) {
+            g->j.err = r;
+            snprintf(g->j.why, sizeof(g->j.why), "The disk file is in use. Linux, or another program, still holds it.");
+        } else {
+            _snwprintf(cmd, 300, L"wsl.exe --manage %ls --resize %.0fGB", g->distro, g->cap);
+            cmd[299] = 0;
+            rc = disk_run(cmd, NULL, &o, 30 * 60 * 1000);
+            if (o) { size_t i; for (i = 0; o[i]; i++) if (o[i] == '\r' || o[i] == '\n') o[i] = ' '; }
+            disk_log(g->distro, "cap size=%.0fGB rc=%ld %s", g->cap, rc, o ? o : "");
+            if (rc) { g->j.err = (DWORD)rc; snprintf(g->j.why, sizeof(g->j.why), "WSL could not resize the Linux disk."); }
+            free(o);
+        }
+    }
+    if (g->kind == DJ_COMPACT)
+        disk_log(g->distro, "compact %s err=%lu L=%.3f->%.3f A=%.3f->%.3f F=%.3f->%.3f minF=%.3f secs=%.1f%s%s",
+                 g->j.err ? "failed" : "ok", (unsigned long)g->j.err, g->j.len_before, g->j.len_after, g->j.alloc_before,
+                 g->j.alloc_after, g->j.free_before, g->j.free_after, g->j.free_min, g->j.secs, g->j.why[0] ? " why=" : "", g->j.why);
+    if (!PostMessageW(g_hwnd, WM_APP_DISK, DISK_MSG_DONE, (LPARAM)g)) free(g);
+    return 0;
+}
+
+/* the key went through and nothing blocks: stop Linux and run the step */
+static void disk_job_start(int kind) {
+    DiskGuiJob *g;
+    HANDLE th;
+    int i;
+    if (g_dk_fake.on) {          /* tests: fake sizes never stop the real Linux */
+        g_dk_job_kind = kind;
+        g_dk_freed = g_dk_fake.freed;
+        disk_set_phase(DP_DONE);
+        return;
+    }
+    if (!g_dk_have || g_dk_job || !(g = (DiskGuiJob *)calloc(1, sizeof(*g)))) return;
+    if (!(g_dk_lock = disk_lock_take())) { free(g); snprintf(g_dk_blocked, sizeof(g_dk_blocked), "Another disk cleanup runs."); disk_set_phase(DP_BLOCKED); return; }
+    _snwprintf(g->distro, 128, L"%ls", g_dk_w.name);
+    _snwprintf(g->j.vhd, MAX_PATH, L"%ls", g_dk_w.vhd);
+    g->kind = kind;
+    g->cap = g_dk_cap;
+    g->j.sparse = g_dk.sparse;
+    g->j.wait_ms = (DWORD)(wsl_vm_idle_ms() + 120000);
+    g->j.progress = disk_job_progress;
+    g_dk_job = &g->j;
+    g_dk_job_kind = kind;
+    session_save();              /* the tabs come back even if this window goes */
+    if (g_spare) { tab_destroy_async(g_spare); g_spare = NULL; }   /* a spare shell would keep Linux running */
+    disk_run_begin(g->distro, kind == DJ_CAP ? "cap" : "compact");
+    disk_log(g->distro, "%s start (window) L=%.3f A=%.3f F=%.3f U=%.3f sparse=%d",
+             kind == DJ_CAP ? "cap" : "compact", g_dk.len, g_dk.alloc, g_dk.free, g_dk.used, g_dk.sparse);
+    EnumWindows(disk_tell_window, WM_APP_DISK_HOLD);
+    disk_set_phase(DP_RUNNING);
+    g_dk_want_idle = 0;
+    for (i = 0; i < g_ntabs; i++) g_tabs[i]->attention = 0;
+    if ((th = CreateThread(NULL, 0, disk_job_thread, g, 0, NULL))) CloseHandle(th);
+    else {
+        g_dk_job = NULL;
+        disk_lock_drop(g_dk_lock);
+        g_dk_lock = NULL;
+        disk_run_end();
+        free(g);
+        disk_set_phase(DP_FAILED);
+    }
+}
+
+/* tabs that stopped with Linux: a new shell each, Claude resuming */
+static void disk_restart_tabs(void) {
+    int i, act = g_active, any = 0;
+    for (i = 0; i < g_ntabs; i++)
+        if (g_tabs[i]->disk_lost) { tab_respawn(i); any = 1; }
+    if (any && act < g_ntabs) activate(act);
+}
+
+static void check_disk(void);
+
+static void disk_job_done(DiskGuiJob *g) {
+    g_dk_job = NULL;
+    disk_state_load();
+    disk_state_set(disk_key(g->distro, g->kind == DJ_CAP ? "cap_at" : "compact_at"), "%lld", (long long)time(NULL));
+    disk_state_set(disk_key(g->distro, "result"), "%s", g->j.err ? "failed" : "ok");
+    if (g->kind == DJ_COMPACT) disk_state_set(disk_key(g->distro, "freed"), "%.3f", g->j.alloc_before - g->j.alloc_after);
+    if (g->j.err) disk_state_set(disk_key(g->distro, "fail_until"), "%lld", (long long)time(NULL) + RECLAIM_SNOOZE_DAYS * 86400LL);
+    disk_state_save();
+    disk_run_end();
+    disk_lock_drop(g_dk_lock);
+    g_dk_lock = NULL;
+    g_dk_freed = g->j.alloc_before - g->j.alloc_after;
+    snprintf(g_dk_blocked, sizeof(g_dk_blocked), "%s", g->j.why);
+    disk_set_phase(g->j.err ? DP_FAILED : DP_DONE);
+    free(g);
+    disk_restart_tabs();         /* the owner chose: tabs start again by themselves */
+    EnumWindows(disk_tell_window, WM_APP_DISK_DONE);
+    check_disk();
+}
+
+static void disk_probe_done(DiskProbe *p) {
+    char own[300];
+    int nown;
+    g_dk_probing = 0;
+    if (_wcsicmp(p->distro, g_dk_w.name)) { free(p); return; }
+    if (p->trim) {
+        disk_log(p->distro, "trim (daily) rc=%ld %s", p->trim_rc, p->trim_msg);
+        if (!p->trim_rc) {
+            disk_state_load();
+            disk_state_set(disk_key(p->distro, "trim_at"), "%lld", (long long)time(NULL));
+            disk_state_save();
+        }
+    }
+    if (p->li.used >= 0) {
+        disk_state_load();
+        disk_state_set(disk_key(p->distro, "used"), "%.3f", p->li.used);
+        disk_state_set(disk_key(p->distro, "fs"), "%.3f", p->li.fs_size);
+        disk_state_set(disk_key(p->distro, "used_at"), "%lld", (long long)time(NULL));
+        disk_state_save();
+    }
+    nown = disk_own_busy(own, sizeof(own));
+    /* what a stop ends, in plain words */
+    g_dk_busy[0] = 0;
+    if (nown) snprintf(g_dk_busy, sizeof(g_dk_busy), "%d tab%s run%s %s.", nown, nown == 1 ? "" : "s", nown == 1 ? "s" : "", own);
+    if (p->li.busy[0] && strcmp(p->li.busy, own)) {
+        size_t n = strlen(g_dk_busy);
+        snprintf(g_dk_busy + n, sizeof(g_dk_busy) - n, "%sLinux runs %s.", n ? " " : "", p->li.busy);
+    }
+    if (p->wc.others) {
+        size_t n = strlen(g_dk_busy);
+        snprintf(g_dk_busy + n, sizeof(g_dk_busy) - n, "%sOther windows use it: %ls.", n ? " " : "", p->wc.other_names);
+    }
+    g_dk_blocked[0] = 0;
+    if (p->others[0]) snprintf(g_dk_blocked, sizeof(g_dk_blocked), "Other Linux distros run: %s. Stop them first.", p->others);
+    else if (wsl_vm_idle_ms() <= 0) snprintf(g_dk_blocked, sizeof(g_dk_blocked), ".wslconfig keeps Linux running (vmIdleTimeout).");
+    if (p->why == DQ_KEY) {
+        if (g_dk_blocked[0]) disk_set_phase(DP_BLOCKED);
+        else disk_set_phase(DP_CONFIRM);    /* the card always says what stops, then R goes on */
+    } else if (p->why == DQ_AUTO) {
+        int busy = g_dk_blocked[0] || g_dk_busy[0] || (p->li.load > RECLAIM_LOAD_BUSY);
+        if (busy) disk_set_phase(DP_NONE);  /* not idle after all: try later */
+        else disk_job_start(g_dk_job_kind);
+    }
+    free(p);
+    check_disk();
+}
+
 static void check_disk(void) {
-    wchar_t p[MAX_PATH], *la = _wgetenv(L"LOCALAPPDATA");
-    ULARGE_INTEGER avail;
-    double gb, was = g_disk_free_gb;
-    _snwprintf(p, MAX_PATH, L"%ls\\wsl\\", la ? la : L"C:");
-    p[MAX_PATH - 1] = 0;
-    if (!GetDiskFreeSpaceExW(p, &avail, NULL, NULL) && !GetDiskFreeSpaceExW(la ? la : L"C:\\", &avail, NULL, NULL)) return;
-    if (la && la[0] && la[1] == ':') { g_disk_name[0] = towupper(la[0]); g_disk_name[1] = ':'; g_disk_name[2] = 0; }
-    gb = (double)avail.QuadPart / (1024.0 * 1024 * 1024);
-    g_disk_free_gb = gb;
-    if ((was < DISK_WARN_GB) != (gb < DISK_WARN_GB) || (gb < DISK_WARN_GB && (int)(was * 10) != (int)(gb * 10)))
+    DiskCtx c;
+    LASTINPUTINFO li = {sizeof(li), 0};
+    SYSTEM_POWER_STATUS ps;
+    double was = g_disk_free_gb, now = (double)time(NULL);
+    int mode = reclaim_mode(), running_tab = 0, i, files;
+    char own[300];
+    memset(&c, 0, sizeof(c));
+    g_dk_have = wsl_distro_find(disk_window_distro(), &g_dk_w) && wsl_distro_is_wsl2(&g_dk_w) && !g_shell_ps;
+    memset(&g_dk, 0, sizeof(g_dk));
+    g_dk.used = g_dk.fs_size = -1;
+    if (g_dk_have) {
+        disk_measure_file(g_dk_w.vhd, &g_dk);
+        g_dk.wsl2 = 1;
+        disk_drive_name(g_dk_w.vhd, g_disk_name);
+        disk_state_load();
+        g_dk.used = disk_state_num(disk_key(g_dk_w.name, "used"));
+        g_dk.fs_size = disk_state_num(disk_key(g_dk_w.name, "fs"));
+    } else {
+        /* no WSL 2 disk: the drive of %LOCALAPPDATA%, as before */
+        wchar_t p[MAX_PATH], *la = _wgetenv(L"LOCALAPPDATA");
+        _snwprintf(p, MAX_PATH, L"%ls\\", la ? la : L"C:");
+        p[MAX_PATH - 1] = 0;
+        g_dk.free = disk_free_gb(p);
+        g_dk.len = g_dk.alloc = -1;
+        if (la) disk_drive_name(la, g_disk_name);
+    }
+    if (disk_fake(g_dk_have ? g_dk_w.name : L"Debian", &g_dk, &g_dk_fake)) {
+        if (!g_dk_have) { g_dk_have = 1; _snwprintf(g_dk_w.name, 128, L"Debian"); }
+    }
+    if (g_dk_have) {
+        disk_state_load();
+        c.snoozed = disk_state_num(disk_key(g_dk_w.name, "snooze_until")) > now;
+        c.failed = disk_state_num(disk_key(g_dk_w.name, "fail_until")) > now;
+    }
+    g_disk_free_gb = g_dk.free;
+    g_dk_state = disk_state(&g_dk);
+    g_dk_dumps = mode == RM_OFF ? 0 : g_dk_fake.on ? g_dk_fake.dumps : disk_dumps(0, &files);
+    g_dk_cap = disk_cap_suggest(&g_dk);
+    c.busy = disk_own_busy(own, sizeof(own)) > 0;
+    if (GetLastInputInfo(&li)) c.idle_min = (GetTickCount() - li.dwTime) / 60000.0;
+    c.on_ac = 1;
+    c.battery_pct = -1;
+    if (GetSystemPowerStatus(&ps)) {
+        c.on_ac = ps.ACLineStatus != 0;
+        c.battery_pct = ps.BatteryLifePercent == 255 ? -1 : ps.BatteryLifePercent;
+    }
+    c.want_idle = g_dk_want_idle;
+    g_dk_act = disk_action(mode, &g_dk, &c);
+    if (g_dk_fake.on && g_dk_fake.phase[0]) {     /* tests: draw a card in a given phase */
+        static const char *names[] = {"", "checking", "confirm", "blocked", "countdown", "running", "done", "failed", "early"};
+        int k;
+        for (k = 1; k < 9; k++) if (!strcmp(g_dk_fake.phase, names[k])) g_dk_phase = k;
+        if (g_dk_phase == DP_RUNNING && g_dk_job == NULL) { static DiskJob fj; fj.pct = g_dk_fake.pct; g_dk_job = &fj; }
+        if (g_dk_phase == DP_CONFIRM && !g_dk_busy[0]) snprintf(g_dk_busy, sizeof(g_dk_busy), "2 tabs run make, claude.");
+        if (g_dk_phase == DP_BLOCKED && !g_dk_blocked[0]) snprintf(g_dk_blocked, sizeof(g_dk_blocked), "Other Linux distros run: Ubuntu. Stop them first.");
+        g_dk_freed = g_dk_fake.freed;
+        g_dk_phase_at = GetTickCount();
+    } else if (g_dk_phase == DP_NONE && mode != RM_OFF && disk_run_stopped_early()) disk_set_phase(DP_EARLY);
+    if (g_dk_fake.on) { InvalidateRect(g_hwnd, NULL, FALSE); return; }
+    /* Linux's own numbers: only while a tab of it runs, so this never starts WSL */
+    for (i = 0; i < g_ntabs; i++) running_tab |= g_tabs[i]->kind == TK_WSL && g_tabs[i]->proc && !g_tabs[i]->help && !g_tabs[i]->spare;
+    if (mode != RM_OFF && g_dk_have && running_tab && !disk_holding() &&
+        (now - disk_state_num(disk_key(g_dk_w.name, "used_at")) > 600 || GetTickCount() - g_dk_probe_at > 600000u || !g_dk_probe_at))
+        disk_probe_start(DQ_PERIODIC);
+    /* idle mode, or L: a countdown that any key stops */
+    if (g_dk_act.automatic && g_dk_phase == DP_NONE && running_tab) {
+        g_dk_job_kind = DJ_COMPACT;
+        disk_set_phase(DP_COUNTDOWN);
+    }
+    /* a finished card stays 10 minutes */
+    if ((g_dk_phase == DP_DONE || g_dk_phase == DP_FAILED) && GetTickCount() - g_dk_phase_at > 600000u) disk_set_phase(DP_NONE);
+    if (was != g_disk_free_gb) InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+/* once a second during a countdown */
+static void disk_tick(void) {
+    if (g_dk_phase == DP_COUNTDOWN && GetTickCount() - g_dk_phase_at >= RECLAIM_COUNTDOWN_S * 1000u) {
+        disk_set_phase(DP_CHECKING);
+        disk_probe_start(DQ_AUTO);
+    }
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+/* a key on the card (or a click on its line). 1 = taken. */
+static int disk_key_press(int k) {
+    if (k >= 'a' && k <= 'z') k -= 32;
+    if (g_dk_phase == DP_RUNNING || g_dk_phase == DP_CHECKING) return k == VK_ESCAPE ? 1 : 0;
+    if (k == VK_ESCAPE) {
+        if (g_dk_phase == DP_NONE) return 0;
+        if (g_dk_phase == DP_EARLY) disk_run_end();
+        disk_set_phase(DP_NONE);
+        return 1;
+    }
+    if (k == 'R' && (g_dk_act.offer || g_dk_phase == DP_EARLY || g_dk_phase == DP_FAILED)) {
+        if (g_dk_phase == DP_CONFIRM) { disk_job_start(g_dk_job_kind); return 1; }
+        g_dk_job_kind = DJ_COMPACT;
+        disk_set_phase(DP_CHECKING);
+        disk_probe_start(DQ_KEY);
+        return 1;
+    }
+    if (k == 'C' && g_dk_cap > 0 && g_dk_act.offer) {
+        if (g_dk_phase == DP_CONFIRM && g_dk_job_kind == DJ_CAP) { disk_job_start(DJ_CAP); return 1; }
+        g_dk_job_kind = DJ_CAP;
+        disk_set_phase(DP_CHECKING);
+        disk_probe_start(DQ_KEY);
+        return 1;
+    }
+    if (k == 'L' && g_dk_act.offer && g_dk_phase == DP_NONE) { g_dk_want_idle = 1; InvalidateRect(g_hwnd, NULL, FALSE); return 1; }
+    if (k == 'N' && g_dk_have && g_dk_phase == DP_NONE) {
+        disk_state_load();
+        disk_state_set(disk_key(g_dk_w.name, "snooze_until"), "%lld", (long long)time(NULL) + RECLAIM_SNOOZE_DAYS * 86400LL);
+        disk_state_save();
+        g_dk_want_idle = 0;
+        check_disk();
         InvalidateRect(g_hwnd, NULL, FALSE);
+        return 1;
+    }
+    if (k == 'D' && g_dk_dumps > RECLAIM_DUMPS_GB && g_dk_phase == DP_NONE) {
+        int files;
+        double gb = disk_dumps(1, &files);
+        disk_log(NULL, "dumps deleted (window) files=%d gb=%.3f", files, gb);
+        check_disk();
+        InvalidateRect(g_hwnd, NULL, FALSE);
+        return 1;
+    }
+    return 0;
+}
+
+/* keys reach the card while the mouse is on it */
+static int disk_card_has_mouse(void) {
+    POINT pt;
+    if (g_dk_top < 0 || !GetCursorPos(&pt) || !ScreenToClient(g_hwnd, &pt)) return 0;
+    return in_sidebar(pt.x) && pt.y >= g_dk_top;
+}
+
+static int disk_card_click(int mx, int my) {
+    int i;
+    if (g_dk_top < 0 || !in_sidebar(mx) || my < g_dk_top) return 0;
+    for (i = 0; i < g_dk_nrows; i++)
+        if (g_dk_rows[i].key && my >= g_dk_rows[i].y0 && my < g_dk_rows[i].y1) { disk_key_press(g_dk_rows[i].key); return 1; }
+    return 1;                    /* the card itself: nothing under it takes the click */
 }
 
 static void render_disk_warning(int win_h) {
-    wchar_t l1[64], l2[64];
-    int total = (win_h - term_oy()) / CH;
-    float y = (float)sb_row_y(total - 3), w = (float)((SB_COLS - 2) * CW);
-    uint32_t col;
-    if (g_disk_free_gb < 0 || g_disk_free_gb >= DISK_WARN_GB) return;
-    col = g_disk_free_gb < DISK_BAD_GB ? g_look.red : AMBER;
-    _snwprintf(l1, 64, L"%ls %.1f GB free", g_disk_name, g_disk_free_gb);
-    _snwprintf(l2, 64, L"WSL crashes when %ls fills", g_disk_name);
+    wchar_t ln[12][64], para[500] = L"";
+    int key[12], dim[12], n = 0, total = (win_h - term_oy()) / CH, i, para_at = -1, para_rows = 0;
+    float y, w = (float)((SB_COLS - 2) * CW);
+    uint32_t col = g_dk_act.red ? g_look.red : AMBER;
+    double slack = disk_slack(&g_dk);
+    const wchar_t *dn = g_disk_name;
+    memset(key, 0, sizeof(key));
+    memset(dim, 0, sizeof(dim));
+    g_dk_top = -1;
+    g_dk_nrows = 0;
+#define LINE(k, d, ...) do { if (n < 12) { _snwprintf(ln[n], 64, __VA_ARGS__); ln[n][63] = 0; key[n] = (k); dim[n] = (d); n++; } } while (0)
+    /* one wrapped paragraph (para), up to 3 lines */
+#define PARA() do { para_rows = layout_text(para, 0, 0, w, 3, 0, 0); if (n + para_rows <= 12) { para_at = n; n += para_rows; } } while (0)
+    switch (g_dk_phase) {
+    case DP_CHECKING:
+        LINE(0, 0, L"Checking Linux programs...");
+        break;
+    case DP_CONFIRM:
+        if (g_dk_job_kind == DJ_CAP) LINE(0, 0, L"Cap Linux at %.0f GB.", g_dk_cap);
+        LINE(0, 0, L"This stops Linux for about");
+        LINE(0, 0, L"%d min. Tabs come back.", disk_minutes_guess(&g_dk) + 1);
+        if (g_dk_busy[0]) {
+            MultiByteToWideChar(CP_UTF8, 0, g_dk_busy, -1, para, 500);
+            PARA();
+            LINE(0, 0, L"They will stop.");
+        } else LINE(0, 1, L"Nothing runs in Linux now.");
+        LINE(g_dk_job_kind == DJ_CAP ? 'C' : 'R', 0, L"%lc  go on", g_dk_job_kind == DJ_CAP ? L'C' : L'R');
+        LINE(VK_ESCAPE, 0, L"Esc  not now");
+        break;
+    case DP_BLOCKED:
+        MultiByteToWideChar(CP_UTF8, 0, g_dk_blocked, -1, para, 500);
+        LINE(0, 0, L"Linux cannot stop now.");
+        PARA();
+        LINE(VK_ESCAPE, 0, L"Esc  close");
+        break;
+    case DP_COUNTDOWN: {
+        int left = RECLAIM_COUNTDOWN_S - (int)((GetTickCount() - g_dk_phase_at) / 1000);
+        LINE(0, 0, L"Giving back space in %d s.", left < 0 ? 0 : left);
+        LINE(0, 0, L"Linux stops for it.");
+        LINE(0, 1, L"Any key stops this.");
+        break;
+    }
+    case DP_RUNNING:
+        if (g_dk_job_kind == DJ_CAP) LINE(0, 0, L"Capping the Linux disk");
+        else LINE(0, 0, L"Giving back space: %ld%%", g_dk_job ? (long)g_dk_job->pct : 0L);
+        LINE(0, 1, L"Linux is stopped. Tabs");
+        LINE(0, 1, L"come back when it ends.");
+        break;
+    case DP_DONE:
+        if (g_dk_job_kind == DJ_CAP) LINE(0, 0, L"Linux's disk is capped.");
+        else LINE(0, 0, L"Gave back %.0f GB.", g_dk_freed < 0 ? 0 : g_dk_freed);
+        LINE(VK_ESCAPE, 1, L"%ls %.1f GB free", dn, g_dk.free);
+        break;
+    case DP_FAILED:
+        LINE(0, 0, L"Could not give space back.");
+        LINE(0, 1, L"Linux is running again.");
+        LINE(0, 1, L"Details: hardcore disk log");
+        LINE(VK_ESCAPE, 0, L"Esc  close");
+        break;
+    case DP_EARLY:
+        LINE(0, 0, L"The last disk cleanup");
+        LINE(0, 0, L"stopped early. Linux files");
+        LINE(0, 0, L"are safe. Run it again?");
+        LINE('R', 0, L"R  run it again");
+        LINE(VK_ESCAPE, 0, L"Esc  not now");
+        break;
+    default:
+        if (g_dk_act.view == DV_NONE && g_dk_dumps <= RECLAIM_DUMPS_GB) return;
+        if (g_dk_act.view == DV_LINE) {
+            if (g_dk_act.offer) LINE('R', 1, L"R  give %.0f GB back to %ls", slack, dn);
+            else LINE(0, 1, L"Linux can give %.0f GB back", slack);
+        } else if (g_dk_act.view == DV_CARD) {
+            LINE(0, 0, L"%ls %.1f GB free", dn, g_dk.free);
+            if (g_dk_act.offer) {
+                LINE(0, 1, L"Linux uses %.0f GB; its", g_dk.used);
+                LINE(0, 1, L"file uses %.0f GB of %ls", g_dk.alloc, dn);
+                LINE('R', 0, L"R  give back about %.0f GB", slack);
+                LINE('R', 1, L"   (stops Linux ~%d min)", disk_minutes_guess(&g_dk) + 1);
+                if (g_dk_want_idle) LINE(0, 1, L"   waits for an idle PC");
+                else LINE('L', 0, L"L  later, when idle");
+                if (g_dk_cap > 0) LINE('C', 0, L"C  cap Linux at %.0f GB", g_dk_cap);
+            } else LINE(0, 1, L"WSL crashes when %ls fills", dn);
+            if (g_dk_state == DS_DANGER) LINE(0, 1, L"Linux stops when %ls fills.", dn);
+        }
+        if (g_dk_dumps > RECLAIM_DUMPS_GB) LINE('D', 0, L"D  delete dumps (%.1f GB)", g_dk_dumps);
+        if (g_dk_act.view == DV_LINE && g_dk_act.offer) LINE('N', 1, L"N  not for 7 days");
+        break;
+    }
+#undef LINE
+#undef PARA
+    if (!n) return;
+    y = (float)sb_row_y(total - n - 1);
+    g_dk_top = y;
     fill_rect(0, y, (float)sidebar_w(), (float)win_h, BAR_BG, 1);
-    layout_text(l1, (float)CW, y, w, 1, col, 1);
-    layout_text(l2, (float)CW, y + CH, w, 2, g_look.dim, 1);
-    fill_rect(0, y, (float)g_scale, y + 3 * CH, col, 1);
+    for (i = 0; i < n; i++) {
+        float ly = y + i * CH;
+        if (i == para_at) {
+            layout_text(para, (float)CW, ly, w, para_rows, g_look.dim, 1);
+            i += para_rows - 1;
+            continue;
+        }
+        int ind = 0;
+        while (ln[i][ind] == L' ') ind++;   /* leading spaces indent (layout_text drops them) */
+        layout_text(ln[i] + ind, (float)(CW * (1 + ind)), ly, w - ind * CW, 1, i == 0 ? col : dim[i] ? g_look.dim : key[i] ? g_look.text : g_look.text_lo, 1);
+        if (g_dk_nrows < 12) { g_dk_rows[g_dk_nrows].y0 = ly; g_dk_rows[g_dk_nrows].y1 = ly + CH; g_dk_rows[g_dk_nrows++].key = key[i]; }
+    }
+    fill_rect(0, y, (float)g_scale, y + n * CH, col, 1);
 }
 
 /* one-pixel-wide strokes, scaled: the caption glyphs stay as sharp as the font */
@@ -5589,6 +6094,9 @@ static int tab_running(const Tab *tb) { return tb->fd >= 0; }
 
 static void make_spare(void) {
     if (g_spare || !g_ntabs || !spare_ok()) return;
+#ifdef _WIN32
+    if (disk_holding()) return;  /* a spare shell would start Linux again under a disk step */
+#endif
     g_spare = tab_create(g_start_dir, 1);
 }
 
@@ -5620,6 +6128,13 @@ static void new_tab_here(void) {
     }
     if (!tb) tb = tab_create(dir, 0);
     if (!tb) return;
+#ifdef _WIN32
+    if (tb->kind == TK_WSL && g_dk_state == DS_DANGER) {
+        char m[120];
+        snprintf(m, sizeof(m), "\x1b[31m%ls is almost full. Linux stops when %ls fills.\x1b[0m\r\n", g_disk_name, g_disk_name);
+        term_message(&tb->t, m);
+    }
+#endif
     schedule_spare();
     /* insert right after the current tab, like a browser */
     for (i = g_ntabs; i > g_active + 1; i--) g_tabs[i] = g_tabs[i - 1];
@@ -8498,6 +9013,26 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SendMessageW(hwnd, WM_RBUTTONUP, 0, MAKELPARAM(x, y));
             } else if (!strncmp(buf, "nchover ", 8)) g_nc_hover = atoi(buf + 8);
             else if (!strncmp(buf, "tophover ", 9)) g_top_hover = atoi(buf + 9);
+            else if (!strncmp(buf, "diskkey ", 8) && _wgetenv(L"HARDCORE_TEST_CONFIG")) {   /* tests: a key on the disk card */
+                int k = !strcmp(buf + 8, "esc") ? VK_ESCAPE : (unsigned char)buf[8];
+                return disk_key_press(k);
+            }
+            else if (!strncmp(buf, "diskstate ", 10) && _wgetenv(L"HARDCORE_TEST_CONFIG")) {   /* tests: what the card shows */
+                wchar_t wp2[MAX_PATH];
+                FILE *f;
+                check_disk();
+                paint_now();
+                MultiByteToWideChar(CP_UTF8, 0, buf + 10, -1, wp2, MAX_PATH);
+                if (!(f = _wfopen(wp2, L"wb"))) return FALSE;
+                fprintf(f, "{\"phase\":%d,\"state\":\"%s\",\"view\":%d,\"offer\":%d,\"red\":%d,\"automatic\":%d,"
+                           "\"free\":%.3f,\"slack\":%.3f,\"cap\":%.1f,\"dumps\":%.3f,\"top\":%.1f,\"rows\":[",
+                        g_dk_phase, disk_state_name(g_dk_state), g_dk_act.view, g_dk_act.offer, g_dk_act.red, g_dk_act.automatic,
+                        g_dk.free, disk_slack(&g_dk), g_dk_cap, g_dk_dumps, g_dk_top);
+                for (int r = 0; r < g_dk_nrows; r++)
+                    fprintf(f, "%s{\"y0\":%.1f,\"y1\":%.1f,\"key\":%d}", r ? "," : "", g_dk_rows[r].y0, g_dk_rows[r].y1, g_dk_rows[r].key);
+                fprintf(f, "]}\n");
+                fclose(f);
+            }
             else if (!strncmp(buf, "sel ", 4) && tb) {   /* sel Y0 X0 Y1 X1: select, in screen rows */
                 int y0, x0, y1, x1;
                 if (sscanf(buf + 4, "%d %d %d %d", &y0, &x0, &y1, &x1) != 4) return FALSE;
@@ -8640,6 +9175,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_DISK) { check_disk(); return 0; }
         if (wp == TIMER_SESSION) { session_tick(); return 0; }
         if (wp == TIMER_CLAUDE) { claude_resync_start(); return 0; }
+        if (wp == TIMER_DISK_TICK) { disk_tick(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
         else if (wp == TIMER_SETTLE) settle_all();
@@ -8764,6 +9300,20 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
            copies of their handles. No ClosePseudoConsole, no session save. */
         ExitProcess(0);
         return 0;
+    case WM_APP_DISK:
+        if (wp == DISK_MSG_PROBE) disk_probe_done((DiskProbe *)lp);
+        else if (wp == DISK_MSG_DONE) disk_job_done((DiskGuiJob *)lp);
+        else InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_APP_DISK_HOLD:
+        g_dk_hold_remote = 1;
+        if (g_spare) { tab_destroy_async(g_spare); g_spare = NULL; }
+        return 0;
+    case WM_APP_DISK_DONE:
+        g_dk_hold_remote = 0;
+        disk_restart_tabs();
+        check_disk();
+        return 0;
     case WM_APP_EXITED: {
         Tab *tb = tab_by_id((int)wp);
         DWORD code = 0;
@@ -8775,6 +9325,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (tb->slurp_hwnd) slurp_detach(tb);
             tb->help = HELP_SLURP;
             term_message(&tb->t, "\r\nAttachment failed or disconnected. The original terminal was not closed.\r\n");
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        /* Linux was stopped for a disk step: keep the tab; it starts again after */
+        if (tb->kind == TK_WSL && !tb->help && !tb->spare && disk_holding()) {
+            tab_lost(tb, code);
+            tb->disk_lost = 1;
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
@@ -8815,6 +9372,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0, alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
             int ours = (ctrl && shift && !alt) || (ctrl && !shift && !alt && wp == VK_TAB) || (ctrl && alt && wp >= '1' && wp <= '9');
             if (!ours && mac_browser_active() && mac_browser_key(wp, ctrl, shift, alt)) return 0;   /* its typing follows as WM_CHAR */
+        }
+        if (g_dk_phase == DP_COUNTDOWN) { g_dk_want_idle = 0; disk_set_phase(DP_NONE); }   /* any key stops it, and still types */
+        else if ((disk_card_has_mouse() || wp == VK_ESCAPE) && !(GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_MENU) & 0x8000) &&
+                 disk_key_press((int)wp)) {
+            MSG m;
+            while (PeekMessageW(&m, hwnd, WM_CHAR, WM_CHAR, PM_REMOVE)) {}
+            return 0;
         }
         if (handle_keydown(wp)) {
             MSG m;
@@ -8894,6 +9458,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         chrome_preview_cancel();
         SetCapture(hwnd);        /* every press is followed to its release, whoever takes it */
         if (mac_music_mouse(MEV_DOWN, mx, my, 0) || mac_camera_mouse(MEV_DOWN, mx, my, 0)) return 0;
+        if (msg == WM_LBUTTONDOWN && disk_card_click(mx, my)) return 0;
         if (cutie_at(mx, my) < 0) mac_cutie_blur();
         if (mac_grid_down(mx, my)) return 0;
         tb = active_tab();
@@ -10211,6 +10776,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
             return slurp_cmd(argc - i - 1, argv + i + 1);
         } else if (!strcmp(a, "tab")) {
             return tab_cmd(argc - i - 1, argv + i + 1);
+        } else if (!strcmp(a, "disk")) {
+            return disk_cmd(argc - i - 1, argv + i + 1);
         } else if (!strcmp(a, "--ensure-tab") && i + 1 < argc) {
             /* --ensure-tab NAME [--] COMMAND...: the rest of the line is the command */
             size_t k = 0;
@@ -10270,6 +10837,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
                 "                          (--force: build main even if this build is newer or a branch's;\n"
                 "                          --self: install this exe, a build of your own checkout)\n"
                 "  hardcore tab [-- CMD]   a new tab in the running window, CMD typed into it\n"
+                "  hardcore disk           WSL disk sizes; give free Linux space back to the drive\n"
+                "                          (hardcore disk help: trim, compact, cap, dumps, log)\n"
                 "  hardcore --ensure-tab NAME -- CMD\n"
                 "                          one tab named NAME running CMD: the running window's, the\n"
                 "                          restored session's, or a new one (a cold start restores first)\n"
