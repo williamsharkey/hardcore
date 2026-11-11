@@ -143,8 +143,9 @@ def wait_for(check, description, timeout=30):
 class App:
     def __init__(self, helper, exe, config, fake):
         self.log = open(OUT / "driver.log", "a")
-        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(fake.parent / "claude-home"))
-        env["WSLENV"] = (env.get("WSLENV", "") + ":CLAUDE_CONFIG_DIR").lstrip(":")
+        # HARDCORE_TEST_BOOT: the file rc.bash reads Linux's boot id from (a test's new "boot")
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=str(fake.parent / "claude-home"), HARDCORE_TEST_BOOT=str(fake.parent / "boot"))
+        env["WSLENV"] = (env.get("WSLENV", "") + ":CLAUDE_CONFIG_DIR:HARDCORE_TEST_BOOT").lstrip(":")
         self.proc = subprocess.Popen([str(helper), winpath(exe), winpath(config), str(fake)],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, env=env)
         self.read(40)
@@ -224,6 +225,8 @@ def run(exe):
     w1.mkdir()
     w2.mkdir()
     home = lin / "claude-home"                                      # CLAUDE_CONFIG_DIR: never the real ~/.claude
+    boot = lin / "boot"                                             # this boot of Linux, as rc.bash sees it
+    boot.write_text(Path("/proc/sys/kernel/random/boot_id").read_text())
     flags = "--dangerously-skip-permissions --model opus"
     try:
         # 1. two Claude tabs, one closed by the user, then a crash
@@ -452,6 +455,27 @@ def run(exe):
                  "only the running one saved with the session", 10)
         app.end("K")
         print("ok   a session another Claude has open isn't resumed a second time; the tab says why")
+
+        # 13. WSL stops and starts again (a new boot of Linux): a tab whose shell stopped under
+        #     Claude resumes it by itself, no Enter. Killed on the same boot, it waits for Enter.
+        for p in (config / "session").glob("*"):
+            p.unlink(missing_ok=True)
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        app.send(f"T cd {w1} && claude {flags}")
+        wait_for(lambda: len(calls(fake)) > before, "a claude")
+        id8 = re.search(r"--session-id (\S+)", calls(fake)[before]).group(1)
+        wait_for(lambda: [t.get("claude") for t in saved_tabs(config)] == [id8], "its session saved")
+        kill_shell(fake, id8)
+        time.sleep(12)                                # two checks: Linux runs on, the same boot
+        assert len(calls(fake)) == before + 1, calls(fake)[before:]
+        boot.write_text("00000000-0000-4000-8000-0000000b0072\n")    # WSL came back: a new boot
+        wait_for(lambda: len(calls(fake)) > before + 1, "Claude resumed by itself", 30)
+        assert calls(fake)[before + 1:] == [f"{w1}|{flags} --resume {id8}"], calls(fake)[before:]
+        time.sleep(11)                                # once: the resumed shell is on the new boot
+        assert len(calls(fake)) == before + 2, calls(fake)[before:]
+        app.end("K")
+        print("ok   after WSL stops and starts again, a stopped Claude tab resumes by itself; not before")
     finally:
         shutil.rmtree(lin, ignore_errors=True)
 

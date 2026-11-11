@@ -559,6 +559,7 @@ typedef struct {
     char claude_args[400];       /* the flags it was started with, shell-quoted, to start it with again */
     int claude_trust;            /* claude_args came with this shell's key: rc.bash sent them, not program output */
     char key[40];                /* the key rc.bash made as the shell started (OSC 7700;key=), "" = none */
+    char boot[40];               /* the WSL boot its shell started in (OSC 7700;boot=, the first one only) */
     int key_set;                 /* a key came (or can't come any more): later ones are ignored */
     char cmd[400];               /* the command running in the shell (rc.bash's PS0), "" at a prompt */
 } Term;
@@ -611,6 +612,8 @@ typedef struct Tab {
     int ps_seen;                 /* t.ps_state as of the last update_busy() */
     int kind;                    /* TK_WSL or TK_PS */
     int help;                    /* a help screen instead of a shell: HELP_* */
+    int auto_resumed;            /* times WSL coming back resumed this tab's Claude by itself (wsl_back_done) */
+    int wsl_seen_down;           /* stopped under Claude: how often its distro was seen not running since (2 = it stopped) */
     DWORD born;                  /* GetTickCount() at spawn: a quick death means a setup problem */
     int spare;                   /* pre-warmed, waiting on stdin for its directory */
     DWORD adopted;               /* when a spare became this tab: hold its first frame for the prompt */
@@ -1983,6 +1986,8 @@ static void osc_dispatch(Term *t) {
         if (!strncmp(rest, "key=", 4)) {         /* rc.bash, first thing: only the first one counts */
             if (!t->key_set) snprintf(t->key, sizeof(t->key), "%s", rest + 4);
             t->key_set = 1;
+        } else if (!strncmp(rest, "boot=", 5)) {        /* rc.bash, at start: which boot of Linux this shell runs in */
+            if (!t->boot[0]) snprintf(t->boot, sizeof(t->boot), "%s", rest + 5);
         } else if (!strncmp(rest, "claude=", 7)) {      /* claude=ID as Claude Code starts, claude= as it exits */
             /* the first id after none is the one on its command line; the watcher's
                later ones (/resume, /clear) change the session, not where it started */
@@ -2753,6 +2758,8 @@ static const char RC_BASH[] =
     "# (--resume ID or --session-id ID, - for none) and the one sessions/PID.json names now.\n"
     "# hardcore matches the first to the id a tab saved, so a Claude whose shell can't say\n"
     "# that it changed (an older rc.bash, a watcher that stopped) is still followed by id.\n"
+    "# bash rc.bash --boot-id: which boot of Linux runs now (it changes when WSL stops and starts)\n"
+    "if [ \"$1\" = --boot-id ]; then cat \"${HARDCORE_TEST_BOOT:-/proc/sys/kernel/random/boot_id}\" 2>/dev/null; exit 0; fi\n"
     "if [ \"$1\" = --claude-ids ]; then\n"
     "  for f in \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"/sessions/[0-9]*.json; do\n"
     "    p=${f##*/}; p=${p%.json}\n"
@@ -2776,6 +2783,9 @@ static const char RC_BASH[] =
     "# is not exported). Claude's flags come with it, so a restore can trust them.\n"
     "__hardcore_key=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)\n"
     "printf '\\033]7700;key=%s\\033\\\\' \"$__hardcore_key\"\n"
+    "# and the boot of Linux this shell runs in: a tab whose shell stopped under Claude\n"
+    "# resumes it by itself once a new boot of WSL runs (hardcore asks: rc.bash --boot-id)\n"
+    "printf '\\033]7700;boot=%s\\033\\\\' \"$(cat \"${HARDCORE_TEST_BOOT:-/proc/sys/kernel/random/boot_id}\" 2>/dev/null)\"\n"
     "[ -r /etc/profile ] && . /etc/profile\n"
     "if [ -r ~/.bash_profile ]; then . ~/.bash_profile\n"
     "elif [ -r ~/.bash_login ]; then . ~/.bash_login\n"
@@ -2925,6 +2935,15 @@ static const char RC_BASH[] =
     "  done\n"
     "  return 1\n"
     "}\n"
+    "# two shells resuming one session at once (windows that come back together after WSL\n"
+    "# stopped): the first to claim it starts it. A claim whose shell is gone is stale.\n"
+    "__hardcore_claim() {\n"
+    "  local d=/tmp/hardcore-resume-$1 o\n"
+    "  if mkdir \"$d\" 2>/dev/null; then echo $$ > \"$d/pid\"; return 0; fi\n"
+    "  read -r o 2>/dev/null < \"$d/pid\"\n"
+    "  [ -n \"$o\" ] && [ \"$o\" != $$ ] && kill -0 \"$o\" 2>/dev/null && return 1\n"
+    "  echo $$ > \"$d/pid\"\n"
+    "}\n"
     "if ! declare -F claude >/dev/null && ! alias claude >/dev/null 2>&1; then\n"
     "  claude() {\n"
     "    local m id d rc keep w me=$BASHPID\n"
@@ -2957,16 +2976,26 @@ static const char RC_BASH[] =
     "      while __hardcore_p=$(__hardcore_claude_holder \"$__hardcore_sid\") && [ $__hardcore_n -lt 10 ]; do\n"
     "        sleep 0.5; __hardcore_n=$((__hardcore_n + 1))\n"
     "      done\n"
+    "      # another shell is starting it this moment: wait (10 s at most) to see that Claude\n"
+    "      if [ -z \"$__hardcore_p\" ] && ! __hardcore_claim \"$__hardcore_sid\"; then\n"
+    "        __hardcore_n=0\n"
+    "        until __hardcore_p=$(__hardcore_claude_holder \"$__hardcore_sid\") || [ $__hardcore_n -ge 20 ]; do\n"
+    "          sleep 0.5; __hardcore_n=$((__hardcore_n + 1))\n"
+    "        done\n"
+    "      fi\n"
     "      if [ -n \"$__hardcore_p\" ]; then\n"
     "        printf '\\033]7700;claude=\\033\\\\'\n"
     "        printf '\\033[2mhardcore: Claude session %s is open in another Claude (pid %s), so it is not resumed here too. Up-arrow resumes it.\\033[0m\\n' \"$__hardcore_sid\" \"$__hardcore_p\"\n"
     "        __hardcore_once=$__hardcore_run; __hardcore_run=\n"
     "      fi\n"
     "    fi\n"
-    "    unset __hardcore_sid __hardcore_n __hardcore_p ;;\n"
+    "    unset __hardcore_n __hardcore_p ;;\n"
     "  esac\n"
     "  if [ -n \"$__hardcore_run\" ]; then __hardcore_once=$__hardcore_run; eval \"$__hardcore_run\"; fi\n"
-    "  unset __hardcore_run\n"
+    "  if [ -n \"$__hardcore_sid\" ] && [ \"$(cat \"/tmp/hardcore-resume-$__hardcore_sid/pid\" 2>/dev/null)\" = $$ ]; then\n"
+    "    rm -rf \"/tmp/hardcore-resume-$__hardcore_sid\"\n"
+    "  fi\n"
+    "  unset __hardcore_run __hardcore_sid\n"
     "fi\n";
 
 /* WSLENV (old) with each of names added unless an entry of that name is there
@@ -6588,6 +6617,80 @@ static void claude_resync_done(unsigned gen, char *ids) {
     free(ids);
 }
 
+/* WSL back after a stop: a tab whose shell stopped under Claude resumes it by
+   itself, as Enter would, once a new boot of Linux runs (its shell said which
+   boot it ran in, OSC 7700;boot=), or once its distro was seen not running and
+   runs again. Asked every 5 s while such a tab waits: wsl -l --running first,
+   which never starts WSL, and only then rc.bash --boot-id. A shell killed while
+   Linux ran on (the same boot) still waits for Enter. A tab whose shell failed
+   right away is resumed this way once at most. rc.bash's guard still applies:
+   a session another Claude has open is not resumed. */
+#define WM_APP_WSL_BACK (WM_APP + 6)     /* lp: the boot of Linux that runs now, "" = not running (malloc'd) */
+#define TIMER_WSL_BACK 12                /* Win32: wsl_back_start, every 5 s */
+static volatile LONG g_wslback_busy;
+typedef struct { wchar_t cmd[600], name[128]; } WslBackAsk;
+
+static int wsl_back_waits(const Tab *tb) {
+    if (tb->kind != TK_WSL || tb->disk_lost || !tb->t.claude[0]) return 0;
+    return tb->help == HELP_LOST || (tb->help == HELP_FAILED && !tb->auto_resumed);
+}
+
+static DWORD WINAPI wsl_back_thread(void *arg) {
+    WslBackAsk *a = (WslBackAsk *)arg;
+    char *o = NULL, *p, *e;
+    int posted = 0;
+    if (!wsl_distro_running(a->name)) {
+        if ((o = (char *)calloc(1, 1))) posted = PostMessageW(g_hwnd, WM_APP_WSL_BACK, 0, (LPARAM)o);
+    } else if (disk_run(a->cmd, NULL, &o, 15000) == 0 && o) {
+        for (p = o; *p == ' ' || *p == '\r' || *p == '\n'; p++) {}
+        for (e = p; isalnum((unsigned char)*e) || *e == '-'; e++) {}
+        *e = 0;
+        if (*p && e - p < 40) {
+            memmove(o, p, (size_t)(e - p) + 1);
+            posted = PostMessageW(g_hwnd, WM_APP_WSL_BACK, 0, (LPARAM)o);
+        }
+    }
+    if (!posted) { free(o); InterlockedExchange(&g_wslback_busy, 0); }
+    free(a);
+    return 0;
+}
+
+static void wsl_back_start(void) {
+    WslBackAsk *a;
+    HANDLE th;
+    int i, any = 0;
+    if (g_no_bash || g_wslback_busy || disk_holding()) return;
+    for (i = 0; i < g_ntabs && !any; i++) any = wsl_back_waits(g_tabs[i]);
+    if (!any || !(a = (WslBackAsk *)calloc(1, sizeof(*a)))) return;
+    if (g_distro[0]) MultiByteToWideChar(CP_UTF8, 0, g_distro, -1, a->name, 128);
+    else _snwprintf(a->name, 128, L"%ls", g_default_distro);
+    a->name[127] = 0;
+    if (!a->name[0]) { free(a); return; }
+    _snwprintf(a->cmd, 600, L"wsl.exe%ls%hs%ls -e bash -c \"exec bash \\\"$HARDCORE_RC\\\" --boot-id\"",
+               g_distro[0] ? L" -d \"" : L"", g_distro, g_distro[0] ? L"\"" : L"");
+    a->cmd[599] = 0;
+    InterlockedExchange(&g_wslback_busy, 1);
+    if ((th = CreateThread(NULL, 0, wsl_back_thread, a, 0, NULL))) CloseHandle(th);
+    else { free(a); InterlockedExchange(&g_wslback_busy, 0); }
+}
+
+static void wsl_back_done(char *boot) {
+    int i, act = g_active, any = 0;
+    InterlockedExchange(&g_wslback_busy, 0);
+    for (i = 0; i < g_ntabs && !disk_holding(); i++) {
+        Tab *tb = g_tabs[i];
+        int n = tb->auto_resumed + 1;
+        if (!wsl_back_waits(tb)) continue;
+        if (!boot[0]) { tb->wsl_seen_down++; continue; }                   /* down: when it runs again */
+        if (tb->wsl_seen_down < 2 && (!tb->t.boot[0] || !strcmp(tb->t.boot, boot))) continue;   /* Linux didn't stop: Enter does it */
+        tab_respawn(i);
+        g_tabs[i]->auto_resumed = n;
+        any = 1;
+    }
+    if (any && act < g_ntabs) activate(act);
+    free(boot);
+}
+
 /* A tab about to resume Claude holds the session already: if its shell
    can't start (WSL still down), the session isn't lost on the next save. */
 static void session_preset(Tab *tb, const char *claude, const char *args, int trust) {
@@ -7083,6 +7186,7 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         blob_line(&b, "lost-claude_trust", t->claude_trust ? "1" : "0");
         blob_line(&b, "lost-claude_origin", t->claude_origin);
         blob_line(&b, "lost-cmd", t->cmd);
+        blob_line(&b, "lost-boot", t->boot);
         blob_line(&b, "lost-tag", tb->tag);
         blob_line(&b, "lost-tag_cmd", tb->tag_cmd);
         snprintf(num, sizeof(num), "%d", t->view);
@@ -7115,6 +7219,7 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         blob_line(&b, "claude_trust", t->claude_trust ? "1" : "0");
         blob_line(&b, "claude_origin", t->claude_origin);
         blob_line(&b, "key", t->key);
+        blob_line(&b, "boot", t->boot);
         blob_line(&b, "cmd", t->cmd);
         blob_line(&b, "run", tb->run);
         blob_line(&b, "tag", tb->tag);
@@ -7252,6 +7357,7 @@ static int adopt_tabs(void) {
             else if (!strcmp(k, "claude_trust")) lost->t.claude_trust = atoi(v) == 1;
             else if (!strcmp(k, "claude_origin")) snprintf(lost->t.claude_origin, sizeof(lost->t.claude_origin), "%s", v);
             else if (!strcmp(k, "cmd")) snprintf(lost->t.cmd, sizeof(lost->t.cmd), "%s", v);
+            else if (!strcmp(k, "boot")) snprintf(lost->t.boot, sizeof(lost->t.boot), "%s", v);
             else if (!strcmp(k, "tag")) snprintf(lost->tag, sizeof(lost->tag), "%s", v);
             else if (!strcmp(k, "tag_cmd")) snprintf(lost->tag_cmd, sizeof(lost->tag_cmd), "%s", v);
             else if (!strcmp(k, "view")) lost_view = atoi(v);
@@ -7309,6 +7415,7 @@ static int adopt_tabs(void) {
         else if (!strcmp(line, "claude_trust")) tb->t.claude_trust = atoi(v) == 1;
         else if (!strcmp(line, "claude_origin")) snprintf(tb->t.claude_origin, sizeof(tb->t.claude_origin), "%s", v);
         else if (!strcmp(line, "key")) snprintf(tb->t.key, sizeof(tb->t.key), "%s", v);
+        else if (!strcmp(line, "boot")) snprintf(tb->t.boot, sizeof(tb->t.boot), "%s", v);
         else if (!strcmp(line, "cmd")) snprintf(tb->t.cmd, sizeof(tb->t.cmd), "%s", v);
         else if (!strcmp(line, "run")) snprintf(tb->run, sizeof(tb->run), "%s", v);
         else if (!strcmp(line, "tag")) snprintf(tb->tag, sizeof(tb->tag), "%s", v);
@@ -9345,6 +9452,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TIMER_DISK) { check_disk(); return 0; }
         if (wp == TIMER_SESSION) { session_tick(); return 0; }
         if (wp == TIMER_CLAUDE) { claude_resync_start(); return 0; }
+        if (wp == TIMER_WSL_BACK) { wsl_back_start(); return 0; }
         if (wp == TIMER_DISK_TICK) { disk_tick(); return 0; }
         KillTimer(hwnd, wp);
         if (wp == TIMER_SPARE) make_spare();
@@ -9461,6 +9569,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_SETTINGS:
         config_load();
         settings_apply();
+        return 0;
+    case WM_APP_WSL_BACK:
+        wsl_back_done((char *)lp);
         return 0;
     case WM_APP_CLAUDE_IDS:
         claude_resync_done((unsigned)wp, (char *)lp);
@@ -11182,6 +11293,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
     SetTimer(h, TIMER_DISK, 60 * 1000, NULL);
     SetTimer(h, TIMER_SESSION, 2000, NULL);
     SetTimer(h, TIMER_CLAUDE, 10000, NULL);
+    SetTimer(h, TIMER_WSL_BACK, 5000, NULL);
     /* wsl.exe boots while the D3D device is created; the tabs from last time
        if there are any (unless a folder was asked for), else one new tab */
     if (g_adopting && adopt_tabs()) {

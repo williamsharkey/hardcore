@@ -45,8 +45,10 @@ static float row_y(int row){return (float)(row*CH);}
 static int sidebar_w(void){return 28*CW;}
 static void fill_rect(float x,float y,float right,float bottom,uint32_t color,float alpha){
     (void)color;(void)alpha;lines++;drawn_y=y;drawn_bottom=bottom;
-    if(x<leftmost)leftmost=x;if(right>rightmost)rightmost=right;
-    if(y<topmost)topmost=y;if(bottom>bottommost)bottommost=bottom;
+    if(x<leftmost)leftmost=x;
+    if(right>rightmost)rightmost=right;
+    if(y<topmost)topmost=y;
+    if(bottom>bottommost)bottommost=bottom;
     if(paint_pixels)for(int yy=(int)y;yy<(int)bottom;yy++)for(int xx=(int)x;xx<(int)right;xx++){
         assert(xx>=0&&xx<1000&&yy>=0&&yy<600);pixels[yy][xx]=1;
     }

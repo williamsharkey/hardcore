@@ -62,7 +62,8 @@ static void display_line(const Term *t,int y,const Cell **cells,int *n){*cells=g
 static void display_cursor_position(const Term *t,int *x,int *y){*x=t->cx;*y=t->cy;}
 static int chrome_terminal_span(const Cell *cells,int n,int *left,int *right){
     *left=n;*right=0;for(int x=0;x<n;x++)if(cell_covers_chrome(cells+x)){
-        if(x<*left)*left=x;*right=x+1;
+        if(x<*left)*left=x;
+        *right=x+1;
     }
     return *right>*left;
 }

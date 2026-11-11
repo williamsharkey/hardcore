@@ -23,7 +23,8 @@ static void allocate(ChromeReflow*out,const Cell*input,int cols,int rows){
     int count=cols*rows;memset(out,0,sizeof(*out));out->cols=cols;out->rows=rows;out->cursor=-1;
     out->cells=malloc(count*sizeof(Cell));out->source=malloc(count*sizeof(int));out->markers=malloc(rows*sizeof(int));
     assert(out->cells&&out->source&&out->markers);memcpy(out->cells,input,count*sizeof(Cell));
-    for(int i=0;i<count;i++)out->source[i]=i;for(int i=0;i<rows;i++)out->markers[i]=-1;
+    for(int i=0;i<count;i++)out->source[i]=i;
+    for(int i=0;i<rows;i++)out->markers[i]=-1;
 }
 static int build(ChromeReflow*out,const Cell*input,int cols,int rows,const unsigned char*protect,int cursor,HcTvRect obstacle,void*opaque){
     Context*c=opaque;c->calls++;
