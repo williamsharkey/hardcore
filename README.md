@@ -755,6 +755,9 @@ itself to the new exe:
   active and each tab scrolled where it was. It draws, and only then does the
   old process end, without closing the pseudoconsoles. So the switch is one
   frame.
+- **A tab whose shell stopped under Claude** (see [Sessions](#sessions)) goes
+  over as it is, with its text and its Claude session. **Enter** resumes
+  Claude there, as before the update.
 - **If anything goes wrong** before that, the old window carries on unchanged
   and `hardcore update` says to close and reopen it.
 
@@ -971,6 +974,11 @@ On the next start the window opens where it was, and each tab is rebuilt:
 - **A Claude tab runs `claude <flags> --resume <id>`**, which is also put in the
   shell's history. A session closed before its first message has no transcript
   yet, so it gets a fresh `claude` with the same flags instead.
+- **A session that a running Claude has open is not resumed again.** This can
+  happen when another tab or window resumed it while this tab's shell was
+  stopped. Two Claudes on one session would both write its transcript. The tab
+  waits up to 5 seconds for a Claude that is still ending, then starts a plain
+  shell, says which Claude has the session, and puts the command behind ↑.
 
 On restore, an id must be letters, digits and dashes, and flags may contain
 only characters plain flags use, because the command goes through `eval`.

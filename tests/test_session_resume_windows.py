@@ -190,7 +190,14 @@ def calls(fake):
 
 
 def kill_shell(fake, sid):
-    pid = (fake / f"shell-{sid}").read_text().strip()
+    def running_shell():                         # the shell of a claude that runs now, not a stale file's
+        try:
+            shell = (fake / f"shell-{sid}").read_text().strip()
+            stat = Path(f"/proc/{(fake / f'pid-{sid}').read_text().strip()}/stat").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        return shell if stat.rsplit(")", 1)[1].split()[1] == shell else None
+    pid = wait_for(running_shell, f"the shell of the claude on {sid}", 15)
     (fake / f"shell-{sid}").unlink()
     subprocess.run(["kill", "-9", pid], check=True)
 
@@ -381,6 +388,70 @@ def run(exe):
         assert calls(fake)[before:] == [f"{w1}|{flags} --resume"], calls(fake)[before:]
         app.end("K")
         print("ok   a tab whose session id was never known opens the picker, never a guessed session")
+
+        # 11. an update (the window reloads in place) while one tab's shell is stopped under
+        #     Claude: the new window keeps that tab and its session; the next start resumes both
+        for p in (config / "session").glob("*"):
+            p.unlink(missing_ok=True)
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        app.send(f"T cd {w1} && claude {flags}")
+        wait_for(lambda: len(calls(fake)) > before, "a claude")
+        app.send("C newtab")
+        app.send(f"T cd {w2} && claude {flags}")
+        wait_for(lambda: len(calls(fake)) > before + 1, "a second claude")
+        id6, id7 = (re.search(r"--session-id (\S+)", c).group(1) for c in calls(fake)[before:before + 2])
+        wait_for(lambda: sorted(t.get("claude") for t in saved_tabs(config)) == sorted([id6, id7]), "both saved")
+        wait_for(lambda: (fake / f"shell-{id7}").exists(), "the second claude's shell")
+        kill_shell(fake, id7)
+        time.sleep(4)                                # stopped, and saved as such
+        assert sorted(t.get("claude") for t in saved_tabs(config)) == sorted([id6, id7]), saved_tabs(config)
+        saved_at = sessions(config)[0].stat().st_mtime
+        app.send("C reload")                         # what `hardcore upgrade` asks of each window
+        wait_for(lambda: sessions(config) and sessions(config)[0].stat().st_mtime != saved_at,
+                 "the reloaded window's save", 20)
+        time.sleep(3)
+        assert sorted(t.get("claude") for t in saved_tabs(config)) == sorted([id6, id7]), saved_tabs(config)
+        app.end("K")
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        wait_for(lambda: len(calls(fake)) >= before + 2, "both sessions resumed", 40)
+        assert sorted(calls(fake)[before:]) == sorted([f"{w1}|{flags} --resume {id6}", f"{w2}|{flags} --resume {id7}"]), \
+            calls(fake)[before:]
+        app.end("K")
+        print("ok   a reload in place keeps a tab whose shell stopped under Claude, and its session")
+
+        # 12. the same session open in two places (another tab or window resumed it while this
+        #     tab's shell was stopped): Enter here doesn't start a second Claude on it
+        for p in (config / "session").glob("*"):
+            p.unlink(missing_ok=True)
+        shared = "5a5e5a5e-0000-4000-8000-00000005a5e0"
+        (proj / f"{shared}.jsonl").touch()
+        before = len(calls(fake))
+        app = App(helper, copied, config, fake)
+        app.send(f"T cd {w1} && claude {flags} --resume {shared}")
+        wait_for(lambda: len(calls(fake)) > before, "a claude on the shared session")
+        first = wait_for(lambda: (fake / f"pid-{shared}").exists() and (fake / f"pid-{shared}").read_text().strip(),
+                         "its pid")
+        app.send("C newtab")
+        app.send(f"T cd {w1} && claude {flags} --resume {shared}")   # a second one, by hand
+        wait_for(lambda: len(calls(fake)) > before + 1, "a second claude on it")
+        second = wait_for(lambda: (fake / f"pid-{shared}").read_text().strip() != first and
+                          (fake / f"pid-{shared}").read_text().strip(), "the second pid")
+        kill_shell(fake, shared)                      # the second tab's shell stops under it
+        wait_for(lambda: not Path(f"/proc/{second}").exists(), "the second claude gone with its shell", 10)
+        time.sleep(2)
+        before = len(calls(fake))
+        app.send("T ")                                # Enter: the first claude still has the session
+        time.sleep(10)
+        assert len(calls(fake)) == before, calls(fake)[before:]
+        os.kill(int(first), 0)
+        wait_for(lambda: any("not resumed here too" in t.read_text(errors="replace")
+                             for t in sorted((config / "session").glob("*-tab*.txt"))), "the reason, in the tab", 10)
+        wait_for(lambda: sorted(t.get("claude", "") for t in saved_tabs(config)) == sorted(["", shared]),
+                 "only the running one saved with the session", 10)
+        app.end("K")
+        print("ok   a session another Claude has open isn't resumed a second time; the tab says why")
     finally:
         shutil.rmtree(lin, ignore_errors=True)
 

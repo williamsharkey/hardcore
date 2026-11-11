@@ -2912,6 +2912,19 @@ static const char RC_BASH[] =
     "    last=$id; printf '\\033]7700;claude=%s\\033\\\\' \"$id\"\n"
     "  done\n"
     "}\n"
+    "# the pid of a Claude Code that runs now with session $1 on its screen (sessions/PID.json,\n"
+    "# checked against the process's start time, as for --claude-ids); none: status 1\n"
+    "__hardcore_claude_holder() {\n"
+    "  local f p j a\n"
+    "  for f in \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"/sessions/[0-9]*.json; do\n"
+    "    p=${f##*/}; p=${p%.json}\n"
+    "    read -r -a a 2>/dev/null < \"/proc/$p/stat\" || continue\n"
+    "    j=; read -r -d '' j 2>/dev/null < \"$f\"\n"
+    "    case $j in *'\"procStart\":'*) case $j in *\"\\\"procStart\\\":\\\"${a[21]}\\\"\"*) ;; *) continue ;; esac ;; esac\n"
+    "    case $j in *\"\\\"sessionId\\\":\\\"$1\\\"\"*) echo \"$p\"; return 0 ;; esac\n"
+    "  done\n"
+    "  return 1\n"
+    "}\n"
     "if ! declare -F claude >/dev/null && ! alias claude >/dev/null 2>&1; then\n"
     "  claude() {\n"
     "    local m id d rc keep w me=$BASHPID\n"
@@ -2933,12 +2946,58 @@ static const char RC_BASH[] =
     "# a restored tab: hardcore hands over a command to run first (claude --resume ...)\n"
     "if [ -n \"$HARDCORE_RUN\" ]; then\n"
     "  __hardcore_run=$HARDCORE_RUN; unset HARDCORE_RUN\n"
-    "  # a session closed before its first message has no transcript yet: start a fresh one\n"
     "  case $__hardcore_run in *\" --resume \"*)\n"
-    "    ls \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"/projects/*/\"${__hardcore_run##* --resume }.jsonl\" >/dev/null 2>&1 || __hardcore_run=${__hardcore_run% --resume *} ;;\n"
+    "    __hardcore_sid=${__hardcore_run##* --resume } __hardcore_n=0 __hardcore_p=\n"
+    "    # a session closed before its first message has no transcript yet: start a fresh one\n"
+    "    if ! ls \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"/projects/*/\"$__hardcore_sid.jsonl\" >/dev/null 2>&1; then\n"
+    "      __hardcore_run=${__hardcore_run% --resume *}\n"
+    "    else\n"
+    "      # open in a Claude that runs now (another tab or window): never a second Claude\n"
+    "      # on it. A Claude that is still ending (this tab's own, a moment ago) gets 5 s.\n"
+    "      while __hardcore_p=$(__hardcore_claude_holder \"$__hardcore_sid\") && [ $__hardcore_n -lt 10 ]; do\n"
+    "        sleep 0.5; __hardcore_n=$((__hardcore_n + 1))\n"
+    "      done\n"
+    "      if [ -n \"$__hardcore_p\" ]; then\n"
+    "        printf '\\033]7700;claude=\\033\\\\'\n"
+    "        printf '\\033[2mhardcore: Claude session %s is open in another Claude (pid %s), so it is not resumed here too. Up-arrow resumes it.\\033[0m\\n' \"$__hardcore_sid\" \"$__hardcore_p\"\n"
+    "        __hardcore_once=$__hardcore_run; __hardcore_run=\n"
+    "      fi\n"
+    "    fi\n"
+    "    unset __hardcore_sid __hardcore_n __hardcore_p ;;\n"
     "  esac\n"
-    "  __hardcore_once=$__hardcore_run; eval \"$__hardcore_run\"; unset __hardcore_run\n"
+    "  if [ -n \"$__hardcore_run\" ]; then __hardcore_once=$__hardcore_run; eval \"$__hardcore_run\"; fi\n"
+    "  unset __hardcore_run\n"
     "fi\n";
+
+/* WSLENV (old) with each of names added unless an entry of that name is there
+   already. A window a reload starts inherits the old window's WSLENV, so adding
+   them again each time made it longer by one copy per update. */
+static void wslenv_join(const wchar_t *old, const wchar_t *names, wchar_t *out, size_t cap) {
+    const wchar_t *nm = names;
+    size_t k;
+    _snwprintf(out, cap, L"%ls", old);
+    out[cap - 1] = 0;
+    while (*nm) {
+        const wchar_t *end = wcschr(nm, L':'), *o = old;
+        size_t len = end ? (size_t)(end - nm) : wcslen(nm), base = 0;
+        int have = 0;
+        while (base < len && nm[base] != L'/') base++;
+        while (*o) {                       /* entries of old: NAME or NAME/flags, ':'-separated */
+            const wchar_t *oe = wcschr(o, L':');
+            size_t ol = oe ? (size_t)(oe - o) : wcslen(o), ob = 0;
+            while (ob < ol && o[ob] != L'/') ob++;
+            if (ob == base && !wcsncmp(o, nm, base)) have = 1;
+            o += ol + (oe ? 1 : 0);
+        }
+        k = wcslen(out);
+        if (!have && len && k + len + 2 < cap) {
+            if (k) out[k++] = L':';
+            wmemcpy(out + k, nm, len);
+            out[k + len] = 0;
+        }
+        nm += len + (end ? 1 : 0);
+    }
+}
 
 static void write_rc(void) {
     wchar_t path[MAX_PATH];
@@ -2971,8 +3030,7 @@ static void write_rc(void) {
         SetEnvironmentVariableW(L"HARDCORE_RC", path);
         GetModuleFileNameW(NULL, exe, MAX_PATH);   /* for rc.bash's `hardcore` (new window, update) */
         SetEnvironmentVariableW(L"HARDCORE_EXE", exe);
-        _snwprintf(wslenv, 2200, L"%ls%lsHARDCORE_RC/p:HARDCORE_EXE/p:HARDCORE_FILES/p", old, n ? L":" : L"");
-        wslenv[2199] = 0;
+        wslenv_join(n < 2048 ? old : L"", L"HARDCORE_RC/p:HARDCORE_EXE/p:HARDCORE_FILES/p", wslenv, 2200);
         SetEnvironmentVariableW(L"WSLENV", wslenv);
     }
     {   /* `hardcore` in this window's PowerShell and cmd tabs (and hardcore.exe in its WSL ones) */
@@ -6931,14 +6989,22 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         if (i == g_active) active = n;
         live[n++] = tb;
     }
-    if (!n) { snprintf(why, cap, "no running tabs"); return 0; }
+    /* tabs whose shell stopped under Claude (WSL stopped) go over too, as they are:
+       their text and their Claude session, for Enter to resume. Dropped, their
+       session was gone from the next start as well. */
+    int nkeep = 0;
+    static wchar_t keep_file[MAX_TABS][MAX_PATH];
+    for (i = 0; i < g_ntabs; i++) if (g_tabs[i]->kind != TK_BROWSER && session_keeps(g_tabs[i])) nkeep++;
+    if (!n && !nkeep) { snprintf(why, cap, "no running tabs"); return 0; }
     /* pages go over too: every carried tab's place, so the order (and the selection) stays */
     int pos_of[MAX_TABS], carried = 0;
     for (i = 0; i < g_ntabs; i++) {
         Tab *tb = g_tabs[i];
         int page = tb->kind == TK_BROWSER && tb->browser_url[0] && strncmp(tb->browser_url, "data:", 5);
         int term = !(tb->help || tb->exited || !tb->hpc);
-        pos_of[i] = page || term ? carried++ : -1;
+        int kept = tb->kind != TK_BROWSER && session_keeps(tb);
+        keep_file[i][0] = 0;
+        pos_of[i] = page || term || kept ? carried++ : -1;
     }
     if (pos_of[g_active] >= 0) active = pos_of[g_active];
     if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) { snprintf(why, cap, "no exe to reload into"); return 0; }
@@ -6992,6 +7058,36 @@ static int reload_into(const wchar_t *exe, char *why, size_t cap) {
         snprintf(page, sizeof(page), "%d %d %d %s %s", pos_of[i], parent, tb->browser_native,
                  tb->browser_target[0] ? tb->browser_target : "-", tb->browser_url);
         blob_line(&b, "www", page);
+    }
+    /* stopped tabs: one line each field, all before the first "tab", so an older
+       build (which has no lost- lines) passes over them; the text in a file */
+    for (i = 0; i < g_ntabs; i++) {
+        Tab *tb = g_tabs[i];
+        Term *t = &tb->t;
+        wchar_t dirw[MAX_PATH];
+        char fu[MAX_PATH * 3] = "", num[16];
+        FILE *v;
+        if (tb->kind == TK_BROWSER || !session_keeps(tb) || pos_of[i] < 0) continue;
+        if (GetTempPathW(MAX_PATH, dirw) && GetTempFileNameW(dirw, L"hcl", 0, keep_file[i])) {
+            if ((v = _wfopen(keep_file[i], L"wb"))) {
+                term_dump(t, v, 3000);
+                fclose(v);
+                WideCharToMultiByte(CP_UTF8, 0, keep_file[i], -1, fu, sizeof(fu), NULL, NULL);
+            }
+        }
+        sb_printf(&b, "lost-tab %d %d %d %d %d\n", pos_of[i], tb->kind, tb->help, t->cols, t->rows);
+        blob_line(&b, "lost-dir", tb->start_dir);
+        blob_line(&b, "lost-cwd", t->cwd);
+        blob_line(&b, "lost-claude", t->claude);
+        blob_line(&b, "lost-claude_args", t->claude_args);
+        blob_line(&b, "lost-claude_trust", t->claude_trust ? "1" : "0");
+        blob_line(&b, "lost-claude_origin", t->claude_origin);
+        blob_line(&b, "lost-cmd", t->cmd);
+        blob_line(&b, "lost-tag", tb->tag);
+        blob_line(&b, "lost-tag_cmd", tb->tag_cmd);
+        snprintf(num, sizeof(num), "%d", t->view);
+        blob_line(&b, "lost-view", num);
+        blob_line(&b, "lost-text", fu);      /* last: the new side makes the tab here */
     }
     for (i = 0; i < n; i++) {
         Tab *tb = live[i];
@@ -7063,6 +7159,7 @@ undo:
     if (ack_r) CloseHandle(ack_r);
     if (ack_w) CloseHandle(ack_w);
     for (i = 0; i < n; i++) reader_start(live[i]);   /* carry on as before */
+    for (i = 0; i < g_ntabs; i++) if (keep_file[i][0]) { DeleteFileW(keep_file[i]); keep_file[i][0] = 0; }
     return 0;
 }
 
@@ -7102,7 +7199,8 @@ static int adopt_tabs(void) {
     char *p = g_adopt_blob, *line;
     Tab *tb = NULL;
     static struct { Tab *tab; int at, parent; } pages[MAX_TABS];
-    int npages = 0;
+    int npages = 0, lost_at = -1, lost_kind = TK_WSL, lost_help = HELP_LOST, lost_view = 0;
+    Tab *lost = NULL;
     if (!p) return 0;
     wcscpy(g_session_id, L"session");   /* an older build's window saved to session.txt; a newer one says */
     while ((line = p) && *p) {
@@ -7128,6 +7226,55 @@ static int adopt_tabs(void) {
                     if (strcmp(target, "-")) snprintf(page->browser_target, sizeof(page->browser_target), "%s", target);
                     pages[npages].tab = page; pages[npages].at = at; pages[npages++].parent = parent;
                 }
+            }
+            continue;
+        }
+        if (!strcmp(line, "lost-tab")) {      /* a tab whose shell stopped under Claude: as it was, no process */
+            int c = 80, r = 24;
+            lost_at = -1; lost_kind = TK_WSL; lost_help = HELP_LOST;
+            sscanf(v, "%d %d %d %d %d", &lost_at, &lost_kind, &lost_help, &c, &r);
+            if (lost) { term_free(&lost->t); DeleteCriticalSection(&lost->lock); free(lost); }
+            if ((lost = (Tab *)calloc(1, sizeof(Tab))) && term_init(&lost->t, c > 0 ? c : 80, r > 0 ? r : 24)) {
+                lost->id = g_next_id++;
+                InitializeCriticalSection(&lost->lock);
+                lost->kind = lost_kind == TK_PS || lost_kind == TK_CMD ? lost_kind : TK_WSL;
+                lost->born = GetTickCount() - 60000;
+            } else { free(lost); lost = NULL; }
+            continue;
+        }
+        if (!strncmp(line, "lost-", 5)) {
+            const char *k = line + 5;
+            if (!lost) continue;
+            if (!strcmp(k, "dir")) snprintf(lost->start_dir, sizeof(lost->start_dir), "%s", v);
+            else if (!strcmp(k, "cwd")) snprintf(lost->t.cwd, sizeof(lost->t.cwd), "%s", v);
+            else if (!strcmp(k, "claude")) snprintf(lost->t.claude, sizeof(lost->t.claude), "%s", v);
+            else if (!strcmp(k, "claude_args")) snprintf(lost->t.claude_args, sizeof(lost->t.claude_args), "%s", v);
+            else if (!strcmp(k, "claude_trust")) lost->t.claude_trust = atoi(v) == 1;
+            else if (!strcmp(k, "claude_origin")) snprintf(lost->t.claude_origin, sizeof(lost->t.claude_origin), "%s", v);
+            else if (!strcmp(k, "cmd")) snprintf(lost->t.cmd, sizeof(lost->t.cmd), "%s", v);
+            else if (!strcmp(k, "tag")) snprintf(lost->tag, sizeof(lost->tag), "%s", v);
+            else if (!strcmp(k, "tag_cmd")) snprintf(lost->tag_cmd, sizeof(lost->tag_cmd), "%s", v);
+            else if (!strcmp(k, "view")) lost_view = atoi(v);
+            else if (!strcmp(k, "text")) {
+                wchar_t path[MAX_PATH];
+                size_t tn = 0;
+                char *text = NULL;
+                if (v[0]) {
+                    utf8_to_wide(v, path, MAX_PATH);
+                    if ((text = read_file(path, &tn))) vt_feed(&lost->t, (const unsigned char *)text, (int)tn);
+                    free(text);
+                    DeleteFileW(path);
+                }
+                lost->help = lost_help == HELP_FAILED ? HELP_FAILED : HELP_LOST;
+                InterlockedExchange(&lost->exited, 1);
+                lost->t.m_cursor_vis = 0;
+                lost->t.view = lost_view > 0 ? (lost_view < lost->t.hcount ? lost_view : lost->t.hcount) : 0;
+                lost->t.dirty = 1;
+                if (npages < MAX_TABS) {      /* placed like a page, where it was */
+                    pages[npages].tab = lost; pages[npages].at = lost_at; pages[npages++].parent = -1;
+                } else { term_free(&lost->t); DeleteCriticalSection(&lost->lock); free(lost); }
+                lost = NULL;
+                lost_view = 0;
             }
             continue;
         }
@@ -7195,6 +7342,14 @@ static int adopt_tabs(void) {
     }
     free(g_adopt_blob);
     g_adopt_blob = NULL;
+    if (lost) { term_free(&lost->t); DeleteCriticalSection(&lost->lock); free(lost); }   /* cut short */
+    for (int k = 1; k < npages; k++)     /* pages and stopped tabs, by place */
+        for (int j = k; j > 0 && pages[j - 1].at > pages[j].at; j--) {
+            Tab *st = pages[j].tab;
+            int sa = pages[j].at, sp = pages[j].parent;
+            pages[j] = pages[j - 1];
+            pages[j - 1].tab = st; pages[j - 1].at = sa; pages[j - 1].parent = sp;
+        }
     for (int k = 0; k < npages; k++) {   /* in order of place, each where it was */
         int at = pages[k].at < 0 ? g_ntabs : pages[k].at > g_ntabs ? g_ntabs : pages[k].at;
         if (g_ntabs >= MAX_TABS) break;
@@ -8153,6 +8308,21 @@ static int unit_issues(FILE *f) {
         fails += !ok;
     }
 #ifdef _WIN32
+    {   /* WSLENV: hardcore's names once, however many windows a reload chain started */
+        wchar_t a[2200], b[2200];
+        const wchar_t *ours = L"HARDCORE_RC/p:HARDCORE_EXE/p:HARDCORE_FILES/p";
+        int ok, r;
+        wslenv_join(L"", ours, a, 2200);
+        ok = !wcscmp(a, ours);
+        for (r = 0; r < 40; r++) { wslenv_join(a, ours, b, 2200); wcscpy(a, b); }   /* 40 updates in place */
+        ok = ok && !wcscmp(a, ours);
+        wslenv_join(L"USERPROFILE/p:HARDCORE_EXE/up:FOO", ours, a, 2200);
+        ok = ok && !wcscmp(a, L"USERPROFILE/p:HARDCORE_EXE/up:FOO:HARDCORE_RC/p:HARDCORE_FILES/p");
+        wslenv_join(L"HARDCORE_RCX:XHARDCORE_RC", L"HARDCORE_RC/p", a, 2200);   /* whole names only */
+        ok = ok && !wcscmp(a, L"HARDCORE_RCX:XHARDCORE_RC:HARDCORE_RC/p");
+        fprintf(f, "%s issue a window started by a reload doesn't add hardcore's WSLENV names again\n", ok ? "ok  " : "FAIL");
+        fails += !ok;
+    }
     {   /* the command a restored or stopped tab resumes Claude with */
         char run[600];
         int ok;
